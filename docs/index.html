@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pane — A seamless Linux desktop on Windows</title>
+  <meta name="description" content="Pane gives you a full Linux desktop environment on Windows via WSL2. One click. No dual boot. No VM hassle.">
+  <meta property="og:title" content="Pane — A seamless Linux desktop on Windows">
+  <meta property="og:description" content="Tired of WSL2 being CLI-only? Pane gives you a full Linux desktop with one click.">
+  <meta property="og:type" content="website">
+  <meta name="theme-color" content="#0a0a0a">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>▢</text></svg>">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="scanlines"></div>
+  <main class="terminal" id="terminal">
+    <div class="terminal-chrome">
+      <div class="terminal-dots">
+        <span class="dot dot-red"></span>
+        <span class="dot dot-yellow"></span>
+        <span class="dot dot-green"></span>
+      </div>
+      <span class="terminal-title">pane</span>
+    </div>
+    <div class="terminal-body">
+      <div id="output"></div>
+      <div id="prompt" class="hidden">
+        <span class="prompt-symbol">$</span>
+        <span id="prompt-text"></span>
+        <span class="cursor">_</span>
+      </div>
+      <div id="choices" class="hidden">
+        <button class="choice" data-key="y" id="btn-yes">[Y] Yes</button>
+        <button class="choice" data-key="n" id="btn-no">[N] No</button>
+      </div>
+      <div id="hero" class="hidden">
+        <div id="hero-text"></div>
+        <div id="hero-links" class="hidden">
+          <a href="https://github.com/NAME0x0/pane" class="link" id="repo-link">
+            <span class="link-icon">*</span> Star on GitHub
+          </a>
+          <a href="https://github.com/NAME0x0/pane/blob/main/CONTRIBUTING.md" class="link" id="contribute-link">
+            <span class="link-icon">></span> Contribute
+          </a>
+        </div>
+      </div>
+      <div id="no-response" class="hidden"></div>
+    </div>
+  </main>
+  <footer class="footer hidden" id="footer">
+    <a href="https://github.com/NAME0x0/pane">GitHub</a>
+    <span class="separator">·</span>
+    <span>MIT License</span>
+  </footer>
+  <script src="main.js"></script>
+</body>
+</html>

@@ -46,19 +46,30 @@ pane status
 
 Pane manages the full pipeline between Windows and your WSL2 Linux desktop:
 
-```
-Windows                          WSL2
-┌──────────────┐    ┌──────────────────────────┐
-│              │    │                          │
-│  pane.exe    │◄──►│  pane-daemon (systemd)   │
-│  (launcher)  │    │  ├─ XRDP + GFX pipeline  │
-│              │    │  ├─ Audio (PipeWire)      │
-│  Embedded    │    │  ├─ Clipboard sync        │
-│  RDP client  │    │  └─ Session management    │
-│              │    │                          │
-│              │    │  Your full DE runs here   │
-│              │    │  (KDE, XFCE, GNOME, etc.) │
-└──────────────┘    └──────────────────────────┘
+```mermaid
+graph LR
+    subgraph Windows
+        A[pane.exe<br>Launcher] --> B[Embedded<br>RDP Client]
+    end
+
+    B <-->|Optimized RDP| C
+
+    subgraph WSL2
+        C[pane-daemon<br>systemd] --> D[XRDP + GFX Pipeline]
+        C --> E[Audio · PipeWire]
+        C --> F[Clipboard Sync]
+        C --> G[Session Management]
+        D --> H[Your Desktop Environment<br>KDE · XFCE · GNOME · etc.]
+    end
+
+    style A fill:#1a1a2e,stroke:#4ade80,color:#e0e0e0
+    style B fill:#1a1a2e,stroke:#4ade80,color:#e0e0e0
+    style C fill:#0f3460,stroke:#4ade80,color:#e0e0e0
+    style D fill:#16213e,stroke:#334155,color:#b0b0b0
+    style E fill:#16213e,stroke:#334155,color:#b0b0b0
+    style F fill:#16213e,stroke:#334155,color:#b0b0b0
+    style G fill:#16213e,stroke:#334155,color:#b0b0b0
+    style H fill:#0f3460,stroke:#4ade80,color:#e0e0e0
 ```
 
 ## Roadmap
@@ -74,6 +85,16 @@ Windows                          WSL2
 - Windows 10 or 11 with WSL2 enabled
 - A WSL2 Linux distribution installed
 - A desktop environment installed in your distro (`sudo pacman -S xfce4`, etc.)
+
+## Sponsor
+
+If Pane is useful to you, consider supporting the project. Sponsorship helps cover development time, testing infrastructure, and keeps the project independent.
+
+<a href="https://github.com/sponsors/NAME0x0">
+  <strong>Sponsor on GitHub</strong>
+</a>
+
+Every bit helps — even starring the repo makes a difference.
 
 ## Contributing
 

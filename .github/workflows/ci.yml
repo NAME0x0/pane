@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+        if: hashFiles('Cargo.toml') != ''
+
+      - name: Clippy
+        run: cargo clippy -- -D warnings
+        if: hashFiles('Cargo.toml') != ''
+
+      - name: Build
+        run: cargo build
+        if: hashFiles('Cargo.toml') != ''
+
+      - name: Test
+        run: cargo test
+        if: hashFiles('Cargo.toml') != ''
+
+  lint-website:
+    name: Lint Website
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate HTML
+        run: |
+          for f in docs/*.html; do
+            echo "Checking $f..."
+            if grep -qP '[\x80-\xff]' "$f" 2>/dev/null; then
+              echo "Warning: non-ASCII characters in $f"
+            fi
+            echo "OK"
+          done
+
+      - name: Check for broken local links
+        run: |
+          cd docs
+          for href in $(grep -oP 'href="(?!http|data:|#)([^"]+)"' *.html | grep -oP '"[^"]+"' | tr -d '"'); do
+            if [ ! -f "$href" ]; then
+              echo "Broken link: $href"
+              exit 1
+            fi
+          done
+          echo "All local links valid"

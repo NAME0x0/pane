@@ -56,6 +56,7 @@ jobs:
         with:
           name: pane-windows-package
           path: |
+            dist/pane-windows-x86_64.exe
             dist/pane-windows-x86_64.zip
             dist/pane-windows-x86_64/**
 

@@ -12,6 +12,7 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 $distRoot = Join-Path $repoRoot "dist"
 $packageDir = Join-Path $distRoot "pane-windows-x86_64"
 $archivePath = Join-Path $distRoot "pane-windows-x86_64.zip"
+$exeAssetPath = Join-Path $distRoot "pane-windows-x86_64.exe"
 $validationScript = Join-Path $repoRoot "scripts\validate-package.ps1"
 $assetRoot = Join-Path $repoRoot "scripts\package-assets"
 $iconAssetRoot = Join-Path $repoRoot "assets"
@@ -39,9 +40,15 @@ try {
         throw "Expected icon asset directory at $iconAssetRoot"
     }
 
+    New-Item -ItemType Directory -Force $distRoot | Out-Null
+
+    if (Test-Path $exeAssetPath) {
+        Remove-Item $exeAssetPath -Force
+    }
     Remove-Item $packageDir -Recurse -Force -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Force $packageDir | Out-Null
 
+    Copy-Item $binaryPath $exeAssetPath
     Copy-Item $binaryPath (Join-Path $packageDir "pane.exe")
     Copy-Item (Join-Path $repoRoot "README.md") $packageDir
     Copy-Item (Join-Path $repoRoot "LICENSE") $packageDir
@@ -59,6 +66,7 @@ try {
     }
     Compress-Archive -Path (Join-Path $packageDir "*") -DestinationPath $archivePath
 
+    Write-Host "Standalone exe: $exeAssetPath"
     Write-Host "Package directory: $packageDir"
     Write-Host "Archive: $archivePath"
 

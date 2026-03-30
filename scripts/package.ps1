@@ -2,7 +2,8 @@ param(
     [string]$Profile = "release",
     [switch]$RunSmoke,
     [string]$Distro = "pane-arch",
-    [string]$DesktopEnvironment = "xfce"
+    [string]$DesktopEnvironment = "xfce",
+    [switch]$Offline
 )
 
 $ErrorActionPreference = "Stop"
@@ -17,7 +18,15 @@ $iconAssetRoot = Join-Path $repoRoot "assets"
 
 Push-Location $repoRoot
 try {
-    cargo build --offline --profile $Profile
+    $cargoArgs = @("build", "--profile", $Profile)
+    if ($Offline) {
+        $cargoArgs += "--offline"
+    }
+
+    cargo @cargoArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "cargo build failed with exit code $LASTEXITCODE"
+    }
 
     $binaryPath = Join-Path $repoRoot "target\$Profile\pane.exe"
     if (-not (Test-Path $binaryPath)) {

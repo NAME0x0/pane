@@ -5,41 +5,62 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
-    name: Check
+  rust-quality:
+    name: Rust Quality
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-rust
 
       - name: Format
         run: cargo fmt --check
-        if: hashFiles('Cargo.toml') != ''
+
+      - name: Check
+        run: cargo check
 
       - name: Clippy
         run: cargo clippy -- -D warnings
-        if: hashFiles('Cargo.toml') != ''
-
-      - name: Build
-        run: cargo build
-        if: hashFiles('Cargo.toml') != ''
 
       - name: Test
         run: cargo test
-        if: hashFiles('Cargo.toml') != ''
 
-  lint-website:
-    name: Lint Website
+  package-windows:
+    name: Package Windows Build
+    runs-on: windows-latest
+    needs: rust-quality
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-rust
+
+      - name: Build packaged release
+        shell: pwsh
+        run: ./scripts/package.ps1 -Profile release
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pane-windows-package
+          path: |
+            dist/pane-windows-x86_64.zip
+            dist/pane-windows-x86_64/**
+
+  docs-check:
+    name: Docs Check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

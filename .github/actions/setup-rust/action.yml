@@ -1,0 +1,13 @@
+name: Setup Rust
+description: Install the stable Rust toolchain with shared caching for Pane workflows.
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+
+    - name: Cache cargo state
+      uses: Swatinem/rust-cache@v2

@@ -51,7 +51,7 @@
     await wait(200);
 
     show(prompt);
-    await typeText(promptText, "Tired of WSL2 being just a CLI?", 40);
+    await typeText(promptText, "Want an Arch Linux desktop in WSL2 without doing the XRDP support dance by hand?", 36);
     await wait(600);
 
     show(choices);
@@ -102,19 +102,20 @@
     show(hero);
 
     await wait(300);
-    addLine(heroText, "We get you.", "line-bright");
+    addLine(heroText, "Pane now ships an Arch-first MVP.", "line-bright");
     await wait(500);
     addLine(heroText, "");
     await wait(200);
-    addLine(heroText, "That's why we built Pane.", "line-accent");
+    addLine(heroText, "The package now ships a Pane Control Center so launch, update, repair, reconnect, logs, reset, and support stay out of the terminal.", "line-accent");
+    await wait(200);
+    addLine(heroText, "Arch + XFCE is the only surfaced desktop profile until the others are supportable enough to stop creating support debt.", "line-accent");
+    await wait(200);
+    addLine(heroText, "Open Pane Shared Folder and Collect Pane Support Bundle keep the recovery path inside the app bundle.", "line-accent");
     await wait(400);
     addLine(heroText, "");
     await wait(200);
-    addLine(heroText, "A full Linux desktop on Windows.", "line");
-    addLine(heroText, "One click. No dual boot. No VM hassle.", "line");
-    await wait(400);
-    addLine(heroText, "");
-    addLine(heroText, "We're just getting started.", "line-dim");
+    addLine(heroText, "Phase 1 is the foundation. The MVP narrows support on purpose.", "line");
+    addLine(heroText, "Pane now uses direct localhost when Windows can reach WSL and falls back to Pane relay when it cannot, but the zero-latency step is still the later non-RDP transport.", "line");
     await wait(500);
 
     show(heroLinks);
@@ -129,7 +130,7 @@
     await wait(500);
     addLine(noResponse, "");
     await wait(200);
-    addLine(noResponse, "We'll be here when you change your mind.", "line-dim");
+    addLine(noResponse, "The Arch MVP guide, audit, and source are still here when you want them.", "line-dim");
     await wait(600);
     addLine(noResponse, "");
 

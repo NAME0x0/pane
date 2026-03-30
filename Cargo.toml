@@ -1,0 +1,17 @@
+[package]
+name = "pane"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+description = "Windows-native app surface for Pane-managed Linux environments."
+repository = "https://github.com/NAME0x0/pane"
+
+[dependencies]
+clap = { version = "4.5.32", features = ["derive"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+thiserror = "2.0.12"
+
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3.0.6"

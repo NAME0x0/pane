@@ -3,13 +3,13 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Pane — A seamless Linux desktop on Windows</title>
-  <meta name="description" content="Pane gives you a full Linux desktop environment on Windows via WSL2. One click. No dual boot. No VM hassle.">
-  <meta property="og:title" content="Pane — A seamless Linux desktop on Windows">
-  <meta property="og:description" content="Tired of WSL2 being CLI-only? Pane gives you a full Linux desktop with one click.">
+  <title>Pane - Arch-first WSL2 desktop launcher</title>
+  <meta name="description" content="Pane ships an Arch-first MVP for WSL2 desktop sessions with a control-center window, a shared workspace, diagnostics, and a localhost-first XRDP path with Pane relay fallback.">
+  <meta property="og:title" content="Pane - Arch-first WSL2 desktop launcher">
+  <meta property="og:description" content="Launch Arch + XFCE on WSL from a packaged Windows app bundle with a control center, shared workspace access, support tooling, and mstsc.exe handoff.">
   <meta property="og:type" content="website">
   <meta name="theme-color" content="#0a0a0a">
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>▢</text></svg>">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>P</text></svg>">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -38,10 +38,10 @@
         <div id="hero-text"></div>
         <div id="hero-links" class="hidden">
           <a href="https://github.com/NAME0x0/pane" class="link" id="repo-link">
-            <span class="link-icon">*</span> Star on GitHub
+            <span class="link-icon">*</span> Source
           </a>
-          <a href="https://github.com/NAME0x0/pane/blob/main/CONTRIBUTING.md" class="link" id="contribute-link">
-            <span class="link-icon">></span> Contribute
+          <a href="mvp-arch.md" class="link" id="guide-link">
+            <span class="link-icon">></span> Arch MVP Guide
           </a>
         </div>
       </div>
@@ -50,8 +50,8 @@
   </main>
   <footer class="footer hidden" id="footer">
     <a href="https://github.com/NAME0x0/pane">GitHub</a>
-    <span class="separator">·</span>
-    <span>MIT License</span>
+    <span class="separator">.</span>
+    <a href="phase-1-audit.md">Phase 1 Audit</a>
   </footer>
   <script src="main.js"></script>
 </body>

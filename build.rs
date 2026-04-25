@@ -58,7 +58,9 @@ END
 
     let rc_path = out_dir.join("pane-version.rc");
     fs::write(&rc_path, rc_contents).expect("write rc");
-    let _ = embed_resource::compile(rc_path, embed_resource::NONE);
+    embed_resource::compile(rc_path, embed_resource::NONE)
+        .manifest_required()
+        .expect("compile Pane Windows resources");
 }
 
 #[cfg(not(windows))]

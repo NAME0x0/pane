@@ -7,8 +7,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::AppResult,
-    model::{DesktopEnvironment, DistroRecord},
+    model::{DesktopEnvironment, DistroRecord, SharedStorageMode},
 };
+
+pub const DEFAULT_RUNTIME_CAPACITY_GIB: u64 = 8;
+pub const MINIMUM_RUNTIME_CAPACITY_GIB: u64 = 8;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -18,6 +21,27 @@ pub struct WorkspacePaths {
     pub rdp_profile: PathBuf,
     pub bootstrap_log: PathBuf,
     pub transport_log: PathBuf,
+    pub shared_dir: PathBuf,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RuntimePaths {
+    pub root: PathBuf,
+    pub downloads: PathBuf,
+    pub images: PathBuf,
+    pub disks: PathBuf,
+    pub snapshots: PathBuf,
+    pub state: PathBuf,
+    pub engines: PathBuf,
+    pub logs: PathBuf,
+    pub base_os_image: PathBuf,
+    pub user_disk: PathBuf,
+    pub base_os_metadata: PathBuf,
+    pub user_disk_metadata: PathBuf,
+    pub runtime_config: PathBuf,
+    pub native_manifest: PathBuf,
+    pub manifest: PathBuf,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -77,19 +101,65 @@ pub fn managed_distro_install_root(distro_name: &str) -> PathBuf {
 }
 
 pub fn workspace_for(session_name: &str) -> WorkspacePaths {
+    workspace_for_with_shared_storage(session_name, SharedStorageMode::Durable)
+}
+
+pub fn workspace_for_with_shared_storage(
+    session_name: &str,
+    shared_storage: SharedStorageMode,
+) -> WorkspacePaths {
     let normalized = sanitize_session_name(session_name);
     let root = app_root().join("sessions").join(&normalized);
+    let shared_dir = match shared_storage {
+        SharedStorageMode::Durable => app_root().join("shared").join(&normalized),
+        SharedStorageMode::Scratch => root.join("shared"),
+    };
     WorkspacePaths {
         bootstrap_script: root.join("pane-bootstrap.sh"),
         rdp_profile: root.join("pane.rdp"),
         bootstrap_log: root.join("bootstrap.log"),
         transport_log: root.join("transport.log"),
+        shared_dir,
+        root,
+    }
+}
+
+pub fn runtime_for(session_name: &str) -> RuntimePaths {
+    let normalized = sanitize_session_name(session_name);
+    let root = app_root().join("runtime").join(&normalized);
+    let downloads = root.join("downloads");
+    let images = root.join("images");
+    let disks = root.join("disks");
+    let snapshots = root.join("snapshots");
+    let state = root.join("state");
+    let engines = root.join("engines");
+    let logs = root.join("logs");
+
+    RuntimePaths {
+        base_os_image: images.join("arch-base.paneimg"),
+        user_disk: disks.join("user-data.panedisk"),
+        base_os_metadata: state.join("base-os-image.json"),
+        user_disk_metadata: state.join("user-disk.json"),
+        runtime_config: root.join("pane-runtime.config.json"),
+        native_manifest: root.join("pane-native-runtime.json"),
+        manifest: root.join("pane-runtime.json"),
+        downloads,
+        images,
+        disks,
+        snapshots,
+        state,
+        engines,
+        logs,
         root,
     }
 }
 
 pub fn shared_dir_for_workspace(workspace: &WorkspacePaths) -> PathBuf {
-    workspace.root.join("shared")
+    if workspace.shared_dir.as_os_str().is_empty() {
+        workspace.root.join("shared")
+    } else {
+        workspace.shared_dir.clone()
+    }
 }
 
 pub fn shared_readme_for_workspace(workspace: &WorkspacePaths) -> PathBuf {
@@ -158,8 +228,8 @@ pub fn windows_to_wsl_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        managed_distro_install_root, sanitize_session_name, shared_dir_for_workspace,
-        windows_to_wsl_path, workspace_for,
+        managed_distro_install_root, runtime_for, sanitize_session_name, shared_dir_for_workspace,
+        windows_to_wsl_path, workspace_for, workspace_for_with_shared_storage,
     };
 
     #[test]
@@ -186,11 +256,21 @@ mod tests {
         assert!(workspace
             .transport_log
             .ends_with("sessions\\pane-session\\transport.log"));
+        assert!(workspace.shared_dir.ends_with("Pane\\shared\\pane-session"));
     }
 
     #[test]
-    fn shared_directory_is_scoped_to_the_session_workspace() {
+    fn shared_directory_is_durable_by_default() {
         let workspace = workspace_for("Pane Session");
+        assert!(shared_dir_for_workspace(&workspace).ends_with("Pane\\shared\\pane-session"));
+    }
+
+    #[test]
+    fn shared_directory_can_be_scoped_to_the_session_workspace() {
+        let workspace = workspace_for_with_shared_storage(
+            "Pane Session",
+            crate::model::SharedStorageMode::Scratch,
+        );
         assert!(shared_dir_for_workspace(&workspace).ends_with("sessions\\pane-session\\shared"));
     }
 
@@ -198,5 +278,28 @@ mod tests {
     fn managed_distro_root_is_scoped_under_local_app_data() {
         let root = managed_distro_install_root("Pane Arch");
         assert!(root.ends_with("Pane\\distros\\pane-arch"));
+    }
+
+    #[test]
+    fn runtime_paths_include_native_engine_boundaries() {
+        let runtime = runtime_for("Pane Session");
+
+        assert!(runtime.root.ends_with("Pane\\runtime\\pane-session"));
+        assert!(runtime.base_os_image.ends_with("images\\arch-base.paneimg"));
+        assert!(runtime.user_disk.ends_with("disks\\user-data.panedisk"));
+        assert!(runtime
+            .runtime_config
+            .ends_with("runtime\\pane-session\\pane-runtime.config.json"));
+        assert!(runtime
+            .base_os_metadata
+            .ends_with("runtime\\pane-session\\state\\base-os-image.json"));
+        assert!(runtime
+            .user_disk_metadata
+            .ends_with("runtime\\pane-session\\state\\user-disk.json"));
+        assert!(runtime
+            .native_manifest
+            .ends_with("runtime\\pane-session\\pane-native-runtime.json"));
+        assert!(runtime.engines.ends_with("runtime\\pane-session\\engines"));
+        assert!(runtime.logs.ends_with("runtime\\pane-session\\logs"));
     }
 }

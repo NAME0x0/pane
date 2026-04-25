@@ -16,7 +16,7 @@ if (-not (Test-Path $paneExe)) {
 $shortcutSpecs = @(
     @{
         Name = "Pane.lnk"
-        Target = Join-Path $packageRoot "Pane Control Center.cmd"
+        Target = $paneExe
         Description = "Open the Pane control center."
     },
     @{
@@ -32,7 +32,7 @@ $shortcutSpecs = @(
     @{
         Name = "Pane Shared Folder.lnk"
         Target = Join-Path $packageRoot "Open Pane Shared Folder.cmd"
-        Description = "Open the Pane-managed shared folder."
+        Description = "Open PaneShared storage."
     },
     @{
         Name = "Pane Support Bundle.lnk"

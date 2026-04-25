@@ -45,7 +45,7 @@
 
   async function intro() {
     await wait(400);
-    addLine(output, "pane v0.1.0", "line-dim");
+    addLine(output, "pane pre-release", "line-dim");
     await wait(300);
     addLine(output, "");
     await wait(200);
@@ -102,7 +102,7 @@
     show(hero);
 
     await wait(300);
-    addLine(heroText, "Pane now ships an Arch-first MVP.", "line-bright");
+    addLine(heroText, "Pane is now an Arch-first pre-release MVP.", "line-bright");
     await wait(500);
     addLine(heroText, "");
     await wait(200);
@@ -110,12 +110,14 @@
     await wait(200);
     addLine(heroText, "Arch + XFCE is the only surfaced desktop profile until the others are supportable enough to stop creating support debt.", "line-accent");
     await wait(200);
-    addLine(heroText, "Open Pane Shared Folder and Collect Pane Support Bundle keep the recovery path inside the app bundle.", "line-accent");
+    addLine(heroText, "Pane now owns runtime storage and probes Windows Hypervisor Platform readiness before the first native boot spike.", "line-accent");
+    await wait(200);
+    addLine(heroText, "PaneShared storage and Collect Pane Support Bundle keep file-sharing and recovery paths inside the app bundle.", "line-accent");
     await wait(400);
     addLine(heroText, "");
     await wait(200);
     addLine(heroText, "Phase 1 is the foundation. The MVP narrows support on purpose.", "line");
-    addLine(heroText, "Pane now uses direct localhost when Windows can reach WSL and falls back to Pane relay when it cannot, but the zero-latency step is still the later non-RDP transport.", "line");
+    addLine(heroText, "Pane still uses the WSL/XRDP bridge for the launchable desktop today; the native-runtime architecture document defines the WHP path beyond that bridge.", "line");
     await wait(500);
 
     show(heroLinks);
@@ -130,7 +132,7 @@
     await wait(500);
     addLine(noResponse, "");
     await wait(200);
-    addLine(noResponse, "The Arch MVP guide, audit, and source are still here when you want them.", "line-dim");
+    addLine(noResponse, "The Arch MVP guide, native runtime contract, audit, and source are still here when you want them.", "line-dim");
     await wait(600);
     addLine(noResponse, "");
 

@@ -152,7 +152,9 @@ $requiredFiles = @(
     "clean-machine-validation.md",
     "vision.md",
     "product-contract.md",
+    "native-runtime-architecture.md",
     "validate-package.ps1",
+    "certify-fresh-machine.ps1",
     "assets\pane-icon.png",
     "assets\pane-icon.ico",
     "Pane Control Center.ps1",
@@ -207,6 +209,10 @@ try {
     $updateDryRun = Invoke-PaneCapture -PaneExe $paneExe -Arguments @("update", "--dry-run", "--de", $DesktopEnvironment, "--session-name", $SessionName) -OutputPath (Join-Path $artifactRoot "update-dry-run.txt")
     $doctor = Invoke-PaneCapture -PaneExe $paneExe -Arguments @("doctor", "--json", "--distro", $Distro, "--de", $DesktopEnvironment, "--session-name", $SessionName) -OutputPath (Join-Path $artifactRoot "doctor.json") | ConvertFrom-Json
     $doctorReconnect = Invoke-PaneCapture -PaneExe $paneExe -Arguments @("doctor", "--json", "--distro", $Distro, "--de", $DesktopEnvironment, "--session-name", $SessionName, "--skip-bootstrap") -OutputPath (Join-Path $artifactRoot "doctor-reconnect.json") | ConvertFrom-Json
+    $appStatus = Invoke-PaneCapture -PaneExe $paneExe -Arguments @("app-status", "--json", "--session-name", $SessionName) -OutputPath (Join-Path $artifactRoot "app-status.json") | ConvertFrom-Json
+    $runtime = Invoke-PaneCapture -PaneExe $paneExe -Arguments @("runtime", "--json", "--prepare", "--create-user-disk", "--session-name", $SessionName, "--capacity-gib", "8") -OutputPath (Join-Path $artifactRoot "runtime.json") | ConvertFrom-Json
+    $nativePreflight = Invoke-PaneCapture -PaneExe $paneExe -Arguments @("native-preflight", "--json", "--session-name", $SessionName) -OutputPath (Join-Path $artifactRoot "native-preflight.json") | ConvertFrom-Json
+    $nativeLaunchDryRun = Invoke-PaneCapture -PaneExe $paneExe -Arguments @("launch", "--runtime", "pane-owned", "--dry-run", "--session-name", $SessionName) -OutputPath (Join-Path $artifactRoot "native-launch-dry-run.txt")
 
     if (-not $init.managed_environment -or $init.managed_environment.distro_name -ne "pane-arch") {
         throw "Init dry-run did not resolve the expected Pane-managed provisioning target."
@@ -248,10 +254,58 @@ try {
     if ($null -eq $doctorReconnect.selected_distro.user_home_ready) {
         throw "pane doctor --skip-bootstrap did not report user-home readiness. Review $artifactRoot\doctor-reconnect.json."
     }
+    if (-not $appStatus.next_action -or -not $appStatus.display) {
+        throw "pane app-status did not return app-facing lifecycle and display information. Review $artifactRoot\app-status.json."
+    }
+    if ($appStatus.display.current_mode -ne "external-mstsc-rdp" -or $appStatus.display.contained_window_available) {
+        throw "pane app-status misrepresented the current display transport boundary. Review $artifactRoot\app-status.json."
+    }
+    if (-not $appStatus.runtime -or $appStatus.runtime.target_engine -ne "pane-owned-os-runtime") {
+        throw "pane app-status did not expose the Pane-owned runtime target. Review $artifactRoot\app-status.json."
+    }
+    if (-not $runtime.prepared -or $runtime.current_engine -ne "wsl-xrdp-bridge" -or $runtime.target_engine -ne "pane-owned-os-runtime") {
+        throw "pane runtime did not prepare or report the current/target runtime engines correctly. Review $artifactRoot\runtime.json."
+    }
+    if ($runtime.storage_budget.requested_capacity_gib -ne 8) {
+        throw "pane runtime did not use the expected 8 GiB runtime reservation. Review $artifactRoot\runtime.json."
+    }
+    if (-not $runtime.native_runtime -or $runtime.native_runtime.requires_wsl -or $runtime.native_runtime.requires_mstsc -or $runtime.native_runtime.requires_xrdp) {
+        throw "pane runtime did not expose a WSL/mstsc/XRDP-free native runtime contract. Review $artifactRoot\runtime.json."
+    }
+    if (-not $runtime.native_host -or $null -eq $runtime.native_runtime.host_ready -or $null -eq $runtime.native_runtime.ready_for_boot_spike) {
+        throw "pane runtime did not expose native host preflight state. Review $artifactRoot\runtime.json."
+    }
+    if (-not $runtime.artifacts.user_disk_ready) {
+        throw "pane runtime did not create a valid Pane-owned user disk descriptor. Review $artifactRoot\runtime.json."
+    }
+    if (-not $nativePreflight.host -or -not $nativePreflight.host.checks) {
+        throw "pane native-preflight did not report host checks. Review $artifactRoot\native-preflight.json."
+    }
+    if (-not $nativePreflight.runtime -or $nativePreflight.runtime.target_engine -ne "pane-owned-os-runtime") {
+        throw "pane native-preflight did not include the Pane-owned runtime target. Review $artifactRoot\native-preflight.json."
+    }
+    if ($nativeLaunchDryRun -notmatch "Pane-Owned Runtime Launch") {
+        throw "pane launch --runtime pane-owned --dry-run did not exercise the native runtime path. Review $artifactRoot\native-launch-dry-run.txt."
+    }
 
     $controlCenterOutput = Invoke-ScriptCapture -ScriptPath $controlCenterScript -Arguments @("-SessionName", $SessionName, "-PrintOnly") -OutputPath (Join-Path $artifactRoot "control-center.txt")
     if ($controlCenterOutput -notmatch "Onboard Arch") {
         throw "Pane Control Center did not advertise the onboarding-first app flow."
+    }
+    if ($controlCenterOutput -notmatch "First Run Wizard") {
+        throw "Pane Control Center did not advertise the first-run app flow."
+    }
+    if ($controlCenterOutput -notmatch "Runtime Space") {
+        throw "Pane Control Center did not advertise the dedicated runtime-space foundation."
+    }
+    if ($controlCenterOutput -notmatch "Native Preview") {
+        throw "Pane Control Center did not advertise the native runtime preview."
+    }
+    if ($controlCenterOutput -notmatch "Native Preflight") {
+        throw "Pane Control Center did not advertise native host preflight."
+    }
+    if ($controlCenterOutput -notmatch "Image Register") {
+        throw "Pane Control Center did not advertise base image registration."
     }
     Invoke-ScriptCapture -ScriptPath $launchScript -Arguments @("-SessionName", $SessionName, "-DryRun", "-NoConnect") -OutputPath (Join-Path $artifactRoot "launch-dry-run.txt") | Out-Null
     Invoke-ScriptCapture -ScriptPath $terminalScript -Arguments @("-PrintOnly") -OutputPath (Join-Path $artifactRoot "terminal.txt") | Out-Null
@@ -308,6 +362,15 @@ try {
         onboard = $onboard
         doctor_ready = $doctor.ready
         doctor_supported_for_mvp = $doctor.supported_for_mvp
+        app_phase = $appStatus.phase
+        app_next_action = $appStatus.next_action
+        runtime_prepared = $runtime.prepared
+        runtime_target = $runtime.target_engine
+        runtime_capacity_gib = $runtime.storage_budget.requested_capacity_gib
+        runtime_user_disk_ready = $runtime.artifacts.user_disk_ready
+        native_preflight_ready = $nativePreflight.ready_for_boot_spike
+        native_host_ready = $runtime.native_runtime.host_ready
+        native_runtime_dry_run = ($nativeLaunchDryRun -match "Pane-Owned Runtime Launch")
         reconnect_session_assets_ready = $doctorReconnect.selected_distro.pane_session_assets_ready
         reconnect_user_home_ready = $doctorReconnect.selected_distro.user_home_ready
         selected_distro = $doctor.target_distro
@@ -330,7 +393,7 @@ try {
 }
 finally {
     try {
-        & $paneExe reset --session-name $SessionName *> $null
+        & $paneExe reset --session-name $SessionName --purge-shared *> $null
     }
     catch {
     }

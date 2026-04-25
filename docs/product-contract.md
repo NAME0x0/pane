@@ -78,11 +78,13 @@ The current implementation:
 
 - provides a Windows-side app surface,
 - prepares and validates the Arch + XFCE path,
-- manages session assets and a shared workspace,
+- manages session assets and PaneShared storage,
 - launches a real Linux desktop,
 - still hands the visible desktop window off to `mstsc.exe` over XRDP.
 
 This means the current product is already app-shaped, but it is not yet the final contained display architecture.
+
+Pane is now reserving a future runtime boundary: a dedicated 8 GiB default app-owned space for downloaded OS images, the base system image, an expandable user disk, snapshots, package/customization data, runtime state, runtime config, base-image verification metadata, user-disk metadata, native-runtime manifest, and Windows Hypervisor Platform host preflight. That reserved space is not a bootable runtime yet; it is the contract that lets Pane move toward an app-owned OS engine without confusing it with PaneShared or the current WSL bridge.
 
 ## End-State Vision
 
@@ -106,11 +108,14 @@ Pane should eventually own:
 - support diagnostics and support bundles,
 - update and repair tooling,
 - reset and recovery flows,
-- Windows-to-Linux shared workspace integration,
-- the app-side presentation and, later, the display transport.
+- Windows-to-Linux PaneShared storage integration,
+- the app-side presentation and, later, the display transport,
+- the runtime image, user disk, snapshot, export/import, and repair boundary once Pane moves beyond the WSL bridge.
+- the native WHP boot host once Pane moves from preflight to real boot execution.
 
 The user should own:
 
+- durable files they intentionally place in PaneShared,
 - packages installed inside their Linux environment,
 - dotfiles,
 - themes,
@@ -218,6 +223,19 @@ That implies future work on:
 
 This is a product-level requirement, not a nice-to-have.
 
+## PaneShared Storage Policy
+
+PaneShared must be treated as user data unless the user explicitly opts into scratch storage.
+
+The default behavior should be:
+
+- durable PaneShared storage lives outside disposable session workspaces,
+- `pane reset` preserves durable PaneShared by default,
+- destructive cleanup requires an explicit purge option,
+- scratch PaneShared storage is allowed for disposable sessions and may be removed with the session workspace.
+
+This distinction matters because file sharing can become user storage. Pane should never casually destroy it during repair or reset flows.
+
 ## Display Requirement
 
 Pane should eventually present Linux desktops in a way that feels contained and local to Pane.
@@ -229,6 +247,23 @@ Until Pane owns the display path:
 - but the product should not claim the final contained-window experience yet.
 
 Replacing the XRDP handoff is the milestone that makes the "contained app" vision real in the strongest sense.
+
+## Release Gate
+
+Pane should not be treated as a first public release until:
+
+- `pane.exe` is the real packaged app entrypoint,
+- standalone `pane.exe` can hydrate the Control Center assets it needs instead of falling back to CLI-only behavior,
+- the Control Center is the primary non-CLI surface,
+- the Control Center can consume `pane app-status` for a single lifecycle phase, next action, PaneShared policy, and current display-transport boundary,
+- `pane runtime` can prepare a dedicated runtime-space manifest, config, native-runtime contract, verified base-image metadata, and user-disk descriptor for the future Pane-owned OS engine without claiming that engine is already bootable,
+- `pane native-preflight` can report WHP host capability and runtime artifact blockers without side effects,
+- `pane launch --runtime pane-owned --dry-run` can exercise the native-runtime path without invoking WSL, `mstsc.exe`, or XRDP, and reports concrete blockers instead of pretending the native engine is ready,
+- clean-machine validation proves the first-run Arch path outside the repo,
+- package-only certification proves a repo-free package can self-test and hydrate standalone `pane.exe` without touching a live WSL install,
+- fresh-machine preflight proves the clean Windows VM has WSL, required WSL install flags, and `mstsc.exe` before live first-run testing,
+- PaneShared durability and reset semantics are documented and tested,
+- the release workflow publishes only intentional draft/prerelease artifacts until the public-release gate is passed.
 
 ## Decision Standard
 
@@ -251,7 +286,8 @@ The next major product topics that follow from this contract are:
 3. how desktop profiles should be packaged and installed,
 4. how Ubuntu LTS should be introduced as a second first-class environment,
 5. how reset, repair, and update should behave without destroying user ownership,
-6. how the future contained display path should replace the current XRDP handoff.
+6. how the future contained display path should replace the current XRDP handoff,
+7. how the Pane-owned boot engine should acquire, verify, boot, snapshot, export, and repair OS images without WSL as the execution backend.
 
 ## Amendment Rule
 

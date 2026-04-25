@@ -14,23 +14,25 @@ use std::{
 use std::os::windows::process::CommandExt;
 
 use clap::Parser;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     bootstrap::{render_bootstrap_script, render_update_script},
     cli::{
-        BundleArgs, Cli, Commands, ConnectArgs, DoctorArgs, EnvironmentsArgs, InitArgs, LaunchArgs,
-        LogsArgs, OnboardArgs, RelayArgs, RepairArgs, ResetArgs, SetupUserArgs, ShareArgs,
-        StatusArgs, StopArgs, TerminalArgs, UpdateArgs,
+        AppStatusArgs, BundleArgs, Cli, Commands, ConnectArgs, DoctorArgs, EnvironmentsArgs,
+        InitArgs, LaunchArgs, LogsArgs, NativePreflightArgs, OnboardArgs, RelayArgs, RepairArgs,
+        ResetArgs, RuntimeArgs, SetupUserArgs, ShareArgs, StatusArgs, StopArgs, TerminalArgs,
+        UpdateArgs,
     },
     error::{AppError, AppResult},
     model::{
         managed_environment_catalog, DesktopEnvironment, DistroFamily, DistroRecord,
-        ManagedEnvironment,
+        ManagedEnvironment, RuntimeMode, SharedStorageMode,
     },
     plan::{
         app_root, managed_distro_install_root, shared_dir_for_workspace, windows_to_wsl_path,
-        workspace_for, LaunchPlan, WorkspacePaths,
+        workspace_for, workspace_for_with_shared_storage, LaunchPlan, RuntimePaths, WorkspacePaths,
+        DEFAULT_RUNTIME_CAPACITY_GIB, MINIMUM_RUNTIME_CAPACITY_GIB,
     },
     rdp::render_rdp_profile,
     state::{
@@ -107,6 +109,7 @@ struct DoctorRequest {
     port: u16,
     bootstrap_requested: bool,
     connect_requested: bool,
+    write_probes_enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -114,11 +117,291 @@ struct StatusReport {
     platform: &'static str,
     wsl_available: bool,
     wsl_version_banner: Option<String>,
+    wsl_default_distro: Option<String>,
     managed_environment: Option<ManagedEnvironmentState>,
     selected_distro: Option<DistroHealth>,
     known_distros: Vec<DistroRecord>,
     last_launch: Option<StoredLaunch>,
     last_launch_workspace: Option<WorkspaceHealth>,
+}
+
+#[derive(Debug, Serialize)]
+struct AppStatusReport {
+    product_shape: &'static str,
+    session_name: String,
+    phase: AppLifecyclePhase,
+    next_action: AppNextAction,
+    next_action_label: &'static str,
+    next_action_summary: String,
+    supported_profile: AppProfileReport,
+    runtime: RuntimeReport,
+    storage: AppStorageReport,
+    display: AppDisplayReport,
+    managed_environment: Option<ManagedEnvironmentState>,
+    selected_distro: Option<DistroHealth>,
+    last_launch: Option<StoredLaunch>,
+    workspace: WorkspaceHealth,
+    blockers: Vec<AppBlocker>,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RuntimeReport {
+    product_shape: &'static str,
+    session_name: String,
+    current_engine: PaneRuntimeEngine,
+    current_engine_label: &'static str,
+    target_engine: PaneRuntimeEngine,
+    target_engine_label: &'static str,
+    prepared: bool,
+    dedicated_space_root: String,
+    directories: RuntimeDirectoryReport,
+    storage_budget: RuntimeStorageBudget,
+    ownership: RuntimeOwnershipReport,
+    artifacts: RuntimeArtifactReport,
+    native_host: crate::native::NativeHostPreflightReport,
+    native_runtime: NativeRuntimeReport,
+    current_limitation: &'static str,
+    next_steps: Vec<String>,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct NativePreflightReport {
+    product_shape: &'static str,
+    session_name: String,
+    host: crate::native::NativeHostPreflightReport,
+    runtime: RuntimeReport,
+    ready_for_boot_spike: bool,
+    blockers: Vec<String>,
+    next_steps: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RuntimeDirectoryReport {
+    downloads: String,
+    images: String,
+    disks: String,
+    snapshots: String,
+    state: String,
+    engines: String,
+    logs: String,
+    base_os_image: String,
+    user_disk: String,
+    base_os_metadata: String,
+    user_disk_metadata: String,
+    runtime_config: String,
+    native_manifest: String,
+    manifest: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RuntimeStorageBudget {
+    requested_capacity_gib: u64,
+    base_os_budget_gib: u64,
+    user_packages_and_customizations_gib: u64,
+    snapshot_budget_gib: u64,
+    minimum_recommended_gib: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct RuntimeOwnershipReport {
+    app_owned_storage: bool,
+    app_owned_boot_engine_available: bool,
+    app_owned_display_available: bool,
+    external_runtime_required_for_current_launch: bool,
+    current_external_dependencies: Vec<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+struct RuntimeArtifactReport {
+    base_os_image_exists: bool,
+    base_os_image_bytes: Option<u64>,
+    base_os_image_sha256: Option<String>,
+    base_os_image_verified: bool,
+    base_os_metadata_exists: bool,
+    user_disk_exists: bool,
+    user_disk_capacity_gib: Option<u64>,
+    user_disk_format: Option<String>,
+    user_disk_ready: bool,
+    user_disk_metadata_exists: bool,
+    runtime_manifest_exists: bool,
+    runtime_config_exists: bool,
+    native_manifest_exists: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BaseOsImageMetadata {
+    schema_version: u32,
+    distro_family: DistroFamily,
+    image_kind: String,
+    source_path: String,
+    stored_path: String,
+    bytes: u64,
+    sha256: String,
+    expected_sha256: Option<String>,
+    verified: bool,
+    registered_at_epoch_seconds: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct UserDiskMetadata {
+    schema_version: u32,
+    format: String,
+    disk_path: String,
+    capacity_gib: u64,
+    materialized_block_device: bool,
+    created_at_epoch_seconds: u64,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeRuntimeReport {
+    state: NativeRuntimeState,
+    state_label: &'static str,
+    bootable: bool,
+    host_ready: bool,
+    ready_for_boot_spike: bool,
+    requires_wsl: bool,
+    requires_mstsc: bool,
+    requires_xrdp: bool,
+    launch_contract: &'static str,
+    blockers: Vec<String>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum NativeRuntimeState {
+    StorageNotPrepared,
+    MissingBaseImage,
+    UnverifiedBaseImage,
+    MissingUserDisk,
+    HostNotReady,
+    EngineNotImplemented,
+}
+
+impl NativeRuntimeState {
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::StorageNotPrepared => "storage-not-prepared",
+            Self::MissingBaseImage => "missing-base-image",
+            Self::UnverifiedBaseImage => "unverified-base-image",
+            Self::MissingUserDisk => "missing-user-disk",
+            Self::HostNotReady => "host-not-ready",
+            Self::EngineNotImplemented => "engine-not-implemented",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum PaneRuntimeEngine {
+    WslXrdpBridge,
+    PaneOwnedOsRuntime,
+}
+
+impl PaneRuntimeEngine {
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::WslXrdpBridge => "WSL2 + XRDP bridge",
+            Self::PaneOwnedOsRuntime => "Pane-owned OS runtime",
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct AppProfileReport {
+    label: &'static str,
+    distro_family: DistroFamily,
+    desktop_environment: DesktopEnvironment,
+    launchable_now: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct AppStorageReport {
+    default_mode: SharedStorageMode,
+    durable_shared_dir: String,
+    scratch_shared_dir: String,
+    policy: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct AppDisplayReport {
+    current_mode: AppDisplayMode,
+    current_mode_label: &'static str,
+    contained_window_available: bool,
+    user_visible_handoff: bool,
+    planned_modes: Vec<AppDisplayMode>,
+    notes: Vec<String>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum AppDisplayMode {
+    ExternalMstscRdp,
+    EmbeddedRdpWindow,
+    NativePaneTransport,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum AppLifecyclePhase {
+    UnsupportedHost,
+    HostNeedsWsl,
+    NeedsManagedEnvironment,
+    NeedsUserSetup,
+    ReadyToLaunch,
+    ReconnectReady,
+    LaunchFailed,
+    NeedsRepair,
+}
+
+impl AppLifecyclePhase {
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::UnsupportedHost => "unsupported-host",
+            Self::HostNeedsWsl => "host-needs-wsl",
+            Self::NeedsManagedEnvironment => "needs-managed-environment",
+            Self::NeedsUserSetup => "needs-user-setup",
+            Self::ReadyToLaunch => "ready-to-launch",
+            Self::ReconnectReady => "reconnect-ready",
+            Self::LaunchFailed => "launch-failed",
+            Self::NeedsRepair => "needs-repair",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum AppNextAction {
+    InstallWsl,
+    OnboardArch,
+    SetupUser,
+    LaunchArch,
+    Reconnect,
+    RepairArch,
+    CollectSupportBundle,
+}
+
+impl AppNextAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::InstallWsl => "Install WSL2",
+            Self::OnboardArch => "Onboard Arch",
+            Self::SetupUser => "Setup User",
+            Self::LaunchArch => "Launch Arch",
+            Self::Reconnect => "Reconnect",
+            Self::RepairArch => "Repair Arch",
+            Self::CollectSupportBundle => "Collect Support Bundle",
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct AppBlocker {
+    id: String,
+    summary: String,
+    remediation: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -192,6 +475,7 @@ struct WorkspaceHealth {
 enum CheckStatus {
     Pass,
     Fail,
+    Skipped,
 }
 
 impl CheckStatus {
@@ -199,6 +483,7 @@ impl CheckStatus {
         match self {
             Self::Pass => "PASS",
             Self::Fail => "FAIL",
+            Self::Skipped => "SKIP",
         }
     }
 }
@@ -219,6 +504,7 @@ struct DoctorReport {
     port: u16,
     bootstrap_requested: bool,
     connect_requested: bool,
+    write_probes_enabled: bool,
     supported_for_mvp: bool,
     ready: bool,
     selected_distro: Option<DistroHealth>,
@@ -245,6 +531,10 @@ struct BundleManifest {
 }
 
 pub fn run() -> AppResult<()> {
+    if std::env::args_os().len() == 1 {
+        return open_default_app_entrypoint();
+    }
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -254,6 +544,9 @@ pub fn run() -> AppResult<()> {
         Commands::Repair(args) => repair(args),
         Commands::Update(args) => update(args),
         Commands::Status(args) => status(args),
+        Commands::AppStatus(args) => app_status(args),
+        Commands::Runtime(args) => runtime(args),
+        Commands::NativePreflight(args) => native_preflight(args),
         Commands::Environments(args) => environments(args),
         Commands::Doctor(args) => doctor(args),
         Commands::Connect(args) => connect(args),
@@ -266,6 +559,141 @@ pub fn run() -> AppResult<()> {
         Commands::Logs(args) => logs(args),
         Commands::Bundle(args) => bundle(args),
     }
+}
+
+const EMBEDDED_APP_ASSETS: &[(&str, &str)] = &[
+    (
+        "Pane Control Center.ps1",
+        include_str!("../scripts/package-assets/Pane Control Center.ps1"),
+    ),
+    (
+        "Pane Control Center.cmd",
+        include_str!("../scripts/package-assets/Pane Control Center.cmd"),
+    ),
+    (
+        "Launch Pane Arch.ps1",
+        include_str!("../scripts/package-assets/Launch Pane Arch.ps1"),
+    ),
+    (
+        "Launch Pane Arch.cmd",
+        include_str!("../scripts/package-assets/Launch Pane Arch.cmd"),
+    ),
+    (
+        "Open Pane Arch Terminal.ps1",
+        include_str!("../scripts/package-assets/Open Pane Arch Terminal.ps1"),
+    ),
+    (
+        "Open Pane Arch Terminal.cmd",
+        include_str!("../scripts/package-assets/Open Pane Arch Terminal.cmd"),
+    ),
+    (
+        "Open Pane Shared Folder.ps1",
+        include_str!("../scripts/package-assets/Open Pane Shared Folder.ps1"),
+    ),
+    (
+        "Open Pane Shared Folder.cmd",
+        include_str!("../scripts/package-assets/Open Pane Shared Folder.cmd"),
+    ),
+    (
+        "Collect Pane Support Bundle.ps1",
+        include_str!("../scripts/package-assets/Collect Pane Support Bundle.ps1"),
+    ),
+    (
+        "Collect Pane Support Bundle.cmd",
+        include_str!("../scripts/package-assets/Collect Pane Support Bundle.cmd"),
+    ),
+    (
+        "Install Pane Shortcuts.ps1",
+        include_str!("../scripts/package-assets/Install Pane Shortcuts.ps1"),
+    ),
+    (
+        "Install Pane Shortcuts.cmd",
+        include_str!("../scripts/package-assets/Install Pane Shortcuts.cmd"),
+    ),
+];
+
+fn open_default_app_entrypoint() -> AppResult<()> {
+    if !cfg!(windows) {
+        println!("Pane");
+        println!("  The app Control Center is only available on Windows.");
+        println!("  Use `pane --help` to inspect CLI commands on this platform.");
+        return Ok(());
+    }
+
+    let executable = std::env::current_exe().map_err(|error| {
+        AppError::message(format!(
+            "failed to locate the Pane executable for app startup: {error}"
+        ))
+    })?;
+    let package_root = executable.parent().ok_or_else(|| {
+        AppError::message("failed to resolve the Pane package directory for app startup")
+    })?;
+    let control_center = package_root.join("Pane Control Center.ps1");
+
+    let control_center = if control_center.exists() {
+        control_center
+    } else {
+        hydrate_embedded_app_bundle(&executable)?
+    };
+
+    if std::env::var_os("PANE_APP_HYDRATE_ONLY").is_some() {
+        println!("Pane app entrypoint hydrated.");
+        println!("  Control Center {}", control_center.display());
+        return Ok(());
+    }
+
+    Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(&control_center)
+        .spawn()
+        .map_err(|error| {
+            AppError::message(format!(
+                "failed to open the Pane Control Center at {}: {error}",
+                control_center.display()
+            ))
+        })?;
+
+    Ok(())
+}
+
+fn hydrate_embedded_app_bundle(executable: &Path) -> AppResult<PathBuf> {
+    let app_dir = app_root().join("app");
+    fs::create_dir_all(&app_dir).map_err(|error| {
+        AppError::message(format!(
+            "failed to create the Pane app directory at {}: {error}",
+            app_dir.display()
+        ))
+    })?;
+
+    let app_exe = app_dir.join("pane.exe");
+    let same_exe =
+        app_exe.exists() && executable.canonicalize().ok() == app_exe.canonicalize().ok();
+    if !same_exe {
+        fs::copy(executable, &app_exe).map_err(|error| {
+            AppError::message(format!(
+                "failed to hydrate Pane app executable at {}: {error}",
+                app_exe.display()
+            ))
+        })?;
+    }
+
+    for (name, contents) in EMBEDDED_APP_ASSETS {
+        let path = app_dir.join(name);
+        fs::write(&path, contents).map_err(|error| {
+            AppError::message(format!(
+                "failed to hydrate Pane app asset at {}: {error}",
+                path.display()
+            ))
+        })?;
+    }
+
+    Ok(app_dir.join("Pane Control Center.ps1"))
 }
 
 fn init(args: InitArgs) -> AppResult<()> {
@@ -345,6 +773,7 @@ fn onboard(args: OnboardArgs) -> AppResult<()> {
                 port: args.port,
                 bootstrap_requested: true,
                 connect_requested: true,
+                write_probes_enabled: true,
             },
             &post_setup_inventory,
             post_setup_state.as_ref(),
@@ -575,6 +1004,10 @@ fn configure_arch_user(
 }
 
 fn launch(args: LaunchArgs) -> AppResult<()> {
+    if args.runtime == RuntimeMode::PaneOwned {
+        return launch_pane_owned_runtime(args);
+    }
+
     let inventory = probe_inventory();
     let saved_state = load_state()?;
     let target = resolve_launch_target(
@@ -584,7 +1017,7 @@ fn launch(args: LaunchArgs) -> AppResult<()> {
         args.dry_run,
     )?;
     let session_name = crate::plan::sanitize_session_name(&args.session_name);
-    let workspace = workspace_for(&session_name);
+    let workspace = workspace_for_with_shared_storage(&session_name, args.shared_storage);
 
     let plan = LaunchPlan {
         steps: build_steps(
@@ -627,6 +1060,7 @@ fn launch(args: LaunchArgs) -> AppResult<()> {
         port: args.port,
         bootstrap_requested: !args.skip_bootstrap,
         connect_requested: !args.no_connect,
+        write_probes_enabled: true,
     };
     let doctor_report = evaluate_doctor(&doctor_request, &inventory, saved_state.as_ref())?;
 
@@ -709,6 +1143,58 @@ fn launch(args: LaunchArgs) -> AppResult<()> {
     Ok(())
 }
 
+fn launch_pane_owned_runtime(args: LaunchArgs) -> AppResult<()> {
+    let session_name = crate::plan::sanitize_session_name(&args.session_name);
+    let report = build_runtime_report(&session_name, DEFAULT_RUNTIME_CAPACITY_GIB, true)?;
+
+    println!("Pane-Owned Runtime Launch");
+    println!("  Session        {}", report.session_name);
+    println!("  Requested      {}", args.runtime.display_name());
+    println!("  Runtime Root   {}", report.dedicated_space_root);
+    println!("  State          {}", report.native_runtime.state_label);
+    println!(
+        "  Host Ready     {}",
+        yes_no(report.native_runtime.host_ready)
+    );
+    println!(
+        "  Boot Spike     {}",
+        yes_no(report.native_runtime.ready_for_boot_spike)
+    );
+    println!(
+        "  Bootable       {}",
+        yes_no(report.native_runtime.bootable)
+    );
+    println!(
+        "  Uses WSL       {}",
+        yes_no(report.native_runtime.requires_wsl)
+    );
+    println!(
+        "  Uses mstsc.exe {}",
+        yes_no(report.native_runtime.requires_mstsc)
+    );
+    println!(
+        "  Uses XRDP      {}",
+        yes_no(report.native_runtime.requires_xrdp)
+    );
+    println!("  Contract       {}", report.native_runtime.launch_contract);
+    if !report.native_runtime.blockers.is_empty() {
+        println!("Blockers");
+        for blocker in &report.native_runtime.blockers {
+            println!("  - {}", blocker);
+        }
+    }
+
+    if args.dry_run {
+        println!("  Dry Run        native runtime storage prepared; no OS boot attempted");
+        return Ok(());
+    }
+
+    Err(AppError::message(format!(
+        "Pane-owned runtime launch is not bootable yet. Current blockers:\n{}",
+        format_blocker_list(&report.native_runtime.blockers)
+    )))
+}
+
 fn repair(args: RepairArgs) -> AppResult<()> {
     let inventory = probe_inventory();
     let saved_state = load_state()?;
@@ -719,7 +1205,7 @@ fn repair(args: RepairArgs) -> AppResult<()> {
         args.dry_run,
     )?;
     let session_name = crate::plan::sanitize_session_name(&args.session_name);
-    let workspace = workspace_for(&session_name);
+    let workspace = workspace_for_with_shared_storage(&session_name, args.shared_storage);
 
     let plan = LaunchPlan {
         steps: build_steps(&target.distro, args.de, args.port, true, false),
@@ -751,6 +1237,7 @@ fn repair(args: RepairArgs) -> AppResult<()> {
         port: args.port,
         bootstrap_requested: true,
         connect_requested: false,
+        write_probes_enabled: true,
     };
     let doctor_report = evaluate_doctor(&doctor_request, &inventory, saved_state.as_ref())?;
 
@@ -813,7 +1300,7 @@ fn update(args: UpdateArgs) -> AppResult<()> {
         args.dry_run,
     )?;
     let session_name = crate::plan::sanitize_session_name(&args.session_name);
-    let workspace = workspace_for(&session_name);
+    let workspace = workspace_for_with_shared_storage(&session_name, args.shared_storage);
 
     let plan = LaunchPlan {
         steps: build_update_steps(&target.distro, args.de, args.port),
@@ -845,6 +1332,7 @@ fn update(args: UpdateArgs) -> AppResult<()> {
         port: args.port,
         bootstrap_requested: true,
         connect_requested: false,
+        write_probes_enabled: true,
     };
     let doctor_report = evaluate_doctor(&doctor_request, &inventory, saved_state.as_ref())?;
 
@@ -911,6 +1399,95 @@ fn status(args: StatusArgs) -> AppResult<()> {
     Ok(())
 }
 
+fn app_status(args: AppStatusArgs) -> AppResult<()> {
+    let inventory = probe_inventory();
+    let saved_state = load_state()?;
+    let report = build_app_status_report(&args.session_name, &inventory, saved_state.as_ref())?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    print_app_status_report(&report);
+    Ok(())
+}
+
+fn runtime(args: RuntimeArgs) -> AppResult<()> {
+    let session_name = crate::plan::sanitize_session_name(&args.session_name);
+    let paths = crate::plan::runtime_for(&session_name);
+    let budget = runtime_storage_budget(args.capacity_gib);
+    let has_runtime_mutation =
+        args.register_base_image.is_some() || args.create_user_disk || args.prepare;
+
+    if has_runtime_mutation {
+        prepare_runtime_paths(&paths)?;
+        write_runtime_config(&paths, &session_name, &budget)?;
+        write_native_runtime_manifest(&paths, &session_name)?;
+    }
+
+    if let Some(source_image) = args.register_base_image.as_deref() {
+        register_base_os_image(
+            &paths,
+            source_image,
+            args.expected_sha256.as_deref(),
+            args.force,
+        )?;
+    } else if args.expected_sha256.is_some() {
+        return Err(AppError::message(
+            "--expected-sha256 requires --register-base-image.",
+        ));
+    }
+
+    if args.create_user_disk {
+        create_user_disk_descriptor(&paths, &budget, args.force)?;
+    }
+
+    let mut report = build_runtime_report(&session_name, args.capacity_gib, false)?;
+    if has_runtime_mutation {
+        write_runtime_manifest(&paths, &report)?;
+        report = build_runtime_report(&session_name, args.capacity_gib, false)?;
+        write_runtime_manifest(&paths, &report)?;
+    }
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    print_runtime_report(&report);
+    Ok(())
+}
+
+fn native_preflight(args: NativePreflightArgs) -> AppResult<()> {
+    let session_name = crate::plan::sanitize_session_name(&args.session_name);
+    let runtime = build_runtime_report(&session_name, DEFAULT_RUNTIME_CAPACITY_GIB, false)?;
+    let host = runtime.native_host.clone();
+    let ready_for_boot_spike = runtime.native_runtime.ready_for_boot_spike;
+    let blockers = runtime.native_runtime.blockers.clone();
+    let mut next_steps = host.next_steps.clone();
+    next_steps.extend(runtime.next_steps.clone());
+    next_steps.dedup();
+
+    let report = NativePreflightReport {
+        product_shape: "Pane native-runtime preflight for moving from runtime artifacts to a WHP boot/display engine.",
+        session_name,
+        host,
+        runtime,
+        ready_for_boot_spike,
+        blockers,
+        next_steps,
+    };
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    print_native_preflight_report(&report);
+    Ok(())
+}
+
 fn environments(args: EnvironmentsArgs) -> AppResult<()> {
     let report = build_environment_catalog_report();
 
@@ -933,6 +1510,7 @@ fn doctor(args: DoctorArgs) -> AppResult<()> {
         port: args.port,
         bootstrap_requested: !args.skip_bootstrap,
         connect_requested: !args.no_connect,
+        write_probes_enabled: !args.no_write,
     };
     let report = evaluate_doctor(&request, &inventory, saved_state.as_ref())?;
 
@@ -957,6 +1535,7 @@ fn connect(args: ConnectArgs) -> AppResult<()> {
             port: launch.port,
             bootstrap_requested: false,
             connect_requested: true,
+            write_probes_enabled: true,
         },
         &inventory,
         saved_state.as_ref(),
@@ -1009,6 +1588,13 @@ fn relay(args: RelayArgs) -> AppResult<()> {
             args.listen_port
         ))
     })?;
+
+    if !relay_backend_available(&args.distro, args.target_port, args.log_file.as_deref()) {
+        return Err(AppError::message(format!(
+            "the Pane relay could not verify a backend path into {}:{} before accepting RDP traffic",
+            args.distro, args.target_port
+        )));
+    }
 
     if let Some(ready_file) = args.ready_file.as_deref() {
         if let Some(parent) = ready_file.parent() {
@@ -1079,10 +1665,68 @@ fn relay(args: RelayArgs) -> AppResult<()> {
     }
 }
 
+fn relay_backend_available(distro: &str, target_port: u16, log_file: Option<&Path>) -> bool {
+    if let Some(address) =
+        wsl::distro_ipv4_address(distro).map(|ip| SocketAddr::from((ip, target_port)))
+    {
+        if socket_reachable(address) {
+            log_transport_event(
+                log_file,
+                &format!("relay backend probe reached {address} directly"),
+            );
+            return true;
+        }
+
+        log_transport_event(
+            log_file,
+            &format!("relay backend direct probe to {address} failed; trying WSL nc"),
+        );
+    }
+
+    if !wsl::distro_command_exists(distro, "nc") {
+        log_transport_event(
+            log_file,
+            &format!("relay backend probe cannot use nc because it is missing inside {distro}"),
+        );
+        return false;
+    }
+
+    let probe_command = format!("nc -z 127.0.0.1 {target_port}");
+    match run_wsl_shell_as_user_capture(distro, None, &probe_command) {
+        Ok(transcript) if transcript.success => {
+            log_transport_event(
+                log_file,
+                &format!("relay backend probe reached 127.0.0.1:{target_port} through WSL nc"),
+            );
+            true
+        }
+        Ok(transcript) => {
+            log_transport_event(
+                log_file,
+                &format!(
+                    "relay backend nc probe failed for {distro}:{target_port}: {}",
+                    transcript.combined_output().trim()
+                ),
+            );
+            false
+        }
+        Err(error) => {
+            log_transport_event(
+                log_file,
+                &format!("relay backend probe failed for {distro}:{target_port}: {error}"),
+            );
+            false
+        }
+    }
+}
+
 fn share(args: ShareArgs) -> AppResult<()> {
     let saved_state = load_state()?;
-    let (session_name, _saved_launch, workspace) =
+    let (session_name, saved_launch, mut workspace) =
         resolve_session_context(args.session_name.as_deref(), saved_state.as_ref());
+    if saved_launch.is_none() {
+        workspace = workspace_for_with_shared_storage(&session_name, args.shared_storage);
+    }
     let shared_directory = shared_dir_for_workspace(&workspace);
     fs::create_dir_all(&shared_directory)?;
     let shared_wsl_path = windows_to_wsl_path(&shared_directory);
@@ -1106,6 +1750,26 @@ fn share(args: ShareArgs) -> AppResult<()> {
 fn terminal(args: TerminalArgs) -> AppResult<()> {
     let inventory = probe_inventory();
     let saved_state = load_state()?;
+
+    if args.print_only {
+        let resolved =
+            resolve_operational_distro(args.distro.as_deref(), &inventory, saved_state.as_ref())
+                .unwrap_or_else(|_| {
+                    args.distro
+                        .clone()
+                        .unwrap_or_else(|| "pane-arch".to_string())
+                });
+        let selected_user = args.user.as_deref().unwrap_or("default");
+
+        println!("Pane Arch Terminal");
+        println!("  Distro         {}", resolved);
+        println!("  User           {}", selected_user);
+        println!("  Print Only     yes");
+        println!(
+            "  Managed Flow   Use this shell for first-run setup, package installs, dotfiles, and desktop customization."
+        );
+        return Ok(());
+    }
 
     if !inventory.available {
         return Err(AppError::message(
@@ -1138,10 +1802,6 @@ fn terminal(args: TerminalArgs) -> AppResult<()> {
         "  Managed Flow   Use this shell for first-run setup, package installs, dotfiles, and desktop customization."
     );
 
-    if args.print_only {
-        return Ok(());
-    }
-
     wsl::open_interactive_terminal(&distro, args.user.as_deref())
 }
 
@@ -1168,8 +1828,11 @@ fn stop(args: StopArgs) -> AppResult<()> {
 fn reset(args: ResetArgs) -> AppResult<()> {
     let inventory = probe_inventory();
     let saved_state = load_state()?;
-    let (_normalized_session, saved_launch, workspace) =
+    let (normalized_session, saved_launch, workspace) =
         resolve_session_context(args.session_name.as_deref(), saved_state.as_ref());
+    let durable_shared =
+        workspace_for_with_shared_storage(&normalized_session, SharedStorageMode::Durable)
+            .shared_dir;
     let managed_environment = resolve_managed_environment_for_reset(&args, saved_state.as_ref())?;
     let managed_distro = managed_environment
         .as_ref()
@@ -1187,6 +1850,24 @@ fn reset(args: ResetArgs) -> AppResult<()> {
             println!(
                 "  Session Workspace  no workspace exists at {}",
                 workspace.root.display()
+            );
+        }
+        if args.purge_shared {
+            if durable_shared.exists() {
+                println!(
+                    "  Durable Shared     would remove {}",
+                    durable_shared.display()
+                );
+            } else {
+                println!(
+                    "  Durable Shared     no durable shared directory exists at {}",
+                    durable_shared.display()
+                );
+            }
+        } else {
+            println!(
+                "  Durable Shared     would preserve {}",
+                durable_shared.display()
             );
         }
         if args.purge_wsl {
@@ -1286,6 +1967,26 @@ fn reset(args: ResetArgs) -> AppResult<()> {
         println!("Removed {}.", workspace.root.display());
     } else {
         println!("No Pane workspace existed at {}.", workspace.root.display());
+    }
+
+    if args.purge_shared {
+        if durable_shared.exists() {
+            fs::remove_dir_all(&durable_shared)?;
+            println!(
+                "Removed durable shared storage {}.",
+                durable_shared.display()
+            );
+        } else {
+            println!(
+                "No durable shared storage existed at {}.",
+                durable_shared.display()
+            );
+        }
+    } else {
+        println!(
+            "Preserved durable shared storage at {}.",
+            durable_shared.display()
+        );
     }
 
     if saved_launch.is_some() || args.session_name.is_none() {
@@ -1409,12 +2110,915 @@ fn build_status_report(
         platform: std::env::consts::OS,
         wsl_available: inventory.available,
         wsl_version_banner: inventory.version_banner.clone(),
+        wsl_default_distro: inventory.default_distro.clone(),
         managed_environment: saved_state.and_then(|state| state.managed_environment.clone()),
         selected_distro,
         known_distros: inventory.distros.clone(),
         last_launch: saved_state.and_then(|state| state.last_launch.clone()),
         last_launch_workspace,
     })
+}
+
+fn build_app_status_report(
+    session_name: &str,
+    inventory: &WslInventory,
+    saved_state: Option<&PaneState>,
+) -> AppResult<AppStatusReport> {
+    let (normalized_session, saved_launch, workspace) =
+        resolve_session_context(Some(session_name), saved_state);
+    let status_report = build_status_report(None, inventory, saved_state)?;
+    let target_distro = status_report
+        .selected_distro
+        .as_ref()
+        .map(|health| health.distro.name.clone())
+        .or_else(|| {
+            status_report
+                .managed_environment
+                .as_ref()
+                .map(|environment| environment.distro_name.clone())
+        });
+    let port = target_distro
+        .as_deref()
+        .map(|name| status_port_for(name, saved_state))
+        .or_else(|| saved_launch.as_ref().map(|launch| launch.port))
+        .unwrap_or(3390);
+    let doctor_request = DoctorRequest {
+        distro: target_distro,
+        session_name: normalized_session.clone(),
+        desktop_environment: DesktopEnvironment::Xfce,
+        port,
+        bootstrap_requested: true,
+        connect_requested: false,
+        write_probes_enabled: false,
+    };
+    let doctor_report = evaluate_doctor(&doctor_request, inventory, saved_state)?;
+    let (phase, next_action, next_action_summary, mut notes) =
+        determine_app_lifecycle(&status_report, &doctor_report, saved_launch.as_ref());
+
+    notes.push(
+        "The current desktop path is still an external mstsc.exe + XRDP handoff; Pane owns setup, repair, transport selection, and support around it."
+            .to_string(),
+    );
+    notes.push(
+        "Pane-owned runtime storage is now first-class, but boot and display ownership are still gated until the native engine can launch an OS image without WSL, mstsc.exe, or XRDP."
+            .to_string(),
+    );
+
+    Ok(AppStatusReport {
+        product_shape: "Windows app for owning Linux environment setup, launch, repair, shared storage, and support; Arch + XFCE is the current launchable profile.",
+        session_name: normalized_session.clone(),
+        phase,
+        next_action,
+        next_action_label: next_action.label(),
+        next_action_summary,
+        supported_profile: AppProfileReport {
+            label: "Arch Linux + XFCE",
+            distro_family: DistroFamily::Arch,
+            desktop_environment: DesktopEnvironment::Xfce,
+            launchable_now: true,
+        },
+        runtime: build_runtime_report(&normalized_session, DEFAULT_RUNTIME_CAPACITY_GIB, false)?,
+        storage: build_app_storage_report(&normalized_session),
+        display: build_app_display_report(),
+        managed_environment: status_report.managed_environment,
+        selected_distro: status_report.selected_distro,
+        last_launch: saved_launch,
+        workspace: inspect_workspace(&workspace),
+        blockers: doctor_report
+            .checks
+            .into_iter()
+            .filter(|check| check.status == CheckStatus::Fail)
+            .map(|check| AppBlocker {
+                id: check.id,
+                summary: check.summary,
+                remediation: check.remediation,
+            })
+            .collect(),
+        notes,
+    })
+}
+
+fn build_runtime_report(
+    session_name: &str,
+    capacity_gib: u64,
+    prepare: bool,
+) -> AppResult<RuntimeReport> {
+    let normalized_session = crate::plan::sanitize_session_name(session_name);
+    let paths = crate::plan::runtime_for(&normalized_session);
+
+    if prepare {
+        prepare_runtime_paths(&paths)?;
+        write_runtime_config(
+            &paths,
+            &normalized_session,
+            &runtime_storage_budget(capacity_gib),
+        )?;
+        write_native_runtime_manifest(&paths, &normalized_session)?;
+    }
+
+    let prepared = runtime_paths_prepared(&paths);
+    let budget = runtime_storage_budget(capacity_gib);
+    let artifacts = build_runtime_artifact_report(&paths);
+    let native_host = crate::native::probe_native_host();
+    let native_runtime = build_native_runtime_report(prepared, &artifacts, &native_host);
+    let ownership = build_runtime_ownership_report(&native_runtime);
+    let mut report = RuntimeReport {
+        product_shape: "Pane-owned runtime boundary for a future contained OS engine. Storage is app-owned now; boot/display are not yet implemented.",
+        session_name: normalized_session,
+        current_engine: PaneRuntimeEngine::WslXrdpBridge,
+        current_engine_label: PaneRuntimeEngine::WslXrdpBridge.display_name(),
+        target_engine: PaneRuntimeEngine::PaneOwnedOsRuntime,
+        target_engine_label: PaneRuntimeEngine::PaneOwnedOsRuntime.display_name(),
+        prepared,
+        dedicated_space_root: paths.root.display().to_string(),
+        directories: RuntimeDirectoryReport {
+            downloads: paths.downloads.display().to_string(),
+            images: paths.images.display().to_string(),
+            disks: paths.disks.display().to_string(),
+            snapshots: paths.snapshots.display().to_string(),
+            state: paths.state.display().to_string(),
+            engines: paths.engines.display().to_string(),
+            logs: paths.logs.display().to_string(),
+            base_os_image: paths.base_os_image.display().to_string(),
+            user_disk: paths.user_disk.display().to_string(),
+            base_os_metadata: paths.base_os_metadata.display().to_string(),
+            user_disk_metadata: paths.user_disk_metadata.display().to_string(),
+            runtime_config: paths.runtime_config.display().to_string(),
+            native_manifest: paths.native_manifest.display().to_string(),
+            manifest: paths.manifest.display().to_string(),
+        },
+        storage_budget: budget,
+        ownership,
+        artifacts,
+        native_host,
+        native_runtime,
+        current_limitation: "Pane owns the runtime storage layout, config, manifests, and host preflight now. It still cannot boot a Pane-owned OS image or draw a Pane-owned desktop window without the current WSL/XRDP bridge.",
+        next_steps: vec![
+            "Run `pane native-preflight --json` to prove the host can support the first WHP boot-to-serial spike."
+                .to_string(),
+            "Register a Pane-approved Arch base OS image with `pane runtime --register-base-image <path> --expected-sha256 <sha256>`."
+                .to_string(),
+            "Create the Pane-owned user disk descriptor with `pane runtime --create-user-disk`."
+                .to_string(),
+            "Implement the Pane-owned WHP boot engine against the runtime config instead of WSL distro state."
+                .to_string(),
+            "Implement a Pane-owned display boundary instead of handing off to mstsc.exe over XRDP."
+                .to_string(),
+            "Move package installs, user customizations, snapshots, export/import, and repair semantics onto this runtime contract."
+                .to_string(),
+        ],
+        notes: vec![
+            "This is intentionally separate from PaneShared. PaneShared is user file exchange; the runtime user disk is the future Linux system/user storage."
+                .to_string(),
+            "No latency and full hardware compatibility cannot be guaranteed as absolute properties; the product target is no noticeable latency for normal desktop use with a measured compatibility envelope."
+                .to_string(),
+        ],
+    };
+
+    if prepare {
+        write_runtime_manifest(&paths, &report)?;
+        report.artifacts = build_runtime_artifact_report(&paths);
+        report.native_host = crate::native::probe_native_host();
+        report.native_runtime =
+            build_native_runtime_report(prepared, &report.artifacts, &report.native_host);
+        report.ownership = build_runtime_ownership_report(&report.native_runtime);
+        write_runtime_manifest(&paths, &report)?;
+    }
+
+    Ok(report)
+}
+
+fn runtime_storage_budget(capacity_gib: u64) -> RuntimeStorageBudget {
+    let requested_capacity_gib = capacity_gib.max(MINIMUM_RUNTIME_CAPACITY_GIB);
+    let base_os_budget_gib = if requested_capacity_gib <= DEFAULT_RUNTIME_CAPACITY_GIB {
+        4
+    } else {
+        (requested_capacity_gib / 4).clamp(4, 12)
+    };
+    let snapshot_budget_gib = (requested_capacity_gib / 8).clamp(1, 16);
+    let user_packages_and_customizations_gib =
+        requested_capacity_gib.saturating_sub(base_os_budget_gib + snapshot_budget_gib);
+
+    RuntimeStorageBudget {
+        requested_capacity_gib,
+        base_os_budget_gib,
+        user_packages_and_customizations_gib,
+        snapshot_budget_gib,
+        minimum_recommended_gib: MINIMUM_RUNTIME_CAPACITY_GIB,
+    }
+}
+
+fn prepare_runtime_paths(paths: &RuntimePaths) -> AppResult<()> {
+    for path in [
+        &paths.root,
+        &paths.downloads,
+        &paths.images,
+        &paths.disks,
+        &paths.snapshots,
+        &paths.state,
+        &paths.engines,
+        &paths.logs,
+    ] {
+        fs::create_dir_all(path)?;
+    }
+
+    Ok(())
+}
+
+fn runtime_paths_prepared(paths: &RuntimePaths) -> bool {
+    [
+        &paths.root,
+        &paths.downloads,
+        &paths.images,
+        &paths.disks,
+        &paths.snapshots,
+        &paths.state,
+        &paths.engines,
+        &paths.logs,
+    ]
+    .iter()
+    .all(|path| path.is_dir())
+}
+
+fn register_base_os_image(
+    paths: &RuntimePaths,
+    source_image: &Path,
+    expected_sha256: Option<&str>,
+    force: bool,
+) -> AppResult<()> {
+    if !source_image.is_file() {
+        return Err(AppError::message(format!(
+            "Base OS image source does not exist or is not a file: {}",
+            source_image.display()
+        )));
+    }
+
+    let expected_sha256 = expected_sha256.map(normalize_sha256_hex).transpose()?;
+    let actual_sha256 = sha256_file(source_image)?;
+    let verified = expected_sha256
+        .as_deref()
+        .map(|expected| expected == actual_sha256)
+        .unwrap_or(false);
+
+    if let Some(expected) = expected_sha256.as_deref() {
+        if expected != actual_sha256 {
+            return Err(AppError::message(format!(
+                "Base OS image SHA-256 mismatch. expected {expected}, got {actual_sha256}."
+            )));
+        }
+    }
+
+    if let Some(parent) = paths.base_os_image.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if let Some(parent) = paths.base_os_metadata.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let same_target = paths.base_os_image.exists()
+        && source_image.canonicalize().ok() == paths.base_os_image.canonicalize().ok();
+    if paths.base_os_image.exists() && !force && !same_target {
+        return Err(AppError::message(format!(
+            "A registered base OS image already exists at {}. Pass --force to replace it.",
+            paths.base_os_image.display()
+        )));
+    }
+
+    if !same_target {
+        let temp_image = paths.base_os_image.with_extension("paneimg.tmp");
+        if temp_image.exists() {
+            fs::remove_file(&temp_image)?;
+        }
+        fs::copy(source_image, &temp_image)?;
+        if paths.base_os_image.exists() {
+            fs::remove_file(&paths.base_os_image)?;
+        }
+        fs::rename(&temp_image, &paths.base_os_image)?;
+    }
+
+    let bytes = fs::metadata(&paths.base_os_image)?.len();
+    let metadata = BaseOsImageMetadata {
+        schema_version: 1,
+        distro_family: DistroFamily::Arch,
+        image_kind: "arch-base-os-image".to_string(),
+        source_path: source_image
+            .canonicalize()
+            .unwrap_or_else(|_| source_image.to_path_buf())
+            .display()
+            .to_string(),
+        stored_path: paths.base_os_image.display().to_string(),
+        bytes,
+        sha256: actual_sha256,
+        expected_sha256,
+        verified,
+        registered_at_epoch_seconds: current_epoch_seconds(),
+    };
+    write_json_file(&paths.base_os_metadata, &metadata)
+}
+
+fn create_user_disk_descriptor(
+    paths: &RuntimePaths,
+    budget: &RuntimeStorageBudget,
+    force: bool,
+) -> AppResult<()> {
+    if paths.user_disk.exists() && !force {
+        if read_json_file::<UserDiskMetadata>(&paths.user_disk_metadata).is_ok() {
+            return Ok(());
+        }
+
+        return Err(AppError::message(format!(
+            "A user disk artifact already exists at {}, but its metadata is missing or invalid. Pass --force to replace it.",
+            paths.user_disk.display()
+        )));
+    }
+
+    if let Some(parent) = paths.user_disk.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if let Some(parent) = paths.user_disk_metadata.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let capacity_gib = budget.user_packages_and_customizations_gib.max(1);
+    let metadata = UserDiskMetadata {
+        schema_version: 1,
+        format: "pane-user-disk-descriptor-v1".to_string(),
+        disk_path: paths.user_disk.display().to_string(),
+        capacity_gib,
+        materialized_block_device: false,
+        created_at_epoch_seconds: current_epoch_seconds(),
+        notes: vec![
+            "This descriptor reserves Pane-owned Linux user/package/customization storage semantics."
+                .to_string(),
+            "The native boot engine will materialize this descriptor into its actual block-device format."
+                .to_string(),
+        ],
+    };
+
+    write_json_file(&paths.user_disk, &metadata)?;
+    write_json_file(&paths.user_disk_metadata, &metadata)
+}
+
+fn write_json_file<T: Serialize>(path: &Path, value: &T) -> AppResult<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_string_pretty(value)?)?;
+    Ok(())
+}
+
+fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> AppResult<T> {
+    Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
+}
+
+fn normalize_sha256_hex(value: &str) -> AppResult<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.len() != 64 || !normalized.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(AppError::message(
+            "Expected SHA-256 must be exactly 64 hexadecimal characters.",
+        ));
+    }
+    Ok(normalized)
+}
+
+fn sha256_file(path: &Path) -> AppResult<String> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    Ok(hex_encode(&hasher.finalize()))
+}
+
+struct Sha256 {
+    state: [u32; 8],
+    buffer: [u8; 64],
+    buffer_len: usize,
+    message_len_bytes: u64,
+}
+
+impl Sha256 {
+    fn new() -> Self {
+        Self {
+            state: [
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+                0x5be0cd19,
+            ],
+            buffer: [0; 64],
+            buffer_len: 0,
+            message_len_bytes: 0,
+        }
+    }
+
+    fn update(&mut self, mut input: &[u8]) {
+        self.message_len_bytes = self.message_len_bytes.saturating_add(input.len() as u64);
+
+        if self.buffer_len > 0 {
+            let needed = 64 - self.buffer_len;
+            let take = needed.min(input.len());
+            self.buffer[self.buffer_len..self.buffer_len + take].copy_from_slice(&input[..take]);
+            self.buffer_len += take;
+            input = &input[take..];
+
+            if self.buffer_len == 64 {
+                let block = self.buffer;
+                self.process_block(&block);
+                self.buffer_len = 0;
+            }
+        }
+
+        while input.len() >= 64 {
+            self.process_block(&input[..64]);
+            input = &input[64..];
+        }
+
+        if !input.is_empty() {
+            self.buffer[..input.len()].copy_from_slice(input);
+            self.buffer_len = input.len();
+        }
+    }
+
+    fn finalize(mut self) -> [u8; 32] {
+        let bit_len = self.message_len_bytes.saturating_mul(8);
+        self.buffer[self.buffer_len] = 0x80;
+        self.buffer_len += 1;
+
+        if self.buffer_len > 56 {
+            for byte in &mut self.buffer[self.buffer_len..] {
+                *byte = 0;
+            }
+            let block = self.buffer;
+            self.process_block(&block);
+            self.buffer_len = 0;
+        }
+
+        for byte in &mut self.buffer[self.buffer_len..56] {
+            *byte = 0;
+        }
+        self.buffer[56..64].copy_from_slice(&bit_len.to_be_bytes());
+        let block = self.buffer;
+        self.process_block(&block);
+
+        let mut output = [0_u8; 32];
+        for (chunk, value) in output.chunks_exact_mut(4).zip(self.state) {
+            chunk.copy_from_slice(&value.to_be_bytes());
+        }
+        output
+    }
+
+    fn process_block(&mut self, block: &[u8]) {
+        const K: [u32; 64] = [
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+            0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+            0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+            0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+            0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+            0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+            0xc67178f2,
+        ];
+
+        let mut words = [0_u32; 64];
+        for (index, chunk) in block.chunks_exact(4).take(16).enumerate() {
+            words[index] = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        for index in 16..64 {
+            let s0 = words[index - 15].rotate_right(7)
+                ^ words[index - 15].rotate_right(18)
+                ^ (words[index - 15] >> 3);
+            let s1 = words[index - 2].rotate_right(17)
+                ^ words[index - 2].rotate_right(19)
+                ^ (words[index - 2] >> 10);
+            words[index] = words[index - 16]
+                .wrapping_add(s0)
+                .wrapping_add(words[index - 7])
+                .wrapping_add(s1);
+        }
+
+        let mut a = self.state[0];
+        let mut b = self.state[1];
+        let mut c = self.state[2];
+        let mut d = self.state[3];
+        let mut e = self.state[4];
+        let mut f = self.state[5];
+        let mut g = self.state[6];
+        let mut h = self.state[7];
+
+        for index in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = h
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[index])
+                .wrapping_add(words[index]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+
+        self.state[0] = self.state[0].wrapping_add(a);
+        self.state[1] = self.state[1].wrapping_add(b);
+        self.state[2] = self.state[2].wrapping_add(c);
+        self.state[3] = self.state[3].wrapping_add(d);
+        self.state[4] = self.state[4].wrapping_add(e);
+        self.state[5] = self.state[5].wrapping_add(f);
+        self.state[6] = self.state[6].wrapping_add(g);
+        self.state[7] = self.state[7].wrapping_add(h);
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn write_runtime_config(
+    paths: &RuntimePaths,
+    session_name: &str,
+    budget: &RuntimeStorageBudget,
+) -> AppResult<()> {
+    if let Some(parent) = paths.runtime_config.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let config = serde_json::json!({
+        "schema_version": 1,
+        "session_name": session_name,
+        "default_capacity_gib": DEFAULT_RUNTIME_CAPACITY_GIB,
+        "minimum_capacity_gib": MINIMUM_RUNTIME_CAPACITY_GIB,
+        "requested_capacity_gib": budget.requested_capacity_gib,
+        "target_engine": "pane-owned-os-runtime",
+        "base_os_image": paths.base_os_image.display().to_string(),
+        "user_disk": paths.user_disk.display().to_string(),
+        "policy": {
+            "pane_shared_is_user_file_exchange": true,
+            "runtime_user_disk_is_linux_system_storage": true,
+            "current_launch_bridge": "wsl-xrdp-bridge"
+        }
+    });
+
+    fs::write(
+        &paths.runtime_config,
+        serde_json::to_string_pretty(&config)?,
+    )?;
+    Ok(())
+}
+
+fn write_native_runtime_manifest(paths: &RuntimePaths, session_name: &str) -> AppResult<()> {
+    if let Some(parent) = paths.native_manifest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "session_name": session_name,
+        "engine": "pane-owned-os-runtime",
+        "bootable": false,
+        "external_integrations_required_by_target": {
+            "wsl": false,
+            "mstsc": false,
+            "xrdp": false
+        },
+        "required_artifacts": {
+            "base_os_image": paths.base_os_image.display().to_string(),
+            "base_os_metadata": paths.base_os_metadata.display().to_string(),
+            "user_disk": paths.user_disk.display().to_string(),
+            "user_disk_metadata": paths.user_disk_metadata.display().to_string()
+        },
+        "blockers": [
+            "verified base OS image must exist before native boot",
+            "Pane user disk descriptor must exist before native boot",
+            "Windows Hypervisor Platform host preflight must pass before the boot spike",
+            "Pane-owned WHP boot engine is not implemented",
+            "Pane-owned display transport is not implemented"
+        ]
+    });
+
+    fs::write(
+        &paths.native_manifest,
+        serde_json::to_string_pretty(&manifest)?,
+    )?;
+    Ok(())
+}
+
+fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport {
+    let base_metadata = read_json_file::<BaseOsImageMetadata>(&paths.base_os_metadata).ok();
+    let base_image_bytes = fs::metadata(&paths.base_os_image)
+        .ok()
+        .map(|metadata| metadata.len());
+    let base_os_image_verified = base_metadata
+        .as_ref()
+        .zip(base_image_bytes)
+        .map(|(metadata, bytes)| metadata.verified && metadata.bytes == bytes)
+        .unwrap_or(false);
+
+    let user_disk_metadata = read_json_file::<UserDiskMetadata>(&paths.user_disk_metadata).ok();
+    let user_disk_ready = user_disk_metadata
+        .as_ref()
+        .map(|metadata| {
+            paths.user_disk.is_file()
+                && metadata.schema_version == 1
+                && metadata.format == "pane-user-disk-descriptor-v1"
+                && metadata.capacity_gib > 0
+        })
+        .unwrap_or(false);
+
+    RuntimeArtifactReport {
+        base_os_image_exists: paths.base_os_image.is_file(),
+        base_os_image_bytes: base_image_bytes,
+        base_os_image_sha256: base_metadata
+            .as_ref()
+            .map(|metadata| metadata.sha256.clone()),
+        base_os_image_verified,
+        base_os_metadata_exists: paths.base_os_metadata.is_file(),
+        user_disk_exists: paths.user_disk.is_file(),
+        user_disk_capacity_gib: user_disk_metadata
+            .as_ref()
+            .map(|metadata| metadata.capacity_gib),
+        user_disk_format: user_disk_metadata
+            .as_ref()
+            .map(|metadata| metadata.format.clone()),
+        user_disk_ready,
+        user_disk_metadata_exists: paths.user_disk_metadata.is_file(),
+        runtime_manifest_exists: paths.manifest.is_file(),
+        runtime_config_exists: paths.runtime_config.is_file(),
+        native_manifest_exists: paths.native_manifest.is_file(),
+    }
+}
+
+fn build_native_runtime_report(
+    prepared: bool,
+    artifacts: &RuntimeArtifactReport,
+    native_host: &crate::native::NativeHostPreflightReport,
+) -> NativeRuntimeReport {
+    let mut blockers = Vec::new();
+    let state = if !prepared {
+        blockers.push(
+            "Dedicated runtime directories have not been prepared. Run `pane runtime --prepare`."
+                .to_string(),
+        );
+        NativeRuntimeState::StorageNotPrepared
+    } else {
+        if !artifacts.base_os_image_exists {
+            blockers.push(
+                "No verified Pane-owned Arch base OS image exists in the runtime images directory."
+                    .to_string(),
+            );
+        } else if !artifacts.base_os_image_verified {
+            blockers.push(
+                "Pane has a base OS image, but it is not trusted. Re-register it with --expected-sha256 so Pane can verify the image before boot."
+                    .to_string(),
+            );
+        }
+        if !artifacts.user_disk_ready {
+            blockers.push(
+                "No valid Pane-owned user disk descriptor exists for packages, user accounts, and customization data. Run `pane runtime --create-user-disk`."
+                    .to_string(),
+            );
+        }
+
+        if !artifacts.base_os_image_exists {
+            NativeRuntimeState::MissingBaseImage
+        } else if !artifacts.base_os_image_verified {
+            NativeRuntimeState::UnverifiedBaseImage
+        } else if !artifacts.user_disk_ready {
+            NativeRuntimeState::MissingUserDisk
+        } else if !native_host.ready_for_boot_spike {
+            NativeRuntimeState::HostNotReady
+        } else {
+            NativeRuntimeState::EngineNotImplemented
+        }
+    };
+
+    if !matches!(state, NativeRuntimeState::StorageNotPrepared) && !artifacts.runtime_config_exists
+    {
+        blockers.push("The runtime config file is missing.".to_string());
+    }
+    if !matches!(state, NativeRuntimeState::StorageNotPrepared) && !artifacts.native_manifest_exists
+    {
+        blockers.push("The native runtime manifest is missing.".to_string());
+    }
+    for check in &native_host.checks {
+        if check.status == crate::native::NativePreflightStatus::Fail {
+            let mut blocker = format!("Native host check `{}` failed: {}", check.id, check.summary);
+            if let Some(remediation) = &check.remediation {
+                blocker.push_str(" Fix: ");
+                blocker.push_str(remediation);
+            }
+            blockers.push(blocker);
+        }
+    }
+    blockers.push(
+        "Pane-owned boot and display execution are not implemented yet; current launch still uses the WSL/XRDP bridge."
+            .to_string(),
+    );
+
+    let ready_for_boot_spike = prepared
+        && artifacts.base_os_image_verified
+        && artifacts.user_disk_ready
+        && artifacts.runtime_config_exists
+        && artifacts.native_manifest_exists
+        && native_host.ready_for_boot_spike;
+
+    NativeRuntimeReport {
+        state,
+        state_label: state.display_name(),
+        bootable: false,
+        host_ready: native_host.ready_for_boot_spike,
+        ready_for_boot_spike,
+        requires_wsl: false,
+        requires_mstsc: false,
+        requires_xrdp: false,
+        launch_contract: "Pane-owned runtime must boot from Pane's base OS image plus user disk and render inside a Pane-owned app window without WSL, mstsc.exe, or XRDP.",
+        blockers,
+    }
+}
+
+fn build_runtime_ownership_report(native_runtime: &NativeRuntimeReport) -> RuntimeOwnershipReport {
+    RuntimeOwnershipReport {
+        app_owned_storage: true,
+        app_owned_boot_engine_available: native_runtime.bootable,
+        app_owned_display_available: false,
+        external_runtime_required_for_current_launch: true,
+        current_external_dependencies: vec!["wsl.exe", "mstsc.exe", "xrdp"],
+    }
+}
+
+fn write_runtime_manifest(paths: &RuntimePaths, report: &RuntimeReport) -> AppResult<()> {
+    if let Some(parent) = paths.manifest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&paths.manifest, serde_json::to_string_pretty(report)?)?;
+    Ok(())
+}
+
+fn build_app_storage_report(session_name: &str) -> AppStorageReport {
+    let durable_workspace = workspace_for(session_name);
+    let scratch_workspace =
+        workspace_for_with_shared_storage(session_name, SharedStorageMode::Scratch);
+
+    AppStorageReport {
+        default_mode: SharedStorageMode::Durable,
+        durable_shared_dir: shared_dir_for_workspace(&durable_workspace)
+            .display()
+            .to_string(),
+        scratch_shared_dir: shared_dir_for_workspace(&scratch_workspace)
+            .display()
+            .to_string(),
+        policy: "Durable PaneShared is user storage and survives reset by default; scratch PaneShared is disposable session storage.",
+    }
+}
+
+fn build_app_display_report() -> AppDisplayReport {
+    AppDisplayReport {
+        current_mode: AppDisplayMode::ExternalMstscRdp,
+        current_mode_label: "External mstsc.exe + XRDP handoff",
+        contained_window_available: false,
+        user_visible_handoff: true,
+        planned_modes: vec![
+            AppDisplayMode::EmbeddedRdpWindow,
+            AppDisplayMode::NativePaneTransport,
+        ],
+        notes: vec![
+            "Pane currently launches the Windows Remote Desktop client after preparing the Arch session."
+                .to_string(),
+            "The next display milestone is a Pane-owned window that embeds the session before any non-RDP transport work."
+                .to_string(),
+        ],
+    }
+}
+
+fn determine_app_lifecycle(
+    status: &StatusReport,
+    doctor: &DoctorReport,
+    saved_launch: Option<&StoredLaunch>,
+) -> (AppLifecyclePhase, AppNextAction, String, Vec<String>) {
+    if !cfg!(windows) {
+        return (
+            AppLifecyclePhase::UnsupportedHost,
+            AppNextAction::CollectSupportBundle,
+            "Pane's app surface currently requires Windows. Use the CLI only for inspection on this platform."
+                .to_string(),
+            vec!["Run Pane from Windows 10 or 11 for the supported MVP path.".to_string()],
+        );
+    }
+
+    if !status.wsl_available {
+        return (
+            AppLifecyclePhase::HostNeedsWsl,
+            AppNextAction::InstallWsl,
+            "Install or repair WSL2 before Pane can create a Linux desktop environment."
+                .to_string(),
+            vec!["After WSL2 is available, return to Pane and run Onboard Arch.".to_string()],
+        );
+    }
+
+    if status.managed_environment.is_none()
+        || status.selected_distro.as_ref().map_or(true, |health| {
+            !health.present_in_inventory || !health.supported_for_mvp
+        })
+    {
+        return (
+            AppLifecyclePhase::NeedsManagedEnvironment,
+            AppNextAction::OnboardArch,
+            "Create or adopt the Pane-managed Arch environment, then configure the Linux login."
+                .to_string(),
+            vec!["Pane keeps Ubuntu, Debian, KDE, GNOME, and Niri hidden until their lifecycle path is supportable.".to_string()],
+        );
+    }
+
+    if status
+        .selected_distro
+        .as_ref()
+        .is_some_and(distro_needs_user_setup)
+    {
+        return (
+            AppLifecyclePhase::NeedsUserSetup,
+            AppNextAction::SetupUser,
+            "Create or repair the non-root Arch login and systemd WSL config before launching the desktop."
+                .to_string(),
+            vec!["XRDP needs a regular Linux user with a usable password; Pane does not grant passwordless sudo.".to_string()],
+        );
+    }
+
+    if let Some(launch) = saved_launch {
+        if launch.stage == LaunchStage::Failed {
+            return (
+                AppLifecyclePhase::LaunchFailed,
+                AppNextAction::RepairArch,
+                "The last launch failed. Repair the Pane-managed Arch integration before reconnecting."
+                    .to_string(),
+                vec!["Collect a support bundle if repair does not resolve the failure.".to_string()],
+            );
+        }
+
+        if matches!(
+            launch.stage,
+            LaunchStage::Bootstrapped | LaunchStage::RdpLaunched
+        ) {
+            return (
+                AppLifecyclePhase::ReconnectReady,
+                AppNextAction::Reconnect,
+                "The Arch session has been bootstrapped. Reconnect or relaunch from the Control Center."
+                    .to_string(),
+                vec!["If the desktop opens blank or disconnects, use Repair Arch before asking for support.".to_string()],
+            );
+        }
+    }
+
+    if doctor.has_failures() {
+        return (
+            AppLifecyclePhase::NeedsRepair,
+            AppNextAction::RepairArch,
+            "Pane found blockers in the supported Arch + XFCE path. Repair before launch."
+                .to_string(),
+            vec!["Open Doctor or collect a support bundle to inspect exact blockers.".to_string()],
+        );
+    }
+
+    (
+        AppLifecyclePhase::ReadyToLaunch,
+        AppNextAction::LaunchArch,
+        "Arch + XFCE is ready for the current Pane launch path.".to_string(),
+        vec!["Launch Arch opens the current XRDP bridge; the contained Pane window remains a later transport milestone.".to_string()],
+    )
+}
+
+fn distro_needs_user_setup(health: &DistroHealth) -> bool {
+    let default_user_ok = health
+        .distro
+        .default_user
+        .as_deref()
+        .is_some_and(|user| !user.eq_ignore_ascii_case("root"));
+    !default_user_ok
+        || !health
+            .default_user_password_status
+            .is_some_and(PasswordStatus::is_usable)
+        || health.systemd_configured != Some(true)
 }
 
 fn resolve_session_context(
@@ -1472,6 +3076,7 @@ fn build_bundle_doctor_request(
         connect_requested: saved_launch
             .map(|launch| launch.connect_requested)
             .unwrap_or(true),
+        write_probes_enabled: true,
     })
 }
 
@@ -1630,7 +3235,10 @@ fn write_bundle_json<T: Serialize>(
         fs::create_dir_all(parent)?;
     }
 
-    fs::write(&path, serde_json::to_string_pretty(value)?)?;
+    fs::write(
+        &path,
+        redact_support_text(&serde_json::to_string_pretty(value)?),
+    )?;
     included_files.push(relative_path.replace('\\', "/"));
     Ok(())
 }
@@ -1646,7 +3254,7 @@ fn write_bundle_text(
         fs::create_dir_all(parent)?;
     }
 
-    fs::write(&path, value)?;
+    fs::write(&path, redact_support_text(value))?;
     included_files.push(relative_path.replace('\\', "/"));
     Ok(())
 }
@@ -1721,6 +3329,27 @@ fn compress_bundle_dir(staging_root: &Path, output_zip: &Path) -> AppResult<()> 
 
 fn powershell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+fn redact_support_text(raw: &str) -> String {
+    let mut redacted = raw.to_string();
+    for (key, label) in [
+        ("USERPROFILE", "<windows-user-profile>"),
+        ("LOCALAPPDATA", "<local-app-data>"),
+        ("APPDATA", "<app-data>"),
+        ("USERNAME", "<windows-user>"),
+        ("COMPUTERNAME", "<computer-name>"),
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                redacted = redacted.replace(trimmed, label);
+                redacted = redacted.replace(&trimmed.replace('\\', "/"), label);
+            }
+        }
+    }
+
+    redacted
 }
 
 fn current_epoch_seconds() -> u64 {
@@ -2093,6 +3722,18 @@ fn resolve_launch_target(
     if let Some(name) = explicit {
         if inventory.available {
             if !inventory_contains_distro(inventory, name) {
+                if dry_run {
+                    return Ok(LaunchTarget {
+                        distro: DistroRecord {
+                            name: name.to_string(),
+                            family: DistroFamily::Arch,
+                            pretty_name: Some(name.to_string()),
+                            ..DistroRecord::default()
+                        },
+                        hypothetical: true,
+                    });
+                }
+
                 return Err(AppError::message(format!(
                     "WSL distro '{}' was not found. Available distros: {}",
                     name,
@@ -2148,28 +3789,21 @@ fn resolve_launch_target(
         ));
     }
 
-    if let Some(distro) = find_supported_arch_distro(inventory)? {
-        return Ok(LaunchTarget {
-            distro,
-            hypothetical: false,
-        });
-    }
-
     if !inventory.available {
         return Err(AppError::message(
-            "No WSL installation was found. Install WSL2 and Arch Linux first, or rerun with --dry-run --distro <arch-distro-name>.",
+            "No WSL installation was found. Install WSL2, then run `pane onboard` or rerun with --dry-run --distro <arch-distro-name>.",
         ));
     }
 
     Err(AppError::message(format!(
-        "Pane MVP currently supports Arch Linux + XFCE only. Installed distros: {}",
+        "Pane is not managing an Arch environment yet. Run `pane onboard` to create pane-arch, or run `pane init --existing-distro <arch-distro-name>` to adopt an existing Arch distro. Installed distros: {}",
         available_distros(inventory)
     )))
 }
 
 fn resolve_status_distro(
     explicit: Option<&str>,
-    inventory: &WslInventory,
+    _inventory: &WslInventory,
     saved_state: Option<&PaneState>,
 ) -> AppResult<Option<String>> {
     if let Some(name) = explicit {
@@ -2187,14 +3821,7 @@ fn resolve_status_distro(
         return Ok(Some(name));
     }
 
-    if let Some(distro) = find_supported_arch_distro(inventory)? {
-        return Ok(Some(distro.name));
-    }
-
-    Ok(inventory
-        .default_distro
-        .clone()
-        .or_else(|| inventory.distros.first().map(|item| item.name.clone())))
+    Ok(None)
 }
 
 fn resolve_operational_distro(
@@ -2207,34 +3834,6 @@ fn resolve_operational_distro(
             "No WSL distro could be resolved. Run `pane doctor` or pass --distro <arch-distro-name>.",
         )
     })
-}
-
-fn find_supported_arch_distro(inventory: &WslInventory) -> AppResult<Option<DistroRecord>> {
-    if !inventory.available {
-        return Ok(None);
-    }
-
-    let mut candidate_names = Vec::new();
-    if let Some(default_distro) = &inventory.default_distro {
-        candidate_names.push(default_distro.clone());
-    }
-    for distro in &inventory.distros {
-        if !candidate_names
-            .iter()
-            .any(|name| name.eq_ignore_ascii_case(&distro.name))
-        {
-            candidate_names.push(distro.name.clone());
-        }
-    }
-
-    for name in candidate_names {
-        let distro = wsl::inspect_distro(&name, inventory)?;
-        if distro.is_mvp_supported() {
-            return Ok(Some(distro));
-        }
-    }
-
-    Ok(None)
 }
 
 fn evaluate_doctor(
@@ -2282,53 +3881,99 @@ fn evaluate_doctor(
             .then_some("Install WSL2, install Arch Linux, then rerun `pane doctor`.".to_string()),
     );
 
-    let workspace_status = if ensure_workspace_writable(&workspace) {
-        CheckStatus::Pass
-    } else {
-        CheckStatus::Fail
-    };
-    push_check(
-        &mut checks,
-        workspace_status,
-        "workspace-writable",
-        if workspace_status == CheckStatus::Pass {
-            format!("Pane can write assets under {}.", workspace.root.display())
+    if request.write_probes_enabled {
+        let workspace_status = if ensure_workspace_writable(&workspace) {
+            CheckStatus::Pass
         } else {
-            format!(
-                "Pane could not write assets under {}.",
-                workspace.root.display()
-            )
-        },
-        (workspace_status == CheckStatus::Fail).then_some(
-            "Ensure your LOCALAPPDATA directory is writable, then rerun `pane doctor`.".to_string(),
-        ),
-    );
+            CheckStatus::Fail
+        };
+        push_check(
+            &mut checks,
+            workspace_status,
+            "workspace-writable",
+            if workspace_status == CheckStatus::Pass {
+                format!("Pane can write assets under {}.", workspace.root.display())
+            } else {
+                format!(
+                    "Pane could not write assets under {}.",
+                    workspace.root.display()
+                )
+            },
+            (workspace_status == CheckStatus::Fail).then_some(
+                "Ensure your LOCALAPPDATA directory is writable, then rerun `pane doctor`."
+                    .to_string(),
+            ),
+        );
 
-    let shared_directory_status = if ensure_shared_dir_writable(&workspace) {
-        CheckStatus::Pass
-    } else {
-        CheckStatus::Fail
-    };
-    push_check(
-        &mut checks,
-        shared_directory_status,
-        "shared-directory-writable",
-        if shared_directory_status == CheckStatus::Pass {
-            format!(
-                "Pane can create the shared directory under {}.",
-                shared_dir_for_workspace(&workspace).display()
-            )
+        let shared_directory_status = if ensure_shared_dir_writable(&workspace) {
+            CheckStatus::Pass
         } else {
-            format!(
-                "Pane could not create the shared directory under {}.",
-                shared_dir_for_workspace(&workspace).display()
-            )
-        },
-        (shared_directory_status == CheckStatus::Fail).then_some(
-            "Ensure your LOCALAPPDATA directory is writable so Pane can create the shared Windows-side workspace."
-                .to_string(),
-        ),
-    );
+            CheckStatus::Fail
+        };
+        push_check(
+            &mut checks,
+            shared_directory_status,
+            "shared-directory-writable",
+            if shared_directory_status == CheckStatus::Pass {
+                format!(
+                    "Pane can create the shared directory under {}.",
+                    shared_dir_for_workspace(&workspace).display()
+                )
+            } else {
+                format!(
+                    "Pane could not create the shared directory under {}.",
+                    shared_dir_for_workspace(&workspace).display()
+                )
+            },
+            (shared_directory_status == CheckStatus::Fail).then_some(
+                "Ensure your LOCALAPPDATA directory is writable so Pane can create the shared Windows-side workspace."
+                    .to_string(),
+            ),
+        );
+    } else {
+        push_check(
+            &mut checks,
+            CheckStatus::Skipped,
+            "workspace-writable",
+            if workspace_health.root_exists {
+                format!(
+                    "Write probe skipped; existing Pane workspace is at {}.",
+                    workspace.root.display()
+                )
+            } else {
+                format!(
+                    "Write probe skipped; Pane workspace does not exist yet at {}.",
+                    workspace.root.display()
+                )
+            },
+            Some(
+                "Rerun `pane doctor` without `--no-write` or run `pane launch` when you want Pane to create and verify the workspace."
+                    .to_string(),
+            ),
+        );
+
+        let shared_dir = shared_dir_for_workspace(&workspace);
+        push_check(
+            &mut checks,
+            CheckStatus::Skipped,
+            "shared-directory-writable",
+            if workspace_health.shared_dir_exists {
+                format!(
+                    "Shared-directory write probe skipped; existing PaneShared directory is at {}.",
+                    shared_dir.display()
+                )
+            } else {
+                format!(
+                    "Shared-directory write probe skipped; PaneShared does not exist yet at {}.",
+                    shared_dir.display()
+                )
+            },
+            Some(
+                "Rerun `pane doctor` without `--no-write` when you want Pane to create and verify PaneShared."
+                    .to_string(),
+            ),
+        );
+    }
 
     if request.connect_requested {
         let mstsc_status = if mstsc_available() {
@@ -2632,6 +4277,7 @@ fn evaluate_doctor(
         port: request.port,
         bootstrap_requested: request.bootstrap_requested,
         connect_requested: request.connect_requested,
+        write_probes_enabled: request.write_probes_enabled,
         supported_for_mvp,
         ready,
         selected_distro,
@@ -2642,7 +4288,7 @@ fn evaluate_doctor(
 
 fn select_doctor_target(
     explicit: Option<&str>,
-    inventory: &WslInventory,
+    _inventory: &WslInventory,
     saved_state: Option<&PaneState>,
 ) -> AppResult<Option<String>> {
     if let Some(name) = explicit {
@@ -2660,14 +4306,7 @@ fn select_doctor_target(
         return Ok(Some(name));
     }
 
-    if let Some(distro) = find_supported_arch_distro(inventory)? {
-        return Ok(Some(distro.name));
-    }
-
-    Ok(inventory
-        .default_distro
-        .clone()
-        .or_else(|| inventory.distros.first().map(|item| item.name.clone())))
+    Ok(None)
 }
 
 fn build_distro_health(
@@ -2713,7 +4352,6 @@ fn build_distro_health(
             .map(|ip| SocketAddr::from((ip, checked_port)))
             .map(socket_reachable);
         let pane_relay_available = Some(wsl_ip.is_some() || wsl::distro_command_exists(name, "nc"));
-        let remembered_transport = last_launch_transport(name, checked_port, saved_state);
         let pane_default_user = distro
             .default_user
             .as_deref()
@@ -2728,14 +4366,12 @@ fn build_distro_health(
             xrdp_listening,
             localhost_reachable,
             pane_relay_available,
-            preferred_transport: remembered_transport.or_else(|| {
-                preferred_transport(
-                    xrdp_listening,
-                    localhost_reachable,
-                    wsl_ip_reachable,
-                    pane_relay_available,
-                )
-            }),
+            preferred_transport: preferred_transport(
+                xrdp_listening,
+                localhost_reachable,
+                wsl_ip_reachable,
+                pane_relay_available,
+            ),
             xsession_present: Some(wsl::distro_file_exists(name, ".xsession")),
             pane_session_assets_ready: pane_default_user
                 .and_then(|user| wsl::distro_pane_session_assets_ready(name, user)),
@@ -2785,21 +4421,6 @@ fn preferred_transport(
     } else {
         None
     }
-}
-
-fn last_launch_transport(
-    name: &str,
-    port: u16,
-    saved_state: Option<&PaneState>,
-) -> Option<LaunchTransport> {
-    saved_state
-        .and_then(|state| state.last_launch.as_ref())
-        .filter(|launch| {
-            launch.stage == LaunchStage::RdpLaunched
-                && launch.distro.name.eq_ignore_ascii_case(name)
-                && launch.port == port
-        })
-        .and_then(|launch| launch.transport)
 }
 
 fn windows_transport_check(port: u16, health: &DistroHealth) -> Option<DoctorCheck> {
@@ -2856,7 +4477,7 @@ fn build_steps(
         format!(
             "Write an RDP profile that can target localhost, the distro IP, or pane-relay on port {port}."
         ),
-        "Prepare a Pane-managed shared directory that appears inside Arch as ~/PaneShared."
+        "Prepare PaneShared storage that appears inside Arch as ~/PaneShared."
             .to_string(),
         "Run preflight diagnostics that block unsupported or broken MVP setups.".to_string(),
     ];
@@ -2892,7 +4513,7 @@ fn build_update_steps(
             distro.name
         ),
         format!("Write an RDP profile that can target localhost, the distro IP, or pane-relay on port {port}."),
-        "Prepare a Pane-managed shared directory that appears inside Arch as ~/PaneShared."
+        "Prepare PaneShared storage that appears inside Arch as ~/PaneShared."
             .to_string(),
         "Run preflight diagnostics that block unsupported or broken MVP setups.".to_string(),
         format!(
@@ -3137,21 +4758,10 @@ fn build_setup_user_shell_command(username: &str) -> String {
     format!(
         "set -euo pipefail\n\n\
          if ! id -u {username} >/dev/null 2>&1; then\n\
-           useradd -m -G wheel -s /bin/bash {username}\n\
+           useradd -m -s /bin/bash {username}\n\
          else\n\
-           usermod -aG wheel {username}\n\
            if command -v chsh >/dev/null 2>&1; then\n\
              chsh -s /bin/bash {username} >/dev/null 2>&1 || true\n\
-           fi\n\
-         fi\n\
-         if ! command -v sudo >/dev/null 2>&1; then\n\
-           pacman -Sy --noconfirm sudo >/dev/null 2>&1 || true\n\
-         fi\n\
-         if command -v sudo >/dev/null 2>&1; then\n\
-           if grep -Eq '^[[:space:]]*#\\s*%wheel[[:space:]]+ALL=\\(ALL:ALL\\)[[:space:]]+ALL[[:space:]]*$' /etc/sudoers; then\n\
-             sed -i 's/^[[:space:]]*#\\s*%wheel[[:space:]]\\+ALL=(ALL:ALL)[[:space:]]\\+ALL[[:space:]]*$/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers\n\
-           elif ! grep -Eq '^[[:space:]]*%wheel[[:space:]]+ALL=\\(ALL:ALL\\)[[:space:]]+ALL[[:space:]]*$' /etc/sudoers; then\n\
-             printf '\\n%%wheel ALL=(ALL:ALL) ALL\\n' >> /etc/sudoers\n\
            fi\n\
          fi\n\
          chpasswd\n",
@@ -3399,6 +5009,9 @@ fn print_status_report(report: &StatusReport) {
     if let Some(version) = &report.wsl_version_banner {
         println!("  WSL Version    {version}");
     }
+    if let Some(default_distro) = &report.wsl_default_distro {
+        println!("  WSL Default    {default_distro}");
+    }
     println!("  Known Distros  {}", report.known_distros.len());
 
     if let Some(managed_environment) = &report.managed_environment {
@@ -3505,6 +5118,311 @@ fn print_status_report(report: &StatusReport) {
     }
 }
 
+fn print_app_status_report(report: &AppStatusReport) {
+    println!("Pane App Status");
+    println!("  Session        {}", report.session_name);
+    println!("  Phase          {}", report.phase.display_name());
+    println!("  Next Action    {}", report.next_action_label);
+    println!("  Summary        {}", report.next_action_summary);
+    println!("  Profile        {}", report.supported_profile.label);
+    println!("Runtime");
+    println!("  Current Engine {}", report.runtime.current_engine_label);
+    println!("  Target Engine  {}", report.runtime.target_engine_label);
+    println!("  Prepared       {}", yes_no(report.runtime.prepared));
+    println!(
+        "  Host Ready     {}",
+        yes_no(report.runtime.native_runtime.host_ready)
+    );
+    println!(
+        "  Boot Spike     {}",
+        yes_no(report.runtime.native_runtime.ready_for_boot_spike)
+    );
+    println!("  Dedicated Root {}", report.runtime.dedicated_space_root);
+    println!(
+        "  Capacity       {} GiB",
+        report.runtime.storage_budget.requested_capacity_gib
+    );
+    println!("  Storage        {}", report.storage.policy);
+    println!("  Durable Shared {}", report.storage.durable_shared_dir);
+    println!("  Scratch Shared {}", report.storage.scratch_shared_dir);
+    println!("Display");
+    println!("  Current        {}", report.display.current_mode_label);
+    println!(
+        "  Contained      {}",
+        yes_no(report.display.contained_window_available)
+    );
+    println!(
+        "  Visible Handoff {}",
+        yes_no(report.display.user_visible_handoff)
+    );
+    if let Some(environment) = &report.managed_environment {
+        println!("Managed Environment");
+        println!("  Distro         {}", environment.distro_name);
+        println!("  Family         {}", environment.family.display_name());
+        println!("  Ownership      {}", environment.ownership.display_name());
+    }
+    if let Some(distro) = &report.selected_distro {
+        println!("Selected Distro");
+        println!("  Name           {}", distro.distro.label());
+        println!("  Supported MVP  {}", yes_no(distro.supported_for_mvp));
+        if let Some(user) = &distro.distro.default_user {
+            println!("  Default User   {user}");
+        }
+        if let Some(password) = distro.default_user_password_status {
+            println!("  Password       {}", password.display_name());
+        }
+    }
+    if let Some(launch) = &report.last_launch {
+        println!("Last Launch");
+        println!("  Stage          {}", launch.stage.display_name());
+        println!("  Port           {}", launch.port);
+        if let Some(transport) = launch.transport {
+            println!("  Transport      {}", transport.display_name());
+        }
+        if let Some(error) = &launch.last_error {
+            println!("  Last Error     {error}");
+        }
+    }
+    if !report.blockers.is_empty() {
+        println!("Blockers");
+        for blocker in &report.blockers {
+            println!("  [{}] {}", blocker.id, blocker.summary);
+            if let Some(remediation) = &blocker.remediation {
+                println!("       fix: {remediation}");
+            }
+        }
+    }
+    if !report.notes.is_empty() {
+        println!("Notes");
+        for note in &report.notes {
+            println!("  - {}", note);
+        }
+    }
+}
+
+fn print_runtime_report(report: &RuntimeReport) {
+    println!("Pane Runtime");
+    println!("  Session        {}", report.session_name);
+    println!("  Current Engine {}", report.current_engine_label);
+    println!("  Target Engine  {}", report.target_engine_label);
+    println!("  Prepared       {}", yes_no(report.prepared));
+    println!("  Dedicated Root {}", report.dedicated_space_root);
+    println!(
+        "  Capacity       {} GiB",
+        report.storage_budget.requested_capacity_gib
+    );
+    println!(
+        "  Base OS Budget {} GiB",
+        report.storage_budget.base_os_budget_gib
+    );
+    println!(
+        "  User Budget    {} GiB",
+        report.storage_budget.user_packages_and_customizations_gib
+    );
+    println!(
+        "  Snapshot Budget {} GiB",
+        report.storage_budget.snapshot_budget_gib
+    );
+    println!("Directories");
+    println!("  Downloads      {}", report.directories.downloads);
+    println!("  Images         {}", report.directories.images);
+    println!("  Disks          {}", report.directories.disks);
+    println!("  Snapshots      {}", report.directories.snapshots);
+    println!("  State          {}", report.directories.state);
+    println!("  Engines        {}", report.directories.engines);
+    println!("  Logs           {}", report.directories.logs);
+    println!("  Base OS Image  {}", report.directories.base_os_image);
+    println!("  User Disk      {}", report.directories.user_disk);
+    println!("  Base Metadata  {}", report.directories.base_os_metadata);
+    println!("  Disk Metadata  {}", report.directories.user_disk_metadata);
+    println!("  Runtime Config {}", report.directories.runtime_config);
+    println!("  Native Manifest {}", report.directories.native_manifest);
+    println!("  Manifest       {}", report.directories.manifest);
+    println!("Artifacts");
+    println!(
+        "  Base Image     {}",
+        yes_no(report.artifacts.base_os_image_exists)
+    );
+    println!(
+        "  Base Verified  {}",
+        yes_no(report.artifacts.base_os_image_verified)
+    );
+    if let Some(sha256) = &report.artifacts.base_os_image_sha256 {
+        println!("  Base SHA-256   {}", sha256);
+    }
+    if let Some(bytes) = report.artifacts.base_os_image_bytes {
+        println!("  Base Bytes     {}", bytes);
+    }
+    println!(
+        "  User Disk      {}",
+        yes_no(report.artifacts.user_disk_exists)
+    );
+    println!(
+        "  User Disk Ready {}",
+        yes_no(report.artifacts.user_disk_ready)
+    );
+    if let Some(capacity_gib) = report.artifacts.user_disk_capacity_gib {
+        println!("  User Disk GiB  {}", capacity_gib);
+    }
+    if let Some(format) = &report.artifacts.user_disk_format {
+        println!("  User Format    {}", format);
+    }
+    println!("Ownership");
+    println!(
+        "  App Storage    {}",
+        yes_no(report.ownership.app_owned_storage)
+    );
+    println!(
+        "  Boot Engine    {}",
+        yes_no(report.ownership.app_owned_boot_engine_available)
+    );
+    println!(
+        "  Display        {}",
+        yes_no(report.ownership.app_owned_display_available)
+    );
+    println!(
+        "  Current Bridge {}",
+        yes_no(
+            report
+                .ownership
+                .external_runtime_required_for_current_launch
+        )
+    );
+    println!("Native Runtime");
+    println!("  State          {}", report.native_runtime.state_label);
+    println!(
+        "  Host Ready     {}",
+        yes_no(report.native_runtime.host_ready)
+    );
+    println!(
+        "  Boot Spike     {}",
+        yes_no(report.native_runtime.ready_for_boot_spike)
+    );
+    println!(
+        "  Bootable       {}",
+        yes_no(report.native_runtime.bootable)
+    );
+    println!(
+        "  Requires WSL   {}",
+        yes_no(report.native_runtime.requires_wsl)
+    );
+    println!(
+        "  Requires mstsc {}",
+        yes_no(report.native_runtime.requires_mstsc)
+    );
+    println!(
+        "  Requires XRDP  {}",
+        yes_no(report.native_runtime.requires_xrdp)
+    );
+    if !report.native_runtime.blockers.is_empty() {
+        println!("Native Runtime Blockers");
+        for blocker in &report.native_runtime.blockers {
+            println!("  - {}", blocker);
+        }
+    }
+    println!("Native Host");
+    println!("  OS             {}", report.native_host.host_os);
+    println!("  Arch           {}", report.native_host.host_arch);
+    println!(
+        "  Windows Host   {}",
+        yes_no(report.native_host.windows_host)
+    );
+    println!(
+        "  Supported Arch {}",
+        yes_no(report.native_host.supported_arch)
+    );
+    println!(
+        "  WHP Library    {}",
+        yes_no(report.native_host.whp.dll_loaded)
+    );
+    println!(
+        "  WHP Hypervisor {}",
+        report
+            .native_host
+            .whp
+            .hypervisor_present
+            .map(yes_no)
+            .unwrap_or("unknown")
+    );
+    println!("Native Host Checks");
+    for check in &report.native_host.checks {
+        println!("  [{}] {}", check.status.display_name(), check.summary);
+        if let Some(remediation) = &check.remediation {
+            println!("       fix: {remediation}");
+        }
+    }
+    println!("Current Limitation");
+    println!("  {}", report.current_limitation);
+    println!("Next Steps");
+    for step in &report.next_steps {
+        println!("  - {}", step);
+    }
+    println!("Notes");
+    for note in &report.notes {
+        println!("  - {}", note);
+    }
+}
+
+fn print_native_preflight_report(report: &NativePreflightReport) {
+    println!("Pane Native Runtime Preflight");
+    println!("  Session        {}", report.session_name);
+    println!("  Ready          {}", yes_no(report.ready_for_boot_spike));
+    println!("Host");
+    println!("  OS             {}", report.host.host_os);
+    println!("  Arch           {}", report.host.host_arch);
+    println!("  Windows Host   {}", yes_no(report.host.windows_host));
+    println!("  Supported Arch {}", yes_no(report.host.supported_arch));
+    println!("WHP");
+    println!("  Library        {}", yes_no(report.host.whp.dll_loaded));
+    println!(
+        "  GetCapability  {}",
+        yes_no(report.host.whp.get_capability_available)
+    );
+    println!(
+        "  Hypervisor     {}",
+        report
+            .host
+            .whp
+            .hypervisor_present
+            .map(yes_no)
+            .unwrap_or("unknown")
+    );
+    if let Some(hresult) = &report.host.whp.get_capability_hresult {
+        println!("  HRESULT        {}", hresult);
+    }
+    println!("Checks");
+    for check in &report.host.checks {
+        println!("  [{}] {}", check.status.display_name(), check.summary);
+        if let Some(remediation) = &check.remediation {
+            println!("       fix: {remediation}");
+        }
+    }
+    println!("Runtime Artifacts");
+    println!("  Prepared       {}", yes_no(report.runtime.prepared));
+    println!(
+        "  Base Verified  {}",
+        yes_no(report.runtime.artifacts.base_os_image_verified)
+    );
+    println!(
+        "  User Disk Ready {}",
+        yes_no(report.runtime.artifacts.user_disk_ready)
+    );
+    println!(
+        "  Boot Spike     {}",
+        yes_no(report.runtime.native_runtime.ready_for_boot_spike)
+    );
+    if !report.blockers.is_empty() {
+        println!("Blockers");
+        for blocker in &report.blockers {
+            println!("  - {}", blocker);
+        }
+    }
+    println!("Next Steps");
+    for step in &report.next_steps {
+        println!("  - {}", step);
+    }
+}
+
 fn print_environment_catalog_report(report: &EnvironmentCatalogReport) {
     println!("Pane Environments");
     println!("  Product Shape  {}", report.product_shape);
@@ -3547,6 +5465,7 @@ fn print_doctor_report(report: &DoctorReport) {
     );
     println!("  Session        {}", report.session_name);
     println!("  Port           {}", report.port);
+    println!("  Write Probes   {}", yes_no(report.write_probes_enabled));
     println!("  Supported MVP  {}", yes_no(report.supported_for_mvp));
     println!("  Ready          {}", yes_no(report.ready));
     println!("Checks");
@@ -3954,6 +5873,18 @@ fn format_doctor_blockers(command: &str, report: &DoctorReport) -> String {
     lines.join("\n")
 }
 
+fn format_blocker_list(blockers: &[String]) -> String {
+    if blockers.is_empty() {
+        return "- no blockers reported".to_string();
+    }
+
+    blockers
+        .iter()
+        .map(|blocker| format!("- {blocker}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn push_check(
     checks: &mut Vec<DoctorCheck>,
     status: CheckStatus,
@@ -3982,7 +5913,8 @@ mod tests {
     use crate::{
         cli::{InitArgs, ResetArgs},
         model::{DesktopEnvironment, DistroFamily, DistroRecord},
-        plan::{LaunchPlan, WorkspacePaths},
+        native::test_native_host_report,
+        plan::{LaunchPlan, RuntimePaths, WorkspacePaths},
         state::{
             LaunchStage, LaunchTransport, ManagedEnvironmentOwnership, ManagedEnvironmentState,
             StoredLaunch,
@@ -3991,14 +5923,96 @@ mod tests {
 
     use super::{
         build_bundle_doctor_request, build_distro_health, build_environment_catalog_report,
-        build_steps, build_update_steps, ensure_wsl_conf_setting, format_doctor_blockers,
-        initialize_managed_arch_environment, inspect_workspace, inventory_contains_distro,
-        last_launch_transport, preferred_transport, resolve_bundle_output_path,
-        resolve_init_source, resolve_managed_environment_for_reset, resolve_saved_launch,
-        resolve_session_context, resolve_status_distro, status_port_for, validate_setup_password,
-        validate_setup_username, windows_transport_check, CheckStatus, DistroHealth, DoctorCheck,
-        DoctorReport, InitSource, WorkspaceHealth, WslInventory,
+        build_native_runtime_report, build_runtime_artifact_report, build_steps,
+        build_update_steps, create_user_disk_descriptor, determine_app_lifecycle,
+        ensure_wsl_conf_setting, format_doctor_blockers, initialize_managed_arch_environment,
+        inspect_workspace, inventory_contains_distro, preferred_transport, register_base_os_image,
+        resolve_bundle_output_path, resolve_init_source, resolve_launch_target,
+        resolve_managed_environment_for_reset, resolve_saved_launch, resolve_session_context,
+        resolve_status_distro, runtime_storage_budget, sha256_file, status_port_for,
+        validate_setup_password, validate_setup_username, windows_transport_check,
+        AppLifecyclePhase, AppNextAction, CheckStatus, DistroHealth, DoctorCheck, DoctorReport,
+        InitSource, NativeRuntimeState, StatusReport, WorkspaceHealth, WslInventory,
+        EMBEDDED_APP_ASSETS,
     };
+
+    fn empty_workspace_health() -> WorkspaceHealth {
+        WorkspaceHealth {
+            root_exists: false,
+            shared_dir_exists: false,
+            bootstrap_script_exists: false,
+            rdp_profile_exists: false,
+            bootstrap_log_exists: false,
+            transport_log_exists: false,
+        }
+    }
+
+    fn temp_runtime_paths(name: &str) -> RuntimePaths {
+        let root = std::env::temp_dir().join(format!(
+            "pane-test-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let downloads = root.join("downloads");
+        let images = root.join("images");
+        let disks = root.join("disks");
+        let snapshots = root.join("snapshots");
+        let state = root.join("state");
+        let engines = root.join("engines");
+        let logs = root.join("logs");
+
+        RuntimePaths {
+            base_os_image: images.join("arch-base.paneimg"),
+            user_disk: disks.join("user-data.panedisk"),
+            base_os_metadata: state.join("base-os-image.json"),
+            user_disk_metadata: state.join("user-disk.json"),
+            runtime_config: root.join("pane-runtime.config.json"),
+            native_manifest: root.join("pane-native-runtime.json"),
+            manifest: root.join("pane-runtime.json"),
+            downloads,
+            images,
+            disks,
+            snapshots,
+            state,
+            engines,
+            logs,
+            root,
+        }
+    }
+
+    fn empty_doctor_report() -> DoctorReport {
+        DoctorReport {
+            target_distro: None,
+            session_name: "pane".to_string(),
+            desktop_environment: DesktopEnvironment::Xfce,
+            port: 3390,
+            bootstrap_requested: true,
+            connect_requested: false,
+            write_probes_enabled: false,
+            supported_for_mvp: false,
+            ready: true,
+            selected_distro: None,
+            workspace: empty_workspace_health(),
+            checks: Vec::new(),
+        }
+    }
+
+    fn empty_status_report(wsl_available: bool) -> StatusReport {
+        StatusReport {
+            platform: "windows",
+            wsl_available,
+            wsl_version_banner: None,
+            wsl_default_distro: None,
+            managed_environment: None,
+            selected_distro: None,
+            known_distros: Vec::new(),
+            last_launch: None,
+            last_launch_workspace: None,
+        }
+    }
 
     #[test]
     fn build_steps_omits_rdp_handoff_when_connect_is_disabled() {
@@ -4039,6 +6053,198 @@ mod tests {
     }
 
     #[test]
+    fn embedded_app_assets_include_control_center_and_launchers() {
+        let names = EMBEDDED_APP_ASSETS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"Pane Control Center.ps1"));
+        assert!(names.contains(&"Launch Pane Arch.ps1"));
+        assert!(names.contains(&"Open Pane Shared Folder.ps1"));
+        assert!(names.contains(&"Install Pane Shortcuts.ps1"));
+        assert!(EMBEDDED_APP_ASSETS
+            .iter()
+            .all(|(_, contents)| !contents.trim().is_empty()));
+    }
+
+    #[test]
+    fn runtime_budget_reserves_space_for_base_os_user_data_and_snapshots() {
+        let budget = runtime_storage_budget(8);
+
+        assert_eq!(budget.requested_capacity_gib, 8);
+        assert_eq!(budget.base_os_budget_gib, 4);
+        assert_eq!(budget.snapshot_budget_gib, 1);
+        assert_eq!(budget.user_packages_and_customizations_gib, 3);
+        assert_eq!(budget.minimum_recommended_gib, 8);
+    }
+
+    #[test]
+    fn runtime_budget_enforces_minimum_capacity() {
+        let budget = runtime_storage_budget(4);
+
+        assert_eq!(budget.requested_capacity_gib, 8);
+        assert_eq!(budget.base_os_budget_gib, 4);
+        assert_eq!(budget.snapshot_budget_gib, 1);
+        assert_eq!(budget.user_packages_and_customizations_gib, 3);
+    }
+
+    #[test]
+    fn sha256_file_matches_known_digest() {
+        let paths = temp_runtime_paths("sha256");
+        std::fs::create_dir_all(&paths.root).unwrap();
+        let source = paths.root.join("source.img");
+        std::fs::write(&source, b"abc").unwrap();
+
+        assert_eq!(
+            sha256_file(&source).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn registers_verified_base_image_and_user_disk_descriptor() {
+        let paths = temp_runtime_paths("runtime-artifacts");
+        super::prepare_runtime_paths(&paths).unwrap();
+        let source = paths.downloads.join("arch.img");
+        std::fs::write(&source, b"pane arch image").unwrap();
+        let expected = sha256_file(&source).unwrap();
+
+        register_base_os_image(&paths, &source, Some(&expected), false).unwrap();
+        create_user_disk_descriptor(&paths, &runtime_storage_budget(8), false).unwrap();
+        super::write_runtime_config(&paths, "pane", &runtime_storage_budget(8)).unwrap();
+        super::write_native_runtime_manifest(&paths, "pane").unwrap();
+
+        let artifacts = build_runtime_artifact_report(&paths);
+        assert!(artifacts.base_os_image_exists);
+        assert!(artifacts.base_os_image_verified);
+        assert_eq!(
+            artifacts.base_os_image_sha256.as_deref(),
+            Some(expected.as_str())
+        );
+        assert!(artifacts.user_disk_exists);
+        assert!(artifacts.user_disk_ready);
+        assert_eq!(artifacts.user_disk_capacity_gib, Some(3));
+
+        let native_host = test_native_host_report(true);
+        let native = build_native_runtime_report(true, &artifacts, &native_host);
+        assert_eq!(native.state, NativeRuntimeState::EngineNotImplemented);
+        assert!(native.ready_for_boot_spike);
+        assert!(!native
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("No valid Pane-owned user disk")));
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn native_runtime_reports_host_blocker_after_artifacts_are_ready() {
+        let paths = temp_runtime_paths("runtime-host-not-ready");
+        super::prepare_runtime_paths(&paths).unwrap();
+        let source = paths.downloads.join("arch.img");
+        std::fs::write(&source, b"pane arch image").unwrap();
+        let expected = sha256_file(&source).unwrap();
+
+        register_base_os_image(&paths, &source, Some(&expected), false).unwrap();
+        create_user_disk_descriptor(&paths, &runtime_storage_budget(8), false).unwrap();
+        super::write_runtime_config(&paths, "pane", &runtime_storage_budget(8)).unwrap();
+        super::write_native_runtime_manifest(&paths, "pane").unwrap();
+
+        let artifacts = build_runtime_artifact_report(&paths);
+        let native_host = test_native_host_report(false);
+        let native = build_native_runtime_report(true, &artifacts, &native_host);
+
+        assert_eq!(native.state, NativeRuntimeState::HostNotReady);
+        assert!(!native.host_ready);
+        assert!(!native.ready_for_boot_spike);
+        assert!(native
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("Native host check")));
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn rejects_base_image_hash_mismatch() {
+        let paths = temp_runtime_paths("runtime-hash-mismatch");
+        super::prepare_runtime_paths(&paths).unwrap();
+        let source = paths.downloads.join("arch.img");
+        std::fs::write(&source, b"pane arch image").unwrap();
+
+        let error = register_base_os_image(
+            &paths,
+            &source,
+            Some("0000000000000000000000000000000000000000000000000000000000000000"),
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("SHA-256 mismatch"));
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn app_lifecycle_requires_wsl_before_onboarding() {
+        let status = empty_status_report(false);
+        let doctor = empty_doctor_report();
+
+        let (phase, next_action, _, _) = determine_app_lifecycle(&status, &doctor, None);
+
+        assert_eq!(phase, AppLifecyclePhase::HostNeedsWsl);
+        assert_eq!(next_action, AppNextAction::InstallWsl);
+    }
+
+    #[test]
+    fn app_lifecycle_launches_after_managed_arch_user_is_ready() {
+        let mut status = empty_status_report(true);
+        status.managed_environment = Some(ManagedEnvironmentState {
+            environment_id: "arch".to_string(),
+            distro_name: "pane-arch".to_string(),
+            family: DistroFamily::Arch,
+            ownership: ManagedEnvironmentOwnership::InstalledOnline,
+            install_dir: None,
+            source_rootfs: None,
+            created_at_epoch_seconds: 1,
+        });
+        status.selected_distro = Some(DistroHealth {
+            distro: DistroRecord {
+                name: "pane-arch".to_string(),
+                family: DistroFamily::Arch,
+                default_user: Some("paneuser".to_string()),
+                ..DistroRecord::default()
+            },
+            supported_for_mvp: true,
+            present_in_inventory: true,
+            checked_port: 3390,
+            systemd_configured: Some(true),
+            xrdp_installed: None,
+            xrdp_service_active: None,
+            xrdp_listening: None,
+            localhost_reachable: None,
+            pane_relay_available: None,
+            preferred_transport: None,
+            xsession_present: None,
+            pane_session_assets_ready: None,
+            user_home_ready: None,
+            default_user_password_status: Some(crate::wsl::PasswordStatus::Usable),
+        });
+        let mut doctor = empty_doctor_report();
+        doctor.supported_for_mvp = true;
+        doctor.ready = true;
+
+        let (phase, next_action, _, _) = determine_app_lifecycle(&status, &doctor, None);
+
+        assert_eq!(phase, AppLifecyclePhase::ReadyToLaunch);
+        assert_eq!(next_action, AppNextAction::LaunchArch);
+    }
+
+    #[test]
     fn preferred_transport_uses_direct_wsl_ip_when_localhost_is_unreachable() {
         assert_eq!(
             preferred_transport(Some(true), Some(false), Some(true), Some(true)),
@@ -4052,46 +6258,6 @@ mod tests {
             preferred_transport(Some(true), Some(false), Some(false), Some(true)),
             Some(LaunchTransport::PaneRelay)
         );
-    }
-
-    #[test]
-    fn last_launch_transport_prefers_recorded_rdp_launch() {
-        let state = crate::state::PaneState {
-            updated_at_epoch_seconds: 1,
-            managed_environment: None,
-            last_launch: Some(StoredLaunch {
-                session_name: "pane".to_string(),
-                distro: DistroRecord {
-                    name: "pane-arch".to_string(),
-                    ..DistroRecord::default()
-                },
-                desktop_environment: DesktopEnvironment::Xfce,
-                port: 3390,
-                workspace: WorkspacePaths {
-                    root: "root".into(),
-                    bootstrap_script: "bootstrap".into(),
-                    rdp_profile: "rdp".into(),
-                    bootstrap_log: "bootstrap.log".into(),
-                    transport_log: "transport.log".into(),
-                },
-                stage: LaunchStage::RdpLaunched,
-                dry_run: false,
-                hypothetical: false,
-                bootstrap_requested: true,
-                connect_requested: true,
-                transport: Some(LaunchTransport::PaneRelay),
-                generated_at_epoch_seconds: 1,
-                bootstrapped_at_epoch_seconds: Some(2),
-                rdp_launched_at_epoch_seconds: Some(3),
-                last_error: None,
-            }),
-        };
-
-        assert_eq!(
-            last_launch_transport("pane-arch", 3390, Some(&state)),
-            Some(LaunchTransport::PaneRelay)
-        );
-        assert_eq!(last_launch_transport("pane-arch", 4489, Some(&state)), None);
     }
 
     #[test]
@@ -4135,6 +6301,7 @@ mod tests {
                 rdp_profile: "rdp".into(),
                 bootstrap_log: "bootstrap.log".into(),
                 transport_log: "transport.log".into(),
+                shared_dir: "shared".into(),
             },
             stage: LaunchStage::Planned,
             dry_run: true,
@@ -4173,6 +6340,7 @@ mod tests {
                 rdp_profile: "rdp".into(),
                 bootstrap_log: "bootstrap.log".into(),
                 transport_log: "transport.log".into(),
+                shared_dir: "shared".into(),
             },
             stage: LaunchStage::Planned,
             dry_run: true,
@@ -4222,6 +6390,7 @@ mod tests {
                     rdp_profile: "rdp".into(),
                     bootstrap_log: "bootstrap.log".into(),
                     transport_log: "transport.log".into(),
+                    shared_dir: "shared".into(),
                 },
                 stage: LaunchStage::Planned,
                 dry_run: false,
@@ -4261,6 +6430,20 @@ mod tests {
             }
             _ => panic!("expected Pane-owned online provisioning source"),
         }
+    }
+
+    #[test]
+    fn dry_run_launch_allows_explicit_missing_distro_for_package_certification() {
+        let inventory = WslInventory {
+            available: true,
+            distros: Vec::new(),
+            ..WslInventory::default()
+        };
+
+        let target = resolve_launch_target(Some("pane-arch"), &inventory, None, true).unwrap();
+        assert!(target.hypothetical);
+        assert_eq!(target.distro.name, "pane-arch");
+        assert_eq!(target.distro.family, DistroFamily::Arch);
     }
 
     #[test]
@@ -4330,6 +6513,7 @@ mod tests {
             session_name: None,
             distro: None,
             purge_wsl: false,
+            purge_shared: false,
             release_managed_environment: false,
             factory_reset: true,
             dry_run: false,
@@ -4383,6 +6567,7 @@ mod tests {
             rdp_profile: rdp,
             bootstrap_log: log.clone(),
             transport_log: log.with_file_name("transport.log"),
+            shared_dir: shared,
         });
 
         assert!(health.root_exists);
@@ -4411,6 +6596,7 @@ mod tests {
                 rdp_profile: "rdp".into(),
                 bootstrap_log: "bootstrap.log".into(),
                 transport_log: "transport.log".into(),
+                shared_dir: "shared".into(),
             },
             bootstrap_script: "script".to_string(),
             rdp_profile: "profile".to_string(),
@@ -4424,6 +6610,39 @@ mod tests {
     }
 
     #[test]
+    fn doctor_skipped_checks_are_visible_but_not_blocking() {
+        let report = DoctorReport {
+            target_distro: None,
+            session_name: "pane".to_string(),
+            desktop_environment: DesktopEnvironment::Xfce,
+            port: 3390,
+            bootstrap_requested: true,
+            connect_requested: false,
+            write_probes_enabled: false,
+            supported_for_mvp: false,
+            ready: true,
+            selected_distro: None,
+            workspace: WorkspaceHealth {
+                root_exists: false,
+                shared_dir_exists: false,
+                bootstrap_script_exists: false,
+                rdp_profile_exists: false,
+                bootstrap_log_exists: false,
+                transport_log_exists: false,
+            },
+            checks: vec![DoctorCheck {
+                id: "workspace-writable".to_string(),
+                status: CheckStatus::Skipped,
+                summary: "Write probe skipped.".to_string(),
+                remediation: None,
+            }],
+        };
+
+        assert_eq!(CheckStatus::Skipped.display_name(), "SKIP");
+        assert!(!report.has_failures());
+    }
+
+    #[test]
     fn blocker_formatting_includes_remediation() {
         let report = DoctorReport {
             target_distro: Some("archlinux".to_string()),
@@ -4432,6 +6651,7 @@ mod tests {
             port: 3390,
             bootstrap_requested: true,
             connect_requested: true,
+            write_probes_enabled: true,
             supported_for_mvp: false,
             ready: false,
             selected_distro: Some(DistroHealth {
@@ -4488,6 +6708,7 @@ mod tests {
                 rdp_profile: "rdp".into(),
                 bootstrap_log: "bootstrap.log".into(),
                 transport_log: "transport.log".into(),
+                shared_dir: "shared".into(),
             },
             stage: LaunchStage::Planned,
             dry_run: false,
@@ -4552,6 +6773,7 @@ mod tests {
                 rdp_profile: "rdp".into(),
                 bootstrap_log: "bootstrap.log".into(),
                 transport_log: "transport.log".into(),
+                shared_dir: "shared".into(),
             },
             stage: LaunchStage::Bootstrapped,
             dry_run: false,

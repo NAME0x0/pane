@@ -6,21 +6,42 @@ use serde::{Deserialize, Serialize};
 pub enum DesktopEnvironment {
     #[default]
     Xfce,
-    Kde,
-    Gnome,
 }
 
 impl DesktopEnvironment {
     pub fn display_name(self) -> &'static str {
         match self {
             Self::Xfce => "XFCE",
-            Self::Kde => "KDE Plasma",
-            Self::Gnome => "GNOME",
         }
     }
 
     pub fn is_mvp_supported(self) -> bool {
         matches!(self, Self::Xfce)
+    }
+}
+
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum SharedStorageMode {
+    #[default]
+    Durable,
+    Scratch,
+}
+
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeMode {
+    #[default]
+    WslBridge,
+    PaneOwned,
+}
+
+impl RuntimeMode {
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::WslBridge => "WSL2 + XRDP bridge",
+            Self::PaneOwned => "Pane-owned OS runtime",
+        }
     }
 }
 

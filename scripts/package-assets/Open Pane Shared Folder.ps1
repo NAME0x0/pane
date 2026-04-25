@@ -1,5 +1,7 @@
 param(
     [string]$SessionName = "pane",
+    [ValidateSet("durable", "scratch")]
+    [string]$SharedStorage = "durable",
     [switch]$PrintOnly
 )
 
@@ -11,7 +13,7 @@ if (-not (Test-Path $paneExe)) {
     throw "Expected pane.exe beside $($MyInvocation.MyCommand.Name)."
 }
 
-$arguments = @("share", "--session-name", $SessionName)
+$arguments = @("share", "--session-name", $SessionName, "--shared-storage", $SharedStorage)
 if ($PrintOnly) {
     $arguments += "--print-only"
 }

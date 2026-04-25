@@ -14,6 +14,7 @@ $packageDir = Join-Path $distRoot "pane-windows-x86_64"
 $archivePath = Join-Path $distRoot "pane-windows-x86_64.zip"
 $exeAssetPath = Join-Path $distRoot "pane-windows-x86_64.exe"
 $validationScript = Join-Path $repoRoot "scripts\validate-package.ps1"
+$certificationScript = Join-Path $repoRoot "scripts\certify-fresh-machine.ps1"
 $assetRoot = Join-Path $repoRoot "scripts\package-assets"
 $iconAssetRoot = Join-Path $repoRoot "assets"
 
@@ -57,7 +58,9 @@ try {
     Copy-Item (Join-Path $repoRoot "docs\clean-machine-validation.md") (Join-Path $packageDir "clean-machine-validation.md")
     Copy-Item (Join-Path $repoRoot "docs\vision.md") (Join-Path $packageDir "vision.md")
     Copy-Item (Join-Path $repoRoot "docs\product-contract.md") (Join-Path $packageDir "product-contract.md")
+    Copy-Item (Join-Path $repoRoot "docs\native-runtime-architecture.md") (Join-Path $packageDir "native-runtime-architecture.md")
     Copy-Item $validationScript (Join-Path $packageDir "validate-package.ps1")
+    Copy-Item $certificationScript (Join-Path $packageDir "certify-fresh-machine.ps1")
     Copy-Item (Join-Path $assetRoot "*") $packageDir
     Copy-Item $iconAssetRoot (Join-Path $packageDir "assets") -Recurse
 
@@ -71,6 +74,7 @@ try {
     Write-Host "Archive: $archivePath"
 
     if ($RunSmoke) {
+        & $certificationScript -PackagePath $packageDir -Mode PackageOnly -Distro $Distro -DesktopEnvironment $DesktopEnvironment
         & $validationScript -PackagePath $packageDir -Distro $Distro -DesktopEnvironment $DesktopEnvironment
     }
 }

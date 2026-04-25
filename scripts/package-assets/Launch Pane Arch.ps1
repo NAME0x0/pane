@@ -2,6 +2,8 @@ param(
     [string]$SessionName = "pane",
     [string]$Distro = "",
     [string]$DesktopEnvironment = "xfce",
+    [ValidateSet("durable", "scratch")]
+    [string]$SharedStorage = "durable",
     [switch]$DryRun,
     [switch]$NoConnect,
     [switch]$ForceLaunch
@@ -52,7 +54,7 @@ if ($shouldReconnect) {
 }
 
 Write-Host "Launching Pane Arch session..."
-$arguments = @("launch", "--de", $DesktopEnvironment, "--session-name", $SessionName)
+$arguments = @("launch", "--de", $DesktopEnvironment, "--session-name", $SessionName, "--shared-storage", $SharedStorage)
 $arguments = Add-DistroArgument -Arguments $arguments -Value $Distro
 if ($DryRun) {
     $arguments += "--dry-run"

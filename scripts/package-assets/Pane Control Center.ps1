@@ -24,10 +24,16 @@ if ($PrintOnly) {
     Write-Host "  Package Root      $packageRoot"
     Write-Host "  Session           $SessionName"
     Write-Host "  Supported Profile Arch Linux + XFCE"
+    Write-Host "  Shared Storage   Durable by default; opt into scratch storage for disposable sessions."
+    Write-Host "  Runtime Space    Dedicated Pane runtime storage can be prepared for the future contained OS engine."
+    Write-Host "  Image Register   Local Arch base images can be copied into Pane runtime storage with SHA-256 metadata."
+    Write-Host "  Native Preflight Probe Windows Hypervisor Platform readiness before the Pane-owned boot spike."
+    Write-Host "  Native Preview   Pane-owned runtime dry-run does not invoke WSL, mstsc.exe, or XRDP."
+    Write-Host "  First Run Wizard Onboard Arch, configure the Linux login, then launch the desktop from one app surface."
+    Write-Host "  Display Transport Current mode is mstsc.exe + XRDP; embedded Pane window and native transport are roadmap modes."
     Write-Host "  Managed Flow      Onboard Arch to create or adopt the managed distro, configure the Arch login, and verify launch readiness."
     Write-Host "  Setup Bridge      Use Setup User later when only the Arch login or WSL config needs repair."
     Write-Host "  Terminal Bridge   Open Pane Arch Terminal for setup, package installs, and customization."
-    Write-Host "  Planned Profiles  KDE Plasma, GNOME, Niri"
     Write-Host "  Current Boundary  Additional desktop profiles stay locked until the underlying support matrix is real."
     exit 0
 }
@@ -183,11 +189,63 @@ function Show-SetupUserDialog {
     }
 }
 
+function Show-TextInputDialog {
+    param(
+        [string]$Title,
+        [string]$Prompt
+    )
+
+    $dialog = New-Object System.Windows.Forms.Form
+    $dialog.Text = $Title
+    $dialog.Size = New-Object System.Drawing.Size(560, 210)
+    $dialog.MinimumSize = New-Object System.Drawing.Size(560, 210)
+    $dialog.StartPosition = "CenterParent"
+    $dialog.FormBorderStyle = "FixedDialog"
+    $dialog.MaximizeBox = $false
+    $dialog.MinimizeBox = $false
+
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = $Prompt
+    $label.AutoSize = $false
+    $label.Size = New-Object System.Drawing.Size(500, 42)
+    $label.Location = New-Object System.Drawing.Point(18, 18)
+    $dialog.Controls.Add($label)
+
+    $textBox = New-Object System.Windows.Forms.TextBox
+    $textBox.Location = New-Object System.Drawing.Point(22, 72)
+    $textBox.Size = New-Object System.Drawing.Size(500, 28)
+    $dialog.Controls.Add($textBox)
+
+    $okButton = New-Object System.Windows.Forms.Button
+    $okButton.Text = "OK"
+    $okButton.Location = New-Object System.Drawing.Point(326, 120)
+    $okButton.Size = New-Object System.Drawing.Size(90, 30)
+    $okButton.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $dialog.Controls.Add($okButton)
+
+    $cancelButton = New-Object System.Windows.Forms.Button
+    $cancelButton.Text = "Cancel"
+    $cancelButton.Location = New-Object System.Drawing.Point(432, 120)
+    $cancelButton.Size = New-Object System.Drawing.Size(90, 30)
+    $cancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $dialog.Controls.Add($cancelButton)
+
+    $dialog.AcceptButton = $okButton
+    $dialog.CancelButton = $cancelButton
+
+    $result = $dialog.ShowDialog($form)
+    if ($result -ne [System.Windows.Forms.DialogResult]::OK) {
+        return $null
+    }
+
+    return $textBox.Text
+}
+
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "Pane Control Center"
 $form.StartPosition = "CenterScreen"
-$form.Size = New-Object System.Drawing.Size(860, 660)
-$form.MinimumSize = New-Object System.Drawing.Size(860, 660)
+$form.Size = New-Object System.Drawing.Size(860, 720)
+$form.MinimumSize = New-Object System.Drawing.Size(860, 720)
 $form.BackColor = [System.Drawing.Color]::FromArgb(247, 246, 243)
 $form.Font = New-Object System.Drawing.Font("Segoe UI", 10)
 
@@ -199,7 +257,7 @@ $title.Location = New-Object System.Drawing.Point(24, 18)
 $form.Controls.Add($title)
 
 $subtitle = New-Object System.Windows.Forms.Label
-$subtitle.Text = "Initialize a Pane-managed Arch environment first, then launch Arch + XFCE from here. KDE, GNOME, and Niri stay locked until their support path is real."
+$subtitle.Text = "Initialize a Pane-managed Arch environment first, then launch Arch + XFCE from here. Durable PaneShared storage is preserved across session reset unless you choose scratch storage."
 $subtitle.AutoSize = $false
 $subtitle.Size = New-Object System.Drawing.Size(790, 44)
 $subtitle.Location = New-Object System.Drawing.Point(26, 58)
@@ -255,11 +313,17 @@ $noConnectBox.AutoSize = $true
 $noConnectBox.Location = New-Object System.Drawing.Point(150, 172)
 $form.Controls.Add($noConnectBox)
 
+$scratchSharedBox = New-Object System.Windows.Forms.CheckBox
+$scratchSharedBox.Text = "Scratch PaneShared"
+$scratchSharedBox.AutoSize = $true
+$scratchSharedBox.Location = New-Object System.Drawing.Point(328, 172)
+$form.Controls.Add($scratchSharedBox)
+
 $statusBox = New-Object System.Windows.Forms.TextBox
 $statusBox.Multiline = $true
 $statusBox.ReadOnly = $true
 $statusBox.ScrollBars = "Vertical"
-$statusBox.Location = New-Object System.Drawing.Point(28, 374)
+$statusBox.Location = New-Object System.Drawing.Point(28, 420)
 $statusBox.Size = New-Object System.Drawing.Size(794, 224)
 $statusBox.BackColor = [System.Drawing.Color]::White
 $statusBox.Font = New-Object System.Drawing.Font("Consolas", 10)
@@ -282,6 +346,7 @@ function Run-Action {
     )
 
     $form.UseWaitCursor = $true
+    Set-StatusText ("[{0}] Starting...`r`nPane is running the requested step. If this touches WSL, it can take a few minutes on first run." -f $Title)
     [System.Windows.Forms.Application]::DoEvents()
     try {
         $result = & $Body
@@ -305,126 +370,258 @@ function Refresh-Overview {
         $sessionBox.Text = $session
     }
 
-    $status = Invoke-PaneExe -Arguments @("status", "--json")
-    $doctor = Invoke-PaneExe -Arguments @("doctor", "--json", "--de", "xfce", "--session-name", $session)
+    $appStatus = Invoke-PaneExe -Arguments @("app-status", "--json", "--session-name", $session)
 
     $lines = @()
     $lines += "Pane Control Center"
     $lines += "Session         $session"
-    $lines += "Profile         Arch Linux + XFCE"
-    $lines += "Transport       mstsc.exe + XRDP"
+    $lines += "PaneShared      $(if ($scratchSharedBox.Checked) { "scratch session storage" } else { "durable user storage" })"
     $lines += ""
 
-    if ($status.ExitCode -eq 0) {
+    if ($appStatus.ExitCode -eq 0) {
         try {
-            $statusJson = $status.Output | ConvertFrom-Json
-            $lines += "WSL Available   $($statusJson.wsl_available)"
-            if ($statusJson.managed_environment) {
-                $lines += "Managed Distro  $($statusJson.managed_environment.distro_name)"
-                $lines += "Ownership       $($statusJson.managed_environment.ownership)"
+            $appJson = $appStatus.Output | ConvertFrom-Json
+            $lines += "App Phase       $($appJson.phase)"
+            $lines += "Next Step       $($appJson.next_action_label)"
+            $lines += "Why             $($appJson.next_action_summary)"
+            $lines += "Profile         $($appJson.supported_profile.label)"
+            $lines += "Runtime Current $($appJson.runtime.current_engine_label)"
+            $lines += "Runtime Target  $($appJson.runtime.target_engine_label)"
+            $lines += "Runtime Ready   $($appJson.runtime.prepared)"
+            if ($appJson.runtime.native_runtime) {
+                $lines += "Native Host     $($appJson.runtime.native_runtime.host_ready)"
+                $lines += "Boot Spike      $($appJson.runtime.native_runtime.ready_for_boot_spike)"
+            }
+            if ($appJson.runtime.native_host -and $appJson.runtime.native_host.whp) {
+                $lines += "WHP Library     $($appJson.runtime.native_host.whp.dll_loaded)"
+                $lines += "WHP Hypervisor  $($appJson.runtime.native_host.whp.hypervisor_present)"
+            }
+            $lines += "Runtime Root    $($appJson.runtime.dedicated_space_root)"
+            $lines += "Display         $($appJson.display.current_mode_label)"
+            $lines += "Contained App   $($appJson.display.contained_window_available)"
+            $lines += "Visible Handoff $($appJson.display.user_visible_handoff)"
+            $lines += ""
+            if ($appJson.managed_environment) {
+                $lines += "Managed Distro  $($appJson.managed_environment.distro_name)"
+                $lines += "Ownership       $($appJson.managed_environment.ownership)"
             }
             else {
                 $lines += "Managed Distro  not initialized"
             }
-            if ($statusJson.selected_distro) {
-                $lines += "Selected Distro $($statusJson.selected_distro.distro.name)"
-                $lines += "Default User    $($statusJson.selected_distro.distro.default_user)"
+            if ($appJson.selected_distro) {
+                $lines += "Selected Distro $($appJson.selected_distro.distro.name)"
+                $lines += "Default User    $($appJson.selected_distro.distro.default_user)"
+                $lines += "Password        $($appJson.selected_distro.default_user_password_status)"
+            }
+            if ($appJson.last_launch) {
+                $lines += "Last Launch     $($appJson.last_launch.stage)"
+                if ($appJson.last_launch.transport) {
+                    $lines += "Last Transport  $($appJson.last_launch.transport)"
+                }
+            }
+            $lines += ""
+            if ($appJson.blockers.Count -gt 0) {
+                $lines += "Blockers"
+                foreach ($blocker in $appJson.blockers) {
+                    $lines += "  [$($blocker.id)] $($blocker.summary)"
+                }
+                $lines += ""
+            }
+            $lines += "Storage Policy  $($appJson.storage.policy)"
+            $lines += "Durable Shared  $($appJson.storage.durable_shared_dir)"
+            $lines += "Scratch Shared  $($appJson.storage.scratch_shared_dir)"
+            $lines += "Runtime Budget  $($appJson.runtime.storage_budget.requested_capacity_gib) GiB total; $($appJson.runtime.storage_budget.user_packages_and_customizations_gib) GiB for packages/customizations"
+            $lines += ""
+            foreach ($note in $appJson.notes) {
+                $lines += "Note            $note"
             }
         }
         catch {
-            $lines += "Status          Unable to parse status JSON"
+            $lines += "App Status      Unable to parse app-status JSON"
+            $lines += $appStatus.Output
         }
     }
     else {
-        $lines += "Status          Failed"
-        $lines += $status.Output
+        $lines += "App Status      Failed"
+        $lines += $appStatus.Output
     }
 
     $lines += ""
-
-    if ($doctor.ExitCode -eq 0) {
-        try {
-            $doctorJson = $doctor.Output | ConvertFrom-Json
-            $lines += "Doctor Ready    $($doctorJson.ready)"
-            $lines += "Supported MVP   $($doctorJson.supported_for_mvp)"
-            $lines += "Target Distro   $($doctorJson.target_distro)"
-        }
-        catch {
-            $lines += "Doctor          Unable to parse doctor JSON"
-        }
-    }
-    else {
-        $lines += "Doctor          Failed"
-        $lines += $doctor.Output
-    }
-
-    $lines += ""
-    $lines += "Onboard Arch    Use Onboard Arch for first-run setup: managed distro, login user, systemd, and readiness verification."
-    $lines += "Setup User      Use Setup User when only the Arch login or WSL config needs repair."
-    $lines += "Arch Terminal   Use the terminal bridge for passwd, pacman, dotfiles, and shell-level customization."
+    $lines += "First Run       Use Start First Run or Onboard Arch for managed distro, login user, systemd, and readiness verification."
+    $lines += "Launch          Launch Arch prepares the session, picks the best current RDP transport, and opens the desktop handoff."
+    $lines += "Repair          Repair Arch re-applies Pane-owned session assets when reconnect or a blank desktop fails."
     $lines += "Other desktop profiles stay hidden here until their launch, bootstrap, and recovery path is supportable."
 
     Set-StatusText ($lines -join "`r`n")
 }
 
+function Invoke-OnboardArchFlow {
+    $session = $sessionBox.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($session)) { $session = "pane"; $sessionBox.Text = $session }
+
+    $suggestedUser = "archuser"
+    $managedDistro = $null
+    $status = Invoke-PaneExe -Arguments @("status", "--json")
+    if ($status.ExitCode -eq 0) {
+        try {
+            $statusJson = $status.Output | ConvertFrom-Json
+            if ($statusJson.managed_environment -and $statusJson.managed_environment.distro_name) {
+                $managedDistro = [string]$statusJson.managed_environment.distro_name
+            }
+            if ($statusJson.selected_distro -and $statusJson.selected_distro.distro.default_user -and $statusJson.selected_distro.distro.default_user -ne "root") {
+                $suggestedUser = [string]$statusJson.selected_distro.distro.default_user
+            }
+        }
+        catch {
+        }
+    }
+
+    $dialog = Show-SetupUserDialog -SuggestedUser $suggestedUser -DryRun $dryRunBox.Checked
+    if ($null -eq $dialog) {
+        return @{ ExitCode = 0; Output = "Onboarding canceled." }
+    }
+    if ([string]::IsNullOrWhiteSpace($dialog.Username)) {
+        return @{ ExitCode = 1; Output = "Enter a Linux username before continuing." }
+    }
+
+    $arguments = @("onboard", "--username", $dialog.Username, "--session-name", $session, "--de", "xfce")
+    if ($managedDistro) {
+        $arguments += @("--existing-distro", $managedDistro)
+    }
+    if (-not $dialog.RestartWSL) { $arguments += "--no-shutdown" }
+    if ($dryRunBox.Checked) {
+        $arguments += "--dry-run"
+        return (Invoke-PaneExe -Arguments $arguments)
+    }
+    if ([string]::IsNullOrWhiteSpace($dialog.Password)) {
+        return @{ ExitCode = 1; Output = "Enter a password before continuing." }
+    }
+    if ($dialog.Password -ne $dialog.ConfirmPassword) {
+        return @{ ExitCode = 1; Output = "The password confirmation does not match." }
+    }
+
+    $arguments += "--password-stdin"
+    return (Invoke-PaneExeWithInput -Arguments $arguments -InputText $dialog.Password)
+}
+
+function Invoke-LaunchArchFlow {
+    $session = $sessionBox.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($session)) { $session = "pane"; $sessionBox.Text = $session }
+    $arguments = @("-SessionName", $session)
+    $arguments += @("-SharedStorage", $(if ($scratchSharedBox.Checked) { "scratch" } else { "durable" }))
+    if ($dryRunBox.Checked) { $arguments += "-DryRun" }
+    if ($noConnectBox.Checked) { $arguments += "-NoConnect" }
+    Invoke-PackageScript -ScriptPath $launchScript -Arguments $arguments
+}
+
+function Invoke-GuidedFirstRunFlow {
+    $session = $sessionBox.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($session)) { $session = "pane"; $sessionBox.Text = $session }
+
+    $appStatus = Invoke-PaneExe -Arguments @("app-status", "--json", "--session-name", $session)
+    if ($appStatus.ExitCode -ne 0) {
+        return $appStatus
+    }
+
+    try {
+        $appJson = $appStatus.Output | ConvertFrom-Json
+    }
+    catch {
+        return @{ ExitCode = 1; Output = "Pane could not parse app-status JSON.`r`n$($appStatus.Output)" }
+    }
+
+    $summary = "Pane phase: $($appJson.phase)`r`nNext step: $($appJson.next_action_label)`r`n`r`n$($appJson.next_action_summary)"
+    $choice = [System.Windows.Forms.MessageBox]::Show(
+        $form,
+        $summary,
+        "Pane First Run",
+        [System.Windows.Forms.MessageBoxButtons]::OKCancel,
+        [System.Windows.Forms.MessageBoxIcon]::Information
+    )
+    if ($choice -ne [System.Windows.Forms.DialogResult]::OK) {
+        return @{ ExitCode = 0; Output = "First-run flow canceled." }
+    }
+
+    switch ([string]$appJson.next_action) {
+        "install-wsl" {
+            return @{ ExitCode = 1; Output = "Install WSL2 from Windows first, then reopen Pane and run Start First Run again." }
+        }
+        { $_ -in @("onboard-arch", "setup-user") } {
+            return (Invoke-OnboardArchFlow)
+        }
+        "launch-arch" {
+            return (Invoke-LaunchArchFlow)
+        }
+        "reconnect" {
+            return (Invoke-PaneExe -Arguments @("connect", "--session-name", $session))
+        }
+        "repair-arch" {
+            $arguments = @("repair", "--de", "xfce", "--session-name", $session, "--shared-storage", $(if ($scratchSharedBox.Checked) { "scratch" } else { "durable" }))
+            if ($dryRunBox.Checked) { $arguments += "--dry-run" }
+            return (Invoke-PaneExe -Arguments $arguments)
+        }
+        default {
+            return @{ ExitCode = 0; Output = "Pane recommends: $($appJson.next_action_label). Use the matching Control Center button for details." }
+        }
+    }
+}
+
+function Invoke-PrepareRuntimeFlow {
+    $session = $sessionBox.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($session)) { $session = "pane"; $sessionBox.Text = $session }
+
+    $choice = [System.Windows.Forms.MessageBox]::Show(
+        $form,
+        "Pane will prepare dedicated app storage for the future contained OS runtime: downloads, OS images, a user disk descriptor, snapshots, and runtime state. This does not replace the current WSL/XRDP bridge yet.`r`n`r`nCreate the 8 GiB runtime reservation layout now?",
+        "Prepare Pane Runtime Space",
+        [System.Windows.Forms.MessageBoxButtons]::OKCancel,
+        [System.Windows.Forms.MessageBoxIcon]::Information
+    )
+    if ($choice -ne [System.Windows.Forms.DialogResult]::OK) {
+        return @{ ExitCode = 0; Output = "Runtime preparation canceled." }
+    }
+
+    return (Invoke-PaneExe -Arguments @("runtime", "--prepare", "--create-user-disk", "--capacity-gib", "8", "--session-name", $session))
+}
+
+function Invoke-NativePreflightFlow {
+    $session = $sessionBox.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($session)) { $session = "pane"; $sessionBox.Text = $session }
+
+    return (Invoke-PaneExe -Arguments @("native-preflight", "--session-name", $session))
+}
+
+function Invoke-RegisterBaseImageFlow {
+    $session = $sessionBox.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($session)) { $session = "pane"; $sessionBox.Text = $session }
+
+    $dialog = New-Object System.Windows.Forms.OpenFileDialog
+    $dialog.Title = "Select Pane Arch Base OS Image"
+    $dialog.Filter = "Pane/Linux images (*.paneimg;*.img;*.raw;*.qcow2;*.vhdx)|*.paneimg;*.img;*.raw;*.qcow2;*.vhdx|All files (*.*)|*.*"
+    $dialog.CheckFileExists = $true
+    $dialog.Multiselect = $false
+    if ($dialog.ShowDialog($form) -ne [System.Windows.Forms.DialogResult]::OK) {
+        return @{ ExitCode = 0; Output = "Base image registration canceled." }
+    }
+
+    $sha = Show-TextInputDialog -Title "Expected SHA-256" -Prompt "Paste the expected 64-character SHA-256 digest for this base image. Leave blank to register it as untrusted metadata only."
+    if ($null -eq $sha) {
+        return @{ ExitCode = 0; Output = "Base image registration canceled." }
+    }
+
+    $arguments = @("runtime", "--prepare", "--register-base-image", $dialog.FileName, "--session-name", $session)
+    if (-not [string]::IsNullOrWhiteSpace($sha)) {
+        $arguments += "--expected-sha256"
+        $arguments += $sha.Trim()
+    }
+
+    return (Invoke-PaneExe -Arguments $arguments)
+}
+
 $buttonSpecs = @(
     @{ Text = "Refresh"; Left = 28; Top = 214; Width = 126; Action = { Refresh-Overview; @{ ExitCode = 0; Output = $statusBox.Text } } },
-    @{ Text = "Onboard Arch"; Left = 166; Top = 214; Width = 126; Action = {
-            $session = $sessionBox.Text.Trim()
-            if ([string]::IsNullOrWhiteSpace($session)) { $session = "pane"; $sessionBox.Text = $session }
-
-            $suggestedUser = "archuser"
-            $managedDistro = $null
-            $status = Invoke-PaneExe -Arguments @("status", "--json")
-            if ($status.ExitCode -eq 0) {
-                try {
-                    $statusJson = $status.Output | ConvertFrom-Json
-                    if ($statusJson.managed_environment -and $statusJson.managed_environment.distro_name) {
-                        $managedDistro = [string]$statusJson.managed_environment.distro_name
-                    }
-                    if ($statusJson.selected_distro -and $statusJson.selected_distro.distro.default_user -and $statusJson.selected_distro.distro.default_user -ne "root") {
-                        $suggestedUser = [string]$statusJson.selected_distro.distro.default_user
-                    }
-                }
-                catch {
-                }
-            }
-
-            $dialog = Show-SetupUserDialog -SuggestedUser $suggestedUser -DryRun $dryRunBox.Checked
-            if ($null -eq $dialog) {
-                return @{ ExitCode = 0; Output = "Onboarding canceled." }
-            }
-            if ([string]::IsNullOrWhiteSpace($dialog.Username)) {
-                return @{ ExitCode = 1; Output = "Enter a Linux username before continuing." }
-            }
-
-            $arguments = @("onboard", "--username", $dialog.Username, "--session-name", $session, "--de", "xfce")
-            if ($managedDistro) {
-                $arguments += @("--existing-distro", $managedDistro)
-            }
-            if (-not $dialog.RestartWSL) { $arguments += "--no-shutdown" }
-            if ($dryRunBox.Checked) {
-                $arguments += "--dry-run"
-                return (Invoke-PaneExe -Arguments $arguments)
-            }
-            if ([string]::IsNullOrWhiteSpace($dialog.Password)) {
-                return @{ ExitCode = 1; Output = "Enter a password before continuing." }
-            }
-            if ($dialog.Password -ne $dialog.ConfirmPassword) {
-                return @{ ExitCode = 1; Output = "The password confirmation does not match." }
-            }
-
-            $arguments += "--password-stdin"
-            return (Invoke-PaneExeWithInput -Arguments $arguments -InputText $dialog.Password)
-        } },
-    @{ Text = "Launch Arch"; Left = 304; Top = 214; Width = 126; Action = {
-            $session = $sessionBox.Text.Trim()
-            if ([string]::IsNullOrWhiteSpace($session)) { $session = "pane"; $sessionBox.Text = $session }
-            $arguments = @("-SessionName", $session)
-            if ($dryRunBox.Checked) { $arguments += "-DryRun" }
-            if ($noConnectBox.Checked) { $arguments += "-NoConnect" }
-            Invoke-PackageScript -ScriptPath $launchScript -Arguments $arguments
-        } },
+    @{ Text = "Onboard Arch"; Left = 166; Top = 214; Width = 126; Action = { Invoke-OnboardArchFlow } },
+    @{ Text = "Launch Arch"; Left = 304; Top = 214; Width = 126; Action = { Invoke-LaunchArchFlow } },
     @{ Text = "Doctor"; Left = 442; Top = 214; Width = 126; Action = {
             $session = $sessionBox.Text.Trim()
             if ([string]::IsNullOrWhiteSpace($session)) { $session = "pane"; $sessionBox.Text = $session }
@@ -438,7 +635,7 @@ $buttonSpecs = @(
     @{ Text = "Shared Folder"; Left = 718; Top = 214; Width = 104; Action = {
             $session = $sessionBox.Text.Trim()
             if ([string]::IsNullOrWhiteSpace($session)) { $session = "pane"; $sessionBox.Text = $session }
-            Invoke-PackageScript -ScriptPath $shareScript -Arguments @("-SessionName", $session)
+            Invoke-PackageScript -ScriptPath $shareScript -Arguments @("-SessionName", $session, "-SharedStorage", $(if ($scratchSharedBox.Checked) { "scratch" } else { "durable" }))
         } },
     @{ Text = "Logs"; Left = 28; Top = 260; Width = 126; Action = {
             $session = $sessionBox.Text.Trim()
@@ -455,7 +652,7 @@ $buttonSpecs = @(
             if ([string]::IsNullOrWhiteSpace($session)) { $session = "pane"; $sessionBox.Text = $session }
             $choice = [System.Windows.Forms.MessageBox]::Show(
                 $form,
-                "Yes = reset the current session assets.`r`nNo = release or factory reset the managed Arch environment.`r`nCancel = do nothing.",
+                "Yes = reset the current session assets. Durable PaneShared is preserved unless you use pane reset --purge-shared.`r`nNo = release or factory reset the managed Arch environment.`r`nCancel = do nothing.",
                 "Pane",
                 [System.Windows.Forms.MessageBoxButtons]::YesNoCancel,
                 [System.Windows.Forms.MessageBoxIcon]::Question
@@ -511,14 +708,14 @@ $buttonSpecs = @(
     @{ Text = "Repair Arch"; Left = 442; Top = 260; Width = 126; Action = {
             $session = $sessionBox.Text.Trim()
             if ([string]::IsNullOrWhiteSpace($session)) { $session = "pane"; $sessionBox.Text = $session }
-            $arguments = @("repair", "--de", "xfce", "--session-name", $session)
+            $arguments = @("repair", "--de", "xfce", "--session-name", $session, "--shared-storage", $(if ($scratchSharedBox.Checked) { "scratch" } else { "durable" }))
             if ($dryRunBox.Checked) { $arguments += "--dry-run" }
             Invoke-PaneExe -Arguments $arguments
         } },
     @{ Text = "Update Arch"; Left = 580; Top = 260; Width = 126; Action = {
             $session = $sessionBox.Text.Trim()
             if ([string]::IsNullOrWhiteSpace($session)) { $session = "pane"; $sessionBox.Text = $session }
-            $arguments = @("update", "--de", "xfce", "--session-name", $session)
+            $arguments = @("update", "--de", "xfce", "--session-name", $session, "--shared-storage", $(if ($scratchSharedBox.Checked) { "scratch" } else { "durable" }))
             if ($dryRunBox.Checked) { $arguments += "--dry-run" }
             Invoke-PaneExe -Arguments $arguments
         } },
@@ -574,11 +771,24 @@ $buttonSpecs = @(
             $arguments += "--password-stdin"
             return (Invoke-PaneExeWithInput -Arguments $arguments -InputText $dialog.Password)
         } },
-    @{ Text = "Open Package Folder"; Left = 718; Top = 260; Width = 104; Action = {
-            Start-Process explorer.exe $packageRoot | Out-Null
-            @{ ExitCode = 0; Output = "Opened $packageRoot" }
+    @{ Text = "Start First Run"; Left = 442; Top = 306; Width = 126; Action = {
+            Invoke-GuidedFirstRunFlow
         } },
-    @{ Text = "Close"; Left = 718; Top = 306; Width = 104; Action = {
+    @{ Text = "Prepare Runtime"; Left = 580; Top = 306; Width = 126; Action = {
+            Invoke-PrepareRuntimeFlow
+        } },
+    @{ Text = "Native Preflight"; Left = 442; Top = 352; Width = 126; Action = {
+            Invoke-NativePreflightFlow
+        } },
+    @{ Text = "Register Image"; Left = 580; Top = 352; Width = 126; Action = {
+            Invoke-RegisterBaseImageFlow
+        } },
+    @{ Text = "Native Runtime"; Left = 718; Top = 260; Width = 104; Action = {
+            $session = $sessionBox.Text.Trim()
+            if ([string]::IsNullOrWhiteSpace($session)) { $session = "pane"; $sessionBox.Text = $session }
+            Invoke-PaneExe -Arguments @("launch", "--runtime", "pane-owned", "--dry-run", "--session-name", $session)
+        } },
+    @{ Text = "Close"; Left = 718; Top = 352; Width = 104; Action = {
             $form.Close()
             @{ ExitCode = 0; Output = "Pane Control Center closed." }
         } }

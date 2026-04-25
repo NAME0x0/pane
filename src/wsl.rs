@@ -7,6 +7,9 @@ use crate::{
     model::{DistroFamily, DistroRecord},
 };
 
+const REQUIRED_ONLINE_INSTALL_FLAGS: &[&str] =
+    &["--name", "--location", "--no-launch", "--web-download"];
+
 #[derive(Debug, Default)]
 pub struct WslInventory {
     pub available: bool,
@@ -229,6 +232,21 @@ pub fn install_online_distro(
     name: &str,
     install_dir: &Path,
 ) -> AppResult<CommandTranscript> {
+    if let Some(help) = wsl_help_text() {
+        let missing_flags = missing_online_install_flags(&help);
+        if !missing_flags.is_empty() {
+            return Ok(CommandTranscript {
+                stdout: String::new(),
+                stderr: format!(
+                    "This version of wsl.exe does not advertise the flags Pane needs for managed online provisioning: {}. Update WSL from the Microsoft Store or use `pane init --rootfs-tar <path>`.",
+                    missing_flags.join(", ")
+                ),
+                success: false,
+                exit_code: Some(1),
+            });
+        }
+    }
+
     let output = Command::new("wsl.exe")
         .arg("--install")
         .arg(distro)
@@ -241,6 +259,26 @@ pub fn install_online_distro(
         .output()?;
 
     Ok(transcript_from_output(output))
+}
+
+fn wsl_help_text() -> Option<String> {
+    Command::new("wsl.exe")
+        .arg("--help")
+        .output()
+        .ok()
+        .and_then(|output| {
+            let transcript = transcript_from_output(output);
+            let combined = transcript.combined_output();
+            (!combined.trim().is_empty()).then_some(combined)
+        })
+}
+
+fn missing_online_install_flags(help: &str) -> Vec<&'static str> {
+    REQUIRED_ONLINE_INSTALL_FLAGS
+        .iter()
+        .copied()
+        .filter(|flag| !help.contains(flag))
+        .collect()
 }
 
 pub fn unregister_distro(distro: &str) -> AppResult<CommandTranscript> {
@@ -742,8 +780,9 @@ mod tests {
     use crate::model::DistroFamily;
 
     use super::{
-        decode_output, normalize_shell_command, parse_ipv4_address, parse_os_release,
-        parse_password_status, parse_verbose_list, yes_no_unknown, PasswordStatus,
+        decode_output, missing_online_install_flags, normalize_shell_command, parse_ipv4_address,
+        parse_os_release, parse_password_status, parse_verbose_list, yes_no_unknown,
+        PasswordStatus,
     };
 
     #[test]
@@ -816,6 +855,18 @@ mod tests {
         assert_eq!(
             parse_password_status("afsah NP 2024-01-01 0 99999 7 -1"),
             Some(PasswordStatus::Missing)
+        );
+    }
+
+    #[test]
+    fn detects_missing_online_install_flags_from_wsl_help() {
+        let current_help = "Usage: wsl.exe --install --name --location --no-launch --web-download";
+        assert!(missing_online_install_flags(current_help).is_empty());
+
+        let old_help = "Usage: wsl.exe --install --distribution";
+        assert_eq!(
+            missing_online_install_flags(old_help),
+            vec!["--name", "--location", "--no-launch", "--web-download"]
         );
     }
 }

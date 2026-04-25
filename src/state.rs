@@ -291,6 +291,7 @@ mod tests {
                 rdp_profile: "rdp".into(),
                 bootstrap_log: "bootstrap.log".into(),
                 transport_log: "transport.log".into(),
+                shared_dir: "shared".into(),
             },
             bootstrap_script: "script".to_string(),
             rdp_profile: "profile".to_string(),

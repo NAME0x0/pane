@@ -60,7 +60,7 @@ fn render_arch_xfce_script(
     ];
     let package_commands = match mode {
         BootstrapMode::Ensure => format!(
-            "  pacman -Sy --noconfirm\n  install_official_packages {}\n  ensure_xrdp_packages",
+            "  pacman -Syu --noconfirm\n  install_official_packages {}\n  ensure_xrdp_packages",
             official_packages.join(" ")
         ),
         BootstrapMode::Update => format!(
@@ -122,43 +122,15 @@ install_official_packages() {{
   pacman -S --needed --noconfirm "$@"
 }}
 
-cleanup_aur_sudoers() {{
-  rm -f /etc/sudoers.d/pane-bootstrap
-}}
-
-install_aur_package() {{
-  local package="$1"
-  local target_user="${{PANE_TARGET_USER:-}}"
-  local aur_root="/var/tmp/pane-aur"
-  local build_dir="${{aur_root}}/${{package}}"
-
-  if [ -z "$target_user" ]; then
-    echo "PANE_TARGET_USER is required for AUR package builds" >&2
-    exit 1
-  fi
-
-  install -d -m 0755 "$aur_root"
-  chown "$target_user:$target_user" "$aur_root"
-  rm -rf "$build_dir"
-  runuser -u "$target_user" -- bash -lc "git clone --depth 1 https://aur.archlinux.org/${{package}}.git '${{build_dir}}' && cd '${{build_dir}}' && makepkg -si --noconfirm --needed --syncdeps --skippgpcheck"
-  rm -rf "$build_dir"
-}}
-
 ensure_xrdp_packages() {{
   if pacman -Si xrdp >/dev/null 2>&1 && pacman -Si xorgxrdp >/dev/null 2>&1; then
     pacman -S --needed --noconfirm xrdp xorgxrdp
     return
   fi
 
-  log "Official repos do not provide xrdp/xorgxrdp on this Arch image. Falling back to AUR builds."
-  install -d -m 0750 /etc/sudoers.d
-  printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "${{PANE_TARGET_USER:-}}" > /etc/sudoers.d/pane-bootstrap
-  chmod 0440 /etc/sudoers.d/pane-bootstrap
-  trap cleanup_aur_sudoers EXIT
-  install_aur_package xrdp
-  install_aur_package xorgxrdp
-  cleanup_aur_sudoers
-  trap - EXIT
+  echo "Pane requires xrdp and xorgxrdp from trusted package sources. This build does not compile AUR packages automatically." >&2
+  echo "Use a Pane-approved Arch image or package source that provides xrdp and xorgxrdp, then rerun pane repair." >&2
+  exit 1
 }}
 
 resolve_target_home() {{
@@ -442,7 +414,9 @@ mod tests {
             "install_official_packages sudo git base-devel xorg-xinit dbus openbsd-netcat xfce4 xfce4-goodies"
         ));
         assert!(script.contains("ensure_xrdp_packages"));
-        assert!(script.contains("https://aur.archlinux.org/${package}.git"));
+        assert!(script.contains("does not compile AUR packages automatically"));
+        assert!(!script.contains("--skippgpcheck"));
+        assert!(!script.contains("https://aur.archlinux.org/${package}.git"));
         assert!(script.contains("systemctl restart xrdp"));
         assert!(script.contains("exec dbus-run-session -- startxfce4"));
         assert!(script.contains(".pane-session-start"));
@@ -489,7 +463,7 @@ mod tests {
                 family: DistroFamily::Ubuntu,
                 ..DistroRecord::default()
             },
-            DesktopEnvironment::Gnome,
+            DesktopEnvironment::Xfce,
             3390,
             "/mnt/c/shared",
         );

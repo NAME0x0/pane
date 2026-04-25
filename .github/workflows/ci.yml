@@ -38,6 +38,9 @@ jobs:
       - name: Test
         run: cargo test
 
+      - name: Native runtime preflight smoke
+        run: cargo run -- native-preflight --json --session-name ci-native-preflight
+
   package-windows:
     name: Package Windows Build
     runs-on: windows-latest
@@ -50,6 +53,10 @@ jobs:
       - name: Build packaged release
         shell: pwsh
         run: ./scripts/package.ps1 -Profile release
+
+      - name: Smoke packaged entrypoints
+        shell: pwsh
+        run: ./dist/pane-windows-x86_64/certify-fresh-machine.ps1 -Mode PackageOnly
 
       - name: Upload packaged artifact
         uses: actions/upload-artifact@v4

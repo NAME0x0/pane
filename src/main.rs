@@ -3,6 +3,7 @@ mod bootstrap;
 mod cli;
 mod error;
 mod model;
+mod native;
 mod plan;
 mod rdp;
 mod state;

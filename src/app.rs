@@ -20,9 +20,9 @@ use crate::{
     bootstrap::{render_bootstrap_script, render_update_script},
     cli::{
         AppStatusArgs, BundleArgs, Cli, Commands, ConnectArgs, DoctorArgs, EnvironmentsArgs,
-        InitArgs, LaunchArgs, LogsArgs, NativePreflightArgs, OnboardArgs, RelayArgs, RepairArgs,
-        ResetArgs, RuntimeArgs, SetupUserArgs, ShareArgs, StatusArgs, StopArgs, TerminalArgs,
-        UpdateArgs,
+        InitArgs, LaunchArgs, LogsArgs, NativeBootSpikeArgs, NativePreflightArgs, OnboardArgs,
+        RelayArgs, RepairArgs, ResetArgs, RuntimeArgs, SetupUserArgs, ShareArgs, StatusArgs,
+        StopArgs, TerminalArgs, UpdateArgs,
     },
     error::{AppError, AppResult},
     model::{
@@ -173,6 +173,19 @@ struct NativePreflightReport {
     host: crate::native::NativeHostPreflightReport,
     runtime: RuntimeReport,
     ready_for_boot_spike: bool,
+    blockers: Vec<String>,
+    next_steps: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeBootSpikeReport {
+    product_shape: &'static str,
+    session_name: String,
+    execute_requested: bool,
+    host: crate::native::NativeHostPreflightReport,
+    runtime: RuntimeReport,
+    partition_smoke: crate::native::NativePartitionSmokeReport,
+    ready_for_serial_kernel_spike: bool,
     blockers: Vec<String>,
     next_steps: Vec<String>,
 }
@@ -547,6 +560,7 @@ pub fn run() -> AppResult<()> {
         Commands::AppStatus(args) => app_status(args),
         Commands::Runtime(args) => runtime(args),
         Commands::NativePreflight(args) => native_preflight(args),
+        Commands::NativeBootSpike(args) => native_boot_spike(args),
         Commands::Environments(args) => environments(args),
         Commands::Doctor(args) => doctor(args),
         Commands::Connect(args) => connect(args),
@@ -1488,6 +1502,68 @@ fn native_preflight(args: NativePreflightArgs) -> AppResult<()> {
     Ok(())
 }
 
+fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
+    let session_name = crate::plan::sanitize_session_name(&args.session_name);
+    let runtime = build_runtime_report(&session_name, DEFAULT_RUNTIME_CAPACITY_GIB, false)?;
+    let host = runtime.native_host.clone();
+    let partition_smoke = crate::native::run_partition_smoke(args.execute, &host);
+    let ready_for_serial_kernel_spike = args.execute
+        && partition_smoke.status == crate::native::NativePartitionSmokeStatus::Pass
+        && runtime.native_runtime.ready_for_boot_spike;
+
+    let mut blockers = Vec::new();
+    if !args.execute {
+        blockers.push(
+            "Partition/vCPU smoke was not executed. Rerun with `--execute` to exercise WHP."
+                .to_string(),
+        );
+    }
+    if !runtime.native_runtime.ready_for_boot_spike {
+        blockers.extend(runtime.native_runtime.blockers.clone());
+    }
+    if let Some(blocker) = &partition_smoke.blocker {
+        blockers.push(blocker.clone());
+    }
+    if args.execute
+        && partition_smoke.status != crate::native::NativePartitionSmokeStatus::Pass
+        && partition_smoke.blocker.is_none()
+    {
+        blockers.push(
+            "WHP partition/vCPU smoke did not pass; inspect the call report for HRESULT details."
+                .to_string(),
+        );
+    }
+
+    let report = NativeBootSpikeReport {
+        product_shape:
+            "Pane WHP boot-spike host step for moving from preflight to boot-to-serial execution.",
+        session_name,
+        execute_requested: args.execute,
+        host,
+        runtime,
+        partition_smoke,
+        ready_for_serial_kernel_spike,
+        blockers,
+        next_steps: vec![
+            "Map a small guest memory range with WHvMapGpaRange.".to_string(),
+            "Load a controlled serial-console test kernel or real-mode fixture into guest memory."
+                .to_string(),
+            "Set initial vCPU registers and run WHvRunVirtualProcessor until a deterministic serial or I/O exit is observed."
+                .to_string(),
+            "Only after that passes, connect the runner to Pane's verified Arch base image and user disk."
+                .to_string(),
+        ],
+    };
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    print_native_boot_spike_report(&report);
+    Ok(())
+}
+
 fn environments(args: EnvironmentsArgs) -> AppResult<()> {
     let report = build_environment_catalog_report();
 
@@ -2260,7 +2336,9 @@ fn build_runtime_report(
                 .to_string(),
             "Create the Pane-owned user disk descriptor with `pane runtime --create-user-disk`."
                 .to_string(),
-            "Implement the Pane-owned WHP boot engine against the runtime config instead of WSL distro state."
+            "Run `pane native-boot-spike --execute` to prove the first WHP partition/vCPU lifecycle step."
+                .to_string(),
+            "Implement guest memory mapping and serial-console execution against the runtime config instead of WSL distro state."
                 .to_string(),
             "Implement a Pane-owned display boundary instead of handing off to mstsc.exe over XRDP."
                 .to_string(),
@@ -5411,6 +5489,88 @@ fn print_native_preflight_report(report: &NativePreflightReport) {
         "  Boot Spike     {}",
         yes_no(report.runtime.native_runtime.ready_for_boot_spike)
     );
+    if !report.blockers.is_empty() {
+        println!("Blockers");
+        for blocker in &report.blockers {
+            println!("  - {}", blocker);
+        }
+    }
+    println!("Next Steps");
+    for step in &report.next_steps {
+        println!("  - {}", step);
+    }
+}
+
+fn print_native_boot_spike_report(report: &NativeBootSpikeReport) {
+    println!("Pane Native Boot Spike");
+    println!("  Session        {}", report.session_name);
+    println!("  Execute        {}", yes_no(report.execute_requested));
+    println!(
+        "  Serial Ready   {}",
+        yes_no(report.ready_for_serial_kernel_spike)
+    );
+    println!("Host");
+    println!("  OS             {}", report.host.host_os);
+    println!("  Arch           {}", report.host.host_arch);
+    println!(
+        "  WHP Ready      {}",
+        yes_no(report.host.ready_for_boot_spike)
+    );
+    println!("Runtime");
+    println!(
+        "  Artifacts Ready {}",
+        yes_no(report.runtime.native_runtime.ready_for_boot_spike)
+    );
+    println!(
+        "  Base Verified  {}",
+        yes_no(report.runtime.artifacts.base_os_image_verified)
+    );
+    println!(
+        "  User Disk Ready {}",
+        yes_no(report.runtime.artifacts.user_disk_ready)
+    );
+    println!("Partition Smoke");
+    println!("  Status         {}", report.partition_smoke.status_label);
+    println!(
+        "  Attempted      {}",
+        yes_no(report.partition_smoke.attempted)
+    );
+    println!(
+        "  Partition      {}",
+        yes_no(report.partition_smoke.partition_created)
+    );
+    println!(
+        "  Processor Cfg  {}",
+        yes_no(report.partition_smoke.processor_count_configured)
+    );
+    println!(
+        "  Setup          {}",
+        yes_no(report.partition_smoke.partition_setup)
+    );
+    println!(
+        "  vCPU Created   {}",
+        yes_no(report.partition_smoke.virtual_processor_created)
+    );
+    println!(
+        "  vCPU Deleted   {}",
+        yes_no(report.partition_smoke.virtual_processor_deleted)
+    );
+    println!(
+        "  Partition Del  {}",
+        yes_no(report.partition_smoke.partition_deleted)
+    );
+    if !report.partition_smoke.calls.is_empty() {
+        println!("WHP Calls");
+        for call in &report.partition_smoke.calls {
+            println!(
+                "  [{}] {} {}",
+                yes_no(call.ok),
+                call.name,
+                call.hresult.as_deref().unwrap_or("")
+            );
+            println!("       {}", call.detail);
+        }
+    }
     if !report.blockers.is_empty() {
         println!("Blockers");
         for blocker in &report.blockers {

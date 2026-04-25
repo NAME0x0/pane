@@ -42,19 +42,20 @@ The package intentionally does not expose KDE, GNOME, Niri, or other desktop pro
 2. Run `pane app-status --json` when you need the same app-facing lifecycle phase and next-action recommendation from the CLI.
 3. Run `pane runtime --prepare --create-user-disk --capacity-gib 8` when you want to prepare Pane's dedicated future runtime space and user-disk descriptor for package, account, and customization data. This does not boot an OS yet.
 4. Run `pane native-preflight --json` when you want to inspect Windows Hypervisor Platform readiness plus the runtime artifact blockers for the future boot-to-serial spike.
-5. Run `pane runtime --register-base-image C:\path\to\arch-base.img --expected-sha256 <64-char-sha256>` when you have a Pane-approved local Arch base OS image to copy into the app-owned runtime store. Images registered without an expected digest are recorded but treated as untrusted.
-6. Run `pane launch --runtime pane-owned --dry-run` when you want to exercise the future native-runtime path without invoking WSL, `mstsc.exe`, or XRDP. This currently reports the remaining host, base-image, boot-engine, and display-engine blockers.
-7. Run `pane doctor --de xfce --no-write --no-connect` when you want an initial diagnostic pass that does not create Pane workspace state or PaneShared.
-8. Run `"strong-password" | pane onboard --username archuser --password-stdin` as the preferred first-run CLI flow. Pane will initialize or reuse the managed Arch distro, create or repair the Arch login, enable the required WSL settings, and verify launch readiness.
-9. Run `pane terminal` when you want shell-level work such as dotfiles or later password changes. Use `pane terminal --user root` for package installation, repair work, or any admin task unless you have configured sudo yourself inside Arch.
-10. Run `pane launch --de xfce`.
-11. If you want to verify reconnect readiness later, run `pane doctor --de xfce --skip-bootstrap`. That path now checks both the Pane-managed XRDP session assets and whether the Arch user's XFCE config/cache directories exist, are owned correctly, and are writable.
-12. Use `pane connect` to reopen the saved `.rdp` profile. Pane will use direct localhost when it is available and fall back to pane-relay when Windows cannot reach the WSL XRDP port directly.
-13. Use `pane share` to open or print the Windows-side directory exposed in Arch as `~/PaneShared`.
-14. Keep the default durable PaneShared mode when the folder is user data. Use `pane launch --shared-storage scratch` when the shared folder should be disposable with the session workspace.
-15. Use `pane logs` when bootstrap or XRDP readiness fails.
-16. Run `pane bundle` before asking for support so the current diagnostics are packaged once.
-17. Use `pane init` plus `pane setup-user` only when you want to split onboarding into separate lifecycle steps or adopt a specific existing Arch distro.
+5. Run `pane native-boot-spike --json` to inspect the first executable WHP partition/vCPU milestone in safe plan mode. Add `--execute` only when you intentionally want Pane to create and tear down the temporary WHP partition.
+6. Run `pane runtime --register-base-image C:\path\to\arch-base.img --expected-sha256 <64-char-sha256>` when you have a Pane-approved local Arch base OS image to copy into the app-owned runtime store. Images registered without an expected digest are recorded but treated as untrusted.
+7. Run `pane launch --runtime pane-owned --dry-run` when you want to exercise the future native-runtime path without invoking WSL, `mstsc.exe`, or XRDP. This currently reports the remaining host, base-image, boot-engine, and display-engine blockers.
+8. Run `pane doctor --de xfce --no-write --no-connect` when you want an initial diagnostic pass that does not create Pane workspace state or PaneShared.
+9. Run `"strong-password" | pane onboard --username archuser --password-stdin` as the preferred first-run CLI flow. Pane will initialize or reuse the managed Arch distro, create or repair the Arch login, enable the required WSL settings, and verify launch readiness.
+10. Run `pane terminal` when you want shell-level work such as dotfiles or later password changes. Use `pane terminal --user root` for package installation, repair work, or any admin task unless you have configured sudo yourself inside Arch.
+11. Run `pane launch --de xfce`.
+12. If you want to verify reconnect readiness later, run `pane doctor --de xfce --skip-bootstrap`. That path now checks both the Pane-managed XRDP session assets and whether the Arch user's XFCE config/cache directories exist, are owned correctly, and are writable.
+13. Use `pane connect` to reopen the saved `.rdp` profile. Pane will use direct localhost when it is available and fall back to pane-relay when Windows cannot reach the WSL XRDP port directly.
+14. Use `pane share` to open or print the Windows-side directory exposed in Arch as `~/PaneShared`.
+15. Keep the default durable PaneShared mode when the folder is user data. Use `pane launch --shared-storage scratch` when the shared folder should be disposable with the session workspace.
+16. Use `pane logs` when bootstrap or XRDP readiness fails.
+17. Run `pane bundle` before asking for support so the current diagnostics are packaged once.
+18. Use `pane init` plus `pane setup-user` only when you want to split onboarding into separate lifecycle steps or adopt a specific existing Arch distro.
 
 ## Recovery Commands
 

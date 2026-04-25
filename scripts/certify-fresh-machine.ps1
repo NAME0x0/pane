@@ -236,6 +236,16 @@ try {
     }
     $checks.native_preflight = "pass"
 
+    $nativeBootSpike = Invoke-Capture -OutputPath (Join-Path $artifactRoot "native-boot-spike.json") -Body {
+        & $paneExe native-boot-spike --json --session-name $SessionName
+    }
+    Assert-Success -Result $nativeBootSpike -Label "pane native-boot-spike"
+    $nativeBootSpikeReport = $nativeBootSpike.Output | ConvertFrom-Json
+    if (-not $nativeBootSpikeReport.partition_smoke -or $nativeBootSpikeReport.partition_smoke.status -ne "planned") {
+        throw "pane native-boot-spike did not report a safe planned partition smoke by default."
+    }
+    $checks.native_boot_spike_plan = "pass"
+
     $nativeLaunch = Invoke-Capture -OutputPath (Join-Path $artifactRoot "native-launch-dry-run.txt") -Body {
         & $paneExe launch --runtime pane-owned --dry-run --session-name $SessionName
     }
@@ -282,6 +292,9 @@ try {
     }
     if ($controlCenter.Output -notmatch "Native Preflight") {
         throw "Pane Control Center did not advertise native host preflight."
+    }
+    if ($controlCenter.Output -notmatch "Boot Spike") {
+        throw "Pane Control Center did not advertise the native boot-spike smoke test."
     }
     if ($controlCenter.Output -notmatch "Image Register") {
         throw "Pane Control Center did not advertise base image registration."

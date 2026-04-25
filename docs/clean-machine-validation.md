@@ -13,6 +13,7 @@ A clean-machine pass should prove all of the following from the shipped package:
 - `app-status` reports the app lifecycle and current display-transport boundary without claiming a contained window,
 - `runtime` can prepare the dedicated app-owned runtime-space layout, config, native-runtime manifest, and user-disk descriptor without requiring a live WSL install,
 - `native-preflight` reports Windows Hypervisor Platform host checks and runtime artifact blockers without requiring a live WSL install,
+- `native-boot-spike` reports its safe plan by default without creating a WHP partition unless `--execute` is passed,
 - `status` and `doctor` run from the packaged binary,
 - the packaged Arch launcher can generate the Windows-side MVP assets in dry-run mode,
 - the packaged shared-folder launcher resolves PaneShared storage,
@@ -60,7 +61,7 @@ Use `-Mode FreshMachinePreflight` on a real clean Windows VM when you want to ve
 The certification script in `PackageOnly` mode:
 
 1. verifies the package contents, including the control center, double-click launchers, and shortcut installer,
-2. runs `pane.exe --help`, `pane.exe environments`, `pane app-status`, `pane runtime --prepare --create-user-disk`, `pane native-preflight`, `pane launch --runtime pane-owned --dry-run`, `pane doctor --no-write`, `pane init --dry-run`, and `pane onboard --dry-run`,
+2. runs `pane.exe --help`, `pane.exe environments`, `pane app-status`, `pane runtime --prepare --create-user-disk`, `pane native-preflight`, `pane native-boot-spike`, `pane launch --runtime pane-owned --dry-run`, `pane doctor --no-write`, `pane init --dry-run`, and `pane onboard --dry-run`,
 3. runs `Pane Control Center.ps1 -PrintOnly` as a headless self-test,
 4. runs `Launch Pane Arch.ps1 -DryRun -NoConnect` with a unique session name and scratch PaneShared storage,
 5. verifies the generated `.rdp` profile contains the latency-oriented settings Pane currently depends on,
@@ -80,6 +81,7 @@ The PackageOnly certification script writes a temporary artifact directory and p
 - `app-status.json`
 - `runtime.json`
 - `native-preflight.json`
+- `native-boot-spike.json`
 - `native-launch-dry-run.txt`
 - `init-dry-run.json`
 - `onboard-dry-run.json`

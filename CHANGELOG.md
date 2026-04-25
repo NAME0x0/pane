@@ -24,6 +24,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - `pane runtime --register-base-image` and `--create-user-disk` for moving native runtime readiness from missing artifacts toward boot-engine work
 - Control Center base-image registration for copying local Arch images into Pane runtime storage with SHA-256 metadata
 - `pane native-preflight` for probing Windows Hypervisor Platform host readiness and runtime artifact blockers before the Pane-owned boot spike
+- `pane native-boot-spike` for the guarded WHP partition/vCPU smoke milestone, with `--execute` required before creating temporary hypervisor resources
 - `docs/native-runtime-architecture.md` documenting the WHP-first native runtime contract and acceptance gates
 
 ### Changed

@@ -16,6 +16,7 @@ Pane currently owns:
 - base OS image registration and SHA-256 verification metadata,
 - a user-disk descriptor for future Linux system, package, account, and customization data,
 - native host preflight through `pane native-preflight`.
+- a guarded WHP partition/vCPU smoke step through `pane native-boot-spike --execute`.
 
 Pane does not yet own:
 
@@ -57,18 +58,20 @@ It must remain side-effect-free. It reports blockers; it does not enable Windows
 ## Implementation Sequence
 
 1. Native preflight: dynamically load WHP and report host/runtime blockers without linking Pane to WHP at startup.
-2. Boot-to-serial spike: create a WHP partition, map guest memory, create one vCPU, and boot a controlled test kernel or minimal image far enough to emit serial output.
-3. Runtime artifact boot: replace the test image with Pane's verified Arch base image and Pane user disk descriptor.
-4. Storage materialization: turn the descriptor into a durable block-device format with resize, snapshot, repair, export, and import semantics.
-5. Display milestone: add a Pane-owned framebuffer and input path inside the app window.
-6. Integration milestone: add clipboard, file exchange boundaries, audio, resize, recovery, logging, and diagnostics.
-7. Compatibility milestone: measure performance, hardware requirements, Windows feature requirements, and failure modes before exposing the native runtime as a default.
+2. Partition smoke: create a WHP partition, configure one vCPU, create that vCPU, and tear everything down cleanly.
+3. Boot-to-serial spike: map guest memory and boot a controlled test kernel or minimal image far enough to emit serial output.
+4. Runtime artifact boot: replace the test image with Pane's verified Arch base image and Pane user disk descriptor.
+5. Storage materialization: turn the descriptor into a durable block-device format with resize, snapshot, repair, export, and import semantics.
+6. Display milestone: add a Pane-owned framebuffer and input path inside the app window.
+7. Integration milestone: add clipboard, file exchange boundaries, audio, resize, recovery, logging, and diagnostics.
+8. Compatibility milestone: measure performance, hardware requirements, Windows feature requirements, and failure modes before exposing the native runtime as a default.
 
 ## Non-Negotiable Acceptance Gates
 
 Pane cannot claim the native runtime is real until:
 
 - a clean Windows machine can run `pane native-preflight` and receive actionable host checks,
+- `pane native-boot-spike --execute` can create and tear down a WHP partition and vCPU without leaking resources,
 - a test image can boot under a Pane-owned WHP host without WSL, XRDP, `mstsc.exe`, QEMU, VirtualBox, or Hyper-V Manager,
 - Pane can boot a verified Arch base image plus a Pane-owned user disk,
 - Pane renders the guest through its own app surface,

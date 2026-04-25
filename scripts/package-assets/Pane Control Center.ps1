@@ -28,6 +28,7 @@ if ($PrintOnly) {
     Write-Host "  Runtime Space    Dedicated Pane runtime storage can be prepared for the future contained OS engine."
     Write-Host "  Image Register   Local Arch base images can be copied into Pane runtime storage with SHA-256 metadata."
     Write-Host "  Native Preflight Probe Windows Hypervisor Platform readiness before the Pane-owned boot spike."
+    Write-Host "  Boot Spike       Explicit WHP partition/vCPU smoke test for the next native-runtime milestone."
     Write-Host "  Native Preview   Pane-owned runtime dry-run does not invoke WSL, mstsc.exe, or XRDP."
     Write-Host "  First Run Wizard Onboard Arch, configure the Linux login, then launch the desktop from one app surface."
     Write-Host "  Display Transport Current mode is mstsc.exe + XRDP; embedded Pane window and native transport are roadmap modes."
@@ -591,6 +592,24 @@ function Invoke-NativePreflightFlow {
     return (Invoke-PaneExe -Arguments @("native-preflight", "--session-name", $session))
 }
 
+function Invoke-NativeBootSpikeFlow {
+    $session = $sessionBox.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($session)) { $session = "pane"; $sessionBox.Text = $session }
+
+    $choice = [System.Windows.Forms.MessageBox]::Show(
+        $form,
+        "Pane will create a temporary Windows Hypervisor Platform partition and one virtual processor, then tear both down. This does not boot Arch yet and does not persist a VM.`r`n`r`nRun the WHP partition/vCPU smoke test now?",
+        "Pane Native Boot Spike",
+        [System.Windows.Forms.MessageBoxButtons]::OKCancel,
+        [System.Windows.Forms.MessageBoxIcon]::Information
+    )
+    if ($choice -ne [System.Windows.Forms.DialogResult]::OK) {
+        return @{ ExitCode = 0; Output = "Native boot spike canceled." }
+    }
+
+    return (Invoke-PaneExe -Arguments @("native-boot-spike", "--execute", "--session-name", $session))
+}
+
 function Invoke-RegisterBaseImageFlow {
     $session = $sessionBox.Text.Trim()
     if ([string]::IsNullOrWhiteSpace($session)) { $session = "pane"; $sessionBox.Text = $session }
@@ -776,6 +795,9 @@ $buttonSpecs = @(
         } },
     @{ Text = "Prepare Runtime"; Left = 580; Top = 306; Width = 126; Action = {
             Invoke-PrepareRuntimeFlow
+        } },
+    @{ Text = "Boot Spike"; Left = 304; Top = 352; Width = 126; Action = {
+            Invoke-NativeBootSpikeFlow
         } },
     @{ Text = "Native Preflight"; Left = 442; Top = 352; Width = 126; Action = {
             Invoke-NativePreflightFlow

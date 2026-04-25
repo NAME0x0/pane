@@ -11,6 +11,7 @@ The current Arch-first MVP already has the shape of the product:
 - an app-facing lifecycle and next-action report through `pane app-status`,
 - a dedicated 8 GiB default runtime-space reservation through `pane runtime`,
 - native host/runtime readiness reporting through `pane native-preflight`,
+- a guarded WHP partition/vCPU smoke milestone through `pane native-boot-spike --execute`,
 - `pane init` as the first ownership slice for provisioning a managed `pane-arch` distro through WSL or adopting an existing Arch distro,
 - Arch + XFCE as the single launchable managed path today,
 - a Pane-managed session workspace under `%LOCALAPPDATA%\Pane\sessions\<session>`,
@@ -33,7 +34,7 @@ Pane also does not yet expose multiple desktop environments in the app surface. 
 
 Pane now has the first distro-lifecycle ownership shape through `pane init`, `pane update`, `pane repair`, and `pane reset`, but it still does not own the full first-launch OOBE and lifecycle breadth end to end. Arch is the current launchable environment, while Ubuntu LTS and Debian are codified as the next managed environments rather than exposed as launchable promises.
 
-Pane also does not yet boot a Pane-owned OS image from its own disk. The `pane runtime` command prepares the dedicated app space for that future engine: downloads, base OS image, user disk, snapshots, runtime state, runtime config, and a native-runtime manifest. It can now register a local Arch base image with SHA-256 metadata and create the Pane-owned user-disk descriptor. `pane native-preflight` probes the Windows Hypervisor Platform host boundary and runtime artifact readiness for the first boot-to-serial spike. `pane launch --runtime pane-owned --dry-run` exercises that future path without invoking WSL, `mstsc.exe`, or XRDP, but it intentionally stops at the current boot/display blockers instead of pretending the native engine exists.
+Pane also does not yet boot a Pane-owned OS image from its own disk. The `pane runtime` command prepares the dedicated app space for that future engine: downloads, base OS image, user disk, snapshots, runtime state, runtime config, and a native-runtime manifest. It can now register a local Arch base image with SHA-256 metadata and create the Pane-owned user-disk descriptor. `pane native-preflight` probes the Windows Hypervisor Platform host boundary and runtime artifact readiness for the first boot-to-serial spike. `pane native-boot-spike --execute` goes one step further by creating a temporary WHP partition and vCPU, then tearing them down, but it still does not boot Arch or render a desktop. `pane launch --runtime pane-owned --dry-run` exercises that future path without invoking WSL, `mstsc.exe`, or XRDP, but it intentionally stops at the current boot/display blockers instead of pretending the native engine exists.
 
 ## Product Direction
 

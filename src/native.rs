@@ -3,8 +3,11 @@ use serde::Serialize;
 const REQUIRED_WHP_EXPORTS: &[&str] = &[
     "WHvGetCapability",
     "WHvCreatePartition",
+    "WHvSetPartitionProperty",
     "WHvSetupPartition",
+    "WHvDeletePartition",
     "WHvCreateVirtualProcessor",
+    "WHvDeleteVirtualProcessor",
     "WHvRunVirtualProcessor",
     "WHvMapGpaRange",
 ];
@@ -63,6 +66,52 @@ impl NativePreflightStatus {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct NativePartitionSmokeReport {
+    pub(crate) product_shape: &'static str,
+    pub(crate) execute_requested: bool,
+    pub(crate) attempted: bool,
+    pub(crate) status: NativePartitionSmokeStatus,
+    pub(crate) status_label: &'static str,
+    pub(crate) partition_created: bool,
+    pub(crate) processor_count_configured: bool,
+    pub(crate) partition_setup: bool,
+    pub(crate) virtual_processor_created: bool,
+    pub(crate) virtual_processor_deleted: bool,
+    pub(crate) partition_deleted: bool,
+    pub(crate) calls: Vec<NativeWhpCallReport>,
+    pub(crate) blocker: Option<String>,
+    pub(crate) next_step: String,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum NativePartitionSmokeStatus {
+    Planned,
+    Skipped,
+    Pass,
+    Fail,
+}
+
+impl NativePartitionSmokeStatus {
+    pub(crate) fn display_name(self) -> &'static str {
+        match self {
+            Self::Planned => "planned",
+            Self::Skipped => "skipped",
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct NativeWhpCallReport {
+    pub(crate) name: &'static str,
+    pub(crate) hresult: Option<String>,
+    pub(crate) ok: bool,
+    pub(crate) detail: String,
+}
+
 pub(crate) fn probe_native_host() -> NativeHostPreflightReport {
     build_native_host_preflight_report(
         std::env::consts::OS.to_string(),
@@ -71,6 +120,24 @@ pub(crate) fn probe_native_host() -> NativeHostPreflightReport {
         supported_host_arch(std::env::consts::ARCH),
         probe_whp(),
     )
+}
+
+pub(crate) fn run_partition_smoke(
+    execute: bool,
+    host: &NativeHostPreflightReport,
+) -> NativePartitionSmokeReport {
+    if !execute {
+        return planned_partition_smoke_report();
+    }
+
+    if !host.ready_for_boot_spike {
+        return skipped_partition_smoke_report(
+            true,
+            "Native host preflight is not ready; run `pane native-preflight` and resolve failures first.",
+        );
+    }
+
+    run_whp_partition_smoke()
 }
 
 fn supported_host_arch(arch: &str) -> bool {
@@ -253,9 +320,11 @@ fn build_native_host_preflight_report(
         );
     }
     next_steps.extend([
-        "Implement WHP partition creation, memory mapping, vCPU creation, and serial-console boot smoke tests."
+        "Run `pane native-boot-spike --execute` to prove WHP partition/vCPU lifecycle on this host."
             .to_string(),
-        "Connect the boot spike to Pane runtime artifacts instead of WSL distro state.".to_string(),
+        "Map guest memory and run a controlled serial-console test kernel.".to_string(),
+        "Connect the serial boot spike to Pane runtime artifacts instead of WSL distro state."
+            .to_string(),
         "Only after boot is measurable, add a Pane-owned framebuffer/input path for the contained app window."
             .to_string(),
     ]);
@@ -280,6 +349,51 @@ fn base_export_checks(available: bool) -> Vec<NativeExportCheck> {
         .collect()
 }
 
+fn planned_partition_smoke_report() -> NativePartitionSmokeReport {
+    NativePartitionSmokeReport {
+        product_shape:
+            "Non-persistent WHP partition/vCPU smoke step for Pane's boot-to-serial milestone.",
+        execute_requested: false,
+        attempted: false,
+        status: NativePartitionSmokeStatus::Planned,
+        status_label: NativePartitionSmokeStatus::Planned.display_name(),
+        partition_created: false,
+        processor_count_configured: false,
+        partition_setup: false,
+        virtual_processor_created: false,
+        virtual_processor_deleted: false,
+        partition_deleted: false,
+        calls: Vec::new(),
+        blocker: None,
+        next_step: "Rerun with `--execute` to create and tear down a WHP partition and vCPU."
+            .to_string(),
+    }
+}
+
+fn skipped_partition_smoke_report(
+    execute_requested: bool,
+    blocker: impl Into<String>,
+) -> NativePartitionSmokeReport {
+    NativePartitionSmokeReport {
+        product_shape:
+            "Non-persistent WHP partition/vCPU smoke step for Pane's boot-to-serial milestone.",
+        execute_requested,
+        attempted: false,
+        status: NativePartitionSmokeStatus::Skipped,
+        status_label: NativePartitionSmokeStatus::Skipped.display_name(),
+        partition_created: false,
+        processor_count_configured: false,
+        partition_setup: false,
+        virtual_processor_created: false,
+        virtual_processor_deleted: false,
+        partition_deleted: false,
+        calls: Vec::new(),
+        blocker: Some(blocker.into()),
+        next_step: "Resolve the blocker, then rerun `pane native-boot-spike --execute`."
+            .to_string(),
+    }
+}
+
 #[cfg(not(windows))]
 fn probe_whp() -> WhpPreflightReport {
     WhpPreflightReport {
@@ -291,9 +405,19 @@ fn probe_whp() -> WhpPreflightReport {
     }
 }
 
+#[cfg(not(windows))]
+fn run_whp_partition_smoke() -> NativePartitionSmokeReport {
+    skipped_partition_smoke_report(true, "WHP partition smoke can only run on Windows hosts.")
+}
+
 #[cfg(windows)]
 fn probe_whp() -> WhpPreflightReport {
     windows_whp::probe_whp()
+}
+
+#[cfg(windows)]
+fn run_whp_partition_smoke() -> NativePartitionSmokeReport {
+    windows_whp::run_partition_smoke()
 }
 
 #[cfg(test)]
@@ -316,11 +440,22 @@ mod windows_whp {
         mem,
     };
 
-    use super::{base_export_checks, NativeExportCheck, WhpPreflightReport, REQUIRED_WHP_EXPORTS};
+    use super::{
+        base_export_checks, NativeExportCheck, NativePartitionSmokeReport,
+        NativePartitionSmokeStatus, NativeWhpCallReport, WhpPreflightReport, REQUIRED_WHP_EXPORTS,
+    };
 
     const WHV_CAPABILITY_CODE_HYPERVISOR_PRESENT: u32 = 0;
+    const WHV_PARTITION_PROPERTY_CODE_PROCESSOR_COUNT: u32 = 0x0000_1fff;
 
     type WhvGetCapability = unsafe extern "system" fn(u32, *mut c_void, u32, *mut u32) -> i32;
+    type WhvCreatePartition = unsafe extern "system" fn(*mut *mut c_void) -> i32;
+    type WhvSetPartitionProperty =
+        unsafe extern "system" fn(*mut c_void, u32, *const c_void, u32) -> i32;
+    type WhvSetupPartition = unsafe extern "system" fn(*mut c_void) -> i32;
+    type WhvDeletePartition = unsafe extern "system" fn(*mut c_void) -> i32;
+    type WhvCreateVirtualProcessor = unsafe extern "system" fn(*mut c_void, u32, u32) -> i32;
+    type WhvDeleteVirtualProcessor = unsafe extern "system" fn(*mut c_void, u32) -> i32;
 
     #[link(name = "kernel32")]
     extern "system" {
@@ -385,6 +520,223 @@ mod windows_whp {
         }
     }
 
+    pub(super) fn run_partition_smoke() -> NativePartitionSmokeReport {
+        let mut report = NativePartitionSmokeReport {
+            product_shape:
+                "Non-persistent WHP partition/vCPU smoke step for Pane's boot-to-serial milestone.",
+            execute_requested: true,
+            attempted: true,
+            status: NativePartitionSmokeStatus::Fail,
+            status_label: NativePartitionSmokeStatus::Fail.display_name(),
+            partition_created: false,
+            processor_count_configured: false,
+            partition_setup: false,
+            virtual_processor_created: false,
+            virtual_processor_deleted: false,
+            partition_deleted: false,
+            calls: Vec::new(),
+            blocker: None,
+            next_step: "After this passes, map guest memory and run a controlled serial-console test kernel.".to_string(),
+        };
+
+        unsafe {
+            let library_name = CString::new("WinHvPlatform.dll").expect("static string");
+            let module = LoadLibraryA(library_name.as_ptr());
+            if module.is_null() {
+                report.calls.push(NativeWhpCallReport {
+                    name: "LoadLibraryA(WinHvPlatform.dll)",
+                    hresult: None,
+                    ok: false,
+                    detail: "WinHvPlatform.dll could not be loaded.".to_string(),
+                });
+                report.blocker = Some(
+                    "Enable Windows Hypervisor Platform and Virtual Machine Platform, then reboot."
+                        .to_string(),
+                );
+                return report;
+            }
+
+            let create_partition = match resolve_whp_function::<WhvCreatePartition>(
+                module,
+                "WHvCreatePartition",
+                &mut report,
+            ) {
+                Some(function) => function,
+                None => {
+                    FreeLibrary(module);
+                    return report;
+                }
+            };
+            let set_partition_property = match resolve_whp_function::<WhvSetPartitionProperty>(
+                module,
+                "WHvSetPartitionProperty",
+                &mut report,
+            ) {
+                Some(function) => function,
+                None => {
+                    FreeLibrary(module);
+                    return report;
+                }
+            };
+            let setup_partition = match resolve_whp_function::<WhvSetupPartition>(
+                module,
+                "WHvSetupPartition",
+                &mut report,
+            ) {
+                Some(function) => function,
+                None => {
+                    FreeLibrary(module);
+                    return report;
+                }
+            };
+            let delete_partition = match resolve_whp_function::<WhvDeletePartition>(
+                module,
+                "WHvDeletePartition",
+                &mut report,
+            ) {
+                Some(function) => function,
+                None => {
+                    FreeLibrary(module);
+                    return report;
+                }
+            };
+            let create_virtual_processor = match resolve_whp_function::<WhvCreateVirtualProcessor>(
+                module,
+                "WHvCreateVirtualProcessor",
+                &mut report,
+            ) {
+                Some(function) => function,
+                None => {
+                    FreeLibrary(module);
+                    return report;
+                }
+            };
+            let delete_virtual_processor = match resolve_whp_function::<WhvDeleteVirtualProcessor>(
+                module,
+                "WHvDeleteVirtualProcessor",
+                &mut report,
+            ) {
+                Some(function) => function,
+                None => {
+                    FreeLibrary(module);
+                    return report;
+                }
+            };
+
+            let mut partition: *mut c_void = std::ptr::null_mut();
+            let hresult = create_partition(&mut partition);
+            report.partition_created = hresult_succeeded(hresult) && !partition.is_null();
+            report.calls.push(hresult_call(
+                "WHvCreatePartition",
+                hresult,
+                if report.partition_created {
+                    "Partition object created."
+                } else {
+                    "Partition object could not be created."
+                },
+            ));
+
+            if report.partition_created {
+                let processor_count = 1_u32;
+                let hresult = set_partition_property(
+                    partition,
+                    WHV_PARTITION_PROPERTY_CODE_PROCESSOR_COUNT,
+                    (&processor_count as *const u32).cast::<c_void>(),
+                    mem::size_of::<u32>() as u32,
+                );
+                report.processor_count_configured = hresult_succeeded(hresult);
+                report.calls.push(hresult_call(
+                    "WHvSetPartitionProperty(ProcessorCount=1)",
+                    hresult,
+                    if report.processor_count_configured {
+                        "Configured the partition for one virtual processor."
+                    } else {
+                        "Could not configure the partition processor count."
+                    },
+                ));
+            }
+
+            if report.partition_created && report.processor_count_configured {
+                let hresult = setup_partition(partition);
+                report.partition_setup = hresult_succeeded(hresult);
+                report.calls.push(hresult_call(
+                    "WHvSetupPartition",
+                    hresult,
+                    if report.partition_setup {
+                        "Hypervisor partition setup completed."
+                    } else {
+                        "Hypervisor partition setup failed."
+                    },
+                ));
+            }
+
+            if report.partition_created && report.partition_setup {
+                let hresult = create_virtual_processor(partition, 0, 0);
+                report.virtual_processor_created = hresult_succeeded(hresult);
+                report.calls.push(hresult_call(
+                    "WHvCreateVirtualProcessor(0)",
+                    hresult,
+                    if report.virtual_processor_created {
+                        "Virtual processor 0 created."
+                    } else {
+                        "Virtual processor 0 could not be created."
+                    },
+                ));
+            }
+
+            if report.partition_created && report.virtual_processor_created {
+                let hresult = delete_virtual_processor(partition, 0);
+                report.virtual_processor_deleted = hresult_succeeded(hresult);
+                report.calls.push(hresult_call(
+                    "WHvDeleteVirtualProcessor(0)",
+                    hresult,
+                    if report.virtual_processor_deleted {
+                        "Virtual processor 0 deleted."
+                    } else {
+                        "Virtual processor 0 could not be deleted cleanly."
+                    },
+                ));
+            }
+
+            if report.partition_created {
+                let hresult = delete_partition(partition);
+                report.partition_deleted = hresult_succeeded(hresult);
+                report.calls.push(hresult_call(
+                    "WHvDeletePartition",
+                    hresult,
+                    if report.partition_deleted {
+                        "Partition deleted and resources released."
+                    } else {
+                        "Partition cleanup failed."
+                    },
+                ));
+            }
+
+            FreeLibrary(module);
+        }
+
+        let passed = report.partition_created
+            && report.processor_count_configured
+            && report.partition_setup
+            && report.virtual_processor_created
+            && report.virtual_processor_deleted
+            && report.partition_deleted;
+
+        report.status = if passed {
+            NativePartitionSmokeStatus::Pass
+        } else {
+            NativePartitionSmokeStatus::Fail
+        };
+        report.status_label = report.status.display_name();
+        if !passed && report.blocker.is_none() {
+            report.blocker = Some(
+                "WHP partition/vCPU lifecycle did not complete; inspect the HRESULT call list."
+                    .to_string(),
+            );
+        }
+        report
+    }
+
     unsafe fn get_proc_address(module: *mut c_void, symbol: &str) -> Option<*mut c_void> {
         let symbol = CString::new(symbol).expect("static symbol");
         let pointer = GetProcAddress(module, symbol.as_ptr());
@@ -398,13 +750,51 @@ mod windows_whp {
     fn format_hresult(value: i32) -> String {
         format!("0x{:08X}", value as u32)
     }
+
+    unsafe fn resolve_whp_function<T>(
+        module: *mut c_void,
+        symbol: &'static str,
+        report: &mut NativePartitionSmokeReport,
+    ) -> Option<T> {
+        let pointer = get_proc_address(module, symbol);
+        report.calls.push(NativeWhpCallReport {
+            name: symbol,
+            hresult: None,
+            ok: pointer.is_some(),
+            detail: if pointer.is_some() {
+                "Resolved WHP export.".to_string()
+            } else {
+                "Missing required WHP export.".to_string()
+            },
+        });
+
+        if let Some(pointer) = pointer {
+            Some(mem::transmute_copy::<*mut c_void, T>(&pointer))
+        } else {
+            report.blocker = Some(format!("Missing required WHP export `{symbol}`."));
+            None
+        }
+    }
+
+    fn hresult_succeeded(value: i32) -> bool {
+        value >= 0
+    }
+
+    fn hresult_call(name: &'static str, hresult: i32, detail: &str) -> NativeWhpCallReport {
+        NativeWhpCallReport {
+            name,
+            hresult: Some(format_hresult(hresult)),
+            ok: hresult_succeeded(hresult),
+            detail: detail.to_string(),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        base_export_checks, build_native_host_preflight_report, NativePreflightStatus,
-        WhpPreflightReport,
+        base_export_checks, build_native_host_preflight_report, run_partition_smoke,
+        NativePartitionSmokeStatus, NativePreflightStatus, WhpPreflightReport,
     };
 
     fn whp_report(
@@ -487,5 +877,39 @@ mod tests {
             .checks
             .iter()
             .any(|check| check.id == "whp-exports" && check.status == NativePreflightStatus::Fail));
+    }
+
+    #[test]
+    fn partition_smoke_is_planned_until_execute_is_requested() {
+        let host = build_native_host_preflight_report(
+            "windows".to_string(),
+            "x86_64".to_string(),
+            true,
+            true,
+            whp_report(true, true, Some(true)),
+        );
+
+        let report = run_partition_smoke(false, &host);
+
+        assert_eq!(report.status, NativePartitionSmokeStatus::Planned);
+        assert!(!report.attempted);
+        assert!(report.blocker.is_none());
+    }
+
+    #[test]
+    fn partition_smoke_is_skipped_when_host_preflight_fails() {
+        let host = build_native_host_preflight_report(
+            "windows".to_string(),
+            "x86_64".to_string(),
+            true,
+            true,
+            whp_report(false, false, None),
+        );
+
+        let report = run_partition_smoke(true, &host);
+
+        assert_eq!(report.status, NativePartitionSmokeStatus::Skipped);
+        assert!(!report.attempted);
+        assert!(report.blocker.is_some());
     }
 }

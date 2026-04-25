@@ -41,6 +41,9 @@ jobs:
       - name: Native runtime preflight smoke
         run: cargo run -- native-preflight --json --session-name ci-native-preflight
 
+      - name: Native boot spike plan smoke
+        run: cargo run -- native-boot-spike --json --session-name ci-native-preflight
+
   package-windows:
     name: Package Windows Build
     runs-on: windows-latest

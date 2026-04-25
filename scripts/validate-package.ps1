@@ -212,6 +212,7 @@ try {
     $appStatus = Invoke-PaneCapture -PaneExe $paneExe -Arguments @("app-status", "--json", "--session-name", $SessionName) -OutputPath (Join-Path $artifactRoot "app-status.json") | ConvertFrom-Json
     $runtime = Invoke-PaneCapture -PaneExe $paneExe -Arguments @("runtime", "--json", "--prepare", "--create-user-disk", "--session-name", $SessionName, "--capacity-gib", "8") -OutputPath (Join-Path $artifactRoot "runtime.json") | ConvertFrom-Json
     $nativePreflight = Invoke-PaneCapture -PaneExe $paneExe -Arguments @("native-preflight", "--json", "--session-name", $SessionName) -OutputPath (Join-Path $artifactRoot "native-preflight.json") | ConvertFrom-Json
+    $nativeBootSpike = Invoke-PaneCapture -PaneExe $paneExe -Arguments @("native-boot-spike", "--json", "--session-name", $SessionName) -OutputPath (Join-Path $artifactRoot "native-boot-spike.json") | ConvertFrom-Json
     $nativeLaunchDryRun = Invoke-PaneCapture -PaneExe $paneExe -Arguments @("launch", "--runtime", "pane-owned", "--dry-run", "--session-name", $SessionName) -OutputPath (Join-Path $artifactRoot "native-launch-dry-run.txt")
 
     if (-not $init.managed_environment -or $init.managed_environment.distro_name -ne "pane-arch") {
@@ -284,6 +285,9 @@ try {
     if (-not $nativePreflight.runtime -or $nativePreflight.runtime.target_engine -ne "pane-owned-os-runtime") {
         throw "pane native-preflight did not include the Pane-owned runtime target. Review $artifactRoot\native-preflight.json."
     }
+    if (-not $nativeBootSpike.partition_smoke -or $nativeBootSpike.partition_smoke.status -ne "planned") {
+        throw "pane native-boot-spike did not report the safe planned partition smoke by default. Review $artifactRoot\native-boot-spike.json."
+    }
     if ($nativeLaunchDryRun -notmatch "Pane-Owned Runtime Launch") {
         throw "pane launch --runtime pane-owned --dry-run did not exercise the native runtime path. Review $artifactRoot\native-launch-dry-run.txt."
     }
@@ -303,6 +307,9 @@ try {
     }
     if ($controlCenterOutput -notmatch "Native Preflight") {
         throw "Pane Control Center did not advertise native host preflight."
+    }
+    if ($controlCenterOutput -notmatch "Boot Spike") {
+        throw "Pane Control Center did not advertise the native boot-spike smoke test."
     }
     if ($controlCenterOutput -notmatch "Image Register") {
         throw "Pane Control Center did not advertise base image registration."
@@ -369,6 +376,7 @@ try {
         runtime_capacity_gib = $runtime.storage_budget.requested_capacity_gib
         runtime_user_disk_ready = $runtime.artifacts.user_disk_ready
         native_preflight_ready = $nativePreflight.ready_for_boot_spike
+        native_boot_spike_status = $nativeBootSpike.partition_smoke.status
         native_host_ready = $runtime.native_runtime.host_ready
         native_runtime_dry_run = ($nativeLaunchDryRun -match "Pane-Owned Runtime Launch")
         reconnect_session_assets_ready = $doctorReconnect.selected_distro.pane_session_assets_ready

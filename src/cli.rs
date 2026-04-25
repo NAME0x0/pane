@@ -39,6 +39,8 @@ pub enum Commands {
     Runtime(RuntimeArgs),
     /// Probe host readiness for Pane's future native OS runtime.
     NativePreflight(NativePreflightArgs),
+    /// Exercise the first non-persistent WHP partition/vCPU boot-spike host step.
+    NativeBootSpike(NativeBootSpikeArgs),
     /// Show Pane's managed Linux environment catalog and support tiers.
     Environments(EnvironmentsArgs),
     /// Run support-focused diagnostics before launch or reconnect.
@@ -265,6 +267,19 @@ pub struct NativePreflightArgs {
     /// Session slug for the Pane-owned runtime reservation.
     #[arg(long, default_value = "pane")]
     pub session_name: String,
+    /// Emit structured JSON instead of a human-readable summary.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct NativeBootSpikeArgs {
+    /// Session slug for the Pane-owned runtime reservation.
+    #[arg(long, default_value = "pane")]
+    pub session_name: String,
+    /// Actually create and tear down a WHP partition/vCPU. Without this flag, Pane prints the plan only.
+    #[arg(long)]
+    pub execute: bool,
     /// Emit structured JSON instead of a human-readable summary.
     #[arg(long)]
     pub json: bool,

@@ -254,6 +254,9 @@ pub struct RuntimeArgs {
     /// Create the Pane-owned user disk descriptor for packages, accounts, and customizations.
     #[arg(long)]
     pub create_user_disk: bool,
+    /// Create the Pane-owned serial boot test image used by the WHP boot-spike runner.
+    #[arg(long)]
+    pub create_serial_boot_image: bool,
     /// Replace an existing registered base image or user disk descriptor.
     #[arg(long)]
     pub force: bool,
@@ -280,6 +283,9 @@ pub struct NativeBootSpikeArgs {
     /// Actually create and tear down a WHP partition/vCPU. Without this flag, Pane prints the plan only.
     #[arg(long)]
     pub execute: bool,
+    /// Map guest memory and run a tiny serial I/O fixture after the partition/vCPU is created.
+    #[arg(long)]
+    pub run_fixture: bool,
     /// Emit structured JSON instead of a human-readable summary.
     #[arg(long)]
     pub json: bool,

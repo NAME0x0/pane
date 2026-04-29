@@ -36,8 +36,10 @@ pub struct RuntimePaths {
     pub engines: PathBuf,
     pub logs: PathBuf,
     pub base_os_image: PathBuf,
+    pub serial_boot_image: PathBuf,
     pub user_disk: PathBuf,
     pub base_os_metadata: PathBuf,
+    pub serial_boot_metadata: PathBuf,
     pub user_disk_metadata: PathBuf,
     pub runtime_config: PathBuf,
     pub native_manifest: PathBuf,
@@ -137,8 +139,10 @@ pub fn runtime_for(session_name: &str) -> RuntimePaths {
 
     RuntimePaths {
         base_os_image: images.join("arch-base.paneimg"),
+        serial_boot_image: engines.join("serial-boot.paneimg"),
         user_disk: disks.join("user-data.panedisk"),
         base_os_metadata: state.join("base-os-image.json"),
+        serial_boot_metadata: state.join("serial-boot-image.json"),
         user_disk_metadata: state.join("user-disk.json"),
         runtime_config: root.join("pane-runtime.config.json"),
         native_manifest: root.join("pane-native-runtime.json"),
@@ -286,6 +290,9 @@ mod tests {
 
         assert!(runtime.root.ends_with("Pane\\runtime\\pane-session"));
         assert!(runtime.base_os_image.ends_with("images\\arch-base.paneimg"));
+        assert!(runtime
+            .serial_boot_image
+            .ends_with("engines\\serial-boot.paneimg"));
         assert!(runtime.user_disk.ends_with("disks\\user-data.panedisk"));
         assert!(runtime
             .runtime_config
@@ -293,6 +300,9 @@ mod tests {
         assert!(runtime
             .base_os_metadata
             .ends_with("runtime\\pane-session\\state\\base-os-image.json"));
+        assert!(runtime
+            .serial_boot_metadata
+            .ends_with("runtime\\pane-session\\state\\serial-boot-image.json"));
         assert!(runtime
             .user_disk_metadata
             .ends_with("runtime\\pane-session\\state\\user-disk.json"));

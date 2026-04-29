@@ -119,10 +119,10 @@ Inspect the app-facing phase, next action, storage policy, and display-transport
 cargo run -- app-status --json
 ```
 
-Prepare the dedicated Pane runtime space and create the app-owned user disk descriptor that will eventually hold package, account, and customization data:
+Prepare the dedicated Pane runtime space, create the app-owned user disk descriptor that will eventually hold package/account/customization data, and write the deterministic serial boot image used by the WHP boot-spike runner:
 
 ```bash
-cargo run -- runtime --prepare --create-user-disk --capacity-gib 8
+cargo run -- runtime --prepare --create-user-disk --create-serial-boot-image --capacity-gib 8
 ```
 
 Probe whether the Windows host and Pane runtime artifacts are ready for the first Pane-owned WHP boot spike:
@@ -131,10 +131,11 @@ Probe whether the Windows host and Pane runtime artifacts are ready for the firs
 cargo run -- native-preflight --json
 ```
 
-Preview the first WHP partition/vCPU smoke step. This is plan-only by default; add `--execute` only when you intentionally want Pane to create and tear down a temporary WHP partition:
+Preview the first WHP boot-spike step. This is plan-only by default; add `--execute` to create and tear down a temporary WHP partition/vCPU, and add `--run-fixture` when you intentionally want Pane to map guest memory, set vCPU registers, run a deterministic serial test image, observe the `PANE_BOOT_OK` COM1 banner, and halt cleanly:
 
 ```bash
 cargo run -- native-boot-spike --json
+cargo run -- native-boot-spike --json --execute --run-fixture
 ```
 
 Register a local Arch base OS image into Pane's runtime image store. Pass the expected SHA-256 whenever you have it; without that digest Pane records the image but keeps it untrusted:
@@ -198,9 +199,9 @@ cargo run -- bundle
 - `pane onboard` is the preferred first-run path: it initializes or reuses the managed Arch distro, configures the Arch login user, and verifies launch readiness in one command.
 - `pane environments` prints Pane's managed Linux environment roadmap and support tiers.
 - `pane app-status` reports the Control Center lifecycle phase, recommended next action, PaneShared policy, and current-vs-planned display transport.
-- `pane runtime` inspects or prepares dedicated Pane-owned runtime storage, config, native-runtime manifest, verified base-image metadata, and the user-disk descriptor for the future contained OS engine. This is separate from PaneShared and does not boot the OS yet.
+- `pane runtime` inspects or prepares dedicated Pane-owned runtime storage, config, native-runtime manifest, verified base-image metadata, the user-disk descriptor, and the runtime-backed serial boot image for the future contained OS engine. This is separate from PaneShared and does not boot Arch yet.
 - `pane native-preflight` checks the Windows Hypervisor Platform host boundary plus runtime artifacts for the future Pane-owned boot-to-serial spike. It is side-effect-free and does not claim the OS is bootable.
-- `pane native-boot-spike` is the first executable WHP host milestone. By default it prints the partition/vCPU smoke plan; with `--execute` it creates one temporary WHP partition and vCPU, then tears them down.
+- `pane native-boot-spike` is the first executable WHP host milestone. By default it prints the safe plan; with `--execute` it creates one temporary WHP partition and vCPU; with `--execute --run-fixture` it also maps guest memory, configures registers, runs a deterministic serial test image, decodes the `PANE_BOOT_OK` COM1 banner across repeated I/O exits, observes HLT, and tears everything down.
 - `pane doctor` validates the supported MVP path and prints actionable fixes before launch or reconnect. Use `--no-write --no-connect` for support diagnostics that must not create the Pane workspace or PaneShared.
 - `pane setup-user` creates or repairs the Arch login user, writes the default-user/systemd WSL config, and can restart WSL so the change takes effect immediately when you do not need the full onboarding flow. It does not grant passwordless sudo or edit `/etc/sudoers`.
 - `pane launch` writes the bootstrap script, `.rdp` profile, persisted launch state, and optionally executes the Arch bootstrap. `--shared-storage durable` is the default; `--shared-storage scratch` scopes PaneShared to the disposable session workspace. `--runtime pane-owned --dry-run` exercises the native runtime contract without touching WSL/RDP.
@@ -260,9 +261,10 @@ cargo clippy -- -D warnings
 cargo test
 cargo run -- status --json
 cargo run -- app-status --json
-cargo run -- runtime --json --prepare --create-user-disk --capacity-gib 8
+cargo run -- runtime --json --prepare --create-user-disk --create-serial-boot-image --capacity-gib 8
 cargo run -- native-preflight --json
 cargo run -- native-boot-spike --json
+cargo run -- native-boot-spike --json --execute --run-fixture
 cargo run -- doctor --json --distro pane-arch --de xfce --no-write --no-connect
 cargo run -- doctor --json --distro pane-arch --de xfce
 cargo run -- doctor --json --distro pane-arch --de xfce --skip-bootstrap
@@ -285,7 +287,7 @@ Kali, Fedora, and other distros are intentionally not in the first support wave.
 | Stage | Focus | Why it matters |
 |-------|-------|----------------|
 | **Now** | Finish the Pane-owned Arch path: managed `pane-arch`, onboarding, account setup, repair/reset/update, support bundles, PaneShared storage, 8 GiB runtime-space reservation, base-image registration, user-disk descriptor creation, native-runtime preflight, and the Windows control surface. | Make first-run, recovery, and data boundaries boring enough to trust. |
-| **Next** | Move from verified runtime artifacts and WHP preflight to a Pane-owned boot-to-serial engine, starting with partition/vCPU smoke and then guest-memory/serial execution. | Make Pane behave more like an app-owned Linux appliance instead of a WSL helper. |
+| **Next** | Replace the synthetic WHP serial test image with a boot-to-serial kernel or loader, then connect that runner to the verified Arch base image and Pane-owned user disk. | Make Pane behave more like an app-owned Linux appliance instead of a WSL helper. |
 | **Later** | Embed the display into a Pane-owned window, then add Ubuntu LTS, Debian, and curated desktop profiles only when their lifecycle, reconnect, repair, and support path are real. | Expand honestly instead of cosmetically. |
 | **Final Architecture** | Replace the XRDP handoff with a Pane-owned runtime/display transport. | Make the contained app and near-native responsiveness vision real. |
 

@@ -8,9 +8,40 @@ const REQUIRED_WHP_EXPORTS: &[&str] = &[
     "WHvDeletePartition",
     "WHvCreateVirtualProcessor",
     "WHvDeleteVirtualProcessor",
+    "WHvSetVirtualProcessorRegisters",
     "WHvRunVirtualProcessor",
     "WHvMapGpaRange",
+    "WHvUnmapGpaRange",
 ];
+pub(crate) const SERIAL_BOOT_BANNER_TEXT: &str = "PANE_BOOT_OK\n";
+pub(crate) const SERIAL_BOOT_TEST_IMAGE_SIZE: usize = 4096;
+
+#[derive(Clone, Debug)]
+pub(crate) struct NativeSerialBootImage {
+    pub(crate) source_label: String,
+    pub(crate) path: Option<String>,
+    pub(crate) bytes: Vec<u8>,
+}
+
+pub(crate) fn serial_boot_test_image_bytes() -> Vec<u8> {
+    let mut image = vec![0_u8; SERIAL_BOOT_TEST_IMAGE_SIZE];
+    write_serial_boot_test_image(&mut image);
+    image
+}
+
+fn write_serial_boot_test_image(page: &mut [u8]) {
+    let mut offset = 0;
+    for byte in SERIAL_BOOT_BANNER_TEXT.as_bytes() {
+        let instruction = [
+            0xba, 0xf8, 0x03, // mov dx, 0x03f8
+            0xb0, *byte, // mov al, byte
+            0xee,  // out dx, al
+        ];
+        page[offset..offset + instruction.len()].copy_from_slice(&instruction);
+        offset += instruction.len();
+    }
+    page[offset] = 0xf4; // hlt after the whole serial banner has been emitted
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct NativeHostPreflightReport {
@@ -79,6 +110,23 @@ pub(crate) struct NativePartitionSmokeReport {
     pub(crate) virtual_processor_created: bool,
     pub(crate) virtual_processor_deleted: bool,
     pub(crate) partition_deleted: bool,
+    pub(crate) fixture_requested: bool,
+    pub(crate) memory_mapped: bool,
+    pub(crate) registers_configured: bool,
+    pub(crate) virtual_processor_ran: bool,
+    pub(crate) memory_unmapped: bool,
+    pub(crate) exit_reason: Option<u32>,
+    pub(crate) exit_reason_label: Option<String>,
+    pub(crate) boot_image_source: Option<String>,
+    pub(crate) boot_image_path: Option<String>,
+    pub(crate) boot_image_bytes: Option<u64>,
+    pub(crate) serial_port: Option<u16>,
+    pub(crate) serial_byte: Option<u8>,
+    pub(crate) serial_bytes: Vec<u8>,
+    pub(crate) serial_text: Option<String>,
+    pub(crate) serial_expected_text: Option<String>,
+    pub(crate) serial_io_exit_count: u32,
+    pub(crate) halt_observed: bool,
     pub(crate) calls: Vec<NativeWhpCallReport>,
     pub(crate) blocker: Option<String>,
     pub(crate) next_step: String,
@@ -124,20 +172,23 @@ pub(crate) fn probe_native_host() -> NativeHostPreflightReport {
 
 pub(crate) fn run_partition_smoke(
     execute: bool,
+    run_fixture: bool,
+    boot_image: Option<&NativeSerialBootImage>,
     host: &NativeHostPreflightReport,
 ) -> NativePartitionSmokeReport {
     if !execute {
-        return planned_partition_smoke_report();
+        return planned_partition_smoke_report(run_fixture);
     }
 
     if !host.ready_for_boot_spike {
         return skipped_partition_smoke_report(
             true,
+            run_fixture,
             "Native host preflight is not ready; run `pane native-preflight` and resolve failures first.",
         );
     }
 
-    run_whp_partition_smoke()
+    run_whp_partition_smoke(run_fixture, boot_image)
 }
 
 fn supported_host_arch(arch: &str) -> bool {
@@ -320,9 +371,10 @@ fn build_native_host_preflight_report(
         );
     }
     next_steps.extend([
-        "Run `pane native-boot-spike --execute` to prove WHP partition/vCPU lifecycle on this host."
+        "Run `pane native-boot-spike --execute --run-fixture` to prove WHP guest memory, register setup, vCPU execution, and serial I/O on this host."
             .to_string(),
-        "Map guest memory and run a controlled serial-console test kernel.".to_string(),
+        "Replace the synthetic serial test image with a boot-to-serial kernel or loader."
+            .to_string(),
         "Connect the serial boot spike to Pane runtime artifacts instead of WSL distro state."
             .to_string(),
         "Only after boot is measurable, add a Pane-owned framebuffer/input path for the contained app window."
@@ -349,10 +401,9 @@ fn base_export_checks(available: bool) -> Vec<NativeExportCheck> {
         .collect()
 }
 
-fn planned_partition_smoke_report() -> NativePartitionSmokeReport {
+fn planned_partition_smoke_report(run_fixture: bool) -> NativePartitionSmokeReport {
     NativePartitionSmokeReport {
-        product_shape:
-            "Non-persistent WHP partition/vCPU smoke step for Pane's boot-to-serial milestone.",
+        product_shape: "Non-persistent WHP boot-spike step for Pane's boot-to-serial milestone.",
         execute_requested: false,
         attempted: false,
         status: NativePartitionSmokeStatus::Planned,
@@ -363,20 +414,41 @@ fn planned_partition_smoke_report() -> NativePartitionSmokeReport {
         virtual_processor_created: false,
         virtual_processor_deleted: false,
         partition_deleted: false,
+        fixture_requested: run_fixture,
+        memory_mapped: false,
+        registers_configured: false,
+        virtual_processor_ran: false,
+        memory_unmapped: false,
+        exit_reason: None,
+        exit_reason_label: None,
+        boot_image_source: None,
+        boot_image_path: None,
+        boot_image_bytes: None,
+        serial_port: None,
+        serial_byte: None,
+        serial_bytes: Vec::new(),
+        serial_text: None,
+        serial_expected_text: run_fixture.then(|| SERIAL_BOOT_BANNER_TEXT.to_string()),
+        serial_io_exit_count: 0,
+        halt_observed: false,
         calls: Vec::new(),
         blocker: None,
-        next_step: "Rerun with `--execute` to create and tear down a WHP partition and vCPU."
-            .to_string(),
+        next_step: if run_fixture {
+            "Rerun with `--execute --run-fixture` to create the WHP partition/vCPU and execute the deterministic serial test image."
+                .to_string()
+        } else {
+            "Rerun with `--execute` to create and tear down a WHP partition and vCPU.".to_string()
+        },
     }
 }
 
 fn skipped_partition_smoke_report(
     execute_requested: bool,
+    run_fixture: bool,
     blocker: impl Into<String>,
 ) -> NativePartitionSmokeReport {
     NativePartitionSmokeReport {
-        product_shape:
-            "Non-persistent WHP partition/vCPU smoke step for Pane's boot-to-serial milestone.",
+        product_shape: "Non-persistent WHP boot-spike step for Pane's boot-to-serial milestone.",
         execute_requested,
         attempted: false,
         status: NativePartitionSmokeStatus::Skipped,
@@ -387,10 +459,31 @@ fn skipped_partition_smoke_report(
         virtual_processor_created: false,
         virtual_processor_deleted: false,
         partition_deleted: false,
+        fixture_requested: run_fixture,
+        memory_mapped: false,
+        registers_configured: false,
+        virtual_processor_ran: false,
+        memory_unmapped: false,
+        exit_reason: None,
+        exit_reason_label: None,
+        boot_image_source: None,
+        boot_image_path: None,
+        boot_image_bytes: None,
+        serial_port: None,
+        serial_byte: None,
+        serial_bytes: Vec::new(),
+        serial_text: None,
+        serial_expected_text: run_fixture.then(|| SERIAL_BOOT_BANNER_TEXT.to_string()),
+        serial_io_exit_count: 0,
+        halt_observed: false,
         calls: Vec::new(),
         blocker: Some(blocker.into()),
-        next_step: "Resolve the blocker, then rerun `pane native-boot-spike --execute`."
-            .to_string(),
+        next_step: if run_fixture {
+            "Resolve the blocker, then rerun `pane native-boot-spike --execute --run-fixture`."
+                .to_string()
+        } else {
+            "Resolve the blocker, then rerun `pane native-boot-spike --execute`.".to_string()
+        },
     }
 }
 
@@ -406,8 +499,15 @@ fn probe_whp() -> WhpPreflightReport {
 }
 
 #[cfg(not(windows))]
-fn run_whp_partition_smoke() -> NativePartitionSmokeReport {
-    skipped_partition_smoke_report(true, "WHP partition smoke can only run on Windows hosts.")
+fn run_whp_partition_smoke(
+    run_fixture: bool,
+    _boot_image: Option<&NativeSerialBootImage>,
+) -> NativePartitionSmokeReport {
+    skipped_partition_smoke_report(
+        true,
+        run_fixture,
+        "WHP partition smoke can only run on Windows hosts.",
+    )
 }
 
 #[cfg(windows)]
@@ -416,8 +516,11 @@ fn probe_whp() -> WhpPreflightReport {
 }
 
 #[cfg(windows)]
-fn run_whp_partition_smoke() -> NativePartitionSmokeReport {
-    windows_whp::run_partition_smoke()
+fn run_whp_partition_smoke(
+    run_fixture: bool,
+    boot_image: Option<&NativeSerialBootImage>,
+) -> NativePartitionSmokeReport {
+    windows_whp::run_partition_smoke(run_fixture, boot_image)
 }
 
 #[cfg(test)]
@@ -436,18 +539,46 @@ pub(crate) fn test_native_host_report(ready: bool) -> NativeHostPreflightReport 
 #[cfg(windows)]
 mod windows_whp {
     use std::{
+        alloc::{alloc_zeroed, dealloc, Layout},
         ffi::{c_char, c_void, CString},
         mem,
     };
 
     use super::{
         base_export_checks, NativeExportCheck, NativePartitionSmokeReport,
-        NativePartitionSmokeStatus, NativeWhpCallReport, WhpPreflightReport, REQUIRED_WHP_EXPORTS,
+        NativePartitionSmokeStatus, NativeSerialBootImage, NativeWhpCallReport, WhpPreflightReport,
+        REQUIRED_WHP_EXPORTS, SERIAL_BOOT_BANNER_TEXT, SERIAL_BOOT_TEST_IMAGE_SIZE,
     };
 
     const WHV_CAPABILITY_CODE_HYPERVISOR_PRESENT: u32 = 0;
     const WHV_PARTITION_PROPERTY_CODE_PROCESSOR_COUNT: u32 = 0x0000_1fff;
-
+    const WHV_MAP_GPA_RANGE_FLAG_READ: u32 = 0x0000_0001;
+    const WHV_MAP_GPA_RANGE_FLAG_WRITE: u32 = 0x0000_0002;
+    const WHV_MAP_GPA_RANGE_FLAG_EXECUTE: u32 = 0x0000_0004;
+    const WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS: u32 = 0x0000_0002;
+    const WHV_RUN_VP_EXIT_REASON_X64_HALT: u32 = 0x0000_0008;
+    const GUEST_FIXTURE_GPA: u64 = 0x1000;
+    const GUEST_PAGE_SIZE: usize = SERIAL_BOOT_TEST_IMAGE_SIZE;
+    const SERIAL_COM1_PORT: u16 = 0x03f8;
+    const MAX_SERIAL_BOOT_EXITS: usize = SERIAL_BOOT_BANNER_TEXT.len() + 2;
+    const VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET: usize = 10;
+    const VP_CONTEXT_RIP_OFFSET: usize = 32;
+    const IO_CONTEXT_OFFSET: usize = 48;
+    const IO_ACCESS_INFO_OFFSET: usize = IO_CONTEXT_OFFSET + 20;
+    const IO_PORT_OFFSET: usize = IO_CONTEXT_OFFSET + 24;
+    const IO_RAX_OFFSET: usize = IO_CONTEXT_OFFSET + 32;
+    const WHV_REGISTER_RAX: u32 = 0x0000_0000;
+    const WHV_REGISTER_RDX: u32 = 0x0000_0002;
+    const WHV_REGISTER_RSP: u32 = 0x0000_0004;
+    const WHV_REGISTER_RIP: u32 = 0x0000_0010;
+    const WHV_REGISTER_RFLAGS: u32 = 0x0000_0011;
+    const WHV_REGISTER_ES: u32 = 0x0000_0012;
+    const WHV_REGISTER_CS: u32 = 0x0000_0013;
+    const WHV_REGISTER_SS: u32 = 0x0000_0014;
+    const WHV_REGISTER_DS: u32 = 0x0000_0015;
+    const WHV_REGISTER_CR0: u32 = 0x0000_001c;
+    const WHV_REGISTER_CR3: u32 = 0x0000_001e;
+    const WHV_REGISTER_CR4: u32 = 0x0000_001f;
     type WhvGetCapability = unsafe extern "system" fn(u32, *mut c_void, u32, *mut u32) -> i32;
     type WhvCreatePartition = unsafe extern "system" fn(*mut *mut c_void) -> i32;
     type WhvSetPartitionProperty =
@@ -456,6 +587,33 @@ mod windows_whp {
     type WhvDeletePartition = unsafe extern "system" fn(*mut c_void) -> i32;
     type WhvCreateVirtualProcessor = unsafe extern "system" fn(*mut c_void, u32, u32) -> i32;
     type WhvDeleteVirtualProcessor = unsafe extern "system" fn(*mut c_void, u32) -> i32;
+    type WhvSetVirtualProcessorRegisters = unsafe extern "system" fn(
+        *mut c_void,
+        u32,
+        *const u32,
+        u32,
+        *const WhvRegisterValue,
+    ) -> i32;
+    type WhvRunVirtualProcessor =
+        unsafe extern "system" fn(*mut c_void, u32, *mut c_void, u32) -> i32;
+    type WhvMapGpaRange = unsafe extern "system" fn(*mut c_void, *mut c_void, u64, u64, u32) -> i32;
+    type WhvUnmapGpaRange = unsafe extern "system" fn(*mut c_void, u64, u64) -> i32;
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct WhvX64SegmentRegister {
+        base: u64,
+        limit: u32,
+        selector: u16,
+        attributes: u16,
+    }
+
+    #[repr(C, align(16))]
+    #[derive(Copy, Clone)]
+    union WhvRegisterValue {
+        reg64: u64,
+        segment: WhvX64SegmentRegister,
+    }
 
     #[link(name = "kernel32")]
     extern "system" {
@@ -520,10 +678,13 @@ mod windows_whp {
         }
     }
 
-    pub(super) fn run_partition_smoke() -> NativePartitionSmokeReport {
+    pub(super) fn run_partition_smoke(
+        run_fixture: bool,
+        boot_image: Option<&NativeSerialBootImage>,
+    ) -> NativePartitionSmokeReport {
         let mut report = NativePartitionSmokeReport {
             product_shape:
-                "Non-persistent WHP partition/vCPU smoke step for Pane's boot-to-serial milestone.",
+                "Non-persistent WHP boot-spike step for Pane's boot-to-serial milestone.",
             execute_requested: true,
             attempted: true,
             status: NativePartitionSmokeStatus::Fail,
@@ -534,9 +695,32 @@ mod windows_whp {
             virtual_processor_created: false,
             virtual_processor_deleted: false,
             partition_deleted: false,
+            fixture_requested: run_fixture,
+            memory_mapped: false,
+            registers_configured: false,
+            virtual_processor_ran: false,
+            memory_unmapped: false,
+            exit_reason: None,
+            exit_reason_label: None,
+            boot_image_source: boot_image.map(|image| image.source_label.clone()),
+            boot_image_path: boot_image.and_then(|image| image.path.clone()),
+            boot_image_bytes: boot_image.map(|image| image.bytes.len() as u64),
+            serial_port: None,
+            serial_byte: None,
+            serial_bytes: Vec::new(),
+            serial_text: None,
+            serial_expected_text: run_fixture.then(|| SERIAL_BOOT_BANNER_TEXT.to_string()),
+            serial_io_exit_count: 0,
+            halt_observed: false,
             calls: Vec::new(),
             blocker: None,
-            next_step: "After this passes, map guest memory and run a controlled serial-console test kernel.".to_string(),
+            next_step: if run_fixture {
+                "After this passes, replace the synthetic serial test image with a boot-to-serial kernel or loader."
+                    .to_string()
+            } else {
+                "After this passes, rerun with `--run-fixture` to execute a deterministic serial test image."
+                    .to_string()
+            },
         };
 
         unsafe {
@@ -622,6 +806,63 @@ mod windows_whp {
                     return report;
                 }
             };
+            let set_virtual_processor_registers = if run_fixture {
+                match resolve_whp_function::<WhvSetVirtualProcessorRegisters>(
+                    module,
+                    "WHvSetVirtualProcessorRegisters",
+                    &mut report,
+                ) {
+                    Some(function) => Some(function),
+                    None => {
+                        FreeLibrary(module);
+                        return report;
+                    }
+                }
+            } else {
+                None
+            };
+            let run_virtual_processor = if run_fixture {
+                match resolve_whp_function::<WhvRunVirtualProcessor>(
+                    module,
+                    "WHvRunVirtualProcessor",
+                    &mut report,
+                ) {
+                    Some(function) => Some(function),
+                    None => {
+                        FreeLibrary(module);
+                        return report;
+                    }
+                }
+            } else {
+                None
+            };
+            let map_gpa_range = if run_fixture {
+                match resolve_whp_function::<WhvMapGpaRange>(module, "WHvMapGpaRange", &mut report)
+                {
+                    Some(function) => Some(function),
+                    None => {
+                        FreeLibrary(module);
+                        return report;
+                    }
+                }
+            } else {
+                None
+            };
+            let unmap_gpa_range = if run_fixture {
+                match resolve_whp_function::<WhvUnmapGpaRange>(
+                    module,
+                    "WHvUnmapGpaRange",
+                    &mut report,
+                ) {
+                    Some(function) => Some(function),
+                    None => {
+                        FreeLibrary(module);
+                        return report;
+                    }
+                }
+            } else {
+                None
+            };
 
             let mut partition: *mut c_void = std::ptr::null_mut();
             let hresult = create_partition(&mut partition);
@@ -684,6 +925,151 @@ mod windows_whp {
                 ));
             }
 
+            let guest_page = if run_fixture && report.virtual_processor_created {
+                match GuestPage::new() {
+                    Some(mut page) => {
+                        let boot_image_bytes = boot_image
+                            .map(|image| image.bytes.as_slice())
+                            .unwrap_or_else(|| &[]);
+                        if boot_image_bytes.is_empty() {
+                            report.calls.push(NativeWhpCallReport {
+                                name: "SerialBootImage",
+                                hresult: None,
+                                ok: false,
+                                detail:
+                                    "No runtime-backed serial boot image was provided to the WHP runner."
+                                        .to_string(),
+                            });
+                            report.blocker = Some(
+                                "Create the Pane serial boot image with `pane runtime --create-serial-boot-image`."
+                                    .to_string(),
+                            );
+                        } else if boot_image_bytes.len() > GUEST_PAGE_SIZE {
+                            report.calls.push(NativeWhpCallReport {
+                                name: "SerialBootImage",
+                                hresult: None,
+                                ok: false,
+                                detail: format!(
+                                    "Serial boot image is {} bytes; current WHP spike maps one {} byte page.",
+                                    boot_image_bytes.len(),
+                                    GUEST_PAGE_SIZE
+                                ),
+                            });
+                            report.blocker =
+                                Some("Serial boot image is too large for the current one-page WHP boot spike.".to_string());
+                        } else {
+                            page.as_mut_slice()[..boot_image_bytes.len()]
+                                .copy_from_slice(boot_image_bytes);
+                            report.calls.push(NativeWhpCallReport {
+                                name: "SerialBootImage",
+                                hresult: None,
+                                ok: true,
+                                detail: format!(
+                                    "Loaded {} bytes from the Pane runtime serial boot image.",
+                                    boot_image_bytes.len()
+                                ),
+                            });
+                        }
+
+                        if report.blocker.is_none() {
+                            if let Some(map_gpa_range) = map_gpa_range {
+                                let hresult = map_gpa_range(
+                                    partition,
+                                    page.as_mut_ptr().cast::<c_void>(),
+                                    GUEST_FIXTURE_GPA,
+                                    GUEST_PAGE_SIZE as u64,
+                                    WHV_MAP_GPA_RANGE_FLAG_READ
+                                        | WHV_MAP_GPA_RANGE_FLAG_WRITE
+                                        | WHV_MAP_GPA_RANGE_FLAG_EXECUTE,
+                                );
+                                report.memory_mapped = hresult_succeeded(hresult);
+                                report.calls.push(hresult_call(
+                                    "WHvMapGpaRange(serial-test-image)",
+                                    hresult,
+                                    if report.memory_mapped {
+                                        "Mapped one executable guest page for the serial test image."
+                                    } else {
+                                        "Could not map guest memory for the serial test image."
+                                    },
+                                ));
+                            }
+                        }
+                        Some(page)
+                    }
+                    None => {
+                        report.calls.push(NativeWhpCallReport {
+                            name: "HostPageAllocation(4096)",
+                            hresult: None,
+                            ok: false,
+                            detail: "Could not allocate a 4 KiB page-aligned host buffer."
+                                .to_string(),
+                        });
+                        report.blocker = Some(
+                            "Could not allocate page-aligned guest serial image memory."
+                                .to_string(),
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            if run_fixture && report.memory_mapped {
+                if let Some(set_virtual_processor_registers) = set_virtual_processor_registers {
+                    let (register_names, register_values) = serial_test_image_registers();
+                    let hresult = set_virtual_processor_registers(
+                        partition,
+                        0,
+                        register_names.as_ptr(),
+                        register_names.len() as u32,
+                        register_values.as_ptr(),
+                    );
+                    report.registers_configured = hresult_succeeded(hresult);
+                    report.calls.push(hresult_call(
+                        "WHvSetVirtualProcessorRegisters(serial-test-image)",
+                        hresult,
+                        if report.registers_configured {
+                            "Configured vCPU registers for the serial test image."
+                        } else {
+                            "Could not configure vCPU registers for the serial test image."
+                        },
+                    ));
+                }
+            }
+
+            if run_fixture && report.registers_configured {
+                if let (Some(run_virtual_processor), Some(set_virtual_processor_registers)) =
+                    (run_virtual_processor, set_virtual_processor_registers)
+                {
+                    run_serial_test_image(
+                        partition,
+                        run_virtual_processor,
+                        set_virtual_processor_registers,
+                        &mut report,
+                    );
+                }
+            }
+
+            if run_fixture && report.memory_mapped {
+                if let Some(unmap_gpa_range) = unmap_gpa_range {
+                    let hresult =
+                        unmap_gpa_range(partition, GUEST_FIXTURE_GPA, GUEST_PAGE_SIZE as u64);
+                    report.memory_unmapped = hresult_succeeded(hresult);
+                    report.calls.push(hresult_call(
+                        "WHvUnmapGpaRange(serial-test-image)",
+                        hresult,
+                        if report.memory_unmapped {
+                            "Unmapped the serial test image guest page."
+                        } else {
+                            "Could not unmap the serial test image guest page cleanly."
+                        },
+                    ));
+                }
+            }
+
+            drop(guest_page);
+
             if report.partition_created && report.virtual_processor_created {
                 let hresult = delete_virtual_processor(partition, 0);
                 report.virtual_processor_deleted = hresult_succeeded(hresult);
@@ -720,7 +1106,17 @@ mod windows_whp {
             && report.partition_setup
             && report.virtual_processor_created
             && report.virtual_processor_deleted
-            && report.partition_deleted;
+            && report.partition_deleted
+            && (!report.fixture_requested
+                || (report.memory_mapped
+                    && report.registers_configured
+                    && report.virtual_processor_ran
+                    && report.memory_unmapped
+                    && report.halt_observed
+                    && report.exit_reason == Some(WHV_RUN_VP_EXIT_REASON_X64_HALT)
+                    && report.serial_port == Some(SERIAL_COM1_PORT)
+                    && report.serial_io_exit_count as usize == SERIAL_BOOT_BANNER_TEXT.len()
+                    && report.serial_text.as_deref() == Some(SERIAL_BOOT_BANNER_TEXT)));
 
         report.status = if passed {
             NativePartitionSmokeStatus::Pass
@@ -786,6 +1182,363 @@ mod windows_whp {
             hresult: Some(format_hresult(hresult)),
             ok: hresult_succeeded(hresult),
             detail: detail.to_string(),
+        }
+    }
+
+    struct GuestPage {
+        ptr: *mut u8,
+        layout: Layout,
+    }
+
+    impl GuestPage {
+        fn new() -> Option<Self> {
+            let layout = Layout::from_size_align(GUEST_PAGE_SIZE, GUEST_PAGE_SIZE).ok()?;
+            let ptr = unsafe { alloc_zeroed(layout) };
+            if ptr.is_null() {
+                None
+            } else {
+                Some(Self { ptr, layout })
+            }
+        }
+
+        fn as_mut_ptr(&mut self) -> *mut u8 {
+            self.ptr
+        }
+
+        fn as_mut_slice(&mut self) -> &mut [u8] {
+            unsafe { std::slice::from_raw_parts_mut(self.ptr, GUEST_PAGE_SIZE) }
+        }
+    }
+
+    impl Drop for GuestPage {
+        fn drop(&mut self) {
+            unsafe {
+                dealloc(self.ptr, self.layout);
+            }
+        }
+    }
+
+    fn serial_test_image_registers() -> ([u32; 12], [WhvRegisterValue; 12]) {
+        let code_segment = WhvX64SegmentRegister {
+            base: 0,
+            limit: 0xffff,
+            selector: 0,
+            attributes: 0x009b,
+        };
+        let data_segment = WhvX64SegmentRegister {
+            base: 0,
+            limit: 0xffff,
+            selector: 0,
+            attributes: 0x0093,
+        };
+        let register_names = [
+            WHV_REGISTER_RAX,
+            WHV_REGISTER_RDX,
+            WHV_REGISTER_RSP,
+            WHV_REGISTER_RIP,
+            WHV_REGISTER_RFLAGS,
+            WHV_REGISTER_CS,
+            WHV_REGISTER_DS,
+            WHV_REGISTER_ES,
+            WHV_REGISTER_SS,
+            WHV_REGISTER_CR0,
+            WHV_REGISTER_CR3,
+            WHV_REGISTER_CR4,
+        ];
+        let register_values = [
+            WhvRegisterValue { reg64: 0 },
+            WhvRegisterValue { reg64: 0 },
+            WhvRegisterValue {
+                reg64: GUEST_FIXTURE_GPA + 0x800,
+            },
+            WhvRegisterValue {
+                reg64: GUEST_FIXTURE_GPA,
+            },
+            WhvRegisterValue { reg64: 0x0002 },
+            WhvRegisterValue {
+                segment: code_segment,
+            },
+            WhvRegisterValue {
+                segment: data_segment,
+            },
+            WhvRegisterValue {
+                segment: data_segment,
+            },
+            WhvRegisterValue {
+                segment: data_segment,
+            },
+            WhvRegisterValue { reg64: 0x0010 },
+            WhvRegisterValue { reg64: 0 },
+            WhvRegisterValue { reg64: 0 },
+        ];
+        (register_names, register_values)
+    }
+
+    fn run_serial_test_image(
+        partition: *mut c_void,
+        run_virtual_processor: WhvRunVirtualProcessor,
+        set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
+        report: &mut NativePartitionSmokeReport,
+    ) {
+        report.serial_expected_text = Some(SERIAL_BOOT_BANNER_TEXT.to_string());
+
+        for exit_index in 0..MAX_SERIAL_BOOT_EXITS {
+            let mut exit_context = [0_u8; 1024];
+            let hresult = unsafe {
+                run_virtual_processor(
+                    partition,
+                    0,
+                    exit_context.as_mut_ptr().cast::<c_void>(),
+                    exit_context.len() as u32,
+                )
+            };
+            let run_ok = hresult_succeeded(hresult);
+            report.virtual_processor_ran |= run_ok;
+            report.calls.push(hresult_call(
+                "WHvRunVirtualProcessor(serial-test-image)",
+                hresult,
+                if run_ok {
+                    "vCPU returned with a WHP exit context."
+                } else {
+                    "vCPU execution failed before producing a WHP exit context."
+                },
+            ));
+
+            if !run_ok {
+                break;
+            }
+
+            match decode_exit_context(&exit_context, report) {
+                DecodedExit::IoPort {
+                    instruction_length,
+                    rip,
+                    is_write,
+                    access_size,
+                    port,
+                    serial_byte,
+                } => {
+                    let serial_ok = is_write
+                        && access_size == 1
+                        && port == SERIAL_COM1_PORT
+                        && report.serial_bytes.len() < SERIAL_BOOT_BANNER_TEXT.len();
+                    if !serial_ok {
+                        break;
+                    }
+
+                    report.serial_bytes.push(serial_byte);
+                    report.serial_port = Some(port);
+                    report.serial_byte = Some(serial_byte);
+                    report.serial_text =
+                        Some(String::from_utf8_lossy(&report.serial_bytes).into_owned());
+
+                    if instruction_length == 0 {
+                        report.calls.push(NativeWhpCallReport {
+                            name: "AdvanceGuestRip",
+                            hresult: None,
+                            ok: false,
+                            detail:
+                                "WHP reported a zero-length I/O instruction; refusing to resume."
+                                    .to_string(),
+                        });
+                        break;
+                    }
+
+                    let next_rip = rip + u64::from(instruction_length);
+                    if !set_guest_rip(partition, set_virtual_processor_registers, next_rip, report)
+                    {
+                        break;
+                    }
+                }
+                DecodedExit::Halt => {
+                    report.halt_observed = true;
+                    let text = report.serial_text.as_deref().unwrap_or("");
+                    let ok = text == SERIAL_BOOT_BANNER_TEXT;
+                    report.calls.push(NativeWhpCallReport {
+                        name: "SerialBootBanner",
+                        hresult: None,
+                        ok,
+                        detail: format!(
+                            "Serial test image halted after emitting {text:?}; expected {SERIAL_BOOT_BANNER_TEXT:?}."
+                        ),
+                    });
+                    break;
+                }
+                DecodedExit::Other => break,
+            }
+
+            if exit_index + 1 == MAX_SERIAL_BOOT_EXITS {
+                report.calls.push(NativeWhpCallReport {
+                    name: "SerialBootExitBudget",
+                    hresult: None,
+                    ok: false,
+                    detail: format!(
+                        "Serial test image exceeded {MAX_SERIAL_BOOT_EXITS} WHP exits without halting."
+                    ),
+                });
+            }
+        }
+
+        report.serial_io_exit_count = report.serial_bytes.len() as u32;
+    }
+
+    fn set_guest_rip(
+        partition: *mut c_void,
+        set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
+        rip: u64,
+        report: &mut NativePartitionSmokeReport,
+    ) -> bool {
+        let register_names = [WHV_REGISTER_RIP];
+        let register_values = [WhvRegisterValue { reg64: rip }];
+        let hresult = unsafe {
+            set_virtual_processor_registers(
+                partition,
+                0,
+                register_names.as_ptr(),
+                register_names.len() as u32,
+                register_values.as_ptr(),
+            )
+        };
+        let ok = hresult_succeeded(hresult);
+        report.calls.push(hresult_call(
+            "WHvSetVirtualProcessorRegisters(RIP)",
+            hresult,
+            if ok {
+                "Advanced guest RIP past the emulated serial I/O instruction."
+            } else {
+                "Could not advance guest RIP after serial I/O exit."
+            },
+        ));
+        ok
+    }
+
+    enum DecodedExit {
+        IoPort {
+            instruction_length: u8,
+            rip: u64,
+            is_write: bool,
+            access_size: u32,
+            port: u16,
+            serial_byte: u8,
+        },
+        Halt,
+        Other,
+    }
+
+    fn decode_exit_context(
+        exit_context: &[u8],
+        report: &mut NativePartitionSmokeReport,
+    ) -> DecodedExit {
+        let exit_reason = read_u32(exit_context, 0);
+        report.exit_reason = Some(exit_reason);
+        report.exit_reason_label = Some(exit_reason_label(exit_reason).to_string());
+
+        if exit_reason == WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS {
+            let instruction_length = exit_context[VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET] & 0x0f;
+            let rip = read_u64(exit_context, VP_CONTEXT_RIP_OFFSET);
+            let access_info = read_u32(exit_context, IO_ACCESS_INFO_OFFSET);
+            let port = read_u16(exit_context, IO_PORT_OFFSET);
+            let rax = read_u64(exit_context, IO_RAX_OFFSET);
+            let is_write = (access_info & 0x1) == 0x1;
+            let access_size = (access_info >> 1) & 0x7;
+            let serial_byte = (rax & 0xff) as u8;
+
+            report.calls.push(NativeWhpCallReport {
+                name: "DecodeX64IoPortAccess",
+                hresult: None,
+                ok: is_write && access_size == 1 && port == SERIAL_COM1_PORT,
+                detail: format!(
+                    "I/O exit write={is_write} size={access_size} port=0x{port:04x} byte=0x{serial_byte:02x} rip=0x{rip:016x} instruction_length={instruction_length}."
+                ),
+            });
+            DecodedExit::IoPort {
+                instruction_length,
+                rip,
+                is_write,
+                access_size,
+                port,
+                serial_byte,
+            }
+        } else if exit_reason == WHV_RUN_VP_EXIT_REASON_X64_HALT {
+            report.calls.push(NativeWhpCallReport {
+                name: "DecodeX64Halt",
+                hresult: None,
+                ok: true,
+                detail: "The serial test image reached HLT after serial output.".to_string(),
+            });
+            DecodedExit::Halt
+        } else {
+            report.calls.push(NativeWhpCallReport {
+                name: "DecodeVpExit",
+                hresult: None,
+                ok: false,
+                detail: format!("Unexpected WHP exit reason 0x{exit_reason:08x}."),
+            });
+            DecodedExit::Other
+        }
+    }
+
+    fn exit_reason_label(value: u32) -> &'static str {
+        match value {
+            0x0000_0000 => "none",
+            0x0000_0001 => "memory-access",
+            WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS => "x64-io-port-access",
+            0x0000_0004 => "unrecoverable-exception",
+            0x0000_0005 => "invalid-vp-register-value",
+            0x0000_0006 => "unsupported-feature",
+            0x0000_0007 => "x64-interrupt-window",
+            WHV_RUN_VP_EXIT_REASON_X64_HALT => "x64-halt",
+            0x0000_0009 => "x64-apic-eoi",
+            0x0000_1000 => "x64-msr-access",
+            0x0000_1001 => "x64-cpuid",
+            0x0000_1002 => "exception",
+            0x0000_2001 => "canceled",
+            _ => "unknown",
+        }
+    }
+
+    fn read_u16(bytes: &[u8], offset: usize) -> u16 {
+        u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
+    }
+
+    fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ])
+    }
+
+    fn read_u64(bytes: &[u8], offset: usize) -> u64 {
+        u64::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
+        ])
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use crate::native::{serial_boot_test_image_bytes, SERIAL_BOOT_BANNER_TEXT};
+
+        #[test]
+        fn serial_test_image_outputs_the_expected_banner_then_halts() {
+            let page = serial_boot_test_image_bytes();
+
+            let mut offset = 0;
+            for byte in SERIAL_BOOT_BANNER_TEXT.as_bytes() {
+                assert_eq!(&page[offset..offset + 3], &[0xba, 0xf8, 0x03]);
+                assert_eq!(&page[offset + 3..offset + 5], &[0xb0, *byte]);
+                assert_eq!(page[offset + 5], 0xee);
+                offset += 6;
+            }
+            assert_eq!(page[offset], 0xf4);
+            assert!(page[offset + 1..].iter().all(|byte| *byte == 0));
         }
     }
 }
@@ -889,11 +1642,28 @@ mod tests {
             whp_report(true, true, Some(true)),
         );
 
-        let report = run_partition_smoke(false, &host);
+        let report = run_partition_smoke(false, false, None, &host);
 
         assert_eq!(report.status, NativePartitionSmokeStatus::Planned);
         assert!(!report.attempted);
         assert!(report.blocker.is_none());
+    }
+
+    #[test]
+    fn partition_smoke_plan_preserves_fixture_intent() {
+        let host = build_native_host_preflight_report(
+            "windows".to_string(),
+            "x86_64".to_string(),
+            true,
+            true,
+            whp_report(true, true, Some(true)),
+        );
+
+        let report = run_partition_smoke(false, true, None, &host);
+
+        assert_eq!(report.status, NativePartitionSmokeStatus::Planned);
+        assert!(report.fixture_requested);
+        assert!(report.next_step.contains("--execute --run-fixture"));
     }
 
     #[test]
@@ -906,10 +1676,27 @@ mod tests {
             whp_report(false, false, None),
         );
 
-        let report = run_partition_smoke(true, &host);
+        let report = run_partition_smoke(true, false, None, &host);
 
         assert_eq!(report.status, NativePartitionSmokeStatus::Skipped);
         assert!(!report.attempted);
         assert!(report.blocker.is_some());
+    }
+
+    #[test]
+    fn partition_smoke_skip_preserves_fixture_intent() {
+        let host = build_native_host_preflight_report(
+            "windows".to_string(),
+            "x86_64".to_string(),
+            true,
+            true,
+            whp_report(false, false, None),
+        );
+
+        let report = run_partition_smoke(true, true, None, &host);
+
+        assert_eq!(report.status, NativePartitionSmokeStatus::Skipped);
+        assert!(report.fixture_requested);
+        assert!(report.next_step.contains("--execute --run-fixture"));
     }
 }

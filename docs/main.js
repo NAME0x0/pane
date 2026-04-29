@@ -110,7 +110,7 @@
     await wait(200);
     addLine(heroText, "Arch + XFCE is the only surfaced desktop profile until the others are supportable enough to stop creating support debt.", "line-accent");
     await wait(200);
-    addLine(heroText, "Pane now owns runtime storage, probes Windows Hypervisor Platform readiness, and can run a guarded WHP partition/vCPU smoke step.", "line-accent");
+    addLine(heroText, "Pane now owns runtime storage, probes Windows Hypervisor Platform readiness, and can run a guarded WHP serial test image that emits PANE_BOOT_OK.", "line-accent");
     await wait(200);
     addLine(heroText, "PaneShared storage and Collect Pane Support Bundle keep file-sharing and recovery paths inside the app bundle.", "line-accent");
     await wait(400);

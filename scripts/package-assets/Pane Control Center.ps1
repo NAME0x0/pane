@@ -28,7 +28,7 @@ if ($PrintOnly) {
     Write-Host "  Runtime Space    Dedicated Pane runtime storage can be prepared for the future contained OS engine."
     Write-Host "  Image Register   Local Arch base images can be copied into Pane runtime storage with SHA-256 metadata."
     Write-Host "  Native Preflight Probe Windows Hypervisor Platform readiness before the Pane-owned boot spike."
-    Write-Host "  Boot Spike       Explicit WHP partition/vCPU smoke test for the next native-runtime milestone."
+    Write-Host "  Boot Spike       Explicit WHP guest-memory, register, vCPU, and serial-I/O fixture for the next native-runtime milestone."
     Write-Host "  Native Preview   Pane-owned runtime dry-run does not invoke WSL, mstsc.exe, or XRDP."
     Write-Host "  First Run Wizard Onboard Arch, configure the Linux login, then launch the desktop from one app surface."
     Write-Host "  Display Transport Current mode is mstsc.exe + XRDP; embedded Pane window and native transport are roadmap modes."
@@ -582,7 +582,7 @@ function Invoke-PrepareRuntimeFlow {
         return @{ ExitCode = 0; Output = "Runtime preparation canceled." }
     }
 
-    return (Invoke-PaneExe -Arguments @("runtime", "--prepare", "--create-user-disk", "--capacity-gib", "8", "--session-name", $session))
+    return (Invoke-PaneExe -Arguments @("runtime", "--prepare", "--create-user-disk", "--create-serial-boot-image", "--capacity-gib", "8", "--session-name", $session))
 }
 
 function Invoke-NativePreflightFlow {
@@ -598,7 +598,7 @@ function Invoke-NativeBootSpikeFlow {
 
     $choice = [System.Windows.Forms.MessageBox]::Show(
         $form,
-        "Pane will create a temporary Windows Hypervisor Platform partition and one virtual processor, then tear both down. This does not boot Arch yet and does not persist a VM.`r`n`r`nRun the WHP partition/vCPU smoke test now?",
+        "Pane will create a temporary Windows Hypervisor Platform partition and one virtual processor, map a deterministic serial test image, configure registers, run until the PANE_BOOT_OK COM1 banner and final HLT are observed, then tear everything down. This does not boot Arch yet and does not persist a VM.`r`n`r`nRun the WHP serial test image now?",
         "Pane Native Boot Spike",
         [System.Windows.Forms.MessageBoxButtons]::OKCancel,
         [System.Windows.Forms.MessageBoxIcon]::Information
@@ -607,7 +607,7 @@ function Invoke-NativeBootSpikeFlow {
         return @{ ExitCode = 0; Output = "Native boot spike canceled." }
     }
 
-    return (Invoke-PaneExe -Arguments @("native-boot-spike", "--execute", "--session-name", $session))
+    return (Invoke-PaneExe -Arguments @("native-boot-spike", "--execute", "--run-fixture", "--session-name", $session))
 }
 
 function Invoke-RegisterBaseImageFlow {

@@ -182,6 +182,7 @@ struct NativeBootSpikeReport {
     product_shape: &'static str,
     session_name: String,
     execute_requested: bool,
+    fixture_requested: bool,
     host: crate::native::NativeHostPreflightReport,
     runtime: RuntimeReport,
     partition_smoke: crate::native::NativePartitionSmokeReport,
@@ -200,8 +201,10 @@ struct RuntimeDirectoryReport {
     engines: String,
     logs: String,
     base_os_image: String,
+    serial_boot_image: String,
     user_disk: String,
     base_os_metadata: String,
+    serial_boot_metadata: String,
     user_disk_metadata: String,
     runtime_config: String,
     native_manifest: String,
@@ -233,6 +236,12 @@ struct RuntimeArtifactReport {
     base_os_image_sha256: Option<String>,
     base_os_image_verified: bool,
     base_os_metadata_exists: bool,
+    serial_boot_image_exists: bool,
+    serial_boot_image_bytes: Option<u64>,
+    serial_boot_image_sha256: Option<String>,
+    serial_boot_image_ready: bool,
+    serial_boot_banner: Option<String>,
+    serial_boot_metadata_exists: bool,
     user_disk_exists: bool,
     user_disk_capacity_gib: Option<u64>,
     user_disk_format: Option<String>,
@@ -255,6 +264,19 @@ struct BaseOsImageMetadata {
     expected_sha256: Option<String>,
     verified: bool,
     registered_at_epoch_seconds: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SerialBootImageMetadata {
+    schema_version: u32,
+    image_kind: String,
+    stored_path: String,
+    bytes: u64,
+    sha256: String,
+    serial_banner: String,
+    guest_entry_gpa: String,
+    created_at_epoch_seconds: u64,
+    notes: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1431,8 +1453,10 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
     let session_name = crate::plan::sanitize_session_name(&args.session_name);
     let paths = crate::plan::runtime_for(&session_name);
     let budget = runtime_storage_budget(args.capacity_gib);
-    let has_runtime_mutation =
-        args.register_base_image.is_some() || args.create_user_disk || args.prepare;
+    let has_runtime_mutation = args.register_base_image.is_some()
+        || args.create_user_disk
+        || args.create_serial_boot_image
+        || args.prepare;
 
     if has_runtime_mutation {
         prepare_runtime_paths(&paths)?;
@@ -1455,6 +1479,10 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
 
     if args.create_user_disk {
         create_user_disk_descriptor(&paths, &budget, args.force)?;
+    }
+
+    if args.create_serial_boot_image {
+        create_serial_boot_image_artifact(&paths, args.force)?;
     }
 
     let mut report = build_runtime_report(&session_name, args.capacity_gib, false)?;
@@ -1504,17 +1532,40 @@ fn native_preflight(args: NativePreflightArgs) -> AppResult<()> {
 
 fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
     let session_name = crate::plan::sanitize_session_name(&args.session_name);
+    let runtime_paths = crate::plan::runtime_for(&session_name);
+    let runtime_budget = runtime_storage_budget(DEFAULT_RUNTIME_CAPACITY_GIB);
+    let boot_image = if args.execute && args.run_fixture {
+        prepare_runtime_paths(&runtime_paths)?;
+        write_runtime_config(&runtime_paths, &session_name, &runtime_budget)?;
+        write_native_runtime_manifest(&runtime_paths, &session_name)?;
+        create_serial_boot_image_artifact(&runtime_paths, false)?;
+        Some(load_serial_boot_image_artifact(&runtime_paths)?)
+    } else {
+        None
+    };
     let runtime = build_runtime_report(&session_name, DEFAULT_RUNTIME_CAPACITY_GIB, false)?;
     let host = runtime.native_host.clone();
-    let partition_smoke = crate::native::run_partition_smoke(args.execute, &host);
+    let partition_smoke = crate::native::run_partition_smoke(
+        args.execute,
+        args.run_fixture,
+        boot_image.as_ref(),
+        &host,
+    );
     let ready_for_serial_kernel_spike = args.execute
+        && args.run_fixture
         && partition_smoke.status == crate::native::NativePartitionSmokeStatus::Pass
         && runtime.native_runtime.ready_for_boot_spike;
 
     let mut blockers = Vec::new();
     if !args.execute {
         blockers.push(
-            "Partition/vCPU smoke was not executed. Rerun with `--execute` to exercise WHP."
+            "WHP boot spike was not executed. Rerun with `--execute` to exercise the partition/vCPU lifecycle."
+                .to_string(),
+        );
+    }
+    if args.run_fixture && !args.execute {
+        blockers.push(
+            "Serial fixture was requested but not executed. Rerun with `--execute --run-fixture`."
                 .to_string(),
         );
     }
@@ -1529,8 +1580,7 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
         && partition_smoke.blocker.is_none()
     {
         blockers.push(
-            "WHP partition/vCPU smoke did not pass; inspect the call report for HRESULT details."
-                .to_string(),
+            "WHP boot spike did not pass; inspect the call report for HRESULT details.".to_string(),
         );
     }
 
@@ -1539,20 +1589,13 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
             "Pane WHP boot-spike host step for moving from preflight to boot-to-serial execution.",
         session_name,
         execute_requested: args.execute,
+        fixture_requested: args.run_fixture,
         host,
         runtime,
         partition_smoke,
         ready_for_serial_kernel_spike,
         blockers,
-        next_steps: vec![
-            "Map a small guest memory range with WHvMapGpaRange.".to_string(),
-            "Load a controlled serial-console test kernel or real-mode fixture into guest memory."
-                .to_string(),
-            "Set initial vCPU registers and run WHvRunVirtualProcessor until a deterministic serial or I/O exit is observed."
-                .to_string(),
-            "Only after that passes, connect the runner to Pane's verified Arch base image and user disk."
-                .to_string(),
-        ],
+        next_steps: native_boot_spike_next_steps(args.execute, args.run_fixture),
     };
 
     if args.json {
@@ -1562,6 +1605,32 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
 
     print_native_boot_spike_report(&report);
     Ok(())
+}
+
+fn native_boot_spike_next_steps(execute: bool, run_fixture: bool) -> Vec<String> {
+    if !execute {
+        return vec![
+            "Rerun with `--execute` to create and tear down the guarded WHP partition/vCPU."
+                .to_string(),
+            "Then rerun with `--execute --run-fixture` to prove guest memory, register setup, vCPU execution, and serial I/O exit handling."
+                .to_string(),
+        ];
+    }
+
+    if !run_fixture {
+        return vec![
+            "Rerun with `--execute --run-fixture` to map guest memory and execute the deterministic serial test image."
+                .to_string(),
+            "Only after the serial test image passes, replace it with a boot-to-serial kernel or loader."
+                .to_string(),
+        ];
+    }
+
+    vec![
+        "Replace the synthetic serial test image with a boot-to-serial kernel or loader.".to_string(),
+        "Connect that runner to Pane's verified Arch base image and user disk once serial boot output is deterministic.".to_string(),
+        "Keep GUI work behind the boot-to-serial milestone so Pane does not advertise a rendered OS before it can boot one.".to_string(),
+    ]
 }
 
 fn environments(args: EnvironmentsArgs) -> AppResult<()> {
@@ -2316,8 +2385,10 @@ fn build_runtime_report(
             engines: paths.engines.display().to_string(),
             logs: paths.logs.display().to_string(),
             base_os_image: paths.base_os_image.display().to_string(),
+            serial_boot_image: paths.serial_boot_image.display().to_string(),
             user_disk: paths.user_disk.display().to_string(),
             base_os_metadata: paths.base_os_metadata.display().to_string(),
+            serial_boot_metadata: paths.serial_boot_metadata.display().to_string(),
             user_disk_metadata: paths.user_disk_metadata.display().to_string(),
             runtime_config: paths.runtime_config.display().to_string(),
             native_manifest: paths.native_manifest.display().to_string(),
@@ -2336,9 +2407,11 @@ fn build_runtime_report(
                 .to_string(),
             "Create the Pane-owned user disk descriptor with `pane runtime --create-user-disk`."
                 .to_string(),
-            "Run `pane native-boot-spike --execute` to prove the first WHP partition/vCPU lifecycle step."
+            "Create the runtime-backed serial boot image with `pane runtime --create-serial-boot-image`."
                 .to_string(),
-            "Implement guest memory mapping and serial-console execution against the runtime config instead of WSL distro state."
+            "Run `pane native-boot-spike --execute --run-fixture` to prove WHP guest memory, register setup, vCPU execution, and serial I/O."
+                .to_string(),
+            "Replace the synthetic serial test image with a boot-to-serial kernel against the runtime config instead of WSL distro state."
                 .to_string(),
             "Implement a Pane-owned display boundary instead of handing off to mstsc.exe over XRDP."
                 .to_string(),
@@ -2537,6 +2610,88 @@ fn create_user_disk_descriptor(
     write_json_file(&paths.user_disk_metadata, &metadata)
 }
 
+fn create_serial_boot_image_artifact(paths: &RuntimePaths, force: bool) -> AppResult<()> {
+    let image = crate::native::serial_boot_test_image_bytes();
+    let sha256 = sha256_bytes(&image);
+
+    if paths.serial_boot_image.exists() && !force {
+        if let Ok(metadata) = read_json_file::<SerialBootImageMetadata>(&paths.serial_boot_metadata)
+        {
+            let existing_len = fs::metadata(&paths.serial_boot_image)
+                .ok()
+                .map(|metadata| metadata.len());
+            if metadata.schema_version == 1
+                && metadata.image_kind == "pane-serial-boot-test-image"
+                && metadata.bytes == image.len() as u64
+                && metadata.sha256 == sha256
+                && existing_len == Some(image.len() as u64)
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    if let Some(parent) = paths.serial_boot_image.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if let Some(parent) = paths.serial_boot_metadata.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let temp_image = paths.serial_boot_image.with_extension("paneimg.tmp");
+    if temp_image.exists() {
+        fs::remove_file(&temp_image)?;
+    }
+    fs::write(&temp_image, &image)?;
+    if paths.serial_boot_image.exists() {
+        fs::remove_file(&paths.serial_boot_image)?;
+    }
+    fs::rename(&temp_image, &paths.serial_boot_image)?;
+
+    let metadata = SerialBootImageMetadata {
+        schema_version: 1,
+        image_kind: "pane-serial-boot-test-image".to_string(),
+        stored_path: paths.serial_boot_image.display().to_string(),
+        bytes: image.len() as u64,
+        sha256,
+        serial_banner: crate::native::SERIAL_BOOT_BANNER_TEXT.to_string(),
+        guest_entry_gpa: "0x1000".to_string(),
+        created_at_epoch_seconds: current_epoch_seconds(),
+        notes: vec![
+            "This is Pane's deterministic WHP boot-spike image, not an Arch base OS image."
+                .to_string(),
+            "The native runner maps this image first so boot execution is tied to runtime artifacts instead of generated-only memory."
+                .to_string(),
+        ],
+    };
+    write_json_file(&paths.serial_boot_metadata, &metadata)
+}
+
+fn load_serial_boot_image_artifact(
+    paths: &RuntimePaths,
+) -> AppResult<crate::native::NativeSerialBootImage> {
+    let metadata = read_json_file::<SerialBootImageMetadata>(&paths.serial_boot_metadata)?;
+    let bytes = fs::read(&paths.serial_boot_image)?;
+    let actual_sha256 = sha256_bytes(&bytes);
+    if metadata.schema_version != 1
+        || metadata.image_kind != "pane-serial-boot-test-image"
+        || metadata.bytes != bytes.len() as u64
+        || metadata.sha256 != actual_sha256
+        || metadata.serial_banner != crate::native::SERIAL_BOOT_BANNER_TEXT
+    {
+        return Err(AppError::message(format!(
+            "Pane serial boot image metadata does not match the artifact at {}. Rerun `pane runtime --create-serial-boot-image --force`.",
+            paths.serial_boot_image.display()
+        )));
+    }
+
+    Ok(crate::native::NativeSerialBootImage {
+        source_label: "pane-runtime-serial-boot-image".to_string(),
+        path: Some(paths.serial_boot_image.display().to_string()),
+        bytes,
+    })
+}
+
 fn write_json_file<T: Serialize>(path: &Path, value: &T) -> AppResult<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -2573,6 +2728,12 @@ fn sha256_file(path: &Path) -> AppResult<String> {
     }
 
     Ok(hex_encode(&hasher.finalize()))
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex_encode(&hasher.finalize())
 }
 
 struct Sha256 {
@@ -2751,6 +2912,7 @@ fn write_runtime_config(
         "requested_capacity_gib": budget.requested_capacity_gib,
         "target_engine": "pane-owned-os-runtime",
         "base_os_image": paths.base_os_image.display().to_string(),
+        "serial_boot_image": paths.serial_boot_image.display().to_string(),
         "user_disk": paths.user_disk.display().to_string(),
         "policy": {
             "pane_shared_is_user_file_exchange": true,
@@ -2784,11 +2946,14 @@ fn write_native_runtime_manifest(paths: &RuntimePaths, session_name: &str) -> Ap
         "required_artifacts": {
             "base_os_image": paths.base_os_image.display().to_string(),
             "base_os_metadata": paths.base_os_metadata.display().to_string(),
+            "serial_boot_image": paths.serial_boot_image.display().to_string(),
+            "serial_boot_metadata": paths.serial_boot_metadata.display().to_string(),
             "user_disk": paths.user_disk.display().to_string(),
             "user_disk_metadata": paths.user_disk_metadata.display().to_string()
         },
         "blockers": [
             "verified base OS image must exist before native boot",
+            "runtime-backed serial boot image must exist before the WHP boot-to-serial spike",
             "Pane user disk descriptor must exist before native boot",
             "Windows Hypervisor Platform host preflight must pass before the boot spike",
             "Pane-owned WHP boot engine is not implemented",
@@ -2814,6 +2979,24 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
         .map(|(metadata, bytes)| metadata.verified && metadata.bytes == bytes)
         .unwrap_or(false);
 
+    let serial_boot_metadata =
+        read_json_file::<SerialBootImageMetadata>(&paths.serial_boot_metadata).ok();
+    let serial_boot_image_bytes = fs::metadata(&paths.serial_boot_image)
+        .ok()
+        .map(|metadata| metadata.len());
+    let serial_boot_actual_sha256 = sha256_file(&paths.serial_boot_image).ok();
+    let serial_boot_image_ready = serial_boot_metadata
+        .as_ref()
+        .zip(serial_boot_image_bytes)
+        .map(|(metadata, bytes)| {
+            metadata.schema_version == 1
+                && metadata.image_kind == "pane-serial-boot-test-image"
+                && metadata.bytes == bytes
+                && Some(metadata.sha256.as_str()) == serial_boot_actual_sha256.as_deref()
+                && metadata.serial_banner == crate::native::SERIAL_BOOT_BANNER_TEXT
+        })
+        .unwrap_or(false);
+
     let user_disk_metadata = read_json_file::<UserDiskMetadata>(&paths.user_disk_metadata).ok();
     let user_disk_ready = user_disk_metadata
         .as_ref()
@@ -2833,6 +3016,16 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
             .map(|metadata| metadata.sha256.clone()),
         base_os_image_verified,
         base_os_metadata_exists: paths.base_os_metadata.is_file(),
+        serial_boot_image_exists: paths.serial_boot_image.is_file(),
+        serial_boot_image_bytes,
+        serial_boot_image_sha256: serial_boot_metadata
+            .as_ref()
+            .map(|metadata| metadata.sha256.clone()),
+        serial_boot_image_ready,
+        serial_boot_banner: serial_boot_metadata
+            .as_ref()
+            .map(|metadata| metadata.serial_banner.clone()),
+        serial_boot_metadata_exists: paths.serial_boot_metadata.is_file(),
         user_disk_exists: paths.user_disk.is_file(),
         user_disk_capacity_gib: user_disk_metadata
             .as_ref()
@@ -2878,6 +3071,12 @@ fn build_native_runtime_report(
                     .to_string(),
             );
         }
+        if !artifacts.serial_boot_image_ready {
+            blockers.push(
+                "No valid Pane-owned serial boot test image exists. Run `pane runtime --create-serial-boot-image`."
+                    .to_string(),
+            );
+        }
 
         if !artifacts.base_os_image_exists {
             NativeRuntimeState::MissingBaseImage
@@ -2918,6 +3117,7 @@ fn build_native_runtime_report(
     let ready_for_boot_spike = prepared
         && artifacts.base_os_image_verified
         && artifacts.user_disk_ready
+        && artifacts.serial_boot_image_ready
         && artifacts.runtime_config_exists
         && artifacts.native_manifest_exists
         && native_host.ready_for_boot_spike;
@@ -5310,8 +5510,13 @@ fn print_runtime_report(report: &RuntimeReport) {
     println!("  Engines        {}", report.directories.engines);
     println!("  Logs           {}", report.directories.logs);
     println!("  Base OS Image  {}", report.directories.base_os_image);
+    println!("  Serial Boot    {}", report.directories.serial_boot_image);
     println!("  User Disk      {}", report.directories.user_disk);
     println!("  Base Metadata  {}", report.directories.base_os_metadata);
+    println!(
+        "  Serial Metadata {}",
+        report.directories.serial_boot_metadata
+    );
     println!("  Disk Metadata  {}", report.directories.user_disk_metadata);
     println!("  Runtime Config {}", report.directories.runtime_config);
     println!("  Native Manifest {}", report.directories.native_manifest);
@@ -5330,6 +5535,23 @@ fn print_runtime_report(report: &RuntimeReport) {
     }
     if let Some(bytes) = report.artifacts.base_os_image_bytes {
         println!("  Base Bytes     {}", bytes);
+    }
+    println!(
+        "  Serial Boot    {}",
+        yes_no(report.artifacts.serial_boot_image_exists)
+    );
+    println!(
+        "  Serial Ready   {}",
+        yes_no(report.artifacts.serial_boot_image_ready)
+    );
+    if let Some(sha256) = &report.artifacts.serial_boot_image_sha256 {
+        println!("  Serial SHA-256 {}", sha256);
+    }
+    if let Some(banner) = &report.artifacts.serial_boot_banner {
+        println!("  Serial Banner  {:?}", banner);
+    }
+    if let Some(bytes) = report.artifacts.serial_boot_image_bytes {
+        println!("  Serial Bytes   {}", bytes);
     }
     println!(
         "  User Disk      {}",
@@ -5505,6 +5727,7 @@ fn print_native_boot_spike_report(report: &NativeBootSpikeReport) {
     println!("Pane Native Boot Spike");
     println!("  Session        {}", report.session_name);
     println!("  Execute        {}", yes_no(report.execute_requested));
+    println!("  Fixture        {}", yes_no(report.fixture_requested));
     println!(
         "  Serial Ready   {}",
         yes_no(report.ready_for_serial_kernel_spike)
@@ -5529,7 +5752,7 @@ fn print_native_boot_spike_report(report: &NativeBootSpikeReport) {
         "  User Disk Ready {}",
         yes_no(report.runtime.artifacts.user_disk_ready)
     );
-    println!("Partition Smoke");
+    println!("Boot Spike");
     println!("  Status         {}", report.partition_smoke.status_label);
     println!(
         "  Attempted      {}",
@@ -5551,6 +5774,54 @@ fn print_native_boot_spike_report(report: &NativeBootSpikeReport) {
         "  vCPU Created   {}",
         yes_no(report.partition_smoke.virtual_processor_created)
     );
+    println!(
+        "  Memory Mapped  {}",
+        yes_no(report.partition_smoke.memory_mapped)
+    );
+    println!(
+        "  Registers      {}",
+        yes_no(report.partition_smoke.registers_configured)
+    );
+    println!(
+        "  vCPU Ran       {}",
+        yes_no(report.partition_smoke.virtual_processor_ran)
+    );
+    if let Some(source) = &report.partition_smoke.boot_image_source {
+        println!("  Boot Image Src {}", source);
+    }
+    if let Some(path) = &report.partition_smoke.boot_image_path {
+        println!("  Boot Image     {}", path);
+    }
+    if let Some(bytes) = report.partition_smoke.boot_image_bytes {
+        println!("  Boot Bytes     {}", bytes);
+    }
+    println!(
+        "  Serial Exits   {}",
+        report.partition_smoke.serial_io_exit_count
+    );
+    println!(
+        "  Halt Observed  {}",
+        yes_no(report.partition_smoke.halt_observed)
+    );
+    println!(
+        "  Memory Unmapped {}",
+        yes_no(report.partition_smoke.memory_unmapped)
+    );
+    if let Some(label) = &report.partition_smoke.exit_reason_label {
+        println!("  Exit Reason    {}", label);
+    }
+    if let Some(port) = report.partition_smoke.serial_port {
+        println!("  Serial Port    0x{port:04x}");
+    }
+    if let Some(byte) = report.partition_smoke.serial_byte {
+        println!("  Serial Byte    0x{byte:02x}");
+    }
+    if let Some(expected) = &report.partition_smoke.serial_expected_text {
+        println!("  Serial Expect  {:?}", expected);
+    }
+    if let Some(text) = &report.partition_smoke.serial_text {
+        println!("  Serial Text    {:?}", text);
+    }
     println!(
         "  vCPU Deleted   {}",
         yes_no(report.partition_smoke.virtual_processor_deleted)
@@ -6084,16 +6355,16 @@ mod tests {
     use super::{
         build_bundle_doctor_request, build_distro_health, build_environment_catalog_report,
         build_native_runtime_report, build_runtime_artifact_report, build_steps,
-        build_update_steps, create_user_disk_descriptor, determine_app_lifecycle,
-        ensure_wsl_conf_setting, format_doctor_blockers, initialize_managed_arch_environment,
-        inspect_workspace, inventory_contains_distro, preferred_transport, register_base_os_image,
-        resolve_bundle_output_path, resolve_init_source, resolve_launch_target,
-        resolve_managed_environment_for_reset, resolve_saved_launch, resolve_session_context,
-        resolve_status_distro, runtime_storage_budget, sha256_file, status_port_for,
-        validate_setup_password, validate_setup_username, windows_transport_check,
-        AppLifecyclePhase, AppNextAction, CheckStatus, DistroHealth, DoctorCheck, DoctorReport,
-        InitSource, NativeRuntimeState, StatusReport, WorkspaceHealth, WslInventory,
-        EMBEDDED_APP_ASSETS,
+        build_update_steps, create_serial_boot_image_artifact, create_user_disk_descriptor,
+        determine_app_lifecycle, ensure_wsl_conf_setting, format_doctor_blockers,
+        initialize_managed_arch_environment, inspect_workspace, inventory_contains_distro,
+        preferred_transport, register_base_os_image, resolve_bundle_output_path,
+        resolve_init_source, resolve_launch_target, resolve_managed_environment_for_reset,
+        resolve_saved_launch, resolve_session_context, resolve_status_distro,
+        runtime_storage_budget, sha256_file, status_port_for, validate_setup_password,
+        validate_setup_username, windows_transport_check, AppLifecyclePhase, AppNextAction,
+        CheckStatus, DistroHealth, DoctorCheck, DoctorReport, InitSource, NativeRuntimeState,
+        StatusReport, WorkspaceHealth, WslInventory, EMBEDDED_APP_ASSETS,
     };
 
     fn empty_workspace_health() -> WorkspaceHealth {
@@ -6126,8 +6397,10 @@ mod tests {
 
         RuntimePaths {
             base_os_image: images.join("arch-base.paneimg"),
+            serial_boot_image: engines.join("serial-boot.paneimg"),
             user_disk: disks.join("user-data.panedisk"),
             base_os_metadata: state.join("base-os-image.json"),
+            serial_boot_metadata: state.join("serial-boot-image.json"),
             user_disk_metadata: state.join("user-disk.json"),
             runtime_config: root.join("pane-runtime.config.json"),
             native_manifest: root.join("pane-native-runtime.json"),
@@ -6265,6 +6538,29 @@ mod tests {
     }
 
     #[test]
+    fn creates_runtime_backed_serial_boot_image() {
+        let paths = temp_runtime_paths("serial-boot-image");
+        super::prepare_runtime_paths(&paths).unwrap();
+
+        create_serial_boot_image_artifact(&paths, false).unwrap();
+
+        let artifacts = build_runtime_artifact_report(&paths);
+        assert!(artifacts.serial_boot_image_exists);
+        assert!(artifacts.serial_boot_metadata_exists);
+        assert!(artifacts.serial_boot_image_ready);
+        assert_eq!(
+            artifacts.serial_boot_banner.as_deref(),
+            Some(crate::native::SERIAL_BOOT_BANNER_TEXT)
+        );
+        assert_eq!(
+            std::fs::read(&paths.serial_boot_image).unwrap(),
+            crate::native::serial_boot_test_image_bytes()
+        );
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
     fn registers_verified_base_image_and_user_disk_descriptor() {
         let paths = temp_runtime_paths("runtime-artifacts");
         super::prepare_runtime_paths(&paths).unwrap();
@@ -6274,6 +6570,7 @@ mod tests {
 
         register_base_os_image(&paths, &source, Some(&expected), false).unwrap();
         create_user_disk_descriptor(&paths, &runtime_storage_budget(8), false).unwrap();
+        create_serial_boot_image_artifact(&paths, false).unwrap();
         super::write_runtime_config(&paths, "pane", &runtime_storage_budget(8)).unwrap();
         super::write_native_runtime_manifest(&paths, "pane").unwrap();
 
@@ -6287,6 +6584,12 @@ mod tests {
         assert!(artifacts.user_disk_exists);
         assert!(artifacts.user_disk_ready);
         assert_eq!(artifacts.user_disk_capacity_gib, Some(3));
+        assert!(artifacts.serial_boot_image_exists);
+        assert!(artifacts.serial_boot_image_ready);
+        assert_eq!(
+            artifacts.serial_boot_banner.as_deref(),
+            Some(crate::native::SERIAL_BOOT_BANNER_TEXT)
+        );
 
         let native_host = test_native_host_report(true);
         let native = build_native_runtime_report(true, &artifacts, &native_host);
@@ -6310,6 +6613,7 @@ mod tests {
 
         register_base_os_image(&paths, &source, Some(&expected), false).unwrap();
         create_user_disk_descriptor(&paths, &runtime_storage_budget(8), false).unwrap();
+        create_serial_boot_image_artifact(&paths, false).unwrap();
         super::write_runtime_config(&paths, "pane", &runtime_storage_budget(8)).unwrap();
         super::write_native_runtime_manifest(&paths, "pane").unwrap();
 

@@ -210,7 +210,7 @@ try {
     $doctor = Invoke-PaneCapture -PaneExe $paneExe -Arguments @("doctor", "--json", "--distro", $Distro, "--de", $DesktopEnvironment, "--session-name", $SessionName) -OutputPath (Join-Path $artifactRoot "doctor.json") | ConvertFrom-Json
     $doctorReconnect = Invoke-PaneCapture -PaneExe $paneExe -Arguments @("doctor", "--json", "--distro", $Distro, "--de", $DesktopEnvironment, "--session-name", $SessionName, "--skip-bootstrap") -OutputPath (Join-Path $artifactRoot "doctor-reconnect.json") | ConvertFrom-Json
     $appStatus = Invoke-PaneCapture -PaneExe $paneExe -Arguments @("app-status", "--json", "--session-name", $SessionName) -OutputPath (Join-Path $artifactRoot "app-status.json") | ConvertFrom-Json
-    $runtime = Invoke-PaneCapture -PaneExe $paneExe -Arguments @("runtime", "--json", "--prepare", "--create-user-disk", "--session-name", $SessionName, "--capacity-gib", "8") -OutputPath (Join-Path $artifactRoot "runtime.json") | ConvertFrom-Json
+    $runtime = Invoke-PaneCapture -PaneExe $paneExe -Arguments @("runtime", "--json", "--prepare", "--create-user-disk", "--create-serial-boot-image", "--session-name", $SessionName, "--capacity-gib", "8") -OutputPath (Join-Path $artifactRoot "runtime.json") | ConvertFrom-Json
     $nativePreflight = Invoke-PaneCapture -PaneExe $paneExe -Arguments @("native-preflight", "--json", "--session-name", $SessionName) -OutputPath (Join-Path $artifactRoot "native-preflight.json") | ConvertFrom-Json
     $nativeBootSpike = Invoke-PaneCapture -PaneExe $paneExe -Arguments @("native-boot-spike", "--json", "--session-name", $SessionName) -OutputPath (Join-Path $artifactRoot "native-boot-spike.json") | ConvertFrom-Json
     $nativeLaunchDryRun = Invoke-PaneCapture -PaneExe $paneExe -Arguments @("launch", "--runtime", "pane-owned", "--dry-run", "--session-name", $SessionName) -OutputPath (Join-Path $artifactRoot "native-launch-dry-run.txt")
@@ -278,6 +278,9 @@ try {
     }
     if (-not $runtime.artifacts.user_disk_ready) {
         throw "pane runtime did not create a valid Pane-owned user disk descriptor. Review $artifactRoot\runtime.json."
+    }
+    if (-not $runtime.artifacts.serial_boot_image_ready) {
+        throw "pane runtime did not create a valid Pane-owned serial boot image. Review $artifactRoot\runtime.json."
     }
     if (-not $nativePreflight.host -or -not $nativePreflight.host.checks) {
         throw "pane native-preflight did not report host checks. Review $artifactRoot\native-preflight.json."

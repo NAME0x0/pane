@@ -40,9 +40,9 @@ The package intentionally does not expose KDE, GNOME, Niri, or other desktop pro
 
 1. Prefer the packaged Control Center and its Start First Run flow when using Pane as an app.
 2. Run `pane app-status --json` when you need the same app-facing lifecycle phase and next-action recommendation from the CLI.
-3. Run `pane runtime --prepare --create-user-disk --capacity-gib 8` when you want to prepare Pane's dedicated future runtime space and user-disk descriptor for package, account, and customization data. This does not boot an OS yet.
+3. Run `pane runtime --prepare --create-user-disk --create-serial-boot-image --capacity-gib 8` when you want to prepare Pane's dedicated future runtime space, user-disk descriptor, and WHP serial boot image artifact. This does not boot Arch yet.
 4. Run `pane native-preflight --json` when you want to inspect Windows Hypervisor Platform readiness plus the runtime artifact blockers for the future boot-to-serial spike.
-5. Run `pane native-boot-spike --json` to inspect the first executable WHP partition/vCPU milestone in safe plan mode. Add `--execute` only when you intentionally want Pane to create and tear down the temporary WHP partition.
+5. Run `pane native-boot-spike --json` to inspect the first executable WHP milestone in safe plan mode. Add `--execute` when you intentionally want Pane to create and tear down the temporary WHP partition/vCPU; add `--execute --run-fixture` when you also want Pane to map guest memory, set registers, run controlled guest code, and observe the COM1 serial I/O exit.
 6. Run `pane runtime --register-base-image C:\path\to\arch-base.img --expected-sha256 <64-char-sha256>` when you have a Pane-approved local Arch base OS image to copy into the app-owned runtime store. Images registered without an expected digest are recorded but treated as untrusted.
 7. Run `pane launch --runtime pane-owned --dry-run` when you want to exercise the future native-runtime path without invoking WSL, `mstsc.exe`, or XRDP. This currently reports the remaining host, base-image, boot-engine, and display-engine blockers.
 8. Run `pane doctor --de xfce --no-write --no-connect` when you want an initial diagnostic pass that does not create Pane workspace state or PaneShared.

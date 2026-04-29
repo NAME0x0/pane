@@ -196,7 +196,7 @@ try {
     $checks.app_status = "pass"
 
     $runtime = Invoke-Capture -OutputPath (Join-Path $artifactRoot "runtime.json") -Body {
-        & $paneExe runtime --json --prepare --create-user-disk --session-name $SessionName --capacity-gib 8
+        & $paneExe runtime --json --prepare --create-user-disk --create-serial-boot-image --session-name $SessionName --capacity-gib 8
     }
     Assert-Success -Result $runtime -Label "pane runtime --prepare"
     $runtimeReport = $runtime.Output | ConvertFrom-Json
@@ -220,6 +220,9 @@ try {
     }
     if (-not $runtimeReport.artifacts.user_disk_ready) {
         throw "pane runtime --create-user-disk did not create a valid Pane-owned user disk descriptor."
+    }
+    if (-not $runtimeReport.artifacts.serial_boot_image_ready) {
+        throw "pane runtime --create-serial-boot-image did not create a valid Pane-owned serial boot image."
     }
     $checks.runtime_prepare = "pass"
 

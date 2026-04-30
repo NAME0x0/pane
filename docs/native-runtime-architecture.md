@@ -16,9 +16,13 @@ Pane currently owns:
 - base OS image registration and SHA-256 verification metadata,
 - a user-disk descriptor for future Linux system, package, account, and customization data,
 - a runtime-backed `serial-boot.paneimg` test image plus SHA-256 metadata for the WHP boot-spike runner,
+- a verified `boot-to-serial-loader.paneimg` candidate path for executing runtime-provided boot code under an explicit serial-output contract,
+- a verified kernel/initramfs boot-plan contract with a serial-console cmdline for the next WHP kernel-entry milestone,
+- a materialized kernel boot-layout contract for boot params, cmdline, kernel, and optional initramfs guest-memory placement,
 - native host preflight through `pane native-preflight`,
 - a guarded WHP partition/vCPU lifecycle smoke through `pane native-boot-spike --execute`,
-- a guarded WHP guest-memory/register/vCPU execution test image through `pane native-boot-spike --execute --run-fixture`.
+- a guarded WHP guest-memory/register/vCPU execution test image through `pane native-boot-spike --execute --run-fixture`,
+- a guarded WHP boot-loader candidate execution path through `pane native-boot-spike --execute --run-boot-loader`.
 
 Pane does not yet own:
 
@@ -62,12 +66,15 @@ It must remain side-effect-free. It reports blockers; it does not enable Windows
 1. Native preflight: dynamically load WHP and report host/runtime blockers without linking Pane to WHP at startup.
 2. Partition smoke: create a WHP partition, configure one vCPU, create that vCPU, and tear everything down cleanly.
 3. Runtime-backed serial test image: materialize `serial-boot.paneimg` under the Pane runtime, map it as guest memory, configure vCPU registers, run it, decode the `PANE_BOOT_OK` COM1 banner across repeated I/O exits, observe HLT, unmap memory, and tear everything down cleanly.
-4. Boot-to-serial spike: replace the synthetic serial test image with a controlled kernel or loader far enough to emit serial output.
-5. Runtime artifact boot: replace the test image with Pane's verified Arch base image and Pane user disk descriptor.
-6. Storage materialization: turn the descriptor into a durable block-device format with resize, snapshot, repair, export, and import semantics.
-7. Display milestone: add a Pane-owned framebuffer and input path inside the app window.
-8. Integration milestone: add clipboard, file exchange boundaries, audio, resize, recovery, logging, and diagnostics.
-9. Compatibility milestone: measure performance, hardware requirements, Windows feature requirements, and failure modes before exposing the native runtime as a default.
+4. Runtime-provided boot-loader candidate: register a verified `boot-to-serial-loader.paneimg`, require a SHA-256 match and expected serial text, then execute that artifact through WHP with `--run-boot-loader`.
+5. Kernel boot plan: register a verified Linux kernel, optional verified initramfs, and an explicit `console=ttyS0` cmdline under `kernel-boot.json` without claiming it executes yet.
+6. Kernel boot layout: materialize `kernel-boot-layout.json` with boot params, cmdline, kernel, and optional initramfs guest-physical addresses.
+7. Boot-to-serial spike: implement WHP kernel entry, boot parameters, initramfs placement, and serial output capture far enough to prove Linux boot progress.
+8. Runtime artifact boot: connect the kernel path to Pane's verified Arch base image and Pane user disk descriptor.
+9. Storage materialization: turn the descriptor into a durable block-device format with resize, snapshot, repair, export, and import semantics.
+10. Display milestone: add a Pane-owned framebuffer and input path inside the app window.
+11. Integration milestone: add clipboard, file exchange boundaries, audio, resize, recovery, logging, and diagnostics.
+12. Compatibility milestone: measure performance, hardware requirements, Windows feature requirements, and failure modes before exposing the native runtime as a default.
 
 ## Non-Negotiable Acceptance Gates
 
@@ -76,6 +83,9 @@ Pane cannot claim the native runtime is real until:
 - a clean Windows machine can run `pane native-preflight` and receive actionable host checks,
 - `pane native-boot-spike --execute` can create and tear down a WHP partition and vCPU without leaking resources,
 - `pane native-boot-spike --execute --run-fixture` can load the runtime-backed serial boot image, map guest memory, set registers, run guest code, decode the deterministic `PANE_BOOT_OK` serial banner, observe HLT, unmap memory, and release all WHP resources,
+- `pane native-boot-spike --execute --run-boot-loader` can load a verified runtime-provided boot-loader candidate, validate its expected serial output, observe HLT, and release all WHP resources,
+- `pane runtime --register-kernel` can prepare a verified kernel/initramfs boot plan with serial console output required before any WHP kernel-entry work starts,
+- `pane native-kernel-plan --materialize` can write and re-validate the deterministic kernel boot layout before the WHP runner maps those guest addresses,
 - a test image can boot under a Pane-owned WHP host without WSL, XRDP, `mstsc.exe`, QEMU, VirtualBox, or Hyper-V Manager,
 - Pane can boot a verified Arch base image plus a Pane-owned user disk,
 - Pane renders the guest through its own app surface,

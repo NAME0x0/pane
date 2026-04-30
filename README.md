@@ -125,6 +125,25 @@ Prepare the dedicated Pane runtime space, create the app-owned user disk descrip
 cargo run -- runtime --prepare --create-user-disk --create-serial-boot-image --capacity-gib 8
 ```
 
+Register a controlled boot-to-serial loader candidate once you have a tiny loader image that emits a known COM1 serial banner and halts. This does not boot Arch yet; it proves Pane can execute a verified runtime-provided boot artifact instead of only its built-in fixture:
+
+```powershell
+cargo run -- runtime --register-boot-loader C:\path\to\loader.img --boot-loader-expected-sha256 <64-char-sha256> --boot-loader-expected-serial "PANE_BOOT_OK\n"
+```
+
+Prepare the first kernel/initramfs boot-plan contract once you have a trusted kernel artifact. Pane requires an explicit serial console cmdline so the next WHP milestone can prove boot progress before any GUI work:
+
+```powershell
+cargo run -- runtime --register-kernel C:\path\to\vmlinuz-linux --kernel-expected-sha256 <64-char-sha256> --kernel-cmdline "console=ttyS0 panic=-1"
+cargo run -- runtime --register-initramfs C:\path\to\initramfs-linux.img --initramfs-expected-sha256 <64-char-sha256> --kernel-cmdline "console=ttyS0 panic=-1"
+```
+
+Materialize the native kernel boot layout after the kernel plan is verified. This writes the guest-physical-address contract for boot params, cmdline, kernel, and optional initramfs. It still does not boot Arch; it creates the exact handoff the WHP kernel-entry runner must satisfy next:
+
+```powershell
+cargo run -- native-kernel-plan --materialize
+```
+
 Probe whether the Windows host and Pane runtime artifacts are ready for the first Pane-owned WHP boot spike:
 
 ```bash
@@ -136,6 +155,7 @@ Preview the first WHP boot-spike step. This is plan-only by default; add `--exec
 ```bash
 cargo run -- native-boot-spike --json
 cargo run -- native-boot-spike --json --execute --run-fixture
+cargo run -- native-boot-spike --json --execute --run-boot-loader
 ```
 
 Register a local Arch base OS image into Pane's runtime image store. Pass the expected SHA-256 whenever you have it; without that digest Pane records the image but keeps it untrusted:
@@ -199,9 +219,9 @@ cargo run -- bundle
 - `pane onboard` is the preferred first-run path: it initializes or reuses the managed Arch distro, configures the Arch login user, and verifies launch readiness in one command.
 - `pane environments` prints Pane's managed Linux environment roadmap and support tiers.
 - `pane app-status` reports the Control Center lifecycle phase, recommended next action, PaneShared policy, and current-vs-planned display transport.
-- `pane runtime` inspects or prepares dedicated Pane-owned runtime storage, config, native-runtime manifest, verified base-image metadata, the user-disk descriptor, and the runtime-backed serial boot image for the future contained OS engine. This is separate from PaneShared and does not boot Arch yet.
+- `pane runtime` inspects or prepares dedicated Pane-owned runtime storage, config, native-runtime manifest, verified base-image metadata, the user-disk descriptor, the runtime-backed serial boot image, an optional verified boot-to-serial loader candidate, and the first verified kernel/initramfs boot plan for the future contained OS engine. This is separate from PaneShared and does not boot Arch yet.
 - `pane native-preflight` checks the Windows Hypervisor Platform host boundary plus runtime artifacts for the future Pane-owned boot-to-serial spike. It is side-effect-free and does not claim the OS is bootable.
-- `pane native-boot-spike` is the first executable WHP host milestone. By default it prints the safe plan; with `--execute` it creates one temporary WHP partition and vCPU; with `--execute --run-fixture` it also maps guest memory, configures registers, runs a deterministic serial test image, decodes the `PANE_BOOT_OK` COM1 banner across repeated I/O exits, observes HLT, and tears everything down.
+- `pane native-boot-spike` is the first executable WHP host milestone. By default it prints the safe plan; with `--execute` it creates one temporary WHP partition and vCPU; with `--execute --run-fixture` it also maps guest memory, configures registers, runs a deterministic serial test image, decodes the `PANE_BOOT_OK` COM1 banner across repeated I/O exits, observes HLT, and tears everything down. With `--execute --run-boot-loader`, it runs the verified runtime-provided boot-loader candidate under the same serial/HALT contract.
 - `pane doctor` validates the supported MVP path and prints actionable fixes before launch or reconnect. Use `--no-write --no-connect` for support diagnostics that must not create the Pane workspace or PaneShared.
 - `pane setup-user` creates or repairs the Arch login user, writes the default-user/systemd WSL config, and can restart WSL so the change takes effect immediately when you do not need the full onboarding flow. It does not grant passwordless sudo or edit `/etc/sudoers`.
 - `pane launch` writes the bootstrap script, `.rdp` profile, persisted launch state, and optionally executes the Arch bootstrap. `--shared-storage durable` is the default; `--shared-storage scratch` scopes PaneShared to the disposable session workspace. `--runtime pane-owned --dry-run` exercises the native runtime contract without touching WSL/RDP.
@@ -262,9 +282,13 @@ cargo test
 cargo run -- status --json
 cargo run -- app-status --json
 cargo run -- runtime --json --prepare --create-user-disk --create-serial-boot-image --capacity-gib 8
+cargo run -- runtime --json --register-boot-loader C:\path\to\loader.img --boot-loader-expected-sha256 <64-char-sha256> --boot-loader-expected-serial "PANE_BOOT_OK\n"
+cargo run -- runtime --json --register-kernel C:\path\to\vmlinuz-linux --kernel-expected-sha256 <64-char-sha256> --kernel-cmdline "console=ttyS0 panic=-1"
+cargo run -- native-kernel-plan --json --materialize
 cargo run -- native-preflight --json
 cargo run -- native-boot-spike --json
 cargo run -- native-boot-spike --json --execute --run-fixture
+cargo run -- native-boot-spike --json --execute --run-boot-loader
 cargo run -- doctor --json --distro pane-arch --de xfce --no-write --no-connect
 cargo run -- doctor --json --distro pane-arch --de xfce
 cargo run -- doctor --json --distro pane-arch --de xfce --skip-bootstrap
@@ -287,7 +311,7 @@ Kali, Fedora, and other distros are intentionally not in the first support wave.
 | Stage | Focus | Why it matters |
 |-------|-------|----------------|
 | **Now** | Finish the Pane-owned Arch path: managed `pane-arch`, onboarding, account setup, repair/reset/update, support bundles, PaneShared storage, 8 GiB runtime-space reservation, base-image registration, user-disk descriptor creation, native-runtime preflight, and the Windows control surface. | Make first-run, recovery, and data boundaries boring enough to trust. |
-| **Next** | Replace the synthetic WHP serial test image with a boot-to-serial kernel or loader, then connect that runner to the verified Arch base image and Pane-owned user disk. | Make Pane behave more like an app-owned Linux appliance instead of a WSL helper. |
+| **Next** | Move from the verified runtime-provided boot-to-serial loader to a verified kernel/initramfs boot plan, then implement WHP kernel entry, boot parameters, initramfs placement, and serial boot-progress capture. | Make Pane behave more like an app-owned Linux appliance instead of a WSL helper. |
 | **Later** | Embed the display into a Pane-owned window, then add Ubuntu LTS, Debian, and curated desktop profiles only when their lifecycle, reconnect, repair, and support path are real. | Expand honestly instead of cosmetically. |
 | **Final Architecture** | Replace the XRDP handoff with a Pane-owned runtime/display transport. | Make the contained app and near-native responsiveness vision real. |
 

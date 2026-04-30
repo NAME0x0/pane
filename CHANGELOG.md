@@ -23,6 +23,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - `pane launch --runtime pane-owned --dry-run` for exercising the native runtime path without WSL, `mstsc.exe`, or XRDP
 - `pane runtime --register-base-image` and `--create-user-disk` for moving native runtime readiness from missing artifacts toward boot-engine work
 - `pane runtime --create-serial-boot-image` for materializing the runtime-backed WHP serial boot image used by the boot-spike runner
+- `pane runtime --register-boot-loader` and `pane native-boot-spike --execute --run-boot-loader` for verifying and executing a runtime-provided boot-to-serial loader candidate under the WHP serial/HALT contract
+- `pane runtime --register-kernel` and optional `--register-initramfs` for preparing a verified kernel boot plan with a required serial console cmdline
+- `pane native-kernel-plan --materialize` for writing the deterministic WHP kernel boot layout covering boot params, cmdline, kernel, and optional initramfs placement
 - Control Center base-image registration for copying local Arch images into Pane runtime storage with SHA-256 metadata
 - `pane native-preflight` for probing Windows Hypervisor Platform host readiness and runtime artifact blockers before the Pane-owned boot spike
 - `pane native-boot-spike --execute --run-fixture` for the guarded WHP guest execution milestone: temporary partition/vCPU creation, guest memory mapping, register setup, repeated COM1 serial I/O exit decoding for the `PANE_BOOT_OK` banner, final HLT observation, cleanup, and no Arch boot claim

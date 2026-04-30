@@ -41,6 +41,8 @@ pub enum Commands {
     NativePreflight(NativePreflightArgs),
     /// Exercise the first non-persistent WHP partition/vCPU boot-spike host step.
     NativeBootSpike(NativeBootSpikeArgs),
+    /// Validate and materialize the native kernel boot layout contract.
+    NativeKernelPlan(NativeKernelPlanArgs),
     /// Show Pane's managed Linux environment catalog and support tiers.
     Environments(EnvironmentsArgs),
     /// Run support-focused diagnostics before launch or reconnect.
@@ -251,6 +253,30 @@ pub struct RuntimeArgs {
     /// Expected SHA-256 digest for --register-base-image. Without this, the image is recorded but not trusted.
     #[arg(long)]
     pub expected_sha256: Option<String>,
+    /// Copy a controlled boot-to-serial loader candidate into Pane's runtime engine store.
+    #[arg(long)]
+    pub register_boot_loader: Option<PathBuf>,
+    /// Expected SHA-256 digest for --register-boot-loader. Without this, the loader is recorded but not trusted.
+    #[arg(long)]
+    pub boot_loader_expected_sha256: Option<String>,
+    /// Serial text the registered boot loader must emit before halting. Supports \n, \r, \t, \0, and \\ escapes.
+    #[arg(long)]
+    pub boot_loader_expected_serial: Option<String>,
+    /// Copy a Linux kernel image into Pane's native runtime boot-plan store.
+    #[arg(long)]
+    pub register_kernel: Option<PathBuf>,
+    /// Expected SHA-256 digest for --register-kernel. Without this, the kernel is recorded but not trusted.
+    #[arg(long)]
+    pub kernel_expected_sha256: Option<String>,
+    /// Copy an initramfs image into Pane's native runtime boot-plan store.
+    #[arg(long)]
+    pub register_initramfs: Option<PathBuf>,
+    /// Expected SHA-256 digest for --register-initramfs. Without this, the initramfs is recorded but not trusted.
+    #[arg(long)]
+    pub initramfs_expected_sha256: Option<String>,
+    /// Kernel command line to persist in the native runtime boot plan.
+    #[arg(long)]
+    pub kernel_cmdline: Option<String>,
     /// Create the Pane-owned user disk descriptor for packages, accounts, and customizations.
     #[arg(long)]
     pub create_user_disk: bool,
@@ -284,8 +310,24 @@ pub struct NativeBootSpikeArgs {
     #[arg(long)]
     pub execute: bool,
     /// Map guest memory and run a tiny serial I/O fixture after the partition/vCPU is created.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "run_boot_loader")]
     pub run_fixture: bool,
+    /// Map guest memory and run the registered boot-to-serial loader artifact.
+    #[arg(long, conflicts_with = "run_fixture")]
+    pub run_boot_loader: bool,
+    /// Emit structured JSON instead of a human-readable summary.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct NativeKernelPlanArgs {
+    /// Session slug for the Pane-owned runtime reservation.
+    #[arg(long, default_value = "pane")]
+    pub session_name: String,
+    /// Write the resolved guest-memory layout into the runtime state directory.
+    #[arg(long)]
+    pub materialize: bool,
     /// Emit structured JSON instead of a human-readable summary.
     #[arg(long)]
     pub json: bool,

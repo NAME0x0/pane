@@ -20,9 +20,9 @@ use crate::{
     bootstrap::{render_bootstrap_script, render_update_script},
     cli::{
         AppStatusArgs, BundleArgs, Cli, Commands, ConnectArgs, DoctorArgs, EnvironmentsArgs,
-        InitArgs, LaunchArgs, LogsArgs, NativeBootSpikeArgs, NativePreflightArgs, OnboardArgs,
-        RelayArgs, RepairArgs, ResetArgs, RuntimeArgs, SetupUserArgs, ShareArgs, StatusArgs,
-        StopArgs, TerminalArgs, UpdateArgs,
+        InitArgs, LaunchArgs, LogsArgs, NativeBootSpikeArgs, NativeKernelPlanArgs,
+        NativePreflightArgs, OnboardArgs, RelayArgs, RepairArgs, ResetArgs, RuntimeArgs,
+        SetupUserArgs, ShareArgs, StatusArgs, StopArgs, TerminalArgs, UpdateArgs,
     },
     error::{AppError, AppResult},
     model::{
@@ -183,10 +183,23 @@ struct NativeBootSpikeReport {
     session_name: String,
     execute_requested: bool,
     fixture_requested: bool,
+    boot_loader_requested: bool,
     host: crate::native::NativeHostPreflightReport,
     runtime: RuntimeReport,
     partition_smoke: crate::native::NativePartitionSmokeReport,
     ready_for_serial_kernel_spike: bool,
+    blockers: Vec<String>,
+    next_steps: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeKernelPlanReport {
+    product_shape: &'static str,
+    session_name: String,
+    materialize_requested: bool,
+    runtime: RuntimeReport,
+    ready_for_kernel_entry_spike: bool,
+    layout: Option<KernelBootLayout>,
     blockers: Vec<String>,
     next_steps: Vec<String>,
 }
@@ -202,12 +215,18 @@ struct RuntimeDirectoryReport {
     logs: String,
     base_os_image: String,
     serial_boot_image: String,
+    boot_loader_image: String,
+    kernel_image: String,
+    initramfs_image: String,
     user_disk: String,
     base_os_metadata: String,
     serial_boot_metadata: String,
+    boot_loader_metadata: String,
+    kernel_boot_metadata: String,
     user_disk_metadata: String,
     runtime_config: String,
     native_manifest: String,
+    kernel_boot_layout: String,
     manifest: String,
 }
 
@@ -242,6 +261,25 @@ struct RuntimeArtifactReport {
     serial_boot_image_ready: bool,
     serial_boot_banner: Option<String>,
     serial_boot_metadata_exists: bool,
+    boot_loader_image_exists: bool,
+    boot_loader_image_bytes: Option<u64>,
+    boot_loader_image_sha256: Option<String>,
+    boot_loader_image_verified: bool,
+    boot_loader_expected_serial: Option<String>,
+    boot_loader_metadata_exists: bool,
+    kernel_image_exists: bool,
+    kernel_image_bytes: Option<u64>,
+    kernel_image_sha256: Option<String>,
+    kernel_image_verified: bool,
+    initramfs_image_exists: bool,
+    initramfs_image_bytes: Option<u64>,
+    initramfs_image_sha256: Option<String>,
+    initramfs_image_verified: bool,
+    kernel_cmdline: Option<String>,
+    kernel_boot_plan_ready: bool,
+    kernel_boot_metadata_exists: bool,
+    kernel_boot_layout_exists: bool,
+    kernel_boot_layout_ready: bool,
     user_disk_exists: bool,
     user_disk_capacity_gib: Option<u64>,
     user_disk_format: Option<String>,
@@ -276,6 +314,67 @@ struct SerialBootImageMetadata {
     serial_banner: String,
     guest_entry_gpa: String,
     created_at_epoch_seconds: u64,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BootLoaderImageMetadata {
+    schema_version: u32,
+    image_kind: String,
+    source_path: String,
+    stored_path: String,
+    bytes: u64,
+    sha256: String,
+    expected_sha256: Option<String>,
+    verified: bool,
+    expected_serial_text: String,
+    guest_entry_gpa: String,
+    registered_at_epoch_seconds: u64,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct KernelBootMetadata {
+    schema_version: u32,
+    image_kind: String,
+    kernel_source_path: String,
+    kernel_stored_path: String,
+    kernel_bytes: u64,
+    kernel_sha256: String,
+    kernel_expected_sha256: Option<String>,
+    kernel_verified: bool,
+    initramfs_source_path: Option<String>,
+    initramfs_stored_path: Option<String>,
+    initramfs_bytes: Option<u64>,
+    initramfs_sha256: Option<String>,
+    initramfs_expected_sha256: Option<String>,
+    initramfs_verified: bool,
+    cmdline: String,
+    expected_serial_device: String,
+    kernel_load_gpa: String,
+    initramfs_load_gpa: Option<String>,
+    registered_at_epoch_seconds: u64,
+    notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct KernelBootLayout {
+    schema_version: u32,
+    layout_kind: String,
+    session_name: String,
+    boot_params_gpa: String,
+    cmdline_gpa: String,
+    kernel_load_gpa: String,
+    initramfs_load_gpa: Option<String>,
+    kernel_path: String,
+    kernel_bytes: u64,
+    kernel_sha256: String,
+    initramfs_path: Option<String>,
+    initramfs_bytes: Option<u64>,
+    initramfs_sha256: Option<String>,
+    cmdline: String,
+    expected_serial_device: String,
+    materialized_at_epoch_seconds: Option<u64>,
     notes: Vec<String>,
 }
 
@@ -583,6 +682,7 @@ pub fn run() -> AppResult<()> {
         Commands::Runtime(args) => runtime(args),
         Commands::NativePreflight(args) => native_preflight(args),
         Commands::NativeBootSpike(args) => native_boot_spike(args),
+        Commands::NativeKernelPlan(args) => native_kernel_plan(args),
         Commands::Environments(args) => environments(args),
         Commands::Doctor(args) => doctor(args),
         Commands::Connect(args) => connect(args),
@@ -1454,6 +1554,10 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
     let paths = crate::plan::runtime_for(&session_name);
     let budget = runtime_storage_budget(args.capacity_gib);
     let has_runtime_mutation = args.register_base_image.is_some()
+        || args.register_boot_loader.is_some()
+        || args.register_kernel.is_some()
+        || args.register_initramfs.is_some()
+        || args.kernel_cmdline.is_some()
         || args.create_user_disk
         || args.create_serial_boot_image
         || args.prepare;
@@ -1474,6 +1578,46 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
     } else if args.expected_sha256.is_some() {
         return Err(AppError::message(
             "--expected-sha256 requires --register-base-image.",
+        ));
+    }
+
+    if let Some(source_image) = args.register_boot_loader.as_deref() {
+        let expected_serial = decode_serial_text(
+            args.boot_loader_expected_serial
+                .as_deref()
+                .unwrap_or(crate::native::SERIAL_BOOT_BANNER_TEXT),
+        )?;
+        register_boot_loader_image(
+            &paths,
+            source_image,
+            args.boot_loader_expected_sha256.as_deref(),
+            &expected_serial,
+            args.force,
+        )?;
+    } else if args.boot_loader_expected_sha256.is_some()
+        || args.boot_loader_expected_serial.is_some()
+    {
+        return Err(AppError::message(
+            "--boot-loader-expected-sha256 and --boot-loader-expected-serial require --register-boot-loader.",
+        ));
+    }
+
+    if args.register_kernel.is_some()
+        || args.register_initramfs.is_some()
+        || args.kernel_cmdline.is_some()
+    {
+        register_kernel_boot_plan(
+            &paths,
+            args.register_kernel.as_deref(),
+            args.kernel_expected_sha256.as_deref(),
+            args.register_initramfs.as_deref(),
+            args.initramfs_expected_sha256.as_deref(),
+            args.kernel_cmdline.as_deref(),
+            args.force,
+        )?;
+    } else if args.kernel_expected_sha256.is_some() || args.initramfs_expected_sha256.is_some() {
+        return Err(AppError::message(
+            "--kernel-expected-sha256 requires --register-kernel, and --initramfs-expected-sha256 requires --register-initramfs.",
         ));
     }
 
@@ -1534,12 +1678,15 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
     let session_name = crate::plan::sanitize_session_name(&args.session_name);
     let runtime_paths = crate::plan::runtime_for(&session_name);
     let runtime_budget = runtime_storage_budget(DEFAULT_RUNTIME_CAPACITY_GIB);
+    let run_guest_image = args.run_fixture || args.run_boot_loader;
     let boot_image = if args.execute && args.run_fixture {
         prepare_runtime_paths(&runtime_paths)?;
         write_runtime_config(&runtime_paths, &session_name, &runtime_budget)?;
         write_native_runtime_manifest(&runtime_paths, &session_name)?;
         create_serial_boot_image_artifact(&runtime_paths, false)?;
         Some(load_serial_boot_image_artifact(&runtime_paths)?)
+    } else if args.execute && args.run_boot_loader {
+        Some(load_boot_loader_image_artifact(&runtime_paths)?)
     } else {
         None
     };
@@ -1547,14 +1694,19 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
     let host = runtime.native_host.clone();
     let partition_smoke = crate::native::run_partition_smoke(
         args.execute,
-        args.run_fixture,
+        run_guest_image,
         boot_image.as_ref(),
         &host,
     );
     let ready_for_serial_kernel_spike = args.execute
-        && args.run_fixture
+        && run_guest_image
         && partition_smoke.status == crate::native::NativePartitionSmokeStatus::Pass
-        && runtime.native_runtime.ready_for_boot_spike;
+        && host.ready_for_boot_spike
+        && runtime.prepared
+        && runtime.artifacts.runtime_config_exists
+        && runtime.artifacts.native_manifest_exists
+        && (!args.run_fixture || runtime.artifacts.serial_boot_image_ready)
+        && (!args.run_boot_loader || runtime.artifacts.boot_loader_image_verified);
 
     let mut blockers = Vec::new();
     if !args.execute {
@@ -1569,7 +1721,49 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
                 .to_string(),
         );
     }
-    if !runtime.native_runtime.ready_for_boot_spike {
+    if args.run_boot_loader && !args.execute {
+        blockers.push(
+            "Boot-loader candidate was requested but not executed. Rerun with `--execute --run-boot-loader`."
+                .to_string(),
+        );
+    }
+    if args.run_boot_loader && !runtime.artifacts.boot_loader_image_verified {
+        blockers.push(
+            "No verified Pane-owned boot-to-serial loader exists. Register one with `pane runtime --register-boot-loader <path> --boot-loader-expected-sha256 <sha256>`."
+                .to_string(),
+        );
+    }
+    if run_guest_image {
+        if !runtime.prepared {
+            blockers.push(
+                "Dedicated runtime directories have not been prepared. Run `pane runtime --prepare`."
+                    .to_string(),
+            );
+        }
+        if !runtime.artifacts.runtime_config_exists {
+            blockers.push("The runtime config file is missing.".to_string());
+        }
+        if !runtime.artifacts.native_manifest_exists {
+            blockers.push("The native runtime manifest is missing.".to_string());
+        }
+        if args.run_fixture && !runtime.artifacts.serial_boot_image_ready {
+            blockers.push(
+                "No valid Pane-owned serial boot test image exists. Run `pane runtime --create-serial-boot-image`."
+                    .to_string(),
+            );
+        }
+        for check in &host.checks {
+            if check.status == crate::native::NativePreflightStatus::Fail {
+                let mut blocker =
+                    format!("Native host check `{}` failed: {}", check.id, check.summary);
+                if let Some(remediation) = &check.remediation {
+                    blocker.push_str(" Fix: ");
+                    blocker.push_str(remediation);
+                }
+                blockers.push(blocker);
+            }
+        }
+    } else if !runtime.native_runtime.ready_for_boot_spike {
         blockers.extend(runtime.native_runtime.blockers.clone());
     }
     if let Some(blocker) = &partition_smoke.blocker {
@@ -1590,12 +1784,17 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
         session_name,
         execute_requested: args.execute,
         fixture_requested: args.run_fixture,
+        boot_loader_requested: args.run_boot_loader,
         host,
         runtime,
         partition_smoke,
         ready_for_serial_kernel_spike,
         blockers,
-        next_steps: native_boot_spike_next_steps(args.execute, args.run_fixture),
+        next_steps: native_boot_spike_next_steps(
+            args.execute,
+            args.run_fixture,
+            args.run_boot_loader,
+        ),
     };
 
     if args.json {
@@ -1607,13 +1806,26 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
     Ok(())
 }
 
-fn native_boot_spike_next_steps(execute: bool, run_fixture: bool) -> Vec<String> {
+fn native_boot_spike_next_steps(
+    execute: bool,
+    run_fixture: bool,
+    run_boot_loader: bool,
+) -> Vec<String> {
     if !execute {
         return vec![
             "Rerun with `--execute` to create and tear down the guarded WHP partition/vCPU."
                 .to_string(),
             "Then rerun with `--execute --run-fixture` to prove guest memory, register setup, vCPU execution, and serial I/O exit handling."
                 .to_string(),
+        ];
+    }
+
+    if run_boot_loader {
+        return vec![
+            "Replace the controlled boot-to-serial loader with the first real kernel/initramfs boot path."
+                .to_string(),
+            "Connect that runner to Pane's verified Arch base image and user disk once serial boot output is deterministic.".to_string(),
+            "Keep GUI work behind the boot-to-serial milestone so Pane does not advertise a rendered OS before it can boot one.".to_string(),
         ];
     }
 
@@ -1626,11 +1838,85 @@ fn native_boot_spike_next_steps(execute: bool, run_fixture: bool) -> Vec<String>
         ];
     }
 
+    if !run_boot_loader {
+        return vec![
+            "Register a controlled boot-to-serial loader with `pane runtime --register-boot-loader <path> --boot-loader-expected-sha256 <sha256>`."
+                .to_string(),
+            "Run `pane native-boot-spike --execute --run-boot-loader` to prove Pane can execute a runtime-provided boot candidate."
+                .to_string(),
+            "Connect that loader to Pane's verified Arch base image and user disk only after its serial contract is deterministic."
+                .to_string(),
+        ];
+    }
+
     vec![
-        "Replace the synthetic serial test image with a boot-to-serial kernel or loader.".to_string(),
-        "Connect that runner to Pane's verified Arch base image and user disk once serial boot output is deterministic.".to_string(),
-        "Keep GUI work behind the boot-to-serial milestone so Pane does not advertise a rendered OS before it can boot one.".to_string(),
+        "Register a controlled boot-to-serial loader with `pane runtime --register-boot-loader <path> --boot-loader-expected-sha256 <sha256>`."
+            .to_string(),
+        "Run `pane native-boot-spike --execute --run-boot-loader` to prove Pane can execute a runtime-provided boot candidate."
+            .to_string(),
+        "Connect that loader to Pane's verified Arch base image and user disk only after its serial contract is deterministic."
+            .to_string(),
     ]
+}
+
+fn native_kernel_plan(args: NativeKernelPlanArgs) -> AppResult<()> {
+    let session_name = crate::plan::sanitize_session_name(&args.session_name);
+    let paths = crate::plan::runtime_for(&session_name);
+    let runtime = build_runtime_report(&session_name, DEFAULT_RUNTIME_CAPACITY_GIB, false)?;
+    let mut blockers = Vec::new();
+
+    if !runtime.prepared {
+        blockers.push(
+            "Dedicated runtime directories have not been prepared. Run `pane runtime --prepare`."
+                .to_string(),
+        );
+    }
+    if !runtime.artifacts.kernel_boot_plan_ready {
+        blockers.push(
+            "No verified kernel boot plan exists. Run `pane runtime --register-kernel <path> --kernel-expected-sha256 <sha256> --kernel-cmdline \"console=ttyS0 ...\"`."
+                .to_string(),
+        );
+    }
+
+    let layout = if blockers.is_empty() {
+        Some(build_kernel_boot_layout(
+            &paths,
+            &session_name,
+            args.materialize,
+        )?)
+    } else {
+        None
+    };
+    let runtime = build_runtime_report(&session_name, DEFAULT_RUNTIME_CAPACITY_GIB, false)?;
+    let ready_for_kernel_entry_spike =
+        blockers.is_empty() && layout.is_some() && runtime.artifacts.kernel_boot_layout_ready;
+
+    let report = NativeKernelPlanReport {
+        product_shape:
+            "Pane native kernel boot-layout contract for the future WHP kernel-entry spike.",
+        session_name,
+        materialize_requested: args.materialize,
+        runtime,
+        ready_for_kernel_entry_spike,
+        layout,
+        blockers,
+        next_steps: vec![
+            "Implement WHP mapping for boot params, cmdline, kernel, and optional initramfs using this layout."
+                .to_string(),
+            "Enter the Linux boot protocol only after serial console output can be captured deterministically."
+                .to_string(),
+            "Keep GUI/display work behind a successful boot-to-serial kernel-entry spike."
+                .to_string(),
+        ],
+    };
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    print_native_kernel_plan_report(&report);
+    Ok(())
 }
 
 fn environments(args: EnvironmentsArgs) -> AppResult<()> {
@@ -2386,12 +2672,18 @@ fn build_runtime_report(
             logs: paths.logs.display().to_string(),
             base_os_image: paths.base_os_image.display().to_string(),
             serial_boot_image: paths.serial_boot_image.display().to_string(),
+            boot_loader_image: paths.boot_loader_image.display().to_string(),
+            kernel_image: paths.kernel_image.display().to_string(),
+            initramfs_image: paths.initramfs_image.display().to_string(),
             user_disk: paths.user_disk.display().to_string(),
             base_os_metadata: paths.base_os_metadata.display().to_string(),
             serial_boot_metadata: paths.serial_boot_metadata.display().to_string(),
+            boot_loader_metadata: paths.boot_loader_metadata.display().to_string(),
+            kernel_boot_metadata: paths.kernel_boot_metadata.display().to_string(),
             user_disk_metadata: paths.user_disk_metadata.display().to_string(),
             runtime_config: paths.runtime_config.display().to_string(),
             native_manifest: paths.native_manifest.display().to_string(),
+            kernel_boot_layout: paths.kernel_boot_layout.display().to_string(),
             manifest: paths.manifest.display().to_string(),
         },
         storage_budget: budget,
@@ -2411,7 +2703,13 @@ fn build_runtime_report(
                 .to_string(),
             "Run `pane native-boot-spike --execute --run-fixture` to prove WHP guest memory, register setup, vCPU execution, and serial I/O."
                 .to_string(),
-            "Replace the synthetic serial test image with a boot-to-serial kernel against the runtime config instead of WSL distro state."
+            "Register and run a controlled boot-to-serial loader candidate with `pane runtime --register-boot-loader` and `pane native-boot-spike --execute --run-boot-loader`."
+                .to_string(),
+            "Register a verified kernel/initramfs boot plan with `pane runtime --register-kernel` and an explicit serial console cmdline."
+                .to_string(),
+            "Materialize the WHP kernel boot layout with `pane native-kernel-plan --materialize`."
+                .to_string(),
+            "Replace the prepared kernel boot plan with actual WHP kernel entry, boot params, initramfs placement, and serial output capture."
                 .to_string(),
             "Implement a Pane-owned display boundary instead of handing off to mstsc.exe over XRDP."
                 .to_string(),
@@ -2689,7 +2987,482 @@ fn load_serial_boot_image_artifact(
         source_label: "pane-runtime-serial-boot-image".to_string(),
         path: Some(paths.serial_boot_image.display().to_string()),
         bytes,
+        expected_serial_text: crate::native::SERIAL_BOOT_BANNER_TEXT.to_string(),
+        guest_entry_gpa: 0x1000,
     })
+}
+
+fn register_boot_loader_image(
+    paths: &RuntimePaths,
+    source_image: &Path,
+    expected_sha256: Option<&str>,
+    expected_serial_text: &str,
+    force: bool,
+) -> AppResult<()> {
+    if !source_image.is_file() {
+        return Err(AppError::message(format!(
+            "Boot-loader source does not exist or is not a file: {}",
+            source_image.display()
+        )));
+    }
+    if expected_serial_text.is_empty() {
+        return Err(AppError::message(
+            "Boot-loader expected serial text must not be empty.",
+        ));
+    }
+    if expected_serial_text.len() > 1024 {
+        return Err(AppError::message(
+            "Boot-loader expected serial text must be 1024 bytes or less for the current WHP serial spike.",
+        ));
+    }
+
+    let source_len = fs::metadata(source_image)?.len();
+    if source_len > crate::native::SERIAL_BOOT_TEST_IMAGE_SIZE as u64 {
+        return Err(AppError::message(format!(
+            "Boot-loader source is {source_len} bytes; the current WHP boot-to-serial spike supports at most {} bytes.",
+            crate::native::SERIAL_BOOT_TEST_IMAGE_SIZE
+        )));
+    }
+
+    let expected_sha256 = expected_sha256.map(normalize_sha256_hex).transpose()?;
+    let actual_sha256 = sha256_file(source_image)?;
+    let verified = expected_sha256
+        .as_deref()
+        .map(|expected| expected == actual_sha256)
+        .unwrap_or(false);
+
+    if let Some(expected) = expected_sha256.as_deref() {
+        if expected != actual_sha256 {
+            return Err(AppError::message(format!(
+                "Boot-loader SHA-256 mismatch. expected {expected}, got {actual_sha256}."
+            )));
+        }
+    }
+
+    if let Some(parent) = paths.boot_loader_image.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if let Some(parent) = paths.boot_loader_metadata.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let same_target = paths.boot_loader_image.exists()
+        && source_image.canonicalize().ok() == paths.boot_loader_image.canonicalize().ok();
+    if paths.boot_loader_image.exists() && !force && !same_target {
+        return Err(AppError::message(format!(
+            "A registered boot-loader image already exists at {}. Pass --force to replace it.",
+            paths.boot_loader_image.display()
+        )));
+    }
+
+    if !same_target {
+        let temp_image = paths.boot_loader_image.with_extension("paneimg.tmp");
+        if temp_image.exists() {
+            fs::remove_file(&temp_image)?;
+        }
+        fs::copy(source_image, &temp_image)?;
+        if paths.boot_loader_image.exists() {
+            fs::remove_file(&paths.boot_loader_image)?;
+        }
+        fs::rename(&temp_image, &paths.boot_loader_image)?;
+    }
+
+    let bytes = fs::metadata(&paths.boot_loader_image)?.len();
+    let metadata = BootLoaderImageMetadata {
+        schema_version: 1,
+        image_kind: "pane-boot-to-serial-loader-image".to_string(),
+        source_path: source_image
+            .canonicalize()
+            .unwrap_or_else(|_| source_image.to_path_buf())
+            .display()
+            .to_string(),
+        stored_path: paths.boot_loader_image.display().to_string(),
+        bytes,
+        sha256: actual_sha256,
+        expected_sha256,
+        verified,
+        expected_serial_text: expected_serial_text.to_string(),
+        guest_entry_gpa: "0x1000".to_string(),
+        registered_at_epoch_seconds: current_epoch_seconds(),
+        notes: vec![
+            "This is a controlled boot-to-serial candidate for the Pane WHP runner, not a complete Arch boot claim."
+                .to_string(),
+            "Pane requires SHA-256 verification and an explicit serial-output contract before executing this artifact."
+                .to_string(),
+        ],
+    };
+    write_json_file(&paths.boot_loader_metadata, &metadata)
+}
+
+fn load_boot_loader_image_artifact(
+    paths: &RuntimePaths,
+) -> AppResult<crate::native::NativeSerialBootImage> {
+    let metadata = read_json_file::<BootLoaderImageMetadata>(&paths.boot_loader_metadata)?;
+    let bytes = fs::read(&paths.boot_loader_image)?;
+    let actual_sha256 = sha256_bytes(&bytes);
+    if metadata.schema_version != 1
+        || metadata.image_kind != "pane-boot-to-serial-loader-image"
+        || metadata.bytes != bytes.len() as u64
+        || metadata.sha256 != actual_sha256
+        || !metadata.verified
+        || metadata.expected_serial_text.is_empty()
+        || metadata.guest_entry_gpa != "0x1000"
+    {
+        return Err(AppError::message(format!(
+            "Pane boot-loader metadata does not match the artifact at {}. Re-register it with `pane runtime --register-boot-loader <path> --boot-loader-expected-sha256 <sha256> --force`.",
+            paths.boot_loader_image.display()
+        )));
+    }
+
+    Ok(crate::native::NativeSerialBootImage {
+        source_label: "pane-runtime-boot-to-serial-loader".to_string(),
+        path: Some(paths.boot_loader_image.display().to_string()),
+        bytes,
+        expected_serial_text: metadata.expected_serial_text,
+        guest_entry_gpa: 0x1000,
+    })
+}
+
+fn register_kernel_boot_plan(
+    paths: &RuntimePaths,
+    kernel_source: Option<&Path>,
+    kernel_expected_sha256: Option<&str>,
+    initramfs_source: Option<&Path>,
+    initramfs_expected_sha256: Option<&str>,
+    cmdline: Option<&str>,
+    force: bool,
+) -> AppResult<()> {
+    if kernel_expected_sha256.is_some() && kernel_source.is_none() {
+        return Err(AppError::message(
+            "--kernel-expected-sha256 requires --register-kernel.",
+        ));
+    }
+    if initramfs_expected_sha256.is_some() && initramfs_source.is_none() {
+        return Err(AppError::message(
+            "--initramfs-expected-sha256 requires --register-initramfs.",
+        ));
+    }
+
+    let previous = read_json_file::<KernelBootMetadata>(&paths.kernel_boot_metadata).ok();
+    if kernel_source.is_none() && previous.is_none() {
+        return Err(AppError::message(
+            "--kernel-cmdline or --register-initramfs requires an existing kernel boot plan or --register-kernel.",
+        ));
+    }
+
+    let kernel_record = if let Some(source) = kernel_source {
+        Some(copy_verified_runtime_artifact(
+            source,
+            &paths.kernel_image,
+            kernel_expected_sha256,
+            "Kernel",
+            force,
+        )?)
+    } else {
+        previous.as_ref().map(|metadata| ArtifactRegistration {
+            source_path: metadata.kernel_source_path.clone(),
+            stored_path: metadata.kernel_stored_path.clone(),
+            bytes: metadata.kernel_bytes,
+            sha256: metadata.kernel_sha256.clone(),
+            expected_sha256: metadata.kernel_expected_sha256.clone(),
+            verified: metadata.kernel_verified,
+        })
+    }
+    .ok_or_else(|| AppError::message("Kernel boot plan is missing a kernel artifact."))?;
+
+    let initramfs_record = if let Some(source) = initramfs_source {
+        Some(copy_verified_runtime_artifact(
+            source,
+            &paths.initramfs_image,
+            initramfs_expected_sha256,
+            "Initramfs",
+            force,
+        )?)
+    } else {
+        previous.as_ref().and_then(|metadata| {
+            metadata
+                .initramfs_stored_path
+                .as_ref()
+                .map(|stored_path| ArtifactRegistration {
+                    source_path: metadata.initramfs_source_path.clone().unwrap_or_default(),
+                    stored_path: stored_path.clone(),
+                    bytes: metadata.initramfs_bytes.unwrap_or_default(),
+                    sha256: metadata.initramfs_sha256.clone().unwrap_or_default(),
+                    expected_sha256: metadata.initramfs_expected_sha256.clone(),
+                    verified: metadata.initramfs_verified,
+                })
+        })
+    };
+
+    let cmdline = cmdline
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| previous.as_ref().map(|metadata| metadata.cmdline.clone()))
+        .unwrap_or_else(|| "console=ttyS0 earlyprintk=serial panic=-1".to_string());
+    validate_kernel_cmdline(&cmdline)?;
+
+    let metadata = KernelBootMetadata {
+        schema_version: 1,
+        image_kind: "pane-linux-kernel-boot-plan-v1".to_string(),
+        kernel_source_path: kernel_record.source_path,
+        kernel_stored_path: kernel_record.stored_path,
+        kernel_bytes: kernel_record.bytes,
+        kernel_sha256: kernel_record.sha256,
+        kernel_expected_sha256: kernel_record.expected_sha256,
+        kernel_verified: kernel_record.verified,
+        initramfs_source_path: initramfs_record
+            .as_ref()
+            .map(|record| record.source_path.clone()),
+        initramfs_stored_path: initramfs_record
+            .as_ref()
+            .map(|record| record.stored_path.clone()),
+        initramfs_bytes: initramfs_record.as_ref().map(|record| record.bytes),
+        initramfs_sha256: initramfs_record
+            .as_ref()
+            .map(|record| record.sha256.clone()),
+        initramfs_expected_sha256: initramfs_record
+            .as_ref()
+            .and_then(|record| record.expected_sha256.clone()),
+        initramfs_verified: initramfs_record
+            .as_ref()
+            .map(|record| record.verified)
+            .unwrap_or(false),
+        cmdline,
+        expected_serial_device: "ttyS0".to_string(),
+        kernel_load_gpa: "0x00100000".to_string(),
+        initramfs_load_gpa: initramfs_record
+            .as_ref()
+            .map(|_| "0x04000000".to_string()),
+        registered_at_epoch_seconds: current_epoch_seconds(),
+        notes: vec![
+            "This is Pane's first native kernel/initramfs boot-plan contract; it is not yet executed by WHP."
+                .to_string(),
+            "The command line must keep serial console output enabled so the next WHP milestone can prove boot progress without a GUI."
+                .to_string(),
+        ],
+    };
+
+    write_json_file(&paths.kernel_boot_metadata, &metadata)
+}
+
+fn build_kernel_boot_layout(
+    paths: &RuntimePaths,
+    session_name: &str,
+    materialize: bool,
+) -> AppResult<KernelBootLayout> {
+    let metadata = read_json_file::<KernelBootMetadata>(&paths.kernel_boot_metadata)?;
+    if metadata.schema_version != 1 || metadata.image_kind != "pane-linux-kernel-boot-plan-v1" {
+        return Err(AppError::message(
+            "Kernel boot metadata is not a Pane kernel boot-plan v1 document.",
+        ));
+    }
+    if !metadata.kernel_verified {
+        return Err(AppError::message(
+            "Kernel artifact is not hash-verified. Re-register it with --kernel-expected-sha256.",
+        ));
+    }
+    validate_kernel_cmdline(&metadata.cmdline)?;
+    if metadata.expected_serial_device != "ttyS0" {
+        return Err(AppError::message(
+            "Kernel boot plan must target ttyS0 as Pane's observable serial console.",
+        ));
+    }
+    if metadata.kernel_stored_path != paths.kernel_image.display().to_string() {
+        return Err(AppError::message(format!(
+            "Kernel boot metadata points at {}, but this runtime expects {}.",
+            metadata.kernel_stored_path,
+            paths.kernel_image.display()
+        )));
+    }
+    if metadata.kernel_bytes != fs::metadata(&paths.kernel_image)?.len()
+        || metadata.kernel_sha256 != sha256_file(&paths.kernel_image)?
+    {
+        return Err(AppError::message(
+            "Kernel artifact no longer matches its boot metadata. Re-register the kernel.",
+        ));
+    }
+
+    if let Some(initramfs_path) = metadata.initramfs_stored_path.as_deref() {
+        if initramfs_path != paths.initramfs_image.display().to_string() {
+            return Err(AppError::message(format!(
+                "Initramfs boot metadata points at {initramfs_path}, but this runtime expects {}.",
+                paths.initramfs_image.display()
+            )));
+        }
+        if !metadata.initramfs_verified {
+            return Err(AppError::message(
+                "Initramfs artifact is not hash-verified. Re-register it with --initramfs-expected-sha256.",
+            ));
+        }
+        if metadata.initramfs_bytes != fs::metadata(&paths.initramfs_image).ok().map(|m| m.len())
+            || metadata.initramfs_sha256.as_deref()
+                != Some(sha256_file(&paths.initramfs_image)?.as_str())
+        {
+            return Err(AppError::message(
+                "Initramfs artifact no longer matches its boot metadata. Re-register the initramfs.",
+            ));
+        }
+    }
+
+    let layout = KernelBootLayout {
+        schema_version: 1,
+        layout_kind: "pane-linux-kernel-boot-layout-v1".to_string(),
+        session_name: session_name.to_string(),
+        boot_params_gpa: "0x00007000".to_string(),
+        cmdline_gpa: "0x00020000".to_string(),
+        kernel_load_gpa: metadata.kernel_load_gpa,
+        initramfs_load_gpa: metadata.initramfs_load_gpa,
+        kernel_path: metadata.kernel_stored_path,
+        kernel_bytes: metadata.kernel_bytes,
+        kernel_sha256: metadata.kernel_sha256,
+        initramfs_path: metadata.initramfs_stored_path,
+        initramfs_bytes: metadata.initramfs_bytes,
+        initramfs_sha256: metadata.initramfs_sha256,
+        cmdline: metadata.cmdline,
+        expected_serial_device: metadata.expected_serial_device,
+        materialized_at_epoch_seconds: materialize.then(current_epoch_seconds),
+        notes: vec![
+            "This layout is Pane's deterministic handoff from artifact registration to the WHP Linux boot-protocol runner."
+                .to_string(),
+            "The next native milestone must map these guest physical addresses and prove serial boot output before GUI/display work."
+                .to_string(),
+        ],
+    };
+
+    if materialize {
+        write_json_file(&paths.kernel_boot_layout, &layout)?;
+    }
+
+    Ok(layout)
+}
+
+struct ArtifactRegistration {
+    source_path: String,
+    stored_path: String,
+    bytes: u64,
+    sha256: String,
+    expected_sha256: Option<String>,
+    verified: bool,
+}
+
+fn copy_verified_runtime_artifact(
+    source: &Path,
+    destination: &Path,
+    expected_sha256: Option<&str>,
+    label: &str,
+    force: bool,
+) -> AppResult<ArtifactRegistration> {
+    if !source.is_file() {
+        return Err(AppError::message(format!(
+            "{label} source does not exist or is not a file: {}",
+            source.display()
+        )));
+    }
+
+    let expected_sha256 = expected_sha256.map(normalize_sha256_hex).transpose()?;
+    let actual_sha256 = sha256_file(source)?;
+    let verified = expected_sha256
+        .as_deref()
+        .map(|expected| expected == actual_sha256)
+        .unwrap_or(false);
+    if let Some(expected) = expected_sha256.as_deref() {
+        if expected != actual_sha256 {
+            return Err(AppError::message(format!(
+                "{label} SHA-256 mismatch. expected {expected}, got {actual_sha256}."
+            )));
+        }
+    }
+
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let same_target =
+        destination.exists() && source.canonicalize().ok() == destination.canonicalize().ok();
+    if destination.exists() && !force && !same_target {
+        return Err(AppError::message(format!(
+            "A registered {label} artifact already exists at {}. Pass --force to replace it.",
+            destination.display()
+        )));
+    }
+
+    if !same_target {
+        let temp_image = destination.with_extension("tmp");
+        if temp_image.exists() {
+            fs::remove_file(&temp_image)?;
+        }
+        fs::copy(source, &temp_image)?;
+        if destination.exists() {
+            fs::remove_file(destination)?;
+        }
+        fs::rename(&temp_image, destination)?;
+    }
+
+    Ok(ArtifactRegistration {
+        source_path: source
+            .canonicalize()
+            .unwrap_or_else(|_| source.to_path_buf())
+            .display()
+            .to_string(),
+        stored_path: destination.display().to_string(),
+        bytes: fs::metadata(destination)?.len(),
+        sha256: actual_sha256,
+        expected_sha256,
+        verified,
+    })
+}
+
+fn validate_kernel_cmdline(value: &str) -> AppResult<()> {
+    if value.len() > 2048 {
+        return Err(AppError::message(
+            "Kernel command line must be 2048 bytes or less.",
+        ));
+    }
+    if value
+        .chars()
+        .any(|ch| ch == '\0' || ch == '\n' || ch == '\r')
+    {
+        return Err(AppError::message(
+            "Kernel command line must be a single line with no NUL, CR, or LF characters.",
+        ));
+    }
+    if !value.contains("console=ttyS0") {
+        return Err(AppError::message(
+            "Kernel command line must include `console=ttyS0` so Pane can observe serial boot progress.",
+        ));
+    }
+    Ok(())
+}
+
+fn decode_serial_text(value: &str) -> AppResult<String> {
+    let mut decoded = String::new();
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            decoded.push(ch);
+            continue;
+        }
+
+        let Some(escaped) = chars.next() else {
+            return Err(AppError::message(
+                "Serial text escape sequence cannot end with a trailing backslash.",
+            ));
+        };
+        match escaped {
+            'n' => decoded.push('\n'),
+            'r' => decoded.push('\r'),
+            't' => decoded.push('\t'),
+            '0' => decoded.push('\0'),
+            '\\' => decoded.push('\\'),
+            other => {
+                return Err(AppError::message(format!(
+                    "Unsupported serial text escape sequence: \\{other}. Supported escapes are \\n, \\r, \\t, \\0, and \\\\."
+                )));
+            }
+        }
+    }
+    Ok(decoded)
 }
 
 fn write_json_file<T: Serialize>(path: &Path, value: &T) -> AppResult<()> {
@@ -2913,6 +3686,10 @@ fn write_runtime_config(
         "target_engine": "pane-owned-os-runtime",
         "base_os_image": paths.base_os_image.display().to_string(),
         "serial_boot_image": paths.serial_boot_image.display().to_string(),
+        "boot_loader_image": paths.boot_loader_image.display().to_string(),
+        "kernel_image": paths.kernel_image.display().to_string(),
+        "initramfs_image": paths.initramfs_image.display().to_string(),
+        "kernel_boot_layout": paths.kernel_boot_layout.display().to_string(),
         "user_disk": paths.user_disk.display().to_string(),
         "policy": {
             "pane_shared_is_user_file_exchange": true,
@@ -2948,12 +3725,21 @@ fn write_native_runtime_manifest(paths: &RuntimePaths, session_name: &str) -> Ap
             "base_os_metadata": paths.base_os_metadata.display().to_string(),
             "serial_boot_image": paths.serial_boot_image.display().to_string(),
             "serial_boot_metadata": paths.serial_boot_metadata.display().to_string(),
+            "boot_loader_image": paths.boot_loader_image.display().to_string(),
+            "boot_loader_metadata": paths.boot_loader_metadata.display().to_string(),
+            "kernel_image": paths.kernel_image.display().to_string(),
+            "initramfs_image": paths.initramfs_image.display().to_string(),
+            "kernel_boot_metadata": paths.kernel_boot_metadata.display().to_string(),
+            "kernel_boot_layout": paths.kernel_boot_layout.display().to_string(),
             "user_disk": paths.user_disk.display().to_string(),
             "user_disk_metadata": paths.user_disk_metadata.display().to_string()
         },
         "blockers": [
             "verified base OS image must exist before native boot",
             "runtime-backed serial boot image must exist before the WHP boot-to-serial spike",
+            "verified boot-to-serial loader must exist before runtime-provided boot-candidate execution",
+            "verified kernel boot plan must exist before WHP kernel-entry execution",
+            "kernel boot layout must be materialized before WHP kernel-entry execution",
             "Pane user disk descriptor must exist before native boot",
             "Windows Hypervisor Platform host preflight must pass before the boot spike",
             "Pane-owned WHP boot engine is not implemented",
@@ -2997,6 +3783,96 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
         })
         .unwrap_or(false);
 
+    let boot_loader_metadata =
+        read_json_file::<BootLoaderImageMetadata>(&paths.boot_loader_metadata).ok();
+    let boot_loader_image_bytes = fs::metadata(&paths.boot_loader_image)
+        .ok()
+        .map(|metadata| metadata.len());
+    let boot_loader_actual_sha256 = sha256_file(&paths.boot_loader_image).ok();
+    let boot_loader_image_verified = boot_loader_metadata
+        .as_ref()
+        .zip(boot_loader_image_bytes)
+        .map(|(metadata, bytes)| {
+            metadata.schema_version == 1
+                && metadata.image_kind == "pane-boot-to-serial-loader-image"
+                && metadata.verified
+                && metadata.bytes == bytes
+                && bytes <= crate::native::SERIAL_BOOT_TEST_IMAGE_SIZE as u64
+                && Some(metadata.sha256.as_str()) == boot_loader_actual_sha256.as_deref()
+                && !metadata.expected_serial_text.is_empty()
+                && metadata.guest_entry_gpa == "0x1000"
+        })
+        .unwrap_or(false);
+
+    let kernel_boot_metadata =
+        read_json_file::<KernelBootMetadata>(&paths.kernel_boot_metadata).ok();
+    let kernel_image_bytes = fs::metadata(&paths.kernel_image)
+        .ok()
+        .map(|metadata| metadata.len());
+    let kernel_actual_sha256 = sha256_file(&paths.kernel_image).ok();
+    let initramfs_image_bytes = fs::metadata(&paths.initramfs_image)
+        .ok()
+        .map(|metadata| metadata.len());
+    let initramfs_actual_sha256 = sha256_file(&paths.initramfs_image).ok();
+    let kernel_image_verified = kernel_boot_metadata
+        .as_ref()
+        .zip(kernel_image_bytes)
+        .map(|(metadata, bytes)| {
+            metadata.schema_version == 1
+                && metadata.image_kind == "pane-linux-kernel-boot-plan-v1"
+                && metadata.kernel_verified
+                && metadata.kernel_bytes == bytes
+                && Some(metadata.kernel_sha256.as_str()) == kernel_actual_sha256.as_deref()
+                && metadata.kernel_stored_path == paths.kernel_image.display().to_string()
+        })
+        .unwrap_or(false);
+    let initramfs_image_verified = kernel_boot_metadata
+        .as_ref()
+        .map(|metadata| {
+            if metadata.initramfs_stored_path.is_none() {
+                true
+            } else {
+                metadata.initramfs_verified
+                    && metadata.initramfs_bytes == initramfs_image_bytes
+                    && metadata.initramfs_sha256.as_deref() == initramfs_actual_sha256.as_deref()
+                    && metadata.initramfs_stored_path.as_deref()
+                        == Some(paths.initramfs_image.display().to_string().as_str())
+            }
+        })
+        .unwrap_or(false);
+    let kernel_boot_plan_ready = kernel_boot_metadata
+        .as_ref()
+        .map(|metadata| {
+            kernel_image_verified
+                && initramfs_image_verified
+                && metadata.cmdline.contains("console=ttyS0")
+                && metadata.kernel_load_gpa == "0x00100000"
+        })
+        .unwrap_or(false);
+    let kernel_boot_layout = read_json_file::<KernelBootLayout>(&paths.kernel_boot_layout).ok();
+    let kernel_boot_layout_ready = kernel_boot_layout
+        .as_ref()
+        .zip(kernel_boot_metadata.as_ref())
+        .map(|(layout, metadata)| {
+            kernel_boot_plan_ready
+                && layout.schema_version == 1
+                && layout.layout_kind == "pane-linux-kernel-boot-layout-v1"
+                && layout.boot_params_gpa == "0x00007000"
+                && layout.cmdline_gpa == "0x00020000"
+                && layout.kernel_load_gpa == metadata.kernel_load_gpa
+                && layout.initramfs_load_gpa == metadata.initramfs_load_gpa
+                && layout.kernel_path == paths.kernel_image.display().to_string()
+                && layout.kernel_bytes == metadata.kernel_bytes
+                && layout.kernel_sha256 == metadata.kernel_sha256
+                && layout.initramfs_path == metadata.initramfs_stored_path
+                && layout.initramfs_bytes == metadata.initramfs_bytes
+                && layout.initramfs_sha256 == metadata.initramfs_sha256
+                && layout.cmdline == metadata.cmdline
+                && layout.cmdline.contains("console=ttyS0")
+                && layout.expected_serial_device == "ttyS0"
+        })
+        .unwrap_or(false);
+
     let user_disk_metadata = read_json_file::<UserDiskMetadata>(&paths.user_disk_metadata).ok();
     let user_disk_ready = user_disk_metadata
         .as_ref()
@@ -3026,6 +3902,35 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
             .as_ref()
             .map(|metadata| metadata.serial_banner.clone()),
         serial_boot_metadata_exists: paths.serial_boot_metadata.is_file(),
+        boot_loader_image_exists: paths.boot_loader_image.is_file(),
+        boot_loader_image_bytes,
+        boot_loader_image_sha256: boot_loader_metadata
+            .as_ref()
+            .map(|metadata| metadata.sha256.clone()),
+        boot_loader_image_verified,
+        boot_loader_expected_serial: boot_loader_metadata
+            .as_ref()
+            .map(|metadata| metadata.expected_serial_text.clone()),
+        boot_loader_metadata_exists: paths.boot_loader_metadata.is_file(),
+        kernel_image_exists: paths.kernel_image.is_file(),
+        kernel_image_bytes,
+        kernel_image_sha256: kernel_boot_metadata
+            .as_ref()
+            .map(|metadata| metadata.kernel_sha256.clone()),
+        kernel_image_verified,
+        initramfs_image_exists: paths.initramfs_image.is_file(),
+        initramfs_image_bytes,
+        initramfs_image_sha256: kernel_boot_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.initramfs_sha256.clone()),
+        initramfs_image_verified,
+        kernel_cmdline: kernel_boot_metadata
+            .as_ref()
+            .map(|metadata| metadata.cmdline.clone()),
+        kernel_boot_plan_ready,
+        kernel_boot_metadata_exists: paths.kernel_boot_metadata.is_file(),
+        kernel_boot_layout_exists: paths.kernel_boot_layout.is_file(),
+        kernel_boot_layout_ready,
         user_disk_exists: paths.user_disk.is_file(),
         user_disk_capacity_gib: user_disk_metadata
             .as_ref()
@@ -5511,12 +6416,24 @@ fn print_runtime_report(report: &RuntimeReport) {
     println!("  Logs           {}", report.directories.logs);
     println!("  Base OS Image  {}", report.directories.base_os_image);
     println!("  Serial Boot    {}", report.directories.serial_boot_image);
+    println!("  Boot Loader    {}", report.directories.boot_loader_image);
+    println!("  Kernel Image   {}", report.directories.kernel_image);
+    println!("  Initramfs      {}", report.directories.initramfs_image);
     println!("  User Disk      {}", report.directories.user_disk);
     println!("  Base Metadata  {}", report.directories.base_os_metadata);
     println!(
         "  Serial Metadata {}",
         report.directories.serial_boot_metadata
     );
+    println!(
+        "  Loader Metadata {}",
+        report.directories.boot_loader_metadata
+    );
+    println!(
+        "  Kernel Metadata {}",
+        report.directories.kernel_boot_metadata
+    );
+    println!("  Kernel Layout {}", report.directories.kernel_boot_layout);
     println!("  Disk Metadata  {}", report.directories.user_disk_metadata);
     println!("  Runtime Config {}", report.directories.runtime_config);
     println!("  Native Manifest {}", report.directories.native_manifest);
@@ -5552,6 +6469,62 @@ fn print_runtime_report(report: &RuntimeReport) {
     }
     if let Some(bytes) = report.artifacts.serial_boot_image_bytes {
         println!("  Serial Bytes   {}", bytes);
+    }
+    println!(
+        "  Boot Loader    {}",
+        yes_no(report.artifacts.boot_loader_image_exists)
+    );
+    println!(
+        "  Loader Verified {}",
+        yes_no(report.artifacts.boot_loader_image_verified)
+    );
+    if let Some(sha256) = &report.artifacts.boot_loader_image_sha256 {
+        println!("  Loader SHA-256 {}", sha256);
+    }
+    if let Some(expected) = &report.artifacts.boot_loader_expected_serial {
+        println!("  Loader Serial  {:?}", expected);
+    }
+    if let Some(bytes) = report.artifacts.boot_loader_image_bytes {
+        println!("  Loader Bytes   {}", bytes);
+    }
+    println!(
+        "  Kernel Image   {}",
+        yes_no(report.artifacts.kernel_image_exists)
+    );
+    println!(
+        "  Kernel Verified {}",
+        yes_no(report.artifacts.kernel_image_verified)
+    );
+    if let Some(sha256) = &report.artifacts.kernel_image_sha256 {
+        println!("  Kernel SHA-256 {}", sha256);
+    }
+    if let Some(bytes) = report.artifacts.kernel_image_bytes {
+        println!("  Kernel Bytes   {}", bytes);
+    }
+    println!(
+        "  Initramfs      {}",
+        yes_no(report.artifacts.initramfs_image_exists)
+    );
+    println!(
+        "  Initramfs Verified {}",
+        yes_no(report.artifacts.initramfs_image_verified)
+    );
+    if let Some(sha256) = &report.artifacts.initramfs_image_sha256 {
+        println!("  Initramfs SHA-256 {}", sha256);
+    }
+    if let Some(bytes) = report.artifacts.initramfs_image_bytes {
+        println!("  Initramfs Bytes {}", bytes);
+    }
+    println!(
+        "  Kernel Plan    {}",
+        yes_no(report.artifacts.kernel_boot_plan_ready)
+    );
+    println!(
+        "  Kernel Layout  {}",
+        yes_no(report.artifacts.kernel_boot_layout_ready)
+    );
+    if let Some(cmdline) = &report.artifacts.kernel_cmdline {
+        println!("  Kernel Cmdline {:?}", cmdline);
     }
     println!(
         "  User Disk      {}",
@@ -5708,9 +6681,62 @@ fn print_native_preflight_report(report: &NativePreflightReport) {
         yes_no(report.runtime.artifacts.user_disk_ready)
     );
     println!(
+        "  Kernel Plan    {}",
+        yes_no(report.runtime.artifacts.kernel_boot_plan_ready)
+    );
+    println!(
+        "  Kernel Layout  {}",
+        yes_no(report.runtime.artifacts.kernel_boot_layout_ready)
+    );
+    println!(
         "  Boot Spike     {}",
         yes_no(report.runtime.native_runtime.ready_for_boot_spike)
     );
+    if !report.blockers.is_empty() {
+        println!("Blockers");
+        for blocker in &report.blockers {
+            println!("  - {}", blocker);
+        }
+    }
+    println!("Next Steps");
+    for step in &report.next_steps {
+        println!("  - {}", step);
+    }
+}
+
+fn print_native_kernel_plan_report(report: &NativeKernelPlanReport) {
+    println!("Pane Native Kernel Plan");
+    println!("  Session        {}", report.session_name);
+    println!("  Materialize    {}", yes_no(report.materialize_requested));
+    println!(
+        "  Ready          {}",
+        yes_no(report.ready_for_kernel_entry_spike)
+    );
+    println!("Runtime");
+    println!("  Prepared       {}", yes_no(report.runtime.prepared));
+    println!(
+        "  Kernel Plan    {}",
+        yes_no(report.runtime.artifacts.kernel_boot_plan_ready)
+    );
+    println!(
+        "  Kernel Layout  {}",
+        yes_no(report.runtime.artifacts.kernel_boot_layout_ready)
+    );
+    if let Some(layout) = &report.layout {
+        println!("Layout");
+        println!("  Kernel         {}", layout.kernel_path);
+        println!("  Kernel GPA     {}", layout.kernel_load_gpa);
+        println!("  Boot Params    {}", layout.boot_params_gpa);
+        println!("  Cmdline GPA    {}", layout.cmdline_gpa);
+        if let Some(initramfs_path) = &layout.initramfs_path {
+            println!("  Initramfs      {}", initramfs_path);
+        }
+        if let Some(initramfs_gpa) = &layout.initramfs_load_gpa {
+            println!("  Initramfs GPA  {}", initramfs_gpa);
+        }
+        println!("  Serial Device  {}", layout.expected_serial_device);
+        println!("  Cmdline        {:?}", layout.cmdline);
+    }
     if !report.blockers.is_empty() {
         println!("Blockers");
         for blocker in &report.blockers {
@@ -5728,6 +6754,7 @@ fn print_native_boot_spike_report(report: &NativeBootSpikeReport) {
     println!("  Session        {}", report.session_name);
     println!("  Execute        {}", yes_no(report.execute_requested));
     println!("  Fixture        {}", yes_no(report.fixture_requested));
+    println!("  Boot Loader    {}", yes_no(report.boot_loader_requested));
     println!(
         "  Serial Ready   {}",
         yes_no(report.ready_for_serial_kernel_spike)
@@ -5751,6 +6778,10 @@ fn print_native_boot_spike_report(report: &NativeBootSpikeReport) {
     println!(
         "  User Disk Ready {}",
         yes_no(report.runtime.artifacts.user_disk_ready)
+    );
+    println!(
+        "  Loader Verified {}",
+        yes_no(report.runtime.artifacts.boot_loader_image_verified)
     );
     println!("Boot Spike");
     println!("  Status         {}", report.partition_smoke.status_label);
@@ -6354,11 +7385,12 @@ mod tests {
 
     use super::{
         build_bundle_doctor_request, build_distro_health, build_environment_catalog_report,
-        build_native_runtime_report, build_runtime_artifact_report, build_steps,
-        build_update_steps, create_serial_boot_image_artifact, create_user_disk_descriptor,
-        determine_app_lifecycle, ensure_wsl_conf_setting, format_doctor_blockers,
-        initialize_managed_arch_environment, inspect_workspace, inventory_contains_distro,
-        preferred_transport, register_base_os_image, resolve_bundle_output_path,
+        build_kernel_boot_layout, build_native_runtime_report, build_runtime_artifact_report,
+        build_steps, build_update_steps, create_serial_boot_image_artifact,
+        create_user_disk_descriptor, determine_app_lifecycle, ensure_wsl_conf_setting,
+        format_doctor_blockers, initialize_managed_arch_environment, inspect_workspace,
+        inventory_contains_distro, preferred_transport, register_base_os_image,
+        register_boot_loader_image, register_kernel_boot_plan, resolve_bundle_output_path,
         resolve_init_source, resolve_launch_target, resolve_managed_environment_for_reset,
         resolve_saved_launch, resolve_session_context, resolve_status_distro,
         runtime_storage_budget, sha256_file, status_port_for, validate_setup_password,
@@ -6398,9 +7430,15 @@ mod tests {
         RuntimePaths {
             base_os_image: images.join("arch-base.paneimg"),
             serial_boot_image: engines.join("serial-boot.paneimg"),
+            boot_loader_image: engines.join("boot-to-serial-loader.paneimg"),
+            kernel_image: engines.join("linux-kernel.paneimg"),
+            initramfs_image: engines.join("initramfs.paneinitrd"),
             user_disk: disks.join("user-data.panedisk"),
             base_os_metadata: state.join("base-os-image.json"),
             serial_boot_metadata: state.join("serial-boot-image.json"),
+            boot_loader_metadata: state.join("boot-to-serial-loader.json"),
+            kernel_boot_metadata: state.join("kernel-boot.json"),
+            kernel_boot_layout: state.join("kernel-boot-layout.json"),
             user_disk_metadata: state.join("user-disk.json"),
             runtime_config: root.join("pane-runtime.config.json"),
             native_manifest: root.join("pane-native-runtime.json"),
@@ -6556,6 +7594,186 @@ mod tests {
             std::fs::read(&paths.serial_boot_image).unwrap(),
             crate::native::serial_boot_test_image_bytes()
         );
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn registers_verified_boot_to_serial_loader_candidate() {
+        let paths = temp_runtime_paths("boot-loader-image");
+        super::prepare_runtime_paths(&paths).unwrap();
+        let source = paths.downloads.join("loader.img");
+        std::fs::write(&source, crate::native::serial_boot_test_image_bytes()).unwrap();
+        let expected = sha256_file(&source).unwrap();
+
+        register_boot_loader_image(
+            &paths,
+            &source,
+            Some(&expected),
+            crate::native::SERIAL_BOOT_BANNER_TEXT,
+            false,
+        )
+        .unwrap();
+
+        let artifacts = build_runtime_artifact_report(&paths);
+        assert!(artifacts.boot_loader_image_exists);
+        assert!(artifacts.boot_loader_metadata_exists);
+        assert!(artifacts.boot_loader_image_verified);
+        assert_eq!(
+            artifacts.boot_loader_expected_serial.as_deref(),
+            Some(crate::native::SERIAL_BOOT_BANNER_TEXT)
+        );
+        assert_eq!(
+            std::fs::read(&paths.boot_loader_image).unwrap(),
+            crate::native::serial_boot_test_image_bytes()
+        );
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn unverified_boot_to_serial_loader_is_not_ready() {
+        let paths = temp_runtime_paths("unverified-boot-loader-image");
+        super::prepare_runtime_paths(&paths).unwrap();
+        let source = paths.downloads.join("loader.img");
+        std::fs::write(&source, crate::native::serial_boot_test_image_bytes()).unwrap();
+
+        register_boot_loader_image(
+            &paths,
+            &source,
+            None,
+            crate::native::SERIAL_BOOT_BANNER_TEXT,
+            false,
+        )
+        .unwrap();
+
+        let artifacts = build_runtime_artifact_report(&paths);
+        assert!(artifacts.boot_loader_image_exists);
+        assert!(!artifacts.boot_loader_image_verified);
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn registers_verified_kernel_boot_plan() {
+        let paths = temp_runtime_paths("kernel-boot-plan");
+        super::prepare_runtime_paths(&paths).unwrap();
+        let kernel = paths.downloads.join("vmlinuz-linux");
+        let initramfs = paths.downloads.join("initramfs-linux.img");
+        std::fs::write(&kernel, b"pane kernel").unwrap();
+        std::fs::write(&initramfs, b"pane initramfs").unwrap();
+        let kernel_sha = sha256_file(&kernel).unwrap();
+        let initramfs_sha = sha256_file(&initramfs).unwrap();
+
+        register_kernel_boot_plan(
+            &paths,
+            Some(&kernel),
+            Some(&kernel_sha),
+            Some(&initramfs),
+            Some(&initramfs_sha),
+            Some("console=ttyS0 root=/dev/pane0 rw"),
+            false,
+        )
+        .unwrap();
+
+        let artifacts = build_runtime_artifact_report(&paths);
+        assert!(artifacts.kernel_image_exists);
+        assert!(artifacts.kernel_image_verified);
+        assert!(artifacts.initramfs_image_exists);
+        assert!(artifacts.initramfs_image_verified);
+        assert!(artifacts.kernel_boot_plan_ready);
+        assert_eq!(
+            artifacts.kernel_cmdline.as_deref(),
+            Some("console=ttyS0 root=/dev/pane0 rw")
+        );
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn kernel_boot_plan_requires_serial_console() {
+        let paths = temp_runtime_paths("kernel-boot-plan-no-serial");
+        super::prepare_runtime_paths(&paths).unwrap();
+        let kernel = paths.downloads.join("vmlinuz-linux");
+        std::fs::write(&kernel, b"pane kernel").unwrap();
+        let kernel_sha = sha256_file(&kernel).unwrap();
+
+        let error = register_kernel_boot_plan(
+            &paths,
+            Some(&kernel),
+            Some(&kernel_sha),
+            None,
+            None,
+            Some("root=/dev/pane0 rw"),
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("console=ttyS0"));
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn materializes_kernel_boot_layout() {
+        let paths = temp_runtime_paths("kernel-boot-layout");
+        super::prepare_runtime_paths(&paths).unwrap();
+        let kernel = paths.downloads.join("vmlinuz-linux");
+        let initramfs = paths.downloads.join("initramfs-linux.img");
+        std::fs::write(&kernel, b"pane kernel").unwrap();
+        std::fs::write(&initramfs, b"pane initramfs").unwrap();
+        let kernel_sha = sha256_file(&kernel).unwrap();
+        let initramfs_sha = sha256_file(&initramfs).unwrap();
+
+        register_kernel_boot_plan(
+            &paths,
+            Some(&kernel),
+            Some(&kernel_sha),
+            Some(&initramfs),
+            Some(&initramfs_sha),
+            Some("console=ttyS0 root=/dev/pane0 rw"),
+            false,
+        )
+        .unwrap();
+
+        let layout = build_kernel_boot_layout(&paths, "pane", true).unwrap();
+        assert_eq!(layout.layout_kind, "pane-linux-kernel-boot-layout-v1");
+        assert_eq!(layout.boot_params_gpa, "0x00007000");
+        assert_eq!(layout.cmdline_gpa, "0x00020000");
+        assert_eq!(layout.kernel_load_gpa, "0x00100000");
+        assert_eq!(layout.initramfs_load_gpa.as_deref(), Some("0x04000000"));
+        assert!(layout.materialized_at_epoch_seconds.is_some());
+
+        let artifacts = build_runtime_artifact_report(&paths);
+        assert!(artifacts.kernel_boot_layout_exists);
+        assert!(artifacts.kernel_boot_layout_ready);
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn kernel_boot_layout_requires_verified_plan() {
+        let paths = temp_runtime_paths("kernel-boot-layout-unverified");
+        super::prepare_runtime_paths(&paths).unwrap();
+        let kernel = paths.downloads.join("vmlinuz-linux");
+        std::fs::write(&kernel, b"pane kernel").unwrap();
+
+        register_kernel_boot_plan(
+            &paths,
+            Some(&kernel),
+            None,
+            None,
+            None,
+            Some("console=ttyS0 root=/dev/pane0 rw"),
+            false,
+        )
+        .unwrap();
+
+        let error = build_kernel_boot_layout(&paths, "pane", true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not hash-verified"));
 
         let _ = std::fs::remove_dir_all(&paths.root);
     }

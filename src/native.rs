@@ -21,6 +21,8 @@ pub(crate) struct NativeSerialBootImage {
     pub(crate) source_label: String,
     pub(crate) path: Option<String>,
     pub(crate) bytes: Vec<u8>,
+    pub(crate) expected_serial_text: String,
+    pub(crate) guest_entry_gpa: u64,
 }
 
 pub(crate) fn serial_boot_test_image_bytes() -> Vec<u8> {
@@ -557,10 +559,8 @@ mod windows_whp {
     const WHV_MAP_GPA_RANGE_FLAG_EXECUTE: u32 = 0x0000_0004;
     const WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS: u32 = 0x0000_0002;
     const WHV_RUN_VP_EXIT_REASON_X64_HALT: u32 = 0x0000_0008;
-    const GUEST_FIXTURE_GPA: u64 = 0x1000;
     const GUEST_PAGE_SIZE: usize = SERIAL_BOOT_TEST_IMAGE_SIZE;
     const SERIAL_COM1_PORT: u16 = 0x03f8;
-    const MAX_SERIAL_BOOT_EXITS: usize = SERIAL_BOOT_BANNER_TEXT.len() + 2;
     const VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET: usize = 10;
     const VP_CONTEXT_RIP_OFFSET: usize = 32;
     const IO_CONTEXT_OFFSET: usize = 48;
@@ -709,13 +709,15 @@ mod windows_whp {
             serial_byte: None,
             serial_bytes: Vec::new(),
             serial_text: None,
-            serial_expected_text: run_fixture.then(|| SERIAL_BOOT_BANNER_TEXT.to_string()),
+            serial_expected_text: boot_image
+                .map(|image| image.expected_serial_text.clone())
+                .or_else(|| run_fixture.then(|| SERIAL_BOOT_BANNER_TEXT.to_string())),
             serial_io_exit_count: 0,
             halt_observed: false,
             calls: Vec::new(),
             blocker: None,
             next_step: if run_fixture {
-                "After this passes, replace the synthetic serial test image with a boot-to-serial kernel or loader."
+                "After this passes, replace the controlled boot image with a boot-to-serial kernel or loader."
                     .to_string()
             } else {
                 "After this passes, rerun with `--run-fixture` to execute a deterministic serial test image."
@@ -931,17 +933,20 @@ mod windows_whp {
                         let boot_image_bytes = boot_image
                             .map(|image| image.bytes.as_slice())
                             .unwrap_or_else(|| &[]);
+                        let guest_entry_gpa = boot_image
+                            .map(|image| image.guest_entry_gpa)
+                            .unwrap_or(0x1000);
                         if boot_image_bytes.is_empty() {
                             report.calls.push(NativeWhpCallReport {
                                 name: "SerialBootImage",
                                 hresult: None,
                                 ok: false,
                                 detail:
-                                    "No runtime-backed serial boot image was provided to the WHP runner."
+                                    "No runtime-backed boot image was provided to the WHP runner."
                                         .to_string(),
                             });
                             report.blocker = Some(
-                                "Create the Pane serial boot image with `pane runtime --create-serial-boot-image`."
+                                "Create the Pane serial boot image with `pane runtime --create-serial-boot-image`, or register a loader with `pane runtime --register-boot-loader`."
                                     .to_string(),
                             );
                         } else if boot_image_bytes.len() > GUEST_PAGE_SIZE {
@@ -950,13 +955,15 @@ mod windows_whp {
                                 hresult: None,
                                 ok: false,
                                 detail: format!(
-                                    "Serial boot image is {} bytes; current WHP spike maps one {} byte page.",
+                                    "Boot image is {} bytes; current WHP spike maps one {} byte page.",
                                     boot_image_bytes.len(),
                                     GUEST_PAGE_SIZE
                                 ),
                             });
-                            report.blocker =
-                                Some("Serial boot image is too large for the current one-page WHP boot spike.".to_string());
+                            report.blocker = Some(
+                                "Boot image is too large for the current one-page WHP boot spike."
+                                    .to_string(),
+                            );
                         } else {
                             page.as_mut_slice()[..boot_image_bytes.len()]
                                 .copy_from_slice(boot_image_bytes);
@@ -965,7 +972,7 @@ mod windows_whp {
                                 hresult: None,
                                 ok: true,
                                 detail: format!(
-                                    "Loaded {} bytes from the Pane runtime serial boot image.",
+                                    "Loaded {} bytes from the Pane runtime boot image.",
                                     boot_image_bytes.len()
                                 ),
                             });
@@ -976,7 +983,7 @@ mod windows_whp {
                                 let hresult = map_gpa_range(
                                     partition,
                                     page.as_mut_ptr().cast::<c_void>(),
-                                    GUEST_FIXTURE_GPA,
+                                    guest_entry_gpa,
                                     GUEST_PAGE_SIZE as u64,
                                     WHV_MAP_GPA_RANGE_FLAG_READ
                                         | WHV_MAP_GPA_RANGE_FLAG_WRITE
@@ -987,9 +994,9 @@ mod windows_whp {
                                     "WHvMapGpaRange(serial-test-image)",
                                     hresult,
                                     if report.memory_mapped {
-                                        "Mapped one executable guest page for the serial test image."
+                                        "Mapped one executable guest page for the boot image."
                                     } else {
-                                        "Could not map guest memory for the serial test image."
+                                        "Could not map guest memory for the boot image."
                                     },
                                 ));
                             }
@@ -1017,7 +1024,11 @@ mod windows_whp {
 
             if run_fixture && report.memory_mapped {
                 if let Some(set_virtual_processor_registers) = set_virtual_processor_registers {
-                    let (register_names, register_values) = serial_test_image_registers();
+                    let guest_entry_gpa = boot_image
+                        .map(|image| image.guest_entry_gpa)
+                        .unwrap_or(0x1000);
+                    let (register_names, register_values) =
+                        serial_test_image_registers(guest_entry_gpa);
                     let hresult = set_virtual_processor_registers(
                         partition,
                         0,
@@ -1046,6 +1057,9 @@ mod windows_whp {
                         partition,
                         run_virtual_processor,
                         set_virtual_processor_registers,
+                        boot_image
+                            .map(|image| image.expected_serial_text.as_str())
+                            .unwrap_or(SERIAL_BOOT_BANNER_TEXT),
                         &mut report,
                     );
                 }
@@ -1053,8 +1067,11 @@ mod windows_whp {
 
             if run_fixture && report.memory_mapped {
                 if let Some(unmap_gpa_range) = unmap_gpa_range {
+                    let guest_entry_gpa = boot_image
+                        .map(|image| image.guest_entry_gpa)
+                        .unwrap_or(0x1000);
                     let hresult =
-                        unmap_gpa_range(partition, GUEST_FIXTURE_GPA, GUEST_PAGE_SIZE as u64);
+                        unmap_gpa_range(partition, guest_entry_gpa, GUEST_PAGE_SIZE as u64);
                     report.memory_unmapped = hresult_succeeded(hresult);
                     report.calls.push(hresult_call(
                         "WHvUnmapGpaRange(serial-test-image)",
@@ -1115,8 +1132,12 @@ mod windows_whp {
                     && report.halt_observed
                     && report.exit_reason == Some(WHV_RUN_VP_EXIT_REASON_X64_HALT)
                     && report.serial_port == Some(SERIAL_COM1_PORT)
-                    && report.serial_io_exit_count as usize == SERIAL_BOOT_BANNER_TEXT.len()
-                    && report.serial_text.as_deref() == Some(SERIAL_BOOT_BANNER_TEXT)));
+                    && report
+                        .serial_expected_text
+                        .as_ref()
+                        .map(|expected| report.serial_io_exit_count as usize == expected.len())
+                        .unwrap_or(false)
+                    && report.serial_text == report.serial_expected_text));
 
         report.status = if passed {
             NativePartitionSmokeStatus::Pass
@@ -1218,7 +1239,7 @@ mod windows_whp {
         }
     }
 
-    fn serial_test_image_registers() -> ([u32; 12], [WhvRegisterValue; 12]) {
+    fn serial_test_image_registers(entry_gpa: u64) -> ([u32; 12], [WhvRegisterValue; 12]) {
         let code_segment = WhvX64SegmentRegister {
             base: 0,
             limit: 0xffff,
@@ -1249,11 +1270,9 @@ mod windows_whp {
             WhvRegisterValue { reg64: 0 },
             WhvRegisterValue { reg64: 0 },
             WhvRegisterValue {
-                reg64: GUEST_FIXTURE_GPA + 0x800,
+                reg64: entry_gpa + 0x800,
             },
-            WhvRegisterValue {
-                reg64: GUEST_FIXTURE_GPA,
-            },
+            WhvRegisterValue { reg64: entry_gpa },
             WhvRegisterValue { reg64: 0x0002 },
             WhvRegisterValue {
                 segment: code_segment,
@@ -1278,11 +1297,13 @@ mod windows_whp {
         partition: *mut c_void,
         run_virtual_processor: WhvRunVirtualProcessor,
         set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
+        expected_serial_text: &str,
         report: &mut NativePartitionSmokeReport,
     ) {
-        report.serial_expected_text = Some(SERIAL_BOOT_BANNER_TEXT.to_string());
+        report.serial_expected_text = Some(expected_serial_text.to_string());
+        let max_serial_boot_exits = expected_serial_text.len() + 2;
 
-        for exit_index in 0..MAX_SERIAL_BOOT_EXITS {
+        for exit_index in 0..max_serial_boot_exits {
             let mut exit_context = [0_u8; 1024];
             let hresult = unsafe {
                 run_virtual_processor(
@@ -1320,7 +1341,7 @@ mod windows_whp {
                     let serial_ok = is_write
                         && access_size == 1
                         && port == SERIAL_COM1_PORT
-                        && report.serial_bytes.len() < SERIAL_BOOT_BANNER_TEXT.len();
+                        && report.serial_bytes.len() < expected_serial_text.len();
                     if !serial_ok {
                         break;
                     }
@@ -1352,13 +1373,13 @@ mod windows_whp {
                 DecodedExit::Halt => {
                     report.halt_observed = true;
                     let text = report.serial_text.as_deref().unwrap_or("");
-                    let ok = text == SERIAL_BOOT_BANNER_TEXT;
+                    let ok = text == expected_serial_text;
                     report.calls.push(NativeWhpCallReport {
                         name: "SerialBootBanner",
                         hresult: None,
                         ok,
                         detail: format!(
-                            "Serial test image halted after emitting {text:?}; expected {SERIAL_BOOT_BANNER_TEXT:?}."
+                            "Serial boot image halted after emitting {text:?}; expected {expected_serial_text:?}."
                         ),
                     });
                     break;
@@ -1366,13 +1387,13 @@ mod windows_whp {
                 DecodedExit::Other => break,
             }
 
-            if exit_index + 1 == MAX_SERIAL_BOOT_EXITS {
+            if exit_index + 1 == max_serial_boot_exits {
                 report.calls.push(NativeWhpCallReport {
                     name: "SerialBootExitBudget",
                     hresult: None,
                     ok: false,
                     detail: format!(
-                        "Serial test image exceeded {MAX_SERIAL_BOOT_EXITS} WHP exits without halting."
+                        "Serial boot image exceeded {max_serial_boot_exits} WHP exits without halting."
                     ),
                 });
             }

@@ -211,6 +211,10 @@ try {
     $doctorReconnect = Invoke-PaneCapture -PaneExe $paneExe -Arguments @("doctor", "--json", "--distro", $Distro, "--de", $DesktopEnvironment, "--session-name", $SessionName, "--skip-bootstrap") -OutputPath (Join-Path $artifactRoot "doctor-reconnect.json") | ConvertFrom-Json
     $appStatus = Invoke-PaneCapture -PaneExe $paneExe -Arguments @("app-status", "--json", "--session-name", $SessionName) -OutputPath (Join-Path $artifactRoot "app-status.json") | ConvertFrom-Json
     $runtime = Invoke-PaneCapture -PaneExe $paneExe -Arguments @("runtime", "--json", "--prepare", "--create-user-disk", "--create-serial-boot-image", "--session-name", $SessionName, "--capacity-gib", "8") -OutputPath (Join-Path $artifactRoot "runtime.json") | ConvertFrom-Json
+    $runtime = Invoke-PaneCapture -PaneExe $paneExe -Arguments @("runtime", "--json", "--register-boot-loader", $runtime.directories.serial_boot_image, "--boot-loader-expected-sha256", $runtime.artifacts.serial_boot_image_sha256, "--boot-loader-expected-serial", "PANE_BOOT_OK\n", "--session-name", $SessionName, "--capacity-gib", "8") -OutputPath (Join-Path $artifactRoot "runtime-boot-loader.json") | ConvertFrom-Json
+    $runtime = Invoke-PaneCapture -PaneExe $paneExe -Arguments @("runtime", "--json", "--register-kernel", $runtime.directories.serial_boot_image, "--kernel-expected-sha256", $runtime.artifacts.serial_boot_image_sha256, "--kernel-cmdline", "console=ttyS0 panic=-1", "--session-name", $SessionName, "--capacity-gib", "8") -OutputPath (Join-Path $artifactRoot "runtime-kernel-plan.json") | ConvertFrom-Json
+    $nativeKernelPlan = Invoke-PaneCapture -PaneExe $paneExe -Arguments @("native-kernel-plan", "--json", "--materialize", "--session-name", $SessionName) -OutputPath (Join-Path $artifactRoot "native-kernel-plan.json") | ConvertFrom-Json
+    $runtime = $nativeKernelPlan.runtime
     $nativePreflight = Invoke-PaneCapture -PaneExe $paneExe -Arguments @("native-preflight", "--json", "--session-name", $SessionName) -OutputPath (Join-Path $artifactRoot "native-preflight.json") | ConvertFrom-Json
     $nativeBootSpike = Invoke-PaneCapture -PaneExe $paneExe -Arguments @("native-boot-spike", "--json", "--session-name", $SessionName) -OutputPath (Join-Path $artifactRoot "native-boot-spike.json") | ConvertFrom-Json
     $nativeLaunchDryRun = Invoke-PaneCapture -PaneExe $paneExe -Arguments @("launch", "--runtime", "pane-owned", "--dry-run", "--session-name", $SessionName) -OutputPath (Join-Path $artifactRoot "native-launch-dry-run.txt")
@@ -282,6 +286,15 @@ try {
     if (-not $runtime.artifacts.serial_boot_image_ready) {
         throw "pane runtime did not create a valid Pane-owned serial boot image. Review $artifactRoot\runtime.json."
     }
+    if (-not $runtime.artifacts.boot_loader_image_verified) {
+        throw "pane runtime did not register a verified boot-to-serial loader image. Review $artifactRoot\runtime-boot-loader.json."
+    }
+    if (-not $runtime.artifacts.kernel_boot_plan_ready) {
+        throw "pane runtime did not register a verified kernel boot plan. Review $artifactRoot\runtime-kernel-plan.json."
+    }
+    if (-not $nativeKernelPlan.ready_for_kernel_entry_spike -or -not $runtime.artifacts.kernel_boot_layout_ready) {
+        throw "pane native-kernel-plan did not materialize a verified kernel boot layout. Review $artifactRoot\native-kernel-plan.json."
+    }
     if (-not $nativePreflight.host -or -not $nativePreflight.host.checks) {
         throw "pane native-preflight did not report host checks. Review $artifactRoot\native-preflight.json."
     }
@@ -316,6 +329,15 @@ try {
     }
     if ($controlCenterOutput -notmatch "Image Register") {
         throw "Pane Control Center did not advertise base image registration."
+    }
+    if ($controlCenterOutput -notmatch "Loader Register") {
+        throw "Pane Control Center did not advertise boot-loader registration."
+    }
+    if ($controlCenterOutput -notmatch "Kernel Register") {
+        throw "Pane Control Center did not advertise kernel boot-plan registration."
+    }
+    if ($controlCenterOutput -notmatch "Kernel Layout") {
+        throw "Pane Control Center did not advertise kernel boot-layout materialization."
     }
     Invoke-ScriptCapture -ScriptPath $launchScript -Arguments @("-SessionName", $SessionName, "-DryRun", "-NoConnect") -OutputPath (Join-Path $artifactRoot "launch-dry-run.txt") | Out-Null
     Invoke-ScriptCapture -ScriptPath $terminalScript -Arguments @("-PrintOnly") -OutputPath (Join-Path $artifactRoot "terminal.txt") | Out-Null
@@ -378,6 +400,10 @@ try {
         runtime_target = $runtime.target_engine
         runtime_capacity_gib = $runtime.storage_budget.requested_capacity_gib
         runtime_user_disk_ready = $runtime.artifacts.user_disk_ready
+        runtime_boot_loader_verified = $runtime.artifacts.boot_loader_image_verified
+        runtime_kernel_boot_plan_ready = $runtime.artifacts.kernel_boot_plan_ready
+        runtime_kernel_boot_layout_ready = $runtime.artifacts.kernel_boot_layout_ready
+        native_kernel_entry_ready = $nativeKernelPlan.ready_for_kernel_entry_spike
         native_preflight_ready = $nativePreflight.ready_for_boot_spike
         native_boot_spike_status = $nativeBootSpike.partition_smoke.status
         native_host_ready = $runtime.native_runtime.host_ready

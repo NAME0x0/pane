@@ -224,6 +224,31 @@ try {
     if (-not $runtimeReport.artifacts.serial_boot_image_ready) {
         throw "pane runtime --create-serial-boot-image did not create a valid Pane-owned serial boot image."
     }
+    $runtimeLoader = Invoke-Capture -OutputPath (Join-Path $artifactRoot "runtime-boot-loader.json") -Body {
+        & $paneExe runtime --json --register-boot-loader $runtimeReport.directories.serial_boot_image --boot-loader-expected-sha256 $runtimeReport.artifacts.serial_boot_image_sha256 --boot-loader-expected-serial "PANE_BOOT_OK\n" --session-name $SessionName --capacity-gib 8
+    }
+    Assert-Success -Result $runtimeLoader -Label "pane runtime --register-boot-loader"
+    $runtimeLoaderReport = $runtimeLoader.Output | ConvertFrom-Json
+    if (-not $runtimeLoaderReport.artifacts.boot_loader_image_verified) {
+        throw "pane runtime --register-boot-loader did not create a verified boot-to-serial loader artifact."
+    }
+    $runtimeKernel = Invoke-Capture -OutputPath (Join-Path $artifactRoot "runtime-kernel-plan.json") -Body {
+        & $paneExe runtime --json --register-kernel $runtimeLoaderReport.directories.serial_boot_image --kernel-expected-sha256 $runtimeLoaderReport.artifacts.serial_boot_image_sha256 --kernel-cmdline "console=ttyS0 panic=-1" --session-name $SessionName --capacity-gib 8
+    }
+    Assert-Success -Result $runtimeKernel -Label "pane runtime --register-kernel"
+    $runtimeKernelReport = $runtimeKernel.Output | ConvertFrom-Json
+    if (-not $runtimeKernelReport.artifacts.kernel_boot_plan_ready) {
+        throw "pane runtime --register-kernel did not create a verified kernel boot plan."
+    }
+    $nativeKernelPlan = Invoke-Capture -OutputPath (Join-Path $artifactRoot "native-kernel-plan.json") -Body {
+        & $paneExe native-kernel-plan --json --materialize --session-name $SessionName
+    }
+    Assert-Success -Result $nativeKernelPlan -Label "pane native-kernel-plan"
+    $nativeKernelPlanReport = $nativeKernelPlan.Output | ConvertFrom-Json
+    if (-not $nativeKernelPlanReport.ready_for_kernel_entry_spike -or -not $nativeKernelPlanReport.runtime.artifacts.kernel_boot_layout_ready) {
+        throw "pane native-kernel-plan did not materialize a verified kernel boot layout."
+    }
+    $checks.native_kernel_plan = "pass"
     $checks.runtime_prepare = "pass"
 
     $nativePreflight = Invoke-Capture -OutputPath (Join-Path $artifactRoot "native-preflight.json") -Body {
@@ -301,6 +326,15 @@ try {
     }
     if ($controlCenter.Output -notmatch "Image Register") {
         throw "Pane Control Center did not advertise base image registration."
+    }
+    if ($controlCenter.Output -notmatch "Loader Register") {
+        throw "Pane Control Center did not advertise boot-loader registration."
+    }
+    if ($controlCenter.Output -notmatch "Kernel Register") {
+        throw "Pane Control Center did not advertise kernel boot-plan registration."
+    }
+    if ($controlCenter.Output -notmatch "Kernel Layout") {
+        throw "Pane Control Center did not advertise kernel boot-layout materialization."
     }
     $checks.control_center = "pass"
 

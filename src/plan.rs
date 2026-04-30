@@ -37,12 +37,18 @@ pub struct RuntimePaths {
     pub logs: PathBuf,
     pub base_os_image: PathBuf,
     pub serial_boot_image: PathBuf,
+    pub boot_loader_image: PathBuf,
+    pub kernel_image: PathBuf,
+    pub initramfs_image: PathBuf,
     pub user_disk: PathBuf,
     pub base_os_metadata: PathBuf,
     pub serial_boot_metadata: PathBuf,
+    pub boot_loader_metadata: PathBuf,
+    pub kernel_boot_metadata: PathBuf,
     pub user_disk_metadata: PathBuf,
     pub runtime_config: PathBuf,
     pub native_manifest: PathBuf,
+    pub kernel_boot_layout: PathBuf,
     pub manifest: PathBuf,
 }
 
@@ -140,12 +146,18 @@ pub fn runtime_for(session_name: &str) -> RuntimePaths {
     RuntimePaths {
         base_os_image: images.join("arch-base.paneimg"),
         serial_boot_image: engines.join("serial-boot.paneimg"),
+        boot_loader_image: engines.join("boot-to-serial-loader.paneimg"),
+        kernel_image: engines.join("linux-kernel.paneimg"),
+        initramfs_image: engines.join("initramfs.paneinitrd"),
         user_disk: disks.join("user-data.panedisk"),
         base_os_metadata: state.join("base-os-image.json"),
         serial_boot_metadata: state.join("serial-boot-image.json"),
+        boot_loader_metadata: state.join("boot-to-serial-loader.json"),
+        kernel_boot_metadata: state.join("kernel-boot.json"),
         user_disk_metadata: state.join("user-disk.json"),
         runtime_config: root.join("pane-runtime.config.json"),
         native_manifest: root.join("pane-native-runtime.json"),
+        kernel_boot_layout: state.join("kernel-boot-layout.json"),
         manifest: root.join("pane-runtime.json"),
         downloads,
         images,
@@ -293,6 +305,15 @@ mod tests {
         assert!(runtime
             .serial_boot_image
             .ends_with("engines\\serial-boot.paneimg"));
+        assert!(runtime
+            .boot_loader_image
+            .ends_with("engines\\boot-to-serial-loader.paneimg"));
+        assert!(runtime
+            .kernel_image
+            .ends_with("engines\\linux-kernel.paneimg"));
+        assert!(runtime
+            .initramfs_image
+            .ends_with("engines\\initramfs.paneinitrd"));
         assert!(runtime.user_disk.ends_with("disks\\user-data.panedisk"));
         assert!(runtime
             .runtime_config
@@ -304,11 +325,20 @@ mod tests {
             .serial_boot_metadata
             .ends_with("runtime\\pane-session\\state\\serial-boot-image.json"));
         assert!(runtime
+            .boot_loader_metadata
+            .ends_with("runtime\\pane-session\\state\\boot-to-serial-loader.json"));
+        assert!(runtime
+            .kernel_boot_metadata
+            .ends_with("runtime\\pane-session\\state\\kernel-boot.json"));
+        assert!(runtime
             .user_disk_metadata
             .ends_with("runtime\\pane-session\\state\\user-disk.json"));
         assert!(runtime
             .native_manifest
             .ends_with("runtime\\pane-session\\pane-native-runtime.json"));
+        assert!(runtime
+            .kernel_boot_layout
+            .ends_with("runtime\\pane-session\\state\\kernel-boot-layout.json"));
         assert!(runtime.engines.ends_with("runtime\\pane-session\\engines"));
         assert!(runtime.logs.ends_with("runtime\\pane-session\\logs"));
     }

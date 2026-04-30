@@ -84,7 +84,7 @@ The current implementation:
 
 This means the current product is already app-shaped, but it is not yet the final contained display architecture.
 
-Pane is now reserving a future runtime boundary: a dedicated 8 GiB default app-owned space for downloaded OS images, the base system image, an expandable user disk, snapshots, package/customization data, runtime state, runtime config, base-image verification metadata, user-disk metadata, native-runtime manifest, Windows Hypervisor Platform host preflight, a guarded WHP partition/vCPU smoke step, and a runtime-backed WHP serial test image that runs controlled guest code and emits a deterministic boot banner. That reserved space is not a bootable runtime yet; it is the contract that lets Pane move toward an app-owned OS engine without confusing it with PaneShared or the current WSL bridge.
+Pane is now reserving a future runtime boundary: a dedicated 8 GiB default app-owned space for downloaded OS images, the base system image, an expandable user disk, snapshots, package/customization data, runtime state, runtime config, base-image verification metadata, user-disk metadata, native-runtime manifest, Windows Hypervisor Platform host preflight, a guarded WHP partition/vCPU smoke step, a runtime-backed WHP serial test image that runs controlled guest code and emits a deterministic boot banner, a verified boot-to-serial loader candidate slot, a verified kernel/initramfs boot-plan slot, and a materialized kernel boot-layout slot. That reserved space is not a bootable runtime yet; it is the contract that lets Pane move toward an app-owned OS engine without confusing it with PaneShared or the current WSL bridge.
 
 ## End-State Vision
 
@@ -259,6 +259,9 @@ Pane should not be treated as a first public release until:
 - `pane runtime` can prepare a dedicated runtime-space manifest, config, native-runtime contract, verified base-image metadata, and user-disk descriptor for the future Pane-owned OS engine without claiming that engine is already bootable,
 - `pane native-preflight` can report WHP host capability and runtime artifact blockers without side effects,
 - `pane native-boot-spike --execute --run-fixture` can create a temporary WHP partition/vCPU, load the runtime-backed serial boot image, map guest memory, set registers, run controlled guest code, decode the deterministic `PANE_BOOT_OK` serial banner, observe HLT, and tear everything down without claiming Arch is bootable,
+- `pane runtime --register-boot-loader` and `pane native-boot-spike --execute --run-boot-loader` can verify and execute a runtime-provided boot-to-serial loader candidate under an explicit SHA-256 and serial-output contract,
+- `pane runtime --register-kernel` can persist a verified Linux kernel plus optional initramfs and serial-console cmdline as the first real kernel boot-plan contract,
+- `pane native-kernel-plan --materialize` can persist the guest-memory boot layout that the WHP kernel-entry runner must execute next,
 - `pane launch --runtime pane-owned --dry-run` can exercise the native-runtime path without invoking WSL, `mstsc.exe`, or XRDP, and reports concrete blockers instead of pretending the native engine is ready,
 - clean-machine validation proves the first-run Arch path outside the repo,
 - package-only certification proves a repo-free package can self-test and hydrate standalone `pane.exe` without touching a live WSL install,

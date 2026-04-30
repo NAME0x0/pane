@@ -27,6 +27,9 @@ if ($PrintOnly) {
     Write-Host "  Shared Storage   Durable by default; opt into scratch storage for disposable sessions."
     Write-Host "  Runtime Space    Dedicated Pane runtime storage can be prepared for the future contained OS engine."
     Write-Host "  Image Register   Local Arch base images can be copied into Pane runtime storage with SHA-256 metadata."
+    Write-Host "  Loader Register  Controlled boot-to-serial loader candidates can be verified before WHP execution."
+    Write-Host "  Kernel Register  Verified kernel/initramfs boot plans can be prepared before WHP kernel entry."
+    Write-Host "  Kernel Layout    Materialized guest-memory layout for boot params, cmdline, kernel, and initramfs."
     Write-Host "  Native Preflight Probe Windows Hypervisor Platform readiness before the Pane-owned boot spike."
     Write-Host "  Boot Spike       Explicit WHP guest-memory, register, vCPU, and serial-I/O fixture for the next native-runtime milestone."
     Write-Host "  Native Preview   Pane-owned runtime dry-run does not invoke WSL, mstsc.exe, or XRDP."
@@ -393,6 +396,9 @@ function Refresh-Overview {
                 $lines += "Native Host     $($appJson.runtime.native_runtime.host_ready)"
                 $lines += "Boot Spike      $($appJson.runtime.native_runtime.ready_for_boot_spike)"
             }
+            if ($appJson.runtime.artifacts) {
+                $lines += "Kernel Layout   $($appJson.runtime.artifacts.kernel_boot_layout_ready)"
+            }
             if ($appJson.runtime.native_host -and $appJson.runtime.native_host.whp) {
                 $lines += "WHP Library     $($appJson.runtime.native_host.whp.dll_loaded)"
                 $lines += "WHP Hypervisor  $($appJson.runtime.native_host.whp.hypervisor_present)"
@@ -637,6 +643,77 @@ function Invoke-RegisterBaseImageFlow {
     return (Invoke-PaneExe -Arguments $arguments)
 }
 
+function Invoke-RegisterBootLoaderFlow {
+    $session = $sessionBox.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($session)) { $session = "pane"; $sessionBox.Text = $session }
+
+    $dialog = New-Object System.Windows.Forms.OpenFileDialog
+    $dialog.Title = "Select Pane Boot-to-Serial Loader Image"
+    $dialog.Filter = "Pane boot images (*.paneimg;*.img;*.bin;*.raw)|*.paneimg;*.img;*.bin;*.raw|All files (*.*)|*.*"
+    $dialog.CheckFileExists = $true
+    $dialog.Multiselect = $false
+    if ($dialog.ShowDialog($form) -ne [System.Windows.Forms.DialogResult]::OK) {
+        return @{ ExitCode = 0; Output = "Boot-loader registration canceled." }
+    }
+
+    $sha = Show-TextInputDialog -Title "Expected SHA-256" -Prompt "Paste the expected 64-character SHA-256 digest. Pane will not treat the loader as executable unless this matches."
+    if ($null -eq $sha) {
+        return @{ ExitCode = 0; Output = "Boot-loader registration canceled." }
+    }
+    if ([string]::IsNullOrWhiteSpace($sha)) {
+        return @{ ExitCode = 1; Output = "Boot-loader registration requires an expected SHA-256 digest." }
+    }
+
+    $serial = Show-TextInputDialog -Title "Expected Serial Text" -Prompt "Enter the exact serial text this loader must emit before HLT. Use \n for newline."
+    if ($null -eq $serial) {
+        return @{ ExitCode = 0; Output = "Boot-loader registration canceled." }
+    }
+    if ([string]::IsNullOrWhiteSpace($serial)) {
+        $serial = "PANE_BOOT_OK\n"
+    }
+
+    return (Invoke-PaneExe -Arguments @("runtime", "--prepare", "--register-boot-loader", $dialog.FileName, "--boot-loader-expected-sha256", $sha.Trim(), "--boot-loader-expected-serial", $serial, "--session-name", $session))
+}
+
+function Invoke-RegisterKernelFlow {
+    $session = $sessionBox.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($session)) { $session = "pane"; $sessionBox.Text = $session }
+
+    $dialog = New-Object System.Windows.Forms.OpenFileDialog
+    $dialog.Title = "Select Pane Kernel Image"
+    $dialog.Filter = "Kernel images (vmlinuz*;*.img;*.bin;*.raw;*.paneimg)|vmlinuz*;*.img;*.bin;*.raw;*.paneimg|All files (*.*)|*.*"
+    $dialog.CheckFileExists = $true
+    $dialog.Multiselect = $false
+    if ($dialog.ShowDialog($form) -ne [System.Windows.Forms.DialogResult]::OK) {
+        return @{ ExitCode = 0; Output = "Kernel boot-plan registration canceled." }
+    }
+
+    $sha = Show-TextInputDialog -Title "Expected Kernel SHA-256" -Prompt "Paste the expected 64-character SHA-256 digest. Pane will not mark the kernel boot plan ready unless this matches."
+    if ($null -eq $sha) {
+        return @{ ExitCode = 0; Output = "Kernel boot-plan registration canceled." }
+    }
+    if ([string]::IsNullOrWhiteSpace($sha)) {
+        return @{ ExitCode = 1; Output = "Kernel boot-plan registration requires an expected SHA-256 digest." }
+    }
+
+    $cmdline = Show-TextInputDialog -Title "Kernel Command Line" -Prompt "Enter the kernel cmdline. It must include console=ttyS0 so Pane can observe boot progress."
+    if ($null -eq $cmdline) {
+        return @{ ExitCode = 0; Output = "Kernel boot-plan registration canceled." }
+    }
+    if ([string]::IsNullOrWhiteSpace($cmdline)) {
+        $cmdline = "console=ttyS0 panic=-1"
+    }
+
+    return (Invoke-PaneExe -Arguments @("runtime", "--prepare", "--register-kernel", $dialog.FileName, "--kernel-expected-sha256", $sha.Trim(), "--kernel-cmdline", $cmdline, "--session-name", $session))
+}
+
+function Invoke-NativeKernelPlanFlow {
+    $session = $sessionBox.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($session)) { $session = "pane"; $sessionBox.Text = $session }
+
+    return (Invoke-PaneExe -Arguments @("native-kernel-plan", "--materialize", "--session-name", $session))
+}
+
 $buttonSpecs = @(
     @{ Text = "Refresh"; Left = 28; Top = 214; Width = 126; Action = { Refresh-Overview; @{ ExitCode = 0; Output = $statusBox.Text } } },
     @{ Text = "Onboard Arch"; Left = 166; Top = 214; Width = 126; Action = { Invoke-OnboardArchFlow } },
@@ -804,6 +881,15 @@ $buttonSpecs = @(
         } },
     @{ Text = "Register Image"; Left = 580; Top = 352; Width = 126; Action = {
             Invoke-RegisterBaseImageFlow
+        } },
+    @{ Text = "Register Loader"; Left = 28; Top = 352; Width = 126; Action = {
+            Invoke-RegisterBootLoaderFlow
+        } },
+    @{ Text = "Register Kernel"; Left = 166; Top = 352; Width = 126; Action = {
+            Invoke-RegisterKernelFlow
+        } },
+    @{ Text = "Kernel Layout"; Left = 718; Top = 306; Width = 104; Action = {
+            Invoke-NativeKernelPlanFlow
         } },
     @{ Text = "Native Runtime"; Left = 718; Top = 260; Width = 104; Action = {
             $session = $sessionBox.Text.Trim()

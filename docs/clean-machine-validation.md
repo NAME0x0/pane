@@ -61,7 +61,7 @@ Use `-Mode FreshMachinePreflight` on a real clean Windows VM when you want to ve
 The certification script in `PackageOnly` mode:
 
 1. verifies the package contents, including the control center, double-click launchers, and shortcut installer,
-2. runs `pane.exe --help`, `pane.exe environments`, `pane app-status`, `pane runtime --prepare --create-user-disk`, `pane runtime --register-boot-loader`, `pane runtime --register-kernel`, `pane native-kernel-plan --materialize`, `pane native-preflight`, `pane native-boot-spike`, `pane launch --runtime pane-owned --dry-run`, `pane doctor --no-write`, `pane init --dry-run`, and `pane onboard --dry-run`,
+2. runs `pane.exe --help`, `pane.exe environments`, `pane app-status`, `pane runtime --prepare --create-user-disk`, `pane runtime --register-boot-loader`, `pane runtime --register-kernel`, `pane native-kernel-plan --materialize`, `pane native-preflight`, `pane native-boot-spike`, `pane native-boot-spike --run-kernel-layout`, `pane launch --runtime pane-owned --dry-run`, `pane doctor --no-write`, `pane init --dry-run`, and `pane onboard --dry-run`,
 3. runs `Pane Control Center.ps1 -PrintOnly` as a headless self-test,
 4. runs `Launch Pane Arch.ps1 -DryRun -NoConnect` with a unique session name and scratch PaneShared storage,
 5. verifies the generated `.rdp` profile contains the latency-oriented settings Pane currently depends on,

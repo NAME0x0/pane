@@ -86,6 +86,7 @@ Pane cannot claim the native runtime is real until:
 - `pane native-boot-spike --execute --run-boot-loader` can load a verified runtime-provided boot-loader candidate, validate its expected serial output, observe HLT, and release all WHP resources,
 - `pane runtime --register-kernel` can prepare a verified kernel/initramfs boot plan with serial console output required before any WHP kernel-entry work starts,
 - `pane native-kernel-plan --materialize` can write and re-validate the deterministic kernel boot layout before the WHP runner maps those guest addresses,
+- `pane native-boot-spike --execute --run-kernel-layout` can consume that layout, map boot params, cmdline, kernel, and optional initramfs regions, then execute a controlled small kernel-layout candidate at the layout's kernel GPA under the serial/HALT contract,
 - a test image can boot under a Pane-owned WHP host without WSL, XRDP, `mstsc.exe`, QEMU, VirtualBox, or Hyper-V Manager,
 - Pane can boot a verified Arch base image plus a Pane-owned user disk,
 - Pane renders the guest through its own app surface,

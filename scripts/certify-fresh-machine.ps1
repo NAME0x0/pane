@@ -274,6 +274,16 @@ try {
     }
     $checks.native_boot_spike_plan = "pass"
 
+    $nativeKernelLayoutSpike = Invoke-Capture -OutputPath (Join-Path $artifactRoot "native-boot-spike-kernel-layout.json") -Body {
+        & $paneExe native-boot-spike --json --run-kernel-layout --session-name $SessionName
+    }
+    Assert-Success -Result $nativeKernelLayoutSpike -Label "pane native-boot-spike --run-kernel-layout"
+    $nativeKernelLayoutSpikeReport = $nativeKernelLayoutSpike.Output | ConvertFrom-Json
+    if (-not $nativeKernelLayoutSpikeReport.kernel_layout_requested -or $nativeKernelLayoutSpikeReport.partition_smoke.status -ne "planned") {
+        throw "pane native-boot-spike --run-kernel-layout did not report the safe planned kernel-layout spike."
+    }
+    $checks.native_kernel_layout_spike_plan = "pass"
+
     $nativeLaunch = Invoke-Capture -OutputPath (Join-Path $artifactRoot "native-launch-dry-run.txt") -Body {
         & $paneExe launch --runtime pane-owned --dry-run --session-name $SessionName
     }

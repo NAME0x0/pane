@@ -217,6 +217,7 @@ try {
     $runtime = $nativeKernelPlan.runtime
     $nativePreflight = Invoke-PaneCapture -PaneExe $paneExe -Arguments @("native-preflight", "--json", "--session-name", $SessionName) -OutputPath (Join-Path $artifactRoot "native-preflight.json") | ConvertFrom-Json
     $nativeBootSpike = Invoke-PaneCapture -PaneExe $paneExe -Arguments @("native-boot-spike", "--json", "--session-name", $SessionName) -OutputPath (Join-Path $artifactRoot "native-boot-spike.json") | ConvertFrom-Json
+    $nativeKernelLayoutSpike = Invoke-PaneCapture -PaneExe $paneExe -Arguments @("native-boot-spike", "--json", "--run-kernel-layout", "--session-name", $SessionName) -OutputPath (Join-Path $artifactRoot "native-boot-spike-kernel-layout.json") | ConvertFrom-Json
     $nativeLaunchDryRun = Invoke-PaneCapture -PaneExe $paneExe -Arguments @("launch", "--runtime", "pane-owned", "--dry-run", "--session-name", $SessionName) -OutputPath (Join-Path $artifactRoot "native-launch-dry-run.txt")
 
     if (-not $init.managed_environment -or $init.managed_environment.distro_name -ne "pane-arch") {
@@ -303,6 +304,9 @@ try {
     }
     if (-not $nativeBootSpike.partition_smoke -or $nativeBootSpike.partition_smoke.status -ne "planned") {
         throw "pane native-boot-spike did not report the safe planned partition smoke by default. Review $artifactRoot\native-boot-spike.json."
+    }
+    if (-not $nativeKernelLayoutSpike.kernel_layout_requested -or $nativeKernelLayoutSpike.partition_smoke.status -ne "planned") {
+        throw "pane native-boot-spike --run-kernel-layout did not report the safe planned kernel-layout spike. Review $artifactRoot\native-boot-spike-kernel-layout.json."
     }
     if ($nativeLaunchDryRun -notmatch "Pane-Owned Runtime Launch") {
         throw "pane launch --runtime pane-owned --dry-run did not exercise the native runtime path. Review $artifactRoot\native-launch-dry-run.txt."
@@ -406,6 +410,7 @@ try {
         native_kernel_entry_ready = $nativeKernelPlan.ready_for_kernel_entry_spike
         native_preflight_ready = $nativePreflight.ready_for_boot_spike
         native_boot_spike_status = $nativeBootSpike.partition_smoke.status
+        native_kernel_layout_spike_status = $nativeKernelLayoutSpike.partition_smoke.status
         native_host_ready = $runtime.native_runtime.host_ready
         native_runtime_dry_run = ($nativeLaunchDryRun -match "Pane-Owned Runtime Launch")
         reconnect_session_assets_ready = $doctorReconnect.selected_distro.pane_session_assets_ready

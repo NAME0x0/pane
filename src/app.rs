@@ -184,6 +184,7 @@ struct NativeBootSpikeReport {
     execute_requested: bool,
     fixture_requested: bool,
     boot_loader_requested: bool,
+    kernel_layout_requested: bool,
     host: crate::native::NativeHostPreflightReport,
     runtime: RuntimeReport,
     partition_smoke: crate::native::NativePartitionSmokeReport,
@@ -1678,7 +1679,7 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
     let session_name = crate::plan::sanitize_session_name(&args.session_name);
     let runtime_paths = crate::plan::runtime_for(&session_name);
     let runtime_budget = runtime_storage_budget(DEFAULT_RUNTIME_CAPACITY_GIB);
-    let run_guest_image = args.run_fixture || args.run_boot_loader;
+    let run_guest_image = args.run_fixture || args.run_boot_loader || args.run_kernel_layout;
     let boot_image = if args.execute && args.run_fixture {
         prepare_runtime_paths(&runtime_paths)?;
         write_runtime_config(&runtime_paths, &session_name, &runtime_budget)?;
@@ -1687,6 +1688,8 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
         Some(load_serial_boot_image_artifact(&runtime_paths)?)
     } else if args.execute && args.run_boot_loader {
         Some(load_boot_loader_image_artifact(&runtime_paths)?)
+    } else if args.execute && args.run_kernel_layout {
+        Some(load_kernel_layout_boot_image_artifact(&runtime_paths)?)
     } else {
         None
     };
@@ -1706,7 +1709,8 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
         && runtime.artifacts.runtime_config_exists
         && runtime.artifacts.native_manifest_exists
         && (!args.run_fixture || runtime.artifacts.serial_boot_image_ready)
-        && (!args.run_boot_loader || runtime.artifacts.boot_loader_image_verified);
+        && (!args.run_boot_loader || runtime.artifacts.boot_loader_image_verified)
+        && (!args.run_kernel_layout || runtime.artifacts.kernel_boot_layout_ready);
 
     let mut blockers = Vec::new();
     if !args.execute {
@@ -1727,9 +1731,21 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
                 .to_string(),
         );
     }
+    if args.run_kernel_layout && !args.execute {
+        blockers.push(
+            "Kernel-layout candidate was requested but not executed. Rerun with `--execute --run-kernel-layout`."
+                .to_string(),
+        );
+    }
     if args.run_boot_loader && !runtime.artifacts.boot_loader_image_verified {
         blockers.push(
             "No verified Pane-owned boot-to-serial loader exists. Register one with `pane runtime --register-boot-loader <path> --boot-loader-expected-sha256 <sha256>`."
+                .to_string(),
+        );
+    }
+    if args.run_kernel_layout && !runtime.artifacts.kernel_boot_layout_ready {
+        blockers.push(
+            "No materialized Pane kernel boot layout exists. Run `pane native-kernel-plan --materialize` after registering a verified kernel plan."
                 .to_string(),
         );
     }
@@ -1785,6 +1801,7 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
         execute_requested: args.execute,
         fixture_requested: args.run_fixture,
         boot_loader_requested: args.run_boot_loader,
+        kernel_layout_requested: args.run_kernel_layout,
         host,
         runtime,
         partition_smoke,
@@ -1794,6 +1811,7 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
             args.execute,
             args.run_fixture,
             args.run_boot_loader,
+            args.run_kernel_layout,
         ),
     };
 
@@ -1810,8 +1828,17 @@ fn native_boot_spike_next_steps(
     execute: bool,
     run_fixture: bool,
     run_boot_loader: bool,
+    run_kernel_layout: bool,
 ) -> Vec<String> {
     if !execute {
+        if run_kernel_layout {
+            return vec![
+                "Rerun with `--execute --run-kernel-layout` to consume the materialized kernel layout in WHP."
+                    .to_string(),
+                "Use only a controlled small serial/HALT candidate until the Linux boot-protocol runner exists."
+                    .to_string(),
+            ];
+        }
         return vec![
             "Rerun with `--execute` to create and tear down the guarded WHP partition/vCPU."
                 .to_string(),
@@ -1826,6 +1853,17 @@ fn native_boot_spike_next_steps(
                 .to_string(),
             "Connect that runner to Pane's verified Arch base image and user disk once serial boot output is deterministic.".to_string(),
             "Keep GUI work behind the boot-to-serial milestone so Pane does not advertise a rendered OS before it can boot one.".to_string(),
+        ];
+    }
+
+    if run_kernel_layout {
+        return vec![
+            "Replace the one-page serial/HALT kernel-layout candidate with a Linux boot-protocol entry path."
+                .to_string(),
+            "Map boot params, cmdline, kernel, and optional initramfs from `kernel-boot-layout.json` before entering the kernel."
+                .to_string(),
+            "Only promote this to a real Arch boot milestone after serial kernel output is deterministic."
+                .to_string(),
         ];
     }
 
@@ -1844,6 +1882,8 @@ fn native_boot_spike_next_steps(
                 .to_string(),
             "Run `pane native-boot-spike --execute --run-boot-loader` to prove Pane can execute a runtime-provided boot candidate."
                 .to_string(),
+            "Materialize a kernel boot layout with `pane native-kernel-plan --materialize`, then run `pane native-boot-spike --execute --run-kernel-layout` with a controlled small candidate."
+                .to_string(),
             "Connect that loader to Pane's verified Arch base image and user disk only after its serial contract is deterministic."
                 .to_string(),
         ];
@@ -1853,6 +1893,8 @@ fn native_boot_spike_next_steps(
         "Register a controlled boot-to-serial loader with `pane runtime --register-boot-loader <path> --boot-loader-expected-sha256 <sha256>`."
             .to_string(),
         "Run `pane native-boot-spike --execute --run-boot-loader` to prove Pane can execute a runtime-provided boot candidate."
+            .to_string(),
+        "Materialize a kernel boot layout with `pane native-kernel-plan --materialize`, then run `pane native-boot-spike --execute --run-kernel-layout` with a controlled small candidate."
             .to_string(),
         "Connect that loader to Pane's verified Arch base image and user disk only after its serial contract is deterministic."
             .to_string(),
@@ -2989,6 +3031,7 @@ fn load_serial_boot_image_artifact(
         bytes,
         expected_serial_text: crate::native::SERIAL_BOOT_BANNER_TEXT.to_string(),
         guest_entry_gpa: 0x1000,
+        extra_regions: Vec::new(),
     })
 }
 
@@ -3120,6 +3163,148 @@ fn load_boot_loader_image_artifact(
         bytes,
         expected_serial_text: metadata.expected_serial_text,
         guest_entry_gpa: 0x1000,
+        extra_regions: Vec::new(),
+    })
+}
+
+fn load_kernel_layout_boot_image_artifact(
+    paths: &RuntimePaths,
+) -> AppResult<crate::native::NativeSerialBootImage> {
+    let layout = read_json_file::<KernelBootLayout>(&paths.kernel_boot_layout)?;
+    let artifacts = build_runtime_artifact_report(paths);
+    if !artifacts.kernel_boot_layout_ready {
+        return Err(AppError::message(
+            "Pane kernel boot layout is missing or stale. Run `pane native-kernel-plan --materialize` after registering a verified kernel plan.",
+        ));
+    }
+    if layout.kernel_path != paths.kernel_image.display().to_string() {
+        return Err(AppError::message(format!(
+            "Kernel layout points at {}, but this runtime expects {}.",
+            layout.kernel_path,
+            paths.kernel_image.display()
+        )));
+    }
+
+    let bytes = fs::read(&paths.kernel_image)?;
+    let actual_sha256 = sha256_bytes(&bytes);
+    if layout.kernel_bytes != bytes.len() as u64 || layout.kernel_sha256 != actual_sha256 {
+        return Err(AppError::message(
+            "Kernel layout no longer matches the registered kernel artifact. Re-run `pane native-kernel-plan --materialize`.",
+        ));
+    }
+
+    let mut extra_regions = Vec::new();
+    let boot_params = build_linux_boot_params_page(&layout)?;
+    extra_regions.push(crate::native::NativeGuestMemoryRegion {
+        label: "linux-boot-params".to_string(),
+        guest_gpa: parse_guest_physical_address(&layout.boot_params_gpa)?,
+        bytes: boot_params,
+        writable: true,
+        executable: false,
+    });
+
+    let mut cmdline_bytes = layout.cmdline.as_bytes().to_vec();
+    cmdline_bytes.push(0);
+    extra_regions.push(crate::native::NativeGuestMemoryRegion {
+        label: "linux-kernel-cmdline".to_string(),
+        guest_gpa: parse_guest_physical_address(&layout.cmdline_gpa)?,
+        bytes: cmdline_bytes,
+        writable: false,
+        executable: false,
+    });
+
+    if let Some(initramfs_path) = layout.initramfs_path.as_deref() {
+        let Some(initramfs_load_gpa) = layout.initramfs_load_gpa.as_deref() else {
+            return Err(AppError::message(
+                "Kernel layout has an initramfs path but no initramfs load GPA.",
+            ));
+        };
+        extra_regions.push(crate::native::NativeGuestMemoryRegion {
+            label: "linux-initramfs".to_string(),
+            guest_gpa: parse_guest_physical_address(initramfs_load_gpa)?,
+            bytes: fs::read(initramfs_path)?,
+            writable: false,
+            executable: false,
+        });
+    }
+
+    Ok(crate::native::NativeSerialBootImage {
+        source_label: "pane-runtime-kernel-layout".to_string(),
+        path: Some(layout.kernel_path),
+        bytes,
+        expected_serial_text: crate::native::SERIAL_BOOT_BANNER_TEXT.to_string(),
+        guest_entry_gpa: parse_guest_physical_address(&layout.kernel_load_gpa)?,
+        extra_regions,
+    })
+}
+
+fn build_linux_boot_params_page(layout: &KernelBootLayout) -> AppResult<Vec<u8>> {
+    let mut boot_params = vec![0_u8; 4096];
+    let cmdline_gpa = checked_u32_gpa(&layout.cmdline_gpa, "kernel cmdline")?;
+    write_u16_le(&mut boot_params, 0x1fe, 0xaa55);
+    boot_params[0x202..0x206].copy_from_slice(b"HdrS");
+    write_u16_le(&mut boot_params, 0x206, 0x020f);
+    boot_params[0x210] = 0xff;
+    boot_params[0x211] = 0x80;
+    write_u32_le(&mut boot_params, 0x228, cmdline_gpa);
+
+    if layout.initramfs_path.is_some() {
+        let initramfs_gpa = layout
+            .initramfs_load_gpa
+            .as_deref()
+            .ok_or_else(|| AppError::message("Initramfs layout is missing a load GPA."))?;
+        write_u32_le(
+            &mut boot_params,
+            0x218,
+            checked_u32_gpa(initramfs_gpa, "initramfs")?,
+        );
+        write_u32_le(
+            &mut boot_params,
+            0x21c,
+            layout
+                .initramfs_bytes
+                .ok_or_else(|| AppError::message("Initramfs layout is missing its byte length."))?
+                .try_into()
+                .map_err(|_| {
+                    AppError::message("Initramfs is too large for the 32-bit boot protocol field.")
+                })?,
+        );
+    }
+
+    Ok(boot_params)
+}
+
+fn checked_u32_gpa(value: &str, label: &str) -> AppResult<u32> {
+    parse_guest_physical_address(value)?
+        .try_into()
+        .map_err(|_| {
+            AppError::message(format!(
+                "{label} GPA must fit in 32 bits for this boot-params scaffold."
+            ))
+        })
+}
+
+fn write_u16_le(bytes: &mut [u8], offset: usize, value: u16) {
+    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u32_le(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn parse_guest_physical_address(value: &str) -> AppResult<u64> {
+    let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    else {
+        return Err(AppError::message(format!(
+            "Guest physical address `{value}` must use 0x-prefixed hexadecimal notation."
+        )));
+    };
+    u64::from_str_radix(hex, 16).map_err(|_| {
+        AppError::message(format!(
+            "Guest physical address `{value}` is not valid hexadecimal."
+        ))
     })
 }
 
@@ -6756,6 +6941,10 @@ fn print_native_boot_spike_report(report: &NativeBootSpikeReport) {
     println!("  Fixture        {}", yes_no(report.fixture_requested));
     println!("  Boot Loader    {}", yes_no(report.boot_loader_requested));
     println!(
+        "  Kernel Layout  {}",
+        yes_no(report.kernel_layout_requested)
+    );
+    println!(
         "  Serial Ready   {}",
         yes_no(report.ready_for_serial_kernel_spike)
     );
@@ -7385,18 +7574,19 @@ mod tests {
 
     use super::{
         build_bundle_doctor_request, build_distro_health, build_environment_catalog_report,
-        build_kernel_boot_layout, build_native_runtime_report, build_runtime_artifact_report,
-        build_steps, build_update_steps, create_serial_boot_image_artifact,
-        create_user_disk_descriptor, determine_app_lifecycle, ensure_wsl_conf_setting,
-        format_doctor_blockers, initialize_managed_arch_environment, inspect_workspace,
-        inventory_contains_distro, preferred_transport, register_base_os_image,
+        build_kernel_boot_layout, build_linux_boot_params_page, build_native_runtime_report,
+        build_runtime_artifact_report, build_steps, build_update_steps,
+        create_serial_boot_image_artifact, create_user_disk_descriptor, determine_app_lifecycle,
+        ensure_wsl_conf_setting, format_doctor_blockers, initialize_managed_arch_environment,
+        inspect_workspace, inventory_contains_distro, load_kernel_layout_boot_image_artifact,
+        parse_guest_physical_address, preferred_transport, register_base_os_image,
         register_boot_loader_image, register_kernel_boot_plan, resolve_bundle_output_path,
         resolve_init_source, resolve_launch_target, resolve_managed_environment_for_reset,
         resolve_saved_launch, resolve_session_context, resolve_status_distro,
         runtime_storage_budget, sha256_file, status_port_for, validate_setup_password,
         validate_setup_username, windows_transport_check, AppLifecyclePhase, AppNextAction,
-        CheckStatus, DistroHealth, DoctorCheck, DoctorReport, InitSource, NativeRuntimeState,
-        StatusReport, WorkspaceHealth, WslInventory, EMBEDDED_APP_ASSETS,
+        CheckStatus, DistroHealth, DoctorCheck, DoctorReport, InitSource, KernelBootLayout,
+        NativeRuntimeState, StatusReport, WorkspaceHealth, WslInventory, EMBEDDED_APP_ASSETS,
     };
 
     fn empty_workspace_health() -> WorkspaceHealth {
@@ -7750,6 +7940,96 @@ mod tests {
         assert!(artifacts.kernel_boot_layout_ready);
 
         let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn loads_kernel_layout_candidate_from_materialized_layout() {
+        let paths = temp_runtime_paths("kernel-layout-candidate");
+        super::prepare_runtime_paths(&paths).unwrap();
+        let kernel = paths.downloads.join("vmlinuz-linux");
+        let initramfs = paths.downloads.join("initramfs-linux.img");
+        std::fs::write(&kernel, crate::native::serial_boot_test_image_bytes()).unwrap();
+        std::fs::write(&initramfs, b"pane initramfs").unwrap();
+        let kernel_sha = sha256_file(&kernel).unwrap();
+        let initramfs_sha = sha256_file(&initramfs).unwrap();
+
+        register_kernel_boot_plan(
+            &paths,
+            Some(&kernel),
+            Some(&kernel_sha),
+            Some(&initramfs),
+            Some(&initramfs_sha),
+            Some("console=ttyS0 panic=-1"),
+            false,
+        )
+        .unwrap();
+        build_kernel_boot_layout(&paths, "pane", true).unwrap();
+
+        let image = load_kernel_layout_boot_image_artifact(&paths).unwrap();
+        assert_eq!(image.source_label, "pane-runtime-kernel-layout");
+        assert_eq!(image.guest_entry_gpa, 0x0010_0000);
+        assert_eq!(
+            image.expected_serial_text,
+            crate::native::SERIAL_BOOT_BANNER_TEXT
+        );
+        assert_eq!(image.bytes, crate::native::serial_boot_test_image_bytes());
+        assert!(image
+            .extra_regions
+            .iter()
+            .any(|region| region.label == "linux-boot-params" && region.guest_gpa == 0x7000));
+        assert!(image.extra_regions.iter().any(|region| {
+            region.label == "linux-kernel-cmdline"
+                && region.guest_gpa == 0x20000
+                && region.bytes.ends_with(&[0])
+        }));
+        assert!(image.extra_regions.iter().any(|region| {
+            region.label == "linux-initramfs"
+                && region.guest_gpa == 0x0400_0000
+                && region.bytes == b"pane initramfs"
+        }));
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn linux_boot_params_page_points_at_cmdline_and_initramfs() {
+        let layout = KernelBootLayout {
+            schema_version: 1,
+            layout_kind: "pane-linux-kernel-boot-layout-v1".to_string(),
+            session_name: "pane".to_string(),
+            boot_params_gpa: "0x00007000".to_string(),
+            cmdline_gpa: "0x00020000".to_string(),
+            kernel_load_gpa: "0x00100000".to_string(),
+            initramfs_load_gpa: Some("0x04000000".to_string()),
+            kernel_path: "kernel".to_string(),
+            kernel_bytes: 4096,
+            kernel_sha256: "0".repeat(64),
+            initramfs_path: Some("initramfs".to_string()),
+            initramfs_bytes: Some(1234),
+            initramfs_sha256: Some("1".repeat(64)),
+            cmdline: "console=ttyS0 panic=-1".to_string(),
+            expected_serial_device: "ttyS0".to_string(),
+            materialized_at_epoch_seconds: Some(1),
+            notes: Vec::new(),
+        };
+
+        let page = build_linux_boot_params_page(&layout).unwrap();
+        assert_eq!(&page[0x1fe..0x200], &0xaa55_u16.to_le_bytes());
+        assert_eq!(&page[0x202..0x206], b"HdrS");
+        assert_eq!(&page[0x206..0x208], &0x020f_u16.to_le_bytes());
+        assert_eq!(&page[0x228..0x22c], &0x0002_0000_u32.to_le_bytes());
+        assert_eq!(&page[0x218..0x21c], &0x0400_0000_u32.to_le_bytes());
+        assert_eq!(&page[0x21c..0x220], &1234_u32.to_le_bytes());
+    }
+
+    #[test]
+    fn parses_guest_physical_address_hex_contract() {
+        assert_eq!(
+            parse_guest_physical_address("0x00100000").unwrap(),
+            0x0010_0000
+        );
+        assert!(parse_guest_physical_address("1048576").is_err());
+        assert!(parse_guest_physical_address("0xnot-hex").is_err());
     }
 
     #[test]

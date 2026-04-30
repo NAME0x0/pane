@@ -138,10 +138,11 @@ cargo run -- runtime --register-kernel C:\path\to\vmlinuz-linux --kernel-expecte
 cargo run -- runtime --register-initramfs C:\path\to\initramfs-linux.img --initramfs-expected-sha256 <64-char-sha256> --kernel-cmdline "console=ttyS0 panic=-1"
 ```
 
-Materialize the native kernel boot layout after the kernel plan is verified. This writes the guest-physical-address contract for boot params, cmdline, kernel, and optional initramfs. It still does not boot Arch; it creates the exact handoff the WHP kernel-entry runner must satisfy next:
+Materialize the native kernel boot layout after the kernel plan is verified. This writes the guest-physical-address contract for boot params, cmdline, kernel, and optional initramfs. `--run-kernel-layout` consumes that contract by mapping those regions under WHP, but it still does not boot Arch; real Linux boot-protocol entry is the next milestone:
 
 ```powershell
 cargo run -- native-kernel-plan --materialize
+cargo run -- native-boot-spike --execute --run-kernel-layout
 ```
 
 Probe whether the Windows host and Pane runtime artifacts are ready for the first Pane-owned WHP boot spike:
@@ -287,6 +288,7 @@ cargo run -- runtime --json --register-kernel C:\path\to\vmlinuz-linux --kernel-
 cargo run -- native-kernel-plan --json --materialize
 cargo run -- native-preflight --json
 cargo run -- native-boot-spike --json
+cargo run -- native-boot-spike --json --run-kernel-layout
 cargo run -- native-boot-spike --json --execute --run-fixture
 cargo run -- native-boot-spike --json --execute --run-boot-loader
 cargo run -- doctor --json --distro pane-arch --de xfce --no-write --no-connect

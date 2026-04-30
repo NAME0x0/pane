@@ -23,6 +23,16 @@ pub(crate) struct NativeSerialBootImage {
     pub(crate) bytes: Vec<u8>,
     pub(crate) expected_serial_text: String,
     pub(crate) guest_entry_gpa: u64,
+    pub(crate) extra_regions: Vec<NativeGuestMemoryRegion>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NativeGuestMemoryRegion {
+    pub(crate) label: String,
+    pub(crate) guest_gpa: u64,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) writable: bool,
+    pub(crate) executable: bool,
 }
 
 pub(crate) fn serial_boot_test_image_bytes() -> Vec<u8> {
@@ -122,6 +132,7 @@ pub(crate) struct NativePartitionSmokeReport {
     pub(crate) boot_image_source: Option<String>,
     pub(crate) boot_image_path: Option<String>,
     pub(crate) boot_image_bytes: Option<u64>,
+    pub(crate) guest_regions: Vec<NativeGuestRegionReport>,
     pub(crate) serial_port: Option<u16>,
     pub(crate) serial_byte: Option<u8>,
     pub(crate) serial_bytes: Vec<u8>,
@@ -132,6 +143,16 @@ pub(crate) struct NativePartitionSmokeReport {
     pub(crate) calls: Vec<NativeWhpCallReport>,
     pub(crate) blocker: Option<String>,
     pub(crate) next_step: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct NativeGuestRegionReport {
+    pub(crate) label: String,
+    pub(crate) guest_gpa: String,
+    pub(crate) source_bytes: u64,
+    pub(crate) mapped_bytes: u64,
+    pub(crate) writable: bool,
+    pub(crate) executable: bool,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize)]
@@ -426,6 +447,7 @@ fn planned_partition_smoke_report(run_fixture: bool) -> NativePartitionSmokeRepo
         boot_image_source: None,
         boot_image_path: None,
         boot_image_bytes: None,
+        guest_regions: Vec::new(),
         serial_port: None,
         serial_byte: None,
         serial_bytes: Vec::new(),
@@ -471,6 +493,7 @@ fn skipped_partition_smoke_report(
         boot_image_source: None,
         boot_image_path: None,
         boot_image_bytes: None,
+        guest_regions: Vec::new(),
         serial_port: None,
         serial_byte: None,
         serial_bytes: Vec::new(),
@@ -547,9 +570,10 @@ mod windows_whp {
     };
 
     use super::{
-        base_export_checks, NativeExportCheck, NativePartitionSmokeReport,
-        NativePartitionSmokeStatus, NativeSerialBootImage, NativeWhpCallReport, WhpPreflightReport,
-        REQUIRED_WHP_EXPORTS, SERIAL_BOOT_BANNER_TEXT, SERIAL_BOOT_TEST_IMAGE_SIZE,
+        base_export_checks, NativeExportCheck, NativeGuestMemoryRegion, NativeGuestRegionReport,
+        NativePartitionSmokeReport, NativePartitionSmokeStatus, NativeSerialBootImage,
+        NativeWhpCallReport, WhpPreflightReport, REQUIRED_WHP_EXPORTS, SERIAL_BOOT_BANNER_TEXT,
+        SERIAL_BOOT_TEST_IMAGE_SIZE,
     };
 
     const WHV_CAPABILITY_CODE_HYPERVISOR_PRESENT: u32 = 0;
@@ -705,6 +729,7 @@ mod windows_whp {
             boot_image_source: boot_image.map(|image| image.source_label.clone()),
             boot_image_path: boot_image.and_then(|image| image.path.clone()),
             boot_image_bytes: boot_image.map(|image| image.bytes.len() as u64),
+            guest_regions: Vec::new(),
             serial_port: None,
             serial_byte: None,
             serial_bytes: Vec::new(),
@@ -927,99 +952,14 @@ mod windows_whp {
                 ));
             }
 
-            let guest_page = if run_fixture && report.virtual_processor_created {
-                match GuestPage::new() {
-                    Some(mut page) => {
-                        let boot_image_bytes = boot_image
-                            .map(|image| image.bytes.as_slice())
-                            .unwrap_or_else(|| &[]);
-                        let guest_entry_gpa = boot_image
-                            .map(|image| image.guest_entry_gpa)
-                            .unwrap_or(0x1000);
-                        if boot_image_bytes.is_empty() {
-                            report.calls.push(NativeWhpCallReport {
-                                name: "SerialBootImage",
-                                hresult: None,
-                                ok: false,
-                                detail:
-                                    "No runtime-backed boot image was provided to the WHP runner."
-                                        .to_string(),
-                            });
-                            report.blocker = Some(
-                                "Create the Pane serial boot image with `pane runtime --create-serial-boot-image`, or register a loader with `pane runtime --register-boot-loader`."
-                                    .to_string(),
-                            );
-                        } else if boot_image_bytes.len() > GUEST_PAGE_SIZE {
-                            report.calls.push(NativeWhpCallReport {
-                                name: "SerialBootImage",
-                                hresult: None,
-                                ok: false,
-                                detail: format!(
-                                    "Boot image is {} bytes; current WHP spike maps one {} byte page.",
-                                    boot_image_bytes.len(),
-                                    GUEST_PAGE_SIZE
-                                ),
-                            });
-                            report.blocker = Some(
-                                "Boot image is too large for the current one-page WHP boot spike."
-                                    .to_string(),
-                            );
-                        } else {
-                            page.as_mut_slice()[..boot_image_bytes.len()]
-                                .copy_from_slice(boot_image_bytes);
-                            report.calls.push(NativeWhpCallReport {
-                                name: "SerialBootImage",
-                                hresult: None,
-                                ok: true,
-                                detail: format!(
-                                    "Loaded {} bytes from the Pane runtime boot image.",
-                                    boot_image_bytes.len()
-                                ),
-                            });
-                        }
-
-                        if report.blocker.is_none() {
-                            if let Some(map_gpa_range) = map_gpa_range {
-                                let hresult = map_gpa_range(
-                                    partition,
-                                    page.as_mut_ptr().cast::<c_void>(),
-                                    guest_entry_gpa,
-                                    GUEST_PAGE_SIZE as u64,
-                                    WHV_MAP_GPA_RANGE_FLAG_READ
-                                        | WHV_MAP_GPA_RANGE_FLAG_WRITE
-                                        | WHV_MAP_GPA_RANGE_FLAG_EXECUTE,
-                                );
-                                report.memory_mapped = hresult_succeeded(hresult);
-                                report.calls.push(hresult_call(
-                                    "WHvMapGpaRange(serial-test-image)",
-                                    hresult,
-                                    if report.memory_mapped {
-                                        "Mapped one executable guest page for the boot image."
-                                    } else {
-                                        "Could not map guest memory for the boot image."
-                                    },
-                                ));
-                            }
-                        }
-                        Some(page)
-                    }
-                    None => {
-                        report.calls.push(NativeWhpCallReport {
-                            name: "HostPageAllocation(4096)",
-                            hresult: None,
-                            ok: false,
-                            detail: "Could not allocate a 4 KiB page-aligned host buffer."
-                                .to_string(),
-                        });
-                        report.blocker = Some(
-                            "Could not allocate page-aligned guest serial image memory."
-                                .to_string(),
-                        );
-                        None
-                    }
+            let guest_regions = if run_fixture && report.virtual_processor_created {
+                if let Some(map_gpa_range) = map_gpa_range {
+                    map_boot_image_regions(partition, map_gpa_range, boot_image, &mut report)
+                } else {
+                    Vec::new()
                 }
             } else {
-                None
+                Vec::new()
             };
 
             if run_fixture && report.memory_mapped {
@@ -1067,25 +1007,26 @@ mod windows_whp {
 
             if run_fixture && report.memory_mapped {
                 if let Some(unmap_gpa_range) = unmap_gpa_range {
-                    let guest_entry_gpa = boot_image
-                        .map(|image| image.guest_entry_gpa)
-                        .unwrap_or(0x1000);
-                    let hresult =
-                        unmap_gpa_range(partition, guest_entry_gpa, GUEST_PAGE_SIZE as u64);
-                    report.memory_unmapped = hresult_succeeded(hresult);
-                    report.calls.push(hresult_call(
-                        "WHvUnmapGpaRange(serial-test-image)",
-                        hresult,
-                        if report.memory_unmapped {
-                            "Unmapped the serial test image guest page."
-                        } else {
-                            "Could not unmap the serial test image guest page cleanly."
-                        },
-                    ));
+                    let mut unmapped_all = true;
+                    for region in guest_regions.iter().rev() {
+                        let hresult = unmap_gpa_range(partition, region.guest_gpa, region.size);
+                        let ok = hresult_succeeded(hresult);
+                        unmapped_all &= ok;
+                        report.calls.push(hresult_call(
+                            "WHvUnmapGpaRange(guest-region)",
+                            hresult,
+                            if ok {
+                                "Unmapped a Pane guest memory region."
+                            } else {
+                                "Could not unmap a Pane guest memory region cleanly."
+                            },
+                        ));
+                    }
+                    report.memory_unmapped = unmapped_all;
                 }
             }
 
-            drop(guest_page);
+            drop(guest_regions);
 
             if report.partition_created && report.virtual_processor_created {
                 let hresult = delete_virtual_processor(partition, 0);
@@ -1206,19 +1147,27 @@ mod windows_whp {
         }
     }
 
-    struct GuestPage {
-        ptr: *mut u8,
-        layout: Layout,
+    struct MappedGuestRegion {
+        guest_gpa: u64,
+        size: u64,
+        _memory: GuestMemory,
     }
 
-    impl GuestPage {
-        fn new() -> Option<Self> {
-            let layout = Layout::from_size_align(GUEST_PAGE_SIZE, GUEST_PAGE_SIZE).ok()?;
+    struct GuestMemory {
+        ptr: *mut u8,
+        layout: Layout,
+        size: usize,
+    }
+
+    impl GuestMemory {
+        fn new(size: usize) -> Option<Self> {
+            let size = page_aligned_len(size)?;
+            let layout = Layout::from_size_align(size, GUEST_PAGE_SIZE).ok()?;
             let ptr = unsafe { alloc_zeroed(layout) };
             if ptr.is_null() {
                 None
             } else {
-                Some(Self { ptr, layout })
+                Some(Self { ptr, layout, size })
             }
         }
 
@@ -1227,11 +1176,11 @@ mod windows_whp {
         }
 
         fn as_mut_slice(&mut self) -> &mut [u8] {
-            unsafe { std::slice::from_raw_parts_mut(self.ptr, GUEST_PAGE_SIZE) }
+            unsafe { std::slice::from_raw_parts_mut(self.ptr, self.size) }
         }
     }
 
-    impl Drop for GuestPage {
+    impl Drop for GuestMemory {
         fn drop(&mut self) {
             unsafe {
                 dealloc(self.ptr, self.layout);
@@ -1239,15 +1188,157 @@ mod windows_whp {
         }
     }
 
+    fn page_aligned_len(size: usize) -> Option<usize> {
+        if size == 0 {
+            return None;
+        }
+        let remainder = size % GUEST_PAGE_SIZE;
+        if remainder == 0 {
+            Some(size)
+        } else {
+            size.checked_add(GUEST_PAGE_SIZE - remainder)
+        }
+    }
+
+    fn map_boot_image_regions(
+        partition: *mut c_void,
+        map_gpa_range: WhvMapGpaRange,
+        boot_image: Option<&NativeSerialBootImage>,
+        report: &mut NativePartitionSmokeReport,
+    ) -> Vec<MappedGuestRegion> {
+        let Some(boot_image) = boot_image else {
+            report.calls.push(NativeWhpCallReport {
+                name: "SerialBootImage",
+                hresult: None,
+                ok: false,
+                detail: "No runtime-backed boot image was provided to the WHP runner.".to_string(),
+            });
+            report.blocker = Some(
+                "Create the Pane serial boot image with `pane runtime --create-serial-boot-image`, or register a loader with `pane runtime --register-boot-loader`."
+                    .to_string(),
+            );
+            return Vec::new();
+        };
+        if boot_image.bytes.is_empty() {
+            report.calls.push(NativeWhpCallReport {
+                name: "SerialBootImage",
+                hresult: None,
+                ok: false,
+                detail: "Runtime-backed boot image is empty.".to_string(),
+            });
+            report.blocker = Some("Runtime-backed boot image is empty.".to_string());
+            return Vec::new();
+        }
+
+        let mut descriptors = Vec::with_capacity(1 + boot_image.extra_regions.len());
+        descriptors.push(NativeGuestMemoryRegion {
+            label: boot_image.source_label.clone(),
+            guest_gpa: boot_image.guest_entry_gpa,
+            bytes: boot_image.bytes.clone(),
+            writable: true,
+            executable: true,
+        });
+        descriptors.extend(boot_image.extra_regions.iter().cloned());
+
+        let mut mapped_regions = Vec::with_capacity(descriptors.len());
+        let mut mapped_all = true;
+        for descriptor in descriptors {
+            let Some(mut memory) = GuestMemory::new(descriptor.bytes.len()) else {
+                report.calls.push(NativeWhpCallReport {
+                    name: "HostPageAllocation",
+                    hresult: None,
+                    ok: false,
+                    detail: format!(
+                        "Could not allocate page-aligned host memory for guest region `{}`.",
+                        descriptor.label
+                    ),
+                });
+                report.blocker = Some(format!(
+                    "Could not allocate page-aligned guest memory for `{}`.",
+                    descriptor.label
+                ));
+                mapped_all = false;
+                break;
+            };
+
+            memory.as_mut_slice()[..descriptor.bytes.len()].copy_from_slice(&descriptor.bytes);
+            let size = memory.size as u64;
+            report.calls.push(NativeWhpCallReport {
+                name: "GuestMemoryRegion",
+                hresult: None,
+                ok: true,
+                detail: format!(
+                    "Loaded {} bytes into guest region `{}` at {:#010x} (mapped {} bytes).",
+                    descriptor.bytes.len(),
+                    descriptor.label,
+                    descriptor.guest_gpa,
+                    size
+                ),
+            });
+            report.guest_regions.push(NativeGuestRegionReport {
+                label: descriptor.label.clone(),
+                guest_gpa: format!("{:#010x}", descriptor.guest_gpa),
+                source_bytes: descriptor.bytes.len() as u64,
+                mapped_bytes: size,
+                writable: descriptor.writable,
+                executable: descriptor.executable,
+            });
+
+            let mut flags = WHV_MAP_GPA_RANGE_FLAG_READ;
+            if descriptor.writable {
+                flags |= WHV_MAP_GPA_RANGE_FLAG_WRITE;
+            }
+            if descriptor.executable {
+                flags |= WHV_MAP_GPA_RANGE_FLAG_EXECUTE;
+            }
+            let hresult = unsafe {
+                map_gpa_range(
+                    partition,
+                    memory.as_mut_ptr().cast::<c_void>(),
+                    descriptor.guest_gpa,
+                    size,
+                    flags,
+                )
+            };
+            let ok = hresult_succeeded(hresult);
+            mapped_all &= ok;
+            report.calls.push(hresult_call(
+                "WHvMapGpaRange(guest-region)",
+                hresult,
+                if ok {
+                    "Mapped a Pane guest memory region."
+                } else {
+                    "Could not map a Pane guest memory region."
+                },
+            ));
+            if !ok {
+                report.blocker = Some(format!(
+                    "Could not map guest memory region `{}` at {:#010x}.",
+                    descriptor.label, descriptor.guest_gpa
+                ));
+                break;
+            }
+
+            mapped_regions.push(MappedGuestRegion {
+                guest_gpa: descriptor.guest_gpa,
+                size,
+                _memory: memory,
+            });
+        }
+
+        report.memory_mapped = mapped_all && !mapped_regions.is_empty();
+        mapped_regions
+    }
+
     fn serial_test_image_registers(entry_gpa: u64) -> ([u32; 12], [WhvRegisterValue; 12]) {
         let code_segment = WhvX64SegmentRegister {
-            base: 0,
+            base: entry_gpa,
             limit: 0xffff,
             selector: 0,
             attributes: 0x009b,
         };
         let data_segment = WhvX64SegmentRegister {
-            base: 0,
+            base: entry_gpa,
             limit: 0xffff,
             selector: 0,
             attributes: 0x0093,
@@ -1269,10 +1360,8 @@ mod windows_whp {
         let register_values = [
             WhvRegisterValue { reg64: 0 },
             WhvRegisterValue { reg64: 0 },
-            WhvRegisterValue {
-                reg64: entry_gpa + 0x800,
-            },
-            WhvRegisterValue { reg64: entry_gpa },
+            WhvRegisterValue { reg64: 0x800 },
+            WhvRegisterValue { reg64: 0 },
             WhvRegisterValue { reg64: 0x0002 },
             WhvRegisterValue {
                 segment: code_segment,

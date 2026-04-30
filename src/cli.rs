@@ -310,11 +310,14 @@ pub struct NativeBootSpikeArgs {
     #[arg(long)]
     pub execute: bool,
     /// Map guest memory and run a tiny serial I/O fixture after the partition/vCPU is created.
-    #[arg(long, conflicts_with = "run_boot_loader")]
+    #[arg(long, conflicts_with_all = ["run_boot_loader", "run_kernel_layout"])]
     pub run_fixture: bool,
     /// Map guest memory and run the registered boot-to-serial loader artifact.
-    #[arg(long, conflicts_with = "run_fixture")]
+    #[arg(long, conflicts_with_all = ["run_fixture", "run_kernel_layout"])]
     pub run_boot_loader: bool,
+    /// Map guest memory and run the materialized kernel-layout artifact under the serial/HALT contract.
+    #[arg(long, conflicts_with_all = ["run_fixture", "run_boot_loader"])]
+    pub run_kernel_layout: bool,
     /// Emit structured JSON instead of a human-readable summary.
     #[arg(long)]
     pub json: bool,

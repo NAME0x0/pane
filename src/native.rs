@@ -621,6 +621,10 @@ mod windows_whp {
     const SERIAL_COM1_PORT: u16 = 0x03f8;
     const VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET: usize = 10;
     const VP_CONTEXT_RIP_OFFSET: usize = 32;
+    const MEMORY_CONTEXT_OFFSET: usize = 48;
+    const MEMORY_ACCESS_INFO_OFFSET: usize = MEMORY_CONTEXT_OFFSET + 20;
+    const MEMORY_GPA_OFFSET: usize = MEMORY_CONTEXT_OFFSET + 24;
+    const MEMORY_GVA_OFFSET: usize = MEMORY_CONTEXT_OFFSET + 32;
     const IO_CONTEXT_OFFSET: usize = 48;
     const IO_ACCESS_INFO_OFFSET: usize = IO_CONTEXT_OFFSET + 20;
     const IO_PORT_OFFSET: usize = IO_CONTEXT_OFFSET + 24;
@@ -1625,6 +1629,29 @@ mod windows_whp {
                     });
                     break;
                 }
+                DecodedExit::MemoryAccess {
+                    access_type,
+                    gpa_unmapped,
+                    gva_valid,
+                    gpa,
+                    gva,
+                } => {
+                    report.calls.push(NativeWhpCallReport {
+                        name: "LinuxMemoryAccessBlocker",
+                        hresult: None,
+                        ok: false,
+                        detail: format!(
+                            "Linux probe stopped on {} access at gpa=0x{gpa:016x}, gva={}, unmapped={gpa_unmapped}.",
+                            memory_access_type_label(access_type),
+                            if gva_valid {
+                                format!("0x{gva:016x}")
+                            } else {
+                                "invalid".to_string()
+                            }
+                        ),
+                    });
+                    break;
+                }
                 DecodedExit::MsrAccess { .. } => break,
                 DecodedExit::Cpuid { .. } => break,
                 DecodedExit::Other => break,
@@ -1720,6 +1747,29 @@ mod windows_whp {
                 }
                 DecodedExit::Halt => {
                     report.halt_observed = true;
+                    break;
+                }
+                DecodedExit::MemoryAccess {
+                    access_type,
+                    gpa_unmapped,
+                    gva_valid,
+                    gpa,
+                    gva,
+                } => {
+                    report.calls.push(NativeWhpCallReport {
+                        name: "SerialMemoryAccessBlocker",
+                        hresult: None,
+                        ok: false,
+                        detail: format!(
+                            "Serial guest stopped on {} access at gpa=0x{gpa:016x}, gva={}, unmapped={gpa_unmapped}.",
+                            memory_access_type_label(access_type),
+                            if gva_valid {
+                                format!("0x{gva:016x}")
+                            } else {
+                                "invalid".to_string()
+                            }
+                        ),
+                    });
                     break;
                 }
                 DecodedExit::Cpuid {
@@ -2102,6 +2152,13 @@ mod windows_whp {
     }
 
     enum DecodedExit {
+        MemoryAccess {
+            access_type: u32,
+            gpa_unmapped: bool,
+            gva_valid: bool,
+            gpa: u64,
+            gva: u64,
+        },
         IoPort {
             instruction_length: u8,
             rip: u64,
@@ -2140,15 +2197,33 @@ mod windows_whp {
         report.exit_reason_label = Some(exit_reason_label(exit_reason).to_string());
 
         if exit_reason == WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS {
+            let access_info = read_u32(exit_context, MEMORY_ACCESS_INFO_OFFSET);
+            let access_type = access_info & 0x3;
+            let gpa_unmapped = ((access_info >> 2) & 0x1) == 0x1;
+            let gva_valid = ((access_info >> 3) & 0x1) == 0x1;
+            let gpa = read_u64(exit_context, MEMORY_GPA_OFFSET);
+            let gva = read_u64(exit_context, MEMORY_GVA_OFFSET);
             report.calls.push(NativeWhpCallReport {
                 name: "DecodeMemoryAccess",
                 hresult: None,
                 ok: false,
-                detail:
-                    "Guest accessed memory outside the currently mapped Pane RAM/artifact regions."
-                        .to_string(),
+                detail: format!(
+                    "Guest memory access type={} gpa=0x{gpa:016x} gva={} unmapped={gpa_unmapped}.",
+                    memory_access_type_label(access_type),
+                    if gva_valid {
+                        format!("0x{gva:016x}")
+                    } else {
+                        "invalid".to_string()
+                    }
+                ),
             });
-            DecodedExit::Other
+            DecodedExit::MemoryAccess {
+                access_type,
+                gpa_unmapped,
+                gva_valid,
+                gpa,
+                gva,
+            }
         } else if exit_reason == WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS {
             let instruction_length = exit_context[VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET] & 0x0f;
             let rip = read_u64(exit_context, VP_CONTEXT_RIP_OFFSET);
@@ -2265,6 +2340,15 @@ mod windows_whp {
         }
     }
 
+    fn memory_access_type_label(value: u32) -> &'static str {
+        match value {
+            0 => "read",
+            1 => "write",
+            2 => "execute",
+            _ => "unknown",
+        }
+    }
+
     fn read_u16(bytes: &[u8], offset: usize) -> u16 {
         u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
     }
@@ -2297,8 +2381,9 @@ mod windows_whp {
             decode_exit_context, guest_contract_passed, linux_entry_probe_detail,
             linux_entry_probe_passed, serial_contract_passed, DecodedExit,
             CPUID_DEFAULT_RAX_OFFSET, CPUID_DEFAULT_RBX_OFFSET, CPUID_DEFAULT_RCX_OFFSET,
-            CPUID_DEFAULT_RDX_OFFSET, CPUID_RAX_OFFSET, CPUID_RCX_OFFSET, MSR_ACCESS_INFO_OFFSET,
-            MSR_NUMBER_OFFSET, MSR_RAX_OFFSET, MSR_RDX_OFFSET,
+            CPUID_DEFAULT_RDX_OFFSET, CPUID_RAX_OFFSET, CPUID_RCX_OFFSET,
+            MEMORY_ACCESS_INFO_OFFSET, MEMORY_GPA_OFFSET, MEMORY_GVA_OFFSET,
+            MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET, MSR_RAX_OFFSET, MSR_RDX_OFFSET,
             VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET, VP_CONTEXT_RIP_OFFSET,
             WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE, WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS,
             WHV_RUN_VP_EXIT_REASON_X64_CPUID, WHV_RUN_VP_EXIT_REASON_X64_HALT,
@@ -2543,6 +2628,42 @@ mod windows_whp {
                 .calls
                 .iter()
                 .any(|call| call.name == "DecodeX64MsrAccess" && call.ok));
+        }
+
+        #[test]
+        fn decodes_memory_access_exit_with_guest_addresses() {
+            let mut exit_context = [0_u8; 128];
+            exit_context[..4].copy_from_slice(&WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS.to_le_bytes());
+            let access_info = 1_u32 | (1 << 2) | (1 << 3);
+            exit_context[MEMORY_ACCESS_INFO_OFFSET..MEMORY_ACCESS_INFO_OFFSET + 4]
+                .copy_from_slice(&access_info.to_le_bytes());
+            exit_context[MEMORY_GPA_OFFSET..MEMORY_GPA_OFFSET + 8]
+                .copy_from_slice(&0x0000_0000_fee0_0000_u64.to_le_bytes());
+            exit_context[MEMORY_GVA_OFFSET..MEMORY_GVA_OFFSET + 8]
+                .copy_from_slice(&0xffff_ffff_fee0_0000_u64.to_le_bytes());
+            let mut report = base_report();
+
+            match decode_exit_context(&exit_context, &mut report) {
+                DecodedExit::MemoryAccess {
+                    access_type,
+                    gpa_unmapped,
+                    gva_valid,
+                    gpa,
+                    gva,
+                } => {
+                    assert_eq!(access_type, 1);
+                    assert!(gpa_unmapped);
+                    assert!(gva_valid);
+                    assert_eq!(gpa, 0x0000_0000_fee0_0000);
+                    assert_eq!(gva, 0xffff_ffff_fee0_0000);
+                }
+                _ => panic!("expected memory access exit"),
+            }
+            assert!(report.calls.iter().any(|call| {
+                call.name == "DecodeMemoryAccess"
+                    && call.detail.contains("write")
+                    && call.detail.contains("0x00000000fee00000")
+            }));
         }
     }
 }

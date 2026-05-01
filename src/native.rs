@@ -593,6 +593,7 @@ pub(crate) fn test_native_host_report(ready: bool) -> NativeHostPreflightReport 
 mod windows_whp {
     use std::{
         alloc::{alloc_zeroed, dealloc, Layout},
+        collections::HashMap,
         ffi::{c_char, c_void, CString},
         mem,
     };
@@ -631,6 +632,11 @@ mod windows_whp {
     const CPUID_DEFAULT_RCX_OFFSET: usize = CPUID_CONTEXT_OFFSET + 40;
     const CPUID_DEFAULT_RDX_OFFSET: usize = CPUID_CONTEXT_OFFSET + 48;
     const CPUID_DEFAULT_RBX_OFFSET: usize = CPUID_CONTEXT_OFFSET + 56;
+    const MSR_CONTEXT_OFFSET: usize = 48;
+    const MSR_ACCESS_INFO_OFFSET: usize = MSR_CONTEXT_OFFSET;
+    const MSR_NUMBER_OFFSET: usize = MSR_CONTEXT_OFFSET + 4;
+    const MSR_RAX_OFFSET: usize = MSR_CONTEXT_OFFSET + 8;
+    const MSR_RDX_OFFSET: usize = MSR_CONTEXT_OFFSET + 16;
     const WHV_REGISTER_RAX: u32 = 0x0000_0000;
     const WHV_REGISTER_RCX: u32 = 0x0000_0001;
     const WHV_REGISTER_RDX: u32 = 0x0000_0002;
@@ -1619,6 +1625,7 @@ mod windows_whp {
                     });
                     break;
                 }
+                DecodedExit::MsrAccess { .. } => break,
                 DecodedExit::Cpuid { .. } => break,
                 DecodedExit::Other => break,
             }
@@ -1646,6 +1653,7 @@ mod windows_whp {
     ) {
         report.serial_expected_text = None;
         let max_guest_exits = 32;
+        let mut msr_state = default_linux_msr_state();
 
         for exit_index in 0..max_guest_exits {
             let mut exit_context = [0_u8; 1024];
@@ -1747,6 +1755,41 @@ mod windows_whp {
                             rbx: default_rbx,
                             rcx: default_rcx,
                             rdx: default_rdx,
+                            next_rip,
+                        },
+                        report,
+                    ) {
+                        break;
+                    }
+                }
+                DecodedExit::MsrAccess {
+                    instruction_length,
+                    rip,
+                    is_write,
+                    msr_number,
+                    value,
+                } => {
+                    if instruction_length == 0 {
+                        report.calls.push(NativeWhpCallReport {
+                            name: "AdvanceGuestRip",
+                            hresult: None,
+                            ok: false,
+                            detail:
+                                "WHP reported a zero-length MSR instruction; refusing to resume."
+                                    .to_string(),
+                        });
+                        break;
+                    }
+
+                    let next_rip = rip + u64::from(instruction_length);
+                    if !handle_msr_access_and_advance_rip(
+                        partition,
+                        set_virtual_processor_registers,
+                        &mut msr_state,
+                        MsrAccess {
+                            is_write,
+                            msr_number,
+                            value,
                             next_rip,
                         },
                         report,
@@ -1871,6 +1914,96 @@ mod windows_whp {
         ok
     }
 
+    struct MsrAccess {
+        is_write: bool,
+        msr_number: u32,
+        value: u64,
+        next_rip: u64,
+    }
+
+    fn default_linux_msr_state() -> HashMap<u32, u64> {
+        HashMap::from([
+            (0x0000_0010, 0),                     // IA32_TIME_STAMP_COUNTER
+            (0x0000_001b, 0x0000_0000_fee0_0900), // IA32_APIC_BASE: BSP + enabled
+            (0xc000_0080, 0),                     // IA32_EFER
+            (0xc000_0081, 0),                     // IA32_STAR
+            (0xc000_0082, 0),                     // IA32_LSTAR
+            (0xc000_0084, 0),                     // IA32_FMASK
+            (0xc000_0100, 0),                     // FS base
+            (0xc000_0101, 0),                     // GS base
+            (0xc000_0102, 0),                     // Kernel GS base
+        ])
+    }
+
+    fn handle_msr_access_and_advance_rip(
+        partition: *mut c_void,
+        set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
+        msr_state: &mut HashMap<u32, u64>,
+        access: MsrAccess,
+        report: &mut NativePartitionSmokeReport,
+    ) -> bool {
+        if access.is_write {
+            msr_state.insert(access.msr_number, access.value);
+            let ok = set_guest_rip(
+                partition,
+                set_virtual_processor_registers,
+                access.next_rip,
+                report,
+            );
+            report.calls.push(NativeWhpCallReport {
+                name: "MsrWrite",
+                hresult: None,
+                ok,
+                detail: format!(
+                    "Stored guest WRMSR msr=0x{:08x} value=0x{:016x}.",
+                    access.msr_number, access.value
+                ),
+            });
+            return ok;
+        }
+
+        let value = *msr_state.get(&access.msr_number).unwrap_or(&0);
+        let register_names = [WHV_REGISTER_RAX, WHV_REGISTER_RDX, WHV_REGISTER_RIP];
+        let register_values = [
+            WhvRegisterValue {
+                reg64: value & 0xffff_ffff,
+            },
+            WhvRegisterValue { reg64: value >> 32 },
+            WhvRegisterValue {
+                reg64: access.next_rip,
+            },
+        ];
+        let hresult = unsafe {
+            set_virtual_processor_registers(
+                partition,
+                0,
+                register_names.as_ptr(),
+                register_names.len() as u32,
+                register_values.as_ptr(),
+            )
+        };
+        let ok = hresult_succeeded(hresult);
+        report.calls.push(hresult_call(
+            "WHvSetVirtualProcessorRegisters(RDMSR)",
+            hresult,
+            if ok {
+                "Returned stored MSR value to guest RDX:RAX and advanced RIP."
+            } else {
+                "Could not return stored MSR value to guest registers."
+            },
+        ));
+        report.calls.push(NativeWhpCallReport {
+            name: "MsrRead",
+            hresult: None,
+            ok,
+            detail: format!(
+                "Returned guest RDMSR msr=0x{:08x} value=0x{:016x}.",
+                access.msr_number, value
+            ),
+        });
+        ok
+    }
+
     fn guest_contract_passed(
         report: &NativePartitionSmokeReport,
         entry_mode: NativeGuestEntryMode,
@@ -1902,16 +2035,28 @@ mod windows_whp {
     fn linux_entry_probe_passed(report: &NativePartitionSmokeReport) -> bool {
         report.virtual_processor_ran
             && report.exit_reason.is_some()
+            && !report.calls.iter().any(|call| {
+                matches!(call.name, "LinuxEntryProbeExitBudget" | "AdvanceGuestRip") && !call.ok
+            })
             && !matches!(
                 report.exit_reason,
                 Some(
                     WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS
                         | WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE
                         | WHV_RUN_VP_EXIT_REASON_UNRECOVERABLE_EXCEPTION
-                        | WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS
-                        | WHV_RUN_VP_EXIT_REASON_X64_CPUID
                 )
             )
+            && match report.exit_reason {
+                Some(WHV_RUN_VP_EXIT_REASON_X64_CPUID) => report
+                    .calls
+                    .iter()
+                    .any(|call| call.name == "CpuidPassthrough" && call.ok),
+                Some(WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS) => report
+                    .calls
+                    .iter()
+                    .any(|call| matches!(call.name, "MsrRead" | "MsrWrite") && call.ok),
+                _ => true,
+            }
     }
 
     fn linux_entry_probe_detail(report: &NativePartitionSmokeReport) -> String {
@@ -1940,7 +2085,7 @@ mod windows_whp {
                     "inspect CPUID pass-through and guest RIP advancement"
                 }
                 Some(WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS) => {
-                    "implement MSR exit handling for the Linux boot CPU contract"
+                    "inspect MSR state handling and guest RIP advancement"
                 }
                 Some(WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE) => {
                     "correct the protected-mode register setup"
@@ -1966,6 +2111,13 @@ mod windows_whp {
             serial_byte: u8,
         },
         Halt,
+        MsrAccess {
+            instruction_length: u8,
+            rip: u64,
+            is_write: bool,
+            msr_number: u32,
+            value: u64,
+        },
         Cpuid {
             instruction_length: u8,
             rip: u64,
@@ -2032,15 +2184,30 @@ mod windows_whp {
             });
             DecodedExit::Halt
         } else if exit_reason == WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS {
+            let instruction_length = exit_context[VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET] & 0x0f;
+            let rip = read_u64(exit_context, VP_CONTEXT_RIP_OFFSET);
+            let access_info = read_u32(exit_context, MSR_ACCESS_INFO_OFFSET);
+            let is_write = (access_info & 0x1) == 0x1;
+            let msr_number = read_u32(exit_context, MSR_NUMBER_OFFSET);
+            let rax = read_u64(exit_context, MSR_RAX_OFFSET);
+            let rdx = read_u64(exit_context, MSR_RDX_OFFSET);
+            let value = (rdx << 32) | (rax & 0xffff_ffff);
             report.calls.push(NativeWhpCallReport {
                 name: "DecodeX64MsrAccess",
                 hresult: None,
-                ok: false,
-                detail:
-                    "Guest reached an MSR access exit; Pane does not emulate Linux boot MSRs yet."
-                        .to_string(),
+                ok: true,
+                detail: format!(
+                    "Guest reached {}MSR msr=0x{msr_number:08x} value=0x{value:016x}; using Pane's minimal Linux MSR state.",
+                    if is_write { "WR" } else { "RD" }
+                ),
             });
-            DecodedExit::Other
+            DecodedExit::MsrAccess {
+                instruction_length,
+                rip,
+                is_write,
+                msr_number,
+                value,
+            }
         } else if exit_reason == WHV_RUN_VP_EXIT_REASON_X64_CPUID {
             let instruction_length = exit_context[VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET] & 0x0f;
             let rip = read_u64(exit_context, VP_CONTEXT_RIP_OFFSET);
@@ -2130,7 +2297,8 @@ mod windows_whp {
             decode_exit_context, guest_contract_passed, linux_entry_probe_detail,
             linux_entry_probe_passed, serial_contract_passed, DecodedExit,
             CPUID_DEFAULT_RAX_OFFSET, CPUID_DEFAULT_RBX_OFFSET, CPUID_DEFAULT_RCX_OFFSET,
-            CPUID_DEFAULT_RDX_OFFSET, CPUID_RAX_OFFSET, CPUID_RCX_OFFSET,
+            CPUID_DEFAULT_RDX_OFFSET, CPUID_RAX_OFFSET, CPUID_RCX_OFFSET, MSR_ACCESS_INFO_OFFSET,
+            MSR_NUMBER_OFFSET, MSR_RAX_OFFSET, MSR_RDX_OFFSET,
             VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET, VP_CONTEXT_RIP_OFFSET,
             WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE, WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS,
             WHV_RUN_VP_EXIT_REASON_X64_CPUID, WHV_RUN_VP_EXIT_REASON_X64_HALT,
@@ -2259,7 +2427,7 @@ mod windows_whp {
                 (
                     WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS,
                     "x64-msr-access",
-                    "implement MSR exit handling",
+                    "inspect MSR state handling",
                 ),
             ] {
                 let mut report = base_report();
@@ -2320,6 +2488,61 @@ mod windows_whp {
                 .calls
                 .iter()
                 .any(|call| call.name == "DecodeX64Cpuid" && call.ok));
+        }
+
+        #[test]
+        fn decodes_msr_read_and_write_exits() {
+            let mut read_context = [0_u8; 128];
+            read_context[..4].copy_from_slice(&WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS.to_le_bytes());
+            read_context[VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET] = 2;
+            read_context[VP_CONTEXT_RIP_OFFSET..VP_CONTEXT_RIP_OFFSET + 8]
+                .copy_from_slice(&0x0010_0100_u64.to_le_bytes());
+            read_context[MSR_NUMBER_OFFSET..MSR_NUMBER_OFFSET + 4]
+                .copy_from_slice(&0xc000_0080_u32.to_le_bytes());
+            let mut report = base_report();
+
+            match decode_exit_context(&read_context, &mut report) {
+                DecodedExit::MsrAccess {
+                    instruction_length,
+                    rip,
+                    is_write,
+                    msr_number,
+                    value,
+                } => {
+                    assert_eq!(instruction_length, 2);
+                    assert_eq!(rip, 0x0010_0100);
+                    assert!(!is_write);
+                    assert_eq!(msr_number, 0xc000_0080);
+                    assert_eq!(value, 0);
+                }
+                _ => panic!("expected MSR read exit"),
+            }
+
+            let mut write_context = read_context;
+            write_context[MSR_ACCESS_INFO_OFFSET..MSR_ACCESS_INFO_OFFSET + 4]
+                .copy_from_slice(&1_u32.to_le_bytes());
+            write_context[MSR_RAX_OFFSET..MSR_RAX_OFFSET + 8]
+                .copy_from_slice(&0x0000_0501_u64.to_le_bytes());
+            write_context[MSR_RDX_OFFSET..MSR_RDX_OFFSET + 8]
+                .copy_from_slice(&0x0000_0001_u64.to_le_bytes());
+
+            match decode_exit_context(&write_context, &mut report) {
+                DecodedExit::MsrAccess {
+                    is_write,
+                    msr_number,
+                    value,
+                    ..
+                } => {
+                    assert!(is_write);
+                    assert_eq!(msr_number, 0xc000_0080);
+                    assert_eq!(value, 0x0000_0001_0000_0501);
+                }
+                _ => panic!("expected MSR write exit"),
+            }
+            assert!(report
+                .calls
+                .iter()
+                .any(|call| call.name == "DecodeX64MsrAccess" && call.ok));
         }
     }
 }

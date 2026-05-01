@@ -624,8 +624,17 @@ mod windows_whp {
     const IO_ACCESS_INFO_OFFSET: usize = IO_CONTEXT_OFFSET + 20;
     const IO_PORT_OFFSET: usize = IO_CONTEXT_OFFSET + 24;
     const IO_RAX_OFFSET: usize = IO_CONTEXT_OFFSET + 32;
+    const CPUID_CONTEXT_OFFSET: usize = 48;
+    const CPUID_RAX_OFFSET: usize = CPUID_CONTEXT_OFFSET;
+    const CPUID_RCX_OFFSET: usize = CPUID_CONTEXT_OFFSET + 8;
+    const CPUID_DEFAULT_RAX_OFFSET: usize = CPUID_CONTEXT_OFFSET + 32;
+    const CPUID_DEFAULT_RCX_OFFSET: usize = CPUID_CONTEXT_OFFSET + 40;
+    const CPUID_DEFAULT_RDX_OFFSET: usize = CPUID_CONTEXT_OFFSET + 48;
+    const CPUID_DEFAULT_RBX_OFFSET: usize = CPUID_CONTEXT_OFFSET + 56;
     const WHV_REGISTER_RAX: u32 = 0x0000_0000;
+    const WHV_REGISTER_RCX: u32 = 0x0000_0001;
     const WHV_REGISTER_RDX: u32 = 0x0000_0002;
+    const WHV_REGISTER_RBX: u32 = 0x0000_0003;
     const WHV_REGISTER_RSP: u32 = 0x0000_0004;
     const WHV_REGISTER_RSI: u32 = 0x0000_0006;
     const WHV_REGISTER_RIP: u32 = 0x0000_0010;
@@ -1610,6 +1619,7 @@ mod windows_whp {
                     });
                     break;
                 }
+                DecodedExit::Cpuid { .. } => break,
                 DecodedExit::Other => break,
             }
 
@@ -1704,6 +1714,46 @@ mod windows_whp {
                     report.halt_observed = true;
                     break;
                 }
+                DecodedExit::Cpuid {
+                    instruction_length,
+                    rip,
+                    leaf,
+                    subleaf,
+                    default_rax,
+                    default_rbx,
+                    default_rcx,
+                    default_rdx,
+                } => {
+                    if instruction_length == 0 {
+                        report.calls.push(NativeWhpCallReport {
+                            name: "AdvanceGuestRip",
+                            hresult: None,
+                            ok: false,
+                            detail:
+                                "WHP reported a zero-length CPUID instruction; refusing to resume."
+                                    .to_string(),
+                        });
+                        break;
+                    }
+
+                    let next_rip = rip + u64::from(instruction_length);
+                    if !set_cpuid_result_and_advance_rip(
+                        partition,
+                        set_virtual_processor_registers,
+                        CpuidResult {
+                            leaf,
+                            subleaf,
+                            rax: default_rax,
+                            rbx: default_rbx,
+                            rcx: default_rcx,
+                            rdx: default_rdx,
+                            next_rip,
+                        },
+                        report,
+                    ) {
+                        break;
+                    }
+                }
                 DecodedExit::Other => break,
             }
 
@@ -1755,6 +1805,69 @@ mod windows_whp {
                 "Could not advance guest RIP after serial I/O exit."
             },
         ));
+        ok
+    }
+
+    struct CpuidResult {
+        leaf: u64,
+        subleaf: u64,
+        rax: u64,
+        rbx: u64,
+        rcx: u64,
+        rdx: u64,
+        next_rip: u64,
+    }
+
+    fn set_cpuid_result_and_advance_rip(
+        partition: *mut c_void,
+        set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
+        result: CpuidResult,
+        report: &mut NativePartitionSmokeReport,
+    ) -> bool {
+        let register_names = [
+            WHV_REGISTER_RAX,
+            WHV_REGISTER_RBX,
+            WHV_REGISTER_RCX,
+            WHV_REGISTER_RDX,
+            WHV_REGISTER_RIP,
+        ];
+        let register_values = [
+            WhvRegisterValue { reg64: result.rax },
+            WhvRegisterValue { reg64: result.rbx },
+            WhvRegisterValue { reg64: result.rcx },
+            WhvRegisterValue { reg64: result.rdx },
+            WhvRegisterValue {
+                reg64: result.next_rip,
+            },
+        ];
+        let hresult = unsafe {
+            set_virtual_processor_registers(
+                partition,
+                0,
+                register_names.as_ptr(),
+                register_names.len() as u32,
+                register_values.as_ptr(),
+            )
+        };
+        let ok = hresult_succeeded(hresult);
+        report.calls.push(hresult_call(
+            "WHvSetVirtualProcessorRegisters(CPUID)",
+            hresult,
+            if ok {
+                "Returned WHP default CPUID results to guest registers and advanced RIP."
+            } else {
+                "Could not return WHP default CPUID results to guest registers."
+            },
+        ));
+        report.calls.push(NativeWhpCallReport {
+            name: "CpuidPassthrough",
+            hresult: None,
+            ok,
+            detail: format!(
+                "leaf=0x{:016x} subleaf=0x{:016x} -> eax=0x{:016x} ebx=0x{:016x} ecx=0x{:016x} edx=0x{:016x}.",
+                result.leaf, result.subleaf, result.rax, result.rbx, result.rcx, result.rdx
+            ),
+        });
         ok
     }
 
@@ -1824,7 +1937,7 @@ mod windows_whp {
                     "map the missing guest memory range or correct the E820/boot params layout"
                 }
                 Some(WHV_RUN_VP_EXIT_REASON_X64_CPUID) => {
-                    "implement CPUID exit handling for the Linux boot CPU contract"
+                    "inspect CPUID pass-through and guest RIP advancement"
                 }
                 Some(WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS) => {
                     "implement MSR exit handling for the Linux boot CPU contract"
@@ -1853,6 +1966,16 @@ mod windows_whp {
             serial_byte: u8,
         },
         Halt,
+        Cpuid {
+            instruction_length: u8,
+            rip: u64,
+            leaf: u64,
+            subleaf: u64,
+            default_rax: u64,
+            default_rbx: u64,
+            default_rcx: u64,
+            default_rdx: u64,
+        },
         Other,
     }
 
@@ -1919,15 +2042,32 @@ mod windows_whp {
             });
             DecodedExit::Other
         } else if exit_reason == WHV_RUN_VP_EXIT_REASON_X64_CPUID {
+            let instruction_length = exit_context[VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET] & 0x0f;
+            let rip = read_u64(exit_context, VP_CONTEXT_RIP_OFFSET);
+            let leaf = read_u64(exit_context, CPUID_RAX_OFFSET);
+            let subleaf = read_u64(exit_context, CPUID_RCX_OFFSET);
+            let default_rax = read_u64(exit_context, CPUID_DEFAULT_RAX_OFFSET);
+            let default_rbx = read_u64(exit_context, CPUID_DEFAULT_RBX_OFFSET);
+            let default_rcx = read_u64(exit_context, CPUID_DEFAULT_RCX_OFFSET);
+            let default_rdx = read_u64(exit_context, CPUID_DEFAULT_RDX_OFFSET);
             report.calls.push(NativeWhpCallReport {
                 name: "DecodeX64Cpuid",
                 hresult: None,
-                ok: false,
-                detail:
-                    "Guest reached a CPUID exit; Pane does not emulate Linux boot CPUID leaves yet."
-                        .to_string(),
+                ok: true,
+                detail: format!(
+                    "Guest reached CPUID leaf=0x{leaf:016x} subleaf=0x{subleaf:016x}; using WHP default result registers."
+                ),
             });
-            DecodedExit::Other
+            DecodedExit::Cpuid {
+                instruction_length,
+                rip,
+                leaf,
+                subleaf,
+                default_rax,
+                default_rbx,
+                default_rcx,
+                default_rdx,
+            }
         } else {
             report.calls.push(NativeWhpCallReport {
                 name: "DecodeVpExit",
@@ -1987,11 +2127,14 @@ mod windows_whp {
     #[cfg(test)]
     mod tests {
         use super::{
-            guest_contract_passed, linux_entry_probe_detail, linux_entry_probe_passed,
-            serial_contract_passed, WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE,
-            WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS, WHV_RUN_VP_EXIT_REASON_X64_CPUID,
-            WHV_RUN_VP_EXIT_REASON_X64_HALT, WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS,
-            WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS,
+            decode_exit_context, guest_contract_passed, linux_entry_probe_detail,
+            linux_entry_probe_passed, serial_contract_passed, DecodedExit,
+            CPUID_DEFAULT_RAX_OFFSET, CPUID_DEFAULT_RBX_OFFSET, CPUID_DEFAULT_RCX_OFFSET,
+            CPUID_DEFAULT_RDX_OFFSET, CPUID_RAX_OFFSET, CPUID_RCX_OFFSET,
+            VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET, VP_CONTEXT_RIP_OFFSET,
+            WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE, WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS,
+            WHV_RUN_VP_EXIT_REASON_X64_CPUID, WHV_RUN_VP_EXIT_REASON_X64_HALT,
+            WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS, WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS,
         };
         use crate::native::{
             serial_boot_test_image_bytes, NativePartitionSmokeReport, NativePartitionSmokeStatus,
@@ -2111,7 +2254,7 @@ mod windows_whp {
                 (
                     WHV_RUN_VP_EXIT_REASON_X64_CPUID,
                     "x64-cpuid",
-                    "implement CPUID exit handling",
+                    "inspect CPUID pass-through",
                 ),
                 (
                     WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS,
@@ -2126,6 +2269,57 @@ mod windows_whp {
                 assert!(!linux_entry_probe_passed(&report));
                 assert!(linux_entry_probe_detail(&report).contains(expected_next_step));
             }
+        }
+
+        #[test]
+        fn decodes_cpuid_exit_with_whp_default_registers() {
+            let mut exit_context = [0_u8; 128];
+            exit_context[..4].copy_from_slice(&WHV_RUN_VP_EXIT_REASON_X64_CPUID.to_le_bytes());
+            exit_context[VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET] = 2;
+            exit_context[VP_CONTEXT_RIP_OFFSET..VP_CONTEXT_RIP_OFFSET + 8]
+                .copy_from_slice(&0x0010_0000_u64.to_le_bytes());
+            exit_context[CPUID_RAX_OFFSET..CPUID_RAX_OFFSET + 8]
+                .copy_from_slice(&0x0000_0001_u64.to_le_bytes());
+            exit_context[CPUID_RCX_OFFSET..CPUID_RCX_OFFSET + 8]
+                .copy_from_slice(&0x0000_0002_u64.to_le_bytes());
+            exit_context[CPUID_DEFAULT_RAX_OFFSET..CPUID_DEFAULT_RAX_OFFSET + 8]
+                .copy_from_slice(&0x0003_06a9_u64.to_le_bytes());
+            exit_context[CPUID_DEFAULT_RBX_OFFSET..CPUID_DEFAULT_RBX_OFFSET + 8]
+                .copy_from_slice(&0x0010_0800_u64.to_le_bytes());
+            exit_context[CPUID_DEFAULT_RCX_OFFSET..CPUID_DEFAULT_RCX_OFFSET + 8]
+                .copy_from_slice(&0x7ffafbff_u64.to_le_bytes());
+            exit_context[CPUID_DEFAULT_RDX_OFFSET..CPUID_DEFAULT_RDX_OFFSET + 8]
+                .copy_from_slice(&0xbfebfbff_u64.to_le_bytes());
+            let mut report = base_report();
+
+            let decoded = decode_exit_context(&exit_context, &mut report);
+
+            match decoded {
+                DecodedExit::Cpuid {
+                    instruction_length,
+                    rip,
+                    leaf,
+                    subleaf,
+                    default_rax,
+                    default_rbx,
+                    default_rcx,
+                    default_rdx,
+                } => {
+                    assert_eq!(instruction_length, 2);
+                    assert_eq!(rip, 0x0010_0000);
+                    assert_eq!(leaf, 1);
+                    assert_eq!(subleaf, 2);
+                    assert_eq!(default_rax, 0x0003_06a9);
+                    assert_eq!(default_rbx, 0x0010_0800);
+                    assert_eq!(default_rcx, 0x7ffa_fbff);
+                    assert_eq!(default_rdx, 0xbfeb_fbff);
+                }
+                _ => panic!("expected CPUID exit"),
+            }
+            assert!(report
+                .calls
+                .iter()
+                .any(|call| call.name == "DecodeX64Cpuid" && call.ok));
         }
     }
 }

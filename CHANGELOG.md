@@ -33,6 +33,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - Linux protected-mode WHP runs now use an entry-probe contract instead of pretending a real bzImage must emit the controlled `PANE_BOOT_OK` serial/HALT fixture banner
 - Linux kernel layouts now materialize a deterministic guest memory map, write an E820 table into boot params, and map non-overlapping low/high RAM regions for protected-mode entry probes
 - Linux entry probes now classify unhandled memory-access, CPUID, and MSR exits as explicit blockers instead of treating them as successful boot progress
+- Linux entry probes now pass WHP default CPUID results back to guest registers and advance RIP, removing the first expected CPU-identification blocker for early kernel execution
 - Control Center base-image registration for copying local Arch images into Pane runtime storage with SHA-256 metadata
 - `pane native-preflight` for probing Windows Hypervisor Platform host readiness and runtime artifact blockers before the Pane-owned boot spike
 - `pane native-boot-spike --execute --run-fixture` for the guarded WHP guest execution milestone: temporary partition/vCPU creation, guest memory mapping, register setup, repeated COM1 serial I/O exit decoding for the `PANE_BOOT_OK` banner, final HLT observation, cleanup, and no Arch boot claim

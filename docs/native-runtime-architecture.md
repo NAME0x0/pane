@@ -68,7 +68,7 @@ It must remain side-effect-free. It reports blockers; it does not enable Windows
 3. Runtime-backed serial test image: materialize `serial-boot.paneimg` under the Pane runtime, map it as guest memory, configure vCPU registers, run it, decode the `PANE_BOOT_OK` COM1 banner across repeated I/O exits, observe HLT, unmap memory, and tear everything down cleanly.
 4. Runtime-provided boot-loader candidate: register a verified `boot-to-serial-loader.paneimg`, require a SHA-256 match and expected serial text, then execute that artifact through WHP with `--run-boot-loader`.
 5. Kernel boot plan: register a verified Linux kernel, inspect its bzImage header for boot-protocol/setup metadata, register an optional verified initramfs, and require an explicit `console=ttyS0` cmdline under `kernel-boot.json` without claiming it executes yet.
-6. Kernel boot layout: materialize `kernel-boot-layout.json` with boot params, cmdline, kernel, and optional initramfs guest-physical addresses.
+6. Kernel boot layout: materialize `kernel-boot-layout.json` with boot params, cmdline, bzImage setup bytes, protected-mode payload placement, explicit Linux entry metadata, and optional initramfs guest-physical addresses.
 7. Boot-to-serial spike: implement WHP kernel entry, boot parameters, initramfs placement, and serial output capture far enough to prove Linux boot progress.
 8. Runtime artifact boot: connect the kernel path to Pane's verified Arch base image and Pane user disk descriptor.
 9. Storage materialization: turn the descriptor into a durable block-device format with resize, snapshot, repair, export, and import semantics.
@@ -86,7 +86,7 @@ Pane cannot claim the native runtime is real until:
 - `pane native-boot-spike --execute --run-boot-loader` can load a verified runtime-provided boot-loader candidate, validate its expected serial output, observe HLT, and release all WHP resources,
 - `pane runtime --register-kernel` can prepare a verified kernel/initramfs boot plan with serial console output required before any WHP kernel-entry work starts,
 - `pane native-kernel-plan --materialize` can write and re-validate the deterministic kernel boot layout before the WHP runner maps those guest addresses,
-- `pane native-boot-spike --execute --run-kernel-layout` can consume that layout, map boot params, cmdline, kernel, and optional initramfs regions, then execute a controlled small kernel-layout candidate at the layout's kernel GPA under the serial/HALT contract,
+- `pane native-boot-spike --execute --run-kernel-layout` can consume that layout, map boot params, cmdline, kernel, and optional initramfs regions, then select the correct guest-entry contract: real-mode serial for the controlled candidate or protected-mode Linux entry with boot params in `rsi` for a bzImage payload,
 - a test image can boot under a Pane-owned WHP host without WSL, XRDP, `mstsc.exe`, QEMU, VirtualBox, or Hyper-V Manager,
 - Pane can boot a verified Arch base image plus a Pane-owned user disk,
 - Pane renders the guest through its own app surface,

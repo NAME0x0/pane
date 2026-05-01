@@ -28,6 +28,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - `pane native-kernel-plan --materialize` for writing the deterministic WHP kernel boot layout covering boot params, cmdline, kernel, and optional initramfs placement
 - `pane native-boot-spike --run-kernel-layout` for consuming the materialized kernel layout, including boot params, cmdline, and optional initramfs mappings, in the guarded WHP serial/HALT runner with controlled small candidates
 - Linux bzImage header inspection during `pane runtime --register-kernel`, with boot-protocol/setup metadata surfaced in runtime reports
+- Linux bzImage layout splitting into setup bytes, protected-mode payload bytes, and an explicit protected-mode entry contract for the next WHP CPU-state milestone
+- WHP guest-entry reporting now distinguishes the controlled real-mode serial candidate from the Linux protected-mode entry contract and carries the boot-params GPA through CLI/JSON output
 - Control Center base-image registration for copying local Arch images into Pane runtime storage with SHA-256 metadata
 - `pane native-preflight` for probing Windows Hypervisor Platform host readiness and runtime artifact blockers before the Pane-owned boot spike
 - `pane native-boot-spike --execute --run-fixture` for the guarded WHP guest execution milestone: temporary partition/vCPU creation, guest memory mapping, register setup, repeated COM1 serial I/O exit decoding for the `PANE_BOOT_OK` banner, final HLT observation, cleanup, and no Arch boot claim

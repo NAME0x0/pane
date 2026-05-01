@@ -23,7 +23,24 @@ pub(crate) struct NativeSerialBootImage {
     pub(crate) bytes: Vec<u8>,
     pub(crate) expected_serial_text: String,
     pub(crate) guest_entry_gpa: u64,
+    pub(crate) entry_mode: NativeGuestEntryMode,
+    pub(crate) boot_params_gpa: Option<u64>,
     pub(crate) extra_regions: Vec<NativeGuestMemoryRegion>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum NativeGuestEntryMode {
+    RealModeSerial,
+    LinuxProtectedMode32,
+}
+
+impl NativeGuestEntryMode {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::RealModeSerial => "real-mode-serial",
+            Self::LinuxProtectedMode32 => "linux-protected-mode-32",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -132,6 +149,8 @@ pub(crate) struct NativePartitionSmokeReport {
     pub(crate) boot_image_source: Option<String>,
     pub(crate) boot_image_path: Option<String>,
     pub(crate) boot_image_bytes: Option<u64>,
+    pub(crate) entry_mode: Option<String>,
+    pub(crate) boot_params_gpa: Option<String>,
     pub(crate) guest_regions: Vec<NativeGuestRegionReport>,
     pub(crate) serial_port: Option<u16>,
     pub(crate) serial_byte: Option<u8>,
@@ -207,6 +226,7 @@ pub(crate) fn run_partition_smoke(
         return skipped_partition_smoke_report(
             true,
             run_fixture,
+            boot_image,
             "Native host preflight is not ready; run `pane native-preflight` and resolve failures first.",
         );
     }
@@ -447,6 +467,8 @@ fn planned_partition_smoke_report(run_fixture: bool) -> NativePartitionSmokeRepo
         boot_image_source: None,
         boot_image_path: None,
         boot_image_bytes: None,
+        entry_mode: None,
+        boot_params_gpa: None,
         guest_regions: Vec::new(),
         serial_port: None,
         serial_byte: None,
@@ -469,6 +491,7 @@ fn planned_partition_smoke_report(run_fixture: bool) -> NativePartitionSmokeRepo
 fn skipped_partition_smoke_report(
     execute_requested: bool,
     run_fixture: bool,
+    boot_image: Option<&NativeSerialBootImage>,
     blocker: impl Into<String>,
 ) -> NativePartitionSmokeReport {
     NativePartitionSmokeReport {
@@ -490,9 +513,13 @@ fn skipped_partition_smoke_report(
         memory_unmapped: false,
         exit_reason: None,
         exit_reason_label: None,
-        boot_image_source: None,
-        boot_image_path: None,
-        boot_image_bytes: None,
+        boot_image_source: boot_image.map(|image| image.source_label.clone()),
+        boot_image_path: boot_image.and_then(|image| image.path.clone()),
+        boot_image_bytes: boot_image.map(|image| image.bytes.len() as u64),
+        entry_mode: boot_image.map(|image| image.entry_mode.label().to_string()),
+        boot_params_gpa: boot_image
+            .and_then(|image| image.boot_params_gpa)
+            .map(|gpa| format!("{gpa:#010x}")),
         guest_regions: Vec::new(),
         serial_port: None,
         serial_byte: None,
@@ -526,11 +553,12 @@ fn probe_whp() -> WhpPreflightReport {
 #[cfg(not(windows))]
 fn run_whp_partition_smoke(
     run_fixture: bool,
-    _boot_image: Option<&NativeSerialBootImage>,
+    boot_image: Option<&NativeSerialBootImage>,
 ) -> NativePartitionSmokeReport {
     skipped_partition_smoke_report(
         true,
         run_fixture,
+        boot_image,
         "WHP partition smoke can only run on Windows hosts.",
     )
 }
@@ -570,10 +598,10 @@ mod windows_whp {
     };
 
     use super::{
-        base_export_checks, NativeExportCheck, NativeGuestMemoryRegion, NativeGuestRegionReport,
-        NativePartitionSmokeReport, NativePartitionSmokeStatus, NativeSerialBootImage,
-        NativeWhpCallReport, WhpPreflightReport, REQUIRED_WHP_EXPORTS, SERIAL_BOOT_BANNER_TEXT,
-        SERIAL_BOOT_TEST_IMAGE_SIZE,
+        base_export_checks, NativeExportCheck, NativeGuestEntryMode, NativeGuestMemoryRegion,
+        NativeGuestRegionReport, NativePartitionSmokeReport, NativePartitionSmokeStatus,
+        NativeSerialBootImage, NativeWhpCallReport, WhpPreflightReport, REQUIRED_WHP_EXPORTS,
+        SERIAL_BOOT_BANNER_TEXT, SERIAL_BOOT_TEST_IMAGE_SIZE,
     };
 
     const WHV_CAPABILITY_CODE_HYPERVISOR_PRESENT: u32 = 0;
@@ -594,6 +622,7 @@ mod windows_whp {
     const WHV_REGISTER_RAX: u32 = 0x0000_0000;
     const WHV_REGISTER_RDX: u32 = 0x0000_0002;
     const WHV_REGISTER_RSP: u32 = 0x0000_0004;
+    const WHV_REGISTER_RSI: u32 = 0x0000_0006;
     const WHV_REGISTER_RIP: u32 = 0x0000_0010;
     const WHV_REGISTER_RFLAGS: u32 = 0x0000_0011;
     const WHV_REGISTER_ES: u32 = 0x0000_0012;
@@ -729,6 +758,10 @@ mod windows_whp {
             boot_image_source: boot_image.map(|image| image.source_label.clone()),
             boot_image_path: boot_image.and_then(|image| image.path.clone()),
             boot_image_bytes: boot_image.map(|image| image.bytes.len() as u64),
+            entry_mode: boot_image.map(|image| image.entry_mode.label().to_string()),
+            boot_params_gpa: boot_image
+                .and_then(|image| image.boot_params_gpa)
+                .map(|gpa| format!("{gpa:#010x}")),
             guest_regions: Vec::new(),
             serial_port: None,
             serial_byte: None,
@@ -964,28 +997,26 @@ mod windows_whp {
 
             if run_fixture && report.memory_mapped {
                 if let Some(set_virtual_processor_registers) = set_virtual_processor_registers {
-                    let guest_entry_gpa = boot_image
-                        .map(|image| image.guest_entry_gpa)
-                        .unwrap_or(0x1000);
-                    let (register_names, register_values) =
-                        serial_test_image_registers(guest_entry_gpa);
-                    let hresult = set_virtual_processor_registers(
-                        partition,
-                        0,
-                        register_names.as_ptr(),
-                        register_names.len() as u32,
-                        register_values.as_ptr(),
-                    );
-                    report.registers_configured = hresult_succeeded(hresult);
-                    report.calls.push(hresult_call(
-                        "WHvSetVirtualProcessorRegisters(serial-test-image)",
-                        hresult,
-                        if report.registers_configured {
-                            "Configured vCPU registers for the serial test image."
-                        } else {
-                            "Could not configure vCPU registers for the serial test image."
-                        },
-                    ));
+                    if let Some(boot_image) = boot_image {
+                        let (register_names, register_values) = boot_image_registers(boot_image);
+                        let hresult = set_virtual_processor_registers(
+                            partition,
+                            0,
+                            register_names.as_ptr(),
+                            register_names.len() as u32,
+                            register_values.as_ptr(),
+                        );
+                        report.registers_configured = hresult_succeeded(hresult);
+                        report.calls.push(hresult_call(
+                            "WHvSetVirtualProcessorRegisters(guest-entry)",
+                            hresult,
+                            if report.registers_configured {
+                                "Configured vCPU registers for the selected guest entry mode."
+                            } else {
+                                "Could not configure vCPU registers for the selected guest entry mode."
+                            },
+                        ));
+                    }
                 }
             }
 
@@ -1330,7 +1361,21 @@ mod windows_whp {
         mapped_regions
     }
 
-    fn serial_test_image_registers(entry_gpa: u64) -> ([u32; 12], [WhvRegisterValue; 12]) {
+    fn boot_image_registers(image: &NativeSerialBootImage) -> (Vec<u32>, Vec<WhvRegisterValue>) {
+        match image.entry_mode {
+            NativeGuestEntryMode::RealModeSerial => {
+                serial_test_image_registers(image.guest_entry_gpa)
+            }
+            NativeGuestEntryMode::LinuxProtectedMode32 => linux_protected_mode_registers(
+                image.guest_entry_gpa,
+                image
+                    .boot_params_gpa
+                    .expect("linux protected-mode entry requires boot params GPA"),
+            ),
+        }
+    }
+
+    fn serial_test_image_registers(entry_gpa: u64) -> (Vec<u32>, Vec<WhvRegisterValue>) {
         let code_segment = WhvX64SegmentRegister {
             base: entry_gpa,
             limit: 0xffff,
@@ -1343,7 +1388,7 @@ mod windows_whp {
             selector: 0,
             attributes: 0x0093,
         };
-        let register_names = [
+        let register_names = vec![
             WHV_REGISTER_RAX,
             WHV_REGISTER_RDX,
             WHV_REGISTER_RSP,
@@ -1357,7 +1402,7 @@ mod windows_whp {
             WHV_REGISTER_CR3,
             WHV_REGISTER_CR4,
         ];
-        let register_values = [
+        let register_values = vec![
             WhvRegisterValue { reg64: 0 },
             WhvRegisterValue { reg64: 0 },
             WhvRegisterValue { reg64: 0x800 },
@@ -1376,6 +1421,65 @@ mod windows_whp {
                 segment: data_segment,
             },
             WhvRegisterValue { reg64: 0x0010 },
+            WhvRegisterValue { reg64: 0 },
+            WhvRegisterValue { reg64: 0 },
+        ];
+        (register_names, register_values)
+    }
+
+    fn linux_protected_mode_registers(
+        entry_gpa: u64,
+        boot_params_gpa: u64,
+    ) -> (Vec<u32>, Vec<WhvRegisterValue>) {
+        let code_segment = WhvX64SegmentRegister {
+            base: 0,
+            limit: 0xffff_ffff,
+            selector: 0x08,
+            attributes: 0x0000_cf9b,
+        };
+        let data_segment = WhvX64SegmentRegister {
+            base: 0,
+            limit: 0xffff_ffff,
+            selector: 0x10,
+            attributes: 0x0000_cf93,
+        };
+        let register_names = vec![
+            WHV_REGISTER_RAX,
+            WHV_REGISTER_RDX,
+            WHV_REGISTER_RSP,
+            WHV_REGISTER_RSI,
+            WHV_REGISTER_RIP,
+            WHV_REGISTER_RFLAGS,
+            WHV_REGISTER_CS,
+            WHV_REGISTER_DS,
+            WHV_REGISTER_ES,
+            WHV_REGISTER_SS,
+            WHV_REGISTER_CR0,
+            WHV_REGISTER_CR3,
+            WHV_REGISTER_CR4,
+        ];
+        let register_values = vec![
+            WhvRegisterValue { reg64: 0 },
+            WhvRegisterValue { reg64: 0 },
+            WhvRegisterValue { reg64: 0x90000 },
+            WhvRegisterValue {
+                reg64: boot_params_gpa,
+            },
+            WhvRegisterValue { reg64: entry_gpa },
+            WhvRegisterValue { reg64: 0x0002 },
+            WhvRegisterValue {
+                segment: code_segment,
+            },
+            WhvRegisterValue {
+                segment: data_segment,
+            },
+            WhvRegisterValue {
+                segment: data_segment,
+            },
+            WhvRegisterValue {
+                segment: data_segment,
+            },
+            WhvRegisterValue { reg64: 0x0011 },
             WhvRegisterValue { reg64: 0 },
             WhvRegisterValue { reg64: 0 },
         ];
@@ -1657,7 +1761,8 @@ mod windows_whp {
 mod tests {
     use super::{
         base_export_checks, build_native_host_preflight_report, run_partition_smoke,
-        NativePartitionSmokeStatus, NativePreflightStatus, WhpPreflightReport,
+        NativeGuestEntryMode, NativePartitionSmokeStatus, NativePreflightStatus,
+        NativeSerialBootImage, WhpPreflightReport, SERIAL_BOOT_BANNER_TEXT,
     };
 
     fn whp_report(
@@ -1808,5 +1913,51 @@ mod tests {
         assert_eq!(report.status, NativePartitionSmokeStatus::Skipped);
         assert!(report.fixture_requested);
         assert!(report.next_step.contains("--execute --run-fixture"));
+    }
+
+    #[test]
+    fn guest_entry_modes_have_stable_report_labels() {
+        assert_eq!(
+            NativeGuestEntryMode::RealModeSerial.label(),
+            "real-mode-serial"
+        );
+        assert_eq!(
+            NativeGuestEntryMode::LinuxProtectedMode32.label(),
+            "linux-protected-mode-32"
+        );
+    }
+
+    #[test]
+    fn skipped_partition_smoke_preserves_linux_entry_metadata() {
+        let host = build_native_host_preflight_report(
+            "windows".to_string(),
+            "x86_64".to_string(),
+            true,
+            true,
+            whp_report(false, false, None),
+        );
+        let image = NativeSerialBootImage {
+            source_label: "pane-runtime-linux-bzimage-protected-mode".to_string(),
+            path: Some("vmlinuz-linux".to_string()),
+            bytes: vec![0_u8; 128],
+            expected_serial_text: SERIAL_BOOT_BANNER_TEXT.to_string(),
+            guest_entry_gpa: 0x0010_0000,
+            entry_mode: NativeGuestEntryMode::LinuxProtectedMode32,
+            boot_params_gpa: Some(0x7000),
+            extra_regions: Vec::new(),
+        };
+
+        let report = run_partition_smoke(true, true, Some(&image), &host);
+
+        assert_eq!(report.status, NativePartitionSmokeStatus::Skipped);
+        assert_eq!(
+            report.boot_image_source.as_deref(),
+            Some("pane-runtime-linux-bzimage-protected-mode")
+        );
+        assert_eq!(
+            report.entry_mode.as_deref(),
+            Some("linux-protected-mode-32")
+        );
+        assert_eq!(report.boot_params_gpa.as_deref(), Some("0x00007000"));
     }
 }

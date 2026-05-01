@@ -390,6 +390,9 @@ struct KernelBootLayout {
     linux_protected_mode_bytes: Option<u64>,
     linux_loadflags: Option<u8>,
     linux_preferred_load_address: Option<String>,
+    linux_entry_point_gpa: Option<String>,
+    linux_boot_params_register: Option<String>,
+    linux_expected_entry_mode: Option<String>,
     initramfs_path: Option<String>,
     initramfs_bytes: Option<u64>,
     initramfs_sha256: Option<String>,
@@ -1878,11 +1881,11 @@ fn native_boot_spike_next_steps(
 
     if run_kernel_layout {
         return vec![
-            "Replace the one-page serial/HALT kernel-layout candidate with a Linux boot-protocol entry path."
+            "Use a real verified Linux bzImage to exercise Pane's protected-mode entry contract."
                 .to_string(),
-            "Map boot params, cmdline, kernel, and optional initramfs from `kernel-boot-layout.json` before entering the kernel."
+            "Keep the serial/HALT candidate for certification while early Linux serial output is still being stabilized."
                 .to_string(),
-            "Only promote this to a real Arch boot milestone after serial kernel output is deterministic."
+            "Only promote this to a real Arch boot milestone after protected-mode kernel entry produces deterministic serial output."
                 .to_string(),
         ];
     }
@@ -3051,6 +3054,8 @@ fn load_serial_boot_image_artifact(
         bytes,
         expected_serial_text: crate::native::SERIAL_BOOT_BANNER_TEXT.to_string(),
         guest_entry_gpa: 0x1000,
+        entry_mode: crate::native::NativeGuestEntryMode::RealModeSerial,
+        boot_params_gpa: None,
         extra_regions: Vec::new(),
     })
 }
@@ -3183,6 +3188,8 @@ fn load_boot_loader_image_artifact(
         bytes,
         expected_serial_text: metadata.expected_serial_text,
         guest_entry_gpa: 0x1000,
+        entry_mode: crate::native::NativeGuestEntryMode::RealModeSerial,
+        boot_params_gpa: None,
         extra_regions: Vec::new(),
     })
 }
@@ -3213,7 +3220,8 @@ fn load_kernel_layout_boot_image_artifact(
         ));
     }
 
-    let mut extra_regions = Vec::new();
+    let (kernel_execution_bytes, kernel_entry_gpa, mut extra_regions) =
+        kernel_layout_execution_image(&layout, &bytes)?;
     let boot_params = build_linux_boot_params_page(&layout)?;
     extra_regions.push(crate::native::NativeGuestMemoryRegion {
         label: "linux-boot-params".to_string(),
@@ -3249,13 +3257,73 @@ fn load_kernel_layout_boot_image_artifact(
     }
 
     Ok(crate::native::NativeSerialBootImage {
-        source_label: "pane-runtime-kernel-layout".to_string(),
+        source_label: if layout.kernel_format == "linux-bzimage" {
+            "pane-runtime-linux-bzimage-protected-mode".to_string()
+        } else {
+            "pane-runtime-kernel-layout".to_string()
+        },
         path: Some(layout.kernel_path),
-        bytes,
+        bytes: kernel_execution_bytes,
         expected_serial_text: crate::native::SERIAL_BOOT_BANNER_TEXT.to_string(),
-        guest_entry_gpa: parse_guest_physical_address(&layout.kernel_load_gpa)?,
+        guest_entry_gpa: kernel_entry_gpa,
+        entry_mode: if layout.kernel_format == "linux-bzimage" {
+            crate::native::NativeGuestEntryMode::LinuxProtectedMode32
+        } else {
+            crate::native::NativeGuestEntryMode::RealModeSerial
+        },
+        boot_params_gpa: (layout.kernel_format == "linux-bzimage")
+            .then(|| parse_guest_physical_address(&layout.boot_params_gpa))
+            .transpose()?,
         extra_regions,
     })
+}
+
+fn kernel_layout_execution_image(
+    layout: &KernelBootLayout,
+    kernel_bytes: &[u8],
+) -> AppResult<(Vec<u8>, u64, Vec<crate::native::NativeGuestMemoryRegion>)> {
+    let kernel_load_gpa = parse_guest_physical_address(&layout.kernel_load_gpa)?;
+    if layout.kernel_format == "controlled-serial-candidate" {
+        return Ok((kernel_bytes.to_vec(), kernel_load_gpa, Vec::new()));
+    }
+    if layout.kernel_format != "linux-bzimage" {
+        return Err(AppError::message(format!(
+            "Unsupported kernel layout format `{}`.",
+            layout.kernel_format
+        )));
+    }
+
+    let setup_bytes = layout
+        .linux_setup_bytes
+        .ok_or_else(|| AppError::message("Linux bzImage layout is missing setup byte metadata."))?
+        as usize;
+    let protected_mode_offset = layout.linux_protected_mode_offset.ok_or_else(|| {
+        AppError::message("Linux bzImage layout is missing protected-mode payload offset.")
+    })? as usize;
+    let protected_mode_bytes = layout.linux_protected_mode_bytes.ok_or_else(|| {
+        AppError::message("Linux bzImage layout is missing protected-mode payload length.")
+    })? as usize;
+
+    if setup_bytes > kernel_bytes.len()
+        || protected_mode_offset > kernel_bytes.len()
+        || protected_mode_offset.saturating_add(protected_mode_bytes) > kernel_bytes.len()
+    {
+        return Err(AppError::message(
+            "Linux bzImage layout offsets no longer match the registered kernel artifact.",
+        ));
+    }
+
+    let setup_region = crate::native::NativeGuestMemoryRegion {
+        label: "linux-bzimage-setup".to_string(),
+        guest_gpa: 0x0009_0000,
+        bytes: kernel_bytes[..setup_bytes].to_vec(),
+        writable: true,
+        executable: false,
+    };
+    let protected_mode_payload =
+        kernel_bytes[protected_mode_offset..protected_mode_offset + protected_mode_bytes].to_vec();
+
+    Ok((protected_mode_payload, kernel_load_gpa, vec![setup_region]))
 }
 
 fn build_linux_boot_params_page(layout: &KernelBootLayout) -> AppResult<Vec<u8>> {
@@ -3546,6 +3614,11 @@ fn build_kernel_boot_layout(
         }
     }
 
+    let is_linux_bzimage = metadata.kernel_format == "linux-bzimage";
+    let linux_entry_point_gpa = is_linux_bzimage.then(|| metadata.kernel_load_gpa.clone());
+    let linux_boot_params_register = is_linux_bzimage.then(|| "rsi".to_string());
+    let linux_expected_entry_mode = is_linux_bzimage.then(|| "x86-protected-mode-32".to_string());
+
     let layout = KernelBootLayout {
         schema_version: 1,
         layout_kind: "pane-linux-kernel-boot-layout-v1".to_string(),
@@ -3565,6 +3638,9 @@ fn build_kernel_boot_layout(
         linux_protected_mode_bytes: metadata.linux_protected_mode_bytes,
         linux_loadflags: metadata.linux_loadflags,
         linux_preferred_load_address: metadata.linux_preferred_load_address,
+        linux_entry_point_gpa,
+        linux_boot_params_register,
+        linux_expected_entry_mode,
         initramfs_path: metadata.initramfs_stored_path,
         initramfs_bytes: metadata.initramfs_bytes,
         initramfs_sha256: metadata.initramfs_sha256,
@@ -4211,6 +4287,14 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
                 && layout.linux_protected_mode_bytes == metadata.linux_protected_mode_bytes
                 && layout.linux_loadflags == metadata.linux_loadflags
                 && layout.linux_preferred_load_address == metadata.linux_preferred_load_address
+                && layout.linux_entry_point_gpa
+                    == (metadata.kernel_format == "linux-bzimage")
+                        .then(|| metadata.kernel_load_gpa.clone())
+                && layout.linux_boot_params_register
+                    == (metadata.kernel_format == "linux-bzimage").then(|| "rsi".to_string())
+                && layout.linux_expected_entry_mode
+                    == (metadata.kernel_format == "linux-bzimage")
+                        .then(|| "x86-protected-mode-32".to_string())
                 && layout.initramfs_path == metadata.initramfs_stored_path
                 && layout.initramfs_bytes == metadata.initramfs_bytes
                 && layout.initramfs_sha256 == metadata.initramfs_sha256
@@ -7105,6 +7189,15 @@ fn print_native_kernel_plan_report(report: &NativeKernelPlanReport) {
         if let Some(initramfs_gpa) = &layout.initramfs_load_gpa {
             println!("  Initramfs GPA  {}", initramfs_gpa);
         }
+        if let Some(entry_gpa) = &layout.linux_entry_point_gpa {
+            println!("  Linux Entry    {}", entry_gpa);
+        }
+        if let Some(register) = &layout.linux_boot_params_register {
+            println!("  Boot Params Reg {}", register);
+        }
+        if let Some(mode) = &layout.linux_expected_entry_mode {
+            println!("  Entry Mode     {}", mode);
+        }
         println!("  Serial Device  {}", layout.expected_serial_device);
         println!("  Cmdline        {:?}", layout.cmdline);
     }
@@ -7200,6 +7293,12 @@ fn print_native_boot_spike_report(report: &NativeBootSpikeReport) {
     }
     if let Some(bytes) = report.partition_smoke.boot_image_bytes {
         println!("  Boot Bytes     {}", bytes);
+    }
+    if let Some(mode) = &report.partition_smoke.entry_mode {
+        println!("  Entry Mode     {}", mode);
+    }
+    if let Some(gpa) = &report.partition_smoke.boot_params_gpa {
+        println!("  Boot Params    {}", gpa);
     }
     println!(
         "  Serial Exits   {}",
@@ -7765,15 +7864,16 @@ mod tests {
         create_serial_boot_image_artifact, create_user_disk_descriptor, determine_app_lifecycle,
         ensure_wsl_conf_setting, format_doctor_blockers, initialize_managed_arch_environment,
         inspect_kernel_image_artifact, inspect_workspace, inventory_contains_distro,
-        load_kernel_layout_boot_image_artifact, parse_guest_physical_address, preferred_transport,
-        read_json_file, register_base_os_image, register_boot_loader_image,
-        register_kernel_boot_plan, resolve_bundle_output_path, resolve_init_source,
-        resolve_launch_target, resolve_managed_environment_for_reset, resolve_saved_launch,
-        resolve_session_context, resolve_status_distro, runtime_storage_budget, sha256_file,
-        status_port_for, validate_setup_password, validate_setup_username, windows_transport_check,
-        AppLifecyclePhase, AppNextAction, CheckStatus, DistroHealth, DoctorCheck, DoctorReport,
-        InitSource, KernelBootLayout, KernelBootMetadata, NativeRuntimeState, StatusReport,
-        WorkspaceHealth, WslInventory, EMBEDDED_APP_ASSETS,
+        kernel_layout_execution_image, load_kernel_layout_boot_image_artifact,
+        parse_guest_physical_address, preferred_transport, read_json_file, register_base_os_image,
+        register_boot_loader_image, register_kernel_boot_plan, resolve_bundle_output_path,
+        resolve_init_source, resolve_launch_target, resolve_managed_environment_for_reset,
+        resolve_saved_launch, resolve_session_context, resolve_status_distro,
+        runtime_storage_budget, sha256_file, status_port_for, validate_setup_password,
+        validate_setup_username, windows_transport_check, AppLifecyclePhase, AppNextAction,
+        CheckStatus, DistroHealth, DoctorCheck, DoctorReport, InitSource, KernelBootLayout,
+        KernelBootMetadata, NativeRuntimeState, StatusReport, WorkspaceHealth, WslInventory,
+        EMBEDDED_APP_ASSETS,
     };
 
     fn empty_workspace_health() -> WorkspaceHealth {
@@ -8259,6 +8359,9 @@ mod tests {
             linux_protected_mode_bytes: Some(1536),
             linux_loadflags: Some(0x80),
             linux_preferred_load_address: Some("0x0000000001000000".to_string()),
+            linux_entry_point_gpa: Some("0x00100000".to_string()),
+            linux_boot_params_register: Some("rsi".to_string()),
+            linux_expected_entry_mode: Some("x86-protected-mode-32".to_string()),
             initramfs_path: Some("initramfs".to_string()),
             initramfs_bytes: Some(1234),
             initramfs_sha256: Some("1".repeat(64)),
@@ -8275,6 +8378,58 @@ mod tests {
         assert_eq!(&page[0x228..0x22c], &0x0002_0000_u32.to_le_bytes());
         assert_eq!(&page[0x218..0x21c], &0x0400_0000_u32.to_le_bytes());
         assert_eq!(&page[0x21c..0x220], &1234_u32.to_le_bytes());
+    }
+
+    #[test]
+    fn linux_bzimage_execution_image_splits_setup_and_payload() {
+        let mut layout = KernelBootLayout {
+            schema_version: 1,
+            layout_kind: "pane-linux-kernel-boot-layout-v1".to_string(),
+            session_name: "pane".to_string(),
+            boot_params_gpa: "0x00007000".to_string(),
+            cmdline_gpa: "0x00020000".to_string(),
+            kernel_load_gpa: "0x00100000".to_string(),
+            initramfs_load_gpa: None,
+            kernel_path: "kernel".to_string(),
+            kernel_bytes: 4096,
+            kernel_sha256: "0".repeat(64),
+            kernel_format: "linux-bzimage".to_string(),
+            linux_boot_protocol: Some("0x020f".to_string()),
+            linux_setup_sectors: Some(4),
+            linux_setup_bytes: Some(2560),
+            linux_protected_mode_offset: Some(2560),
+            linux_protected_mode_bytes: Some(1536),
+            linux_loadflags: Some(0x80),
+            linux_preferred_load_address: Some("0x0000000001000000".to_string()),
+            linux_entry_point_gpa: Some("0x00100000".to_string()),
+            linux_boot_params_register: Some("rsi".to_string()),
+            linux_expected_entry_mode: Some("x86-protected-mode-32".to_string()),
+            initramfs_path: None,
+            initramfs_bytes: None,
+            initramfs_sha256: None,
+            cmdline: "console=ttyS0 panic=-1".to_string(),
+            expected_serial_device: "ttyS0".to_string(),
+            materialized_at_epoch_seconds: Some(1),
+            notes: Vec::new(),
+        };
+        let kernel = fake_linux_bzimage();
+
+        let (payload, entry_gpa, extra_regions) =
+            kernel_layout_execution_image(&layout, &kernel).unwrap();
+        assert_eq!(entry_gpa, 0x0010_0000);
+        assert_eq!(payload, kernel[2560..].to_vec());
+        assert!(extra_regions.iter().any(|region| {
+            region.label == "linux-bzimage-setup"
+                && region.guest_gpa == 0x0009_0000
+                && region.bytes == kernel[..2560]
+        }));
+
+        layout.kernel_format = "controlled-serial-candidate".to_string();
+        let (payload, entry_gpa, extra_regions) =
+            kernel_layout_execution_image(&layout, &kernel).unwrap();
+        assert_eq!(entry_gpa, 0x0010_0000);
+        assert_eq!(payload, kernel);
+        assert!(extra_regions.is_empty());
     }
 
     #[test]

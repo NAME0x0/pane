@@ -610,6 +610,8 @@ mod windows_whp {
     const WHV_MAP_GPA_RANGE_FLAG_WRITE: u32 = 0x0000_0002;
     const WHV_MAP_GPA_RANGE_FLAG_EXECUTE: u32 = 0x0000_0004;
     const WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS: u32 = 0x0000_0002;
+    const WHV_RUN_VP_EXIT_REASON_UNRECOVERABLE_EXCEPTION: u32 = 0x0000_0004;
+    const WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE: u32 = 0x0000_0005;
     const WHV_RUN_VP_EXIT_REASON_X64_HALT: u32 = 0x0000_0008;
     const GUEST_PAGE_SIZE: usize = SERIAL_BOOT_TEST_IMAGE_SIZE;
     const SERIAL_COM1_PORT: u16 = 0x03f8;
@@ -768,7 +770,10 @@ mod windows_whp {
             serial_bytes: Vec::new(),
             serial_text: None,
             serial_expected_text: boot_image
-                .map(|image| image.expected_serial_text.clone())
+                .and_then(|image| {
+                    (image.entry_mode == NativeGuestEntryMode::RealModeSerial)
+                        .then(|| image.expected_serial_text.clone())
+                })
                 .or_else(|| run_fixture.then(|| SERIAL_BOOT_BANNER_TEXT.to_string())),
             serial_io_exit_count: 0,
             halt_observed: false,
@@ -1008,7 +1013,7 @@ mod windows_whp {
                         );
                         report.registers_configured = hresult_succeeded(hresult);
                         report.calls.push(hresult_call(
-                            "WHvSetVirtualProcessorRegisters(guest-entry)",
+                            guest_entry_register_call_name(boot_image.entry_mode),
                             hresult,
                             if report.registers_configured {
                                 "Configured vCPU registers for the selected guest entry mode."
@@ -1024,15 +1029,15 @@ mod windows_whp {
                 if let (Some(run_virtual_processor), Some(set_virtual_processor_registers)) =
                     (run_virtual_processor, set_virtual_processor_registers)
                 {
-                    run_serial_test_image(
-                        partition,
-                        run_virtual_processor,
-                        set_virtual_processor_registers,
-                        boot_image
-                            .map(|image| image.expected_serial_text.as_str())
-                            .unwrap_or(SERIAL_BOOT_BANNER_TEXT),
-                        &mut report,
-                    );
+                    if let Some(boot_image) = boot_image {
+                        run_guest_image_until_boundary(
+                            partition,
+                            run_virtual_processor,
+                            set_virtual_processor_registers,
+                            boot_image,
+                            &mut report,
+                        );
+                    }
                 }
             }
 
@@ -1090,26 +1095,16 @@ mod windows_whp {
             FreeLibrary(module);
         }
 
+        let selected_entry_mode = boot_image
+            .map(|image| image.entry_mode)
+            .unwrap_or(NativeGuestEntryMode::RealModeSerial);
         let passed = report.partition_created
             && report.processor_count_configured
             && report.partition_setup
             && report.virtual_processor_created
             && report.virtual_processor_deleted
             && report.partition_deleted
-            && (!report.fixture_requested
-                || (report.memory_mapped
-                    && report.registers_configured
-                    && report.virtual_processor_ran
-                    && report.memory_unmapped
-                    && report.halt_observed
-                    && report.exit_reason == Some(WHV_RUN_VP_EXIT_REASON_X64_HALT)
-                    && report.serial_port == Some(SERIAL_COM1_PORT)
-                    && report
-                        .serial_expected_text
-                        .as_ref()
-                        .map(|expected| report.serial_io_exit_count as usize == expected.len())
-                        .unwrap_or(false)
-                    && report.serial_text == report.serial_expected_text));
+            && (!report.fixture_requested || guest_contract_passed(&report, selected_entry_mode));
 
         report.status = if passed {
             NativePartitionSmokeStatus::Pass
@@ -1375,6 +1370,17 @@ mod windows_whp {
         }
     }
 
+    fn guest_entry_register_call_name(entry_mode: NativeGuestEntryMode) -> &'static str {
+        match entry_mode {
+            NativeGuestEntryMode::RealModeSerial => {
+                "WHvSetVirtualProcessorRegisters(real-mode-serial)"
+            }
+            NativeGuestEntryMode::LinuxProtectedMode32 => {
+                "WHvSetVirtualProcessorRegisters(linux-protected-mode-32)"
+            }
+        }
+    }
+
     fn serial_test_image_registers(entry_gpa: u64) -> (Vec<u32>, Vec<WhvRegisterValue>) {
         let code_segment = WhvX64SegmentRegister {
             base: entry_gpa,
@@ -1486,6 +1492,30 @@ mod windows_whp {
         (register_names, register_values)
     }
 
+    fn run_guest_image_until_boundary(
+        partition: *mut c_void,
+        run_virtual_processor: WhvRunVirtualProcessor,
+        set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
+        boot_image: &NativeSerialBootImage,
+        report: &mut NativePartitionSmokeReport,
+    ) {
+        match boot_image.entry_mode {
+            NativeGuestEntryMode::RealModeSerial => run_serial_test_image(
+                partition,
+                run_virtual_processor,
+                set_virtual_processor_registers,
+                &boot_image.expected_serial_text,
+                report,
+            ),
+            NativeGuestEntryMode::LinuxProtectedMode32 => run_linux_entry_probe(
+                partition,
+                run_virtual_processor,
+                set_virtual_processor_registers,
+                report,
+            ),
+        }
+    }
+
     fn run_serial_test_image(
         partition: *mut c_void,
         run_virtual_processor: WhvRunVirtualProcessor,
@@ -1595,6 +1625,106 @@ mod windows_whp {
         report.serial_io_exit_count = report.serial_bytes.len() as u32;
     }
 
+    fn run_linux_entry_probe(
+        partition: *mut c_void,
+        run_virtual_processor: WhvRunVirtualProcessor,
+        set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
+        report: &mut NativePartitionSmokeReport,
+    ) {
+        report.serial_expected_text = None;
+        let max_guest_exits = 32;
+
+        for exit_index in 0..max_guest_exits {
+            let mut exit_context = [0_u8; 1024];
+            let hresult = unsafe {
+                run_virtual_processor(
+                    partition,
+                    0,
+                    exit_context.as_mut_ptr().cast::<c_void>(),
+                    exit_context.len() as u32,
+                )
+            };
+            let run_ok = hresult_succeeded(hresult);
+            report.virtual_processor_ran |= run_ok;
+            report.calls.push(hresult_call(
+                "WHvRunVirtualProcessor(linux-entry-probe)",
+                hresult,
+                if run_ok {
+                    "vCPU returned with a WHP exit context for the Linux protected-mode entry probe."
+                } else {
+                    "vCPU execution failed before the Linux protected-mode entry probe produced a WHP exit context."
+                },
+            ));
+
+            if !run_ok {
+                break;
+            }
+
+            match decode_exit_context(&exit_context, report) {
+                DecodedExit::IoPort {
+                    instruction_length,
+                    rip,
+                    is_write,
+                    access_size,
+                    port,
+                    serial_byte,
+                } => {
+                    if !(is_write && access_size == 1 && port == SERIAL_COM1_PORT) {
+                        break;
+                    }
+
+                    report.serial_bytes.push(serial_byte);
+                    report.serial_port = Some(port);
+                    report.serial_byte = Some(serial_byte);
+                    report.serial_text =
+                        Some(String::from_utf8_lossy(&report.serial_bytes).into_owned());
+
+                    if instruction_length == 0 {
+                        report.calls.push(NativeWhpCallReport {
+                            name: "AdvanceGuestRip",
+                            hresult: None,
+                            ok: false,
+                            detail:
+                                "WHP reported a zero-length I/O instruction; refusing to resume."
+                                    .to_string(),
+                        });
+                        break;
+                    }
+
+                    let next_rip = rip + u64::from(instruction_length);
+                    if !set_guest_rip(partition, set_virtual_processor_registers, next_rip, report)
+                    {
+                        break;
+                    }
+                }
+                DecodedExit::Halt => {
+                    report.halt_observed = true;
+                    break;
+                }
+                DecodedExit::Other => break,
+            }
+
+            if exit_index + 1 == max_guest_exits {
+                report.calls.push(NativeWhpCallReport {
+                    name: "LinuxEntryProbeExitBudget",
+                    hresult: None,
+                    ok: false,
+                    detail: format!(
+                        "Linux protected-mode entry probe exceeded {max_guest_exits} WHP exits without reaching a stable serial or halt boundary."
+                    ),
+                });
+            }
+        }
+
+        report.serial_io_exit_count = report.serial_bytes.len() as u32;
+        report.calls.push(NativeWhpCallReport {
+            name: "LinuxEntryProbeBoundary",
+            hresult: None,
+            ok: linux_entry_probe_passed(report),
+            detail: linux_entry_probe_detail(report),
+        });
+    }
+
     fn set_guest_rip(
         partition: *mut c_void,
         set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
@@ -1623,6 +1753,70 @@ mod windows_whp {
             },
         ));
         ok
+    }
+
+    fn guest_contract_passed(
+        report: &NativePartitionSmokeReport,
+        entry_mode: NativeGuestEntryMode,
+    ) -> bool {
+        let common_guest_execution_passed = report.memory_mapped
+            && report.registers_configured
+            && report.virtual_processor_ran
+            && report.memory_unmapped;
+
+        common_guest_execution_passed
+            && match entry_mode {
+                NativeGuestEntryMode::RealModeSerial => serial_contract_passed(report),
+                NativeGuestEntryMode::LinuxProtectedMode32 => linux_entry_probe_passed(report),
+            }
+    }
+
+    fn serial_contract_passed(report: &NativePartitionSmokeReport) -> bool {
+        report.halt_observed
+            && report.exit_reason == Some(WHV_RUN_VP_EXIT_REASON_X64_HALT)
+            && report.serial_port == Some(SERIAL_COM1_PORT)
+            && report
+                .serial_expected_text
+                .as_ref()
+                .map(|expected| report.serial_io_exit_count as usize == expected.len())
+                .unwrap_or(false)
+            && report.serial_text == report.serial_expected_text
+    }
+
+    fn linux_entry_probe_passed(report: &NativePartitionSmokeReport) -> bool {
+        report.virtual_processor_ran
+            && report.exit_reason.is_some()
+            && !matches!(
+                report.exit_reason,
+                Some(
+                    WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE
+                        | WHV_RUN_VP_EXIT_REASON_UNRECOVERABLE_EXCEPTION
+                )
+            )
+    }
+
+    fn linux_entry_probe_detail(report: &NativePartitionSmokeReport) -> String {
+        if linux_entry_probe_passed(report) {
+            let exit = report.exit_reason_label.as_deref().unwrap_or("unknown");
+            let serial = report.serial_text.as_deref().unwrap_or("");
+            if serial.is_empty() {
+                format!(
+                    "Linux protected-mode entry was accepted and reached WHP exit `{exit}`; early Linux serial output is not proven yet."
+                )
+            } else {
+                format!(
+                    "Linux protected-mode entry emitted serial text {serial:?} before WHP exit `{exit}`."
+                )
+            }
+        } else if !report.virtual_processor_ran {
+            "Linux protected-mode entry did not run far enough to produce a WHP exit context."
+                .to_string()
+        } else {
+            let exit = report.exit_reason_label.as_deref().unwrap_or("unknown");
+            format!(
+                "Linux protected-mode entry reached failing WHP exit `{exit}`; inspect CPU state, mapped memory, and boot params."
+            )
+        }
     }
 
     enum DecodedExit {
@@ -1677,7 +1871,7 @@ mod windows_whp {
                 name: "DecodeX64Halt",
                 hresult: None,
                 ok: true,
-                detail: "The serial test image reached HLT after serial output.".to_string(),
+                detail: "The guest reached HLT.".to_string(),
             });
             DecodedExit::Halt
         } else {
@@ -1696,8 +1890,8 @@ mod windows_whp {
             0x0000_0000 => "none",
             0x0000_0001 => "memory-access",
             WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS => "x64-io-port-access",
-            0x0000_0004 => "unrecoverable-exception",
-            0x0000_0005 => "invalid-vp-register-value",
+            WHV_RUN_VP_EXIT_REASON_UNRECOVERABLE_EXCEPTION => "unrecoverable-exception",
+            WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE => "invalid-vp-register-value",
             0x0000_0006 => "unsupported-feature",
             0x0000_0007 => "x64-interrupt-window",
             WHV_RUN_VP_EXIT_REASON_X64_HALT => "x64-halt",
@@ -1738,7 +1932,15 @@ mod windows_whp {
 
     #[cfg(test)]
     mod tests {
-        use crate::native::{serial_boot_test_image_bytes, SERIAL_BOOT_BANNER_TEXT};
+        use super::{
+            guest_contract_passed, linux_entry_probe_passed, serial_contract_passed,
+            WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE, WHV_RUN_VP_EXIT_REASON_X64_HALT,
+            WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS,
+        };
+        use crate::native::{
+            serial_boot_test_image_bytes, NativePartitionSmokeReport, NativePartitionSmokeStatus,
+            SERIAL_BOOT_BANNER_TEXT,
+        };
 
         #[test]
         fn serial_test_image_outputs_the_expected_banner_then_halts() {
@@ -1753,6 +1955,93 @@ mod windows_whp {
             }
             assert_eq!(page[offset], 0xf4);
             assert!(page[offset + 1..].iter().all(|byte| *byte == 0));
+        }
+
+        fn base_report() -> NativePartitionSmokeReport {
+            NativePartitionSmokeReport {
+                product_shape: "test",
+                execute_requested: true,
+                attempted: true,
+                status: NativePartitionSmokeStatus::Fail,
+                status_label: NativePartitionSmokeStatus::Fail.display_name(),
+                partition_created: true,
+                processor_count_configured: true,
+                partition_setup: true,
+                virtual_processor_created: true,
+                virtual_processor_deleted: true,
+                partition_deleted: true,
+                fixture_requested: true,
+                memory_mapped: true,
+                registers_configured: true,
+                virtual_processor_ran: true,
+                memory_unmapped: true,
+                exit_reason: None,
+                exit_reason_label: None,
+                boot_image_source: None,
+                boot_image_path: None,
+                boot_image_bytes: None,
+                entry_mode: None,
+                boot_params_gpa: None,
+                guest_regions: Vec::new(),
+                serial_port: None,
+                serial_byte: None,
+                serial_bytes: Vec::new(),
+                serial_text: None,
+                serial_expected_text: None,
+                serial_io_exit_count: 0,
+                halt_observed: false,
+                calls: Vec::new(),
+                blocker: None,
+                next_step: "test".to_string(),
+            }
+        }
+
+        #[test]
+        fn serial_contract_requires_expected_banner_and_halt() {
+            let mut report = base_report();
+            report.halt_observed = true;
+            report.exit_reason = Some(WHV_RUN_VP_EXIT_REASON_X64_HALT);
+            report.serial_port = Some(0x03f8);
+            report.serial_bytes = SERIAL_BOOT_BANNER_TEXT.as_bytes().to_vec();
+            report.serial_io_exit_count = report.serial_bytes.len() as u32;
+            report.serial_text = Some(SERIAL_BOOT_BANNER_TEXT.to_string());
+            report.serial_expected_text = Some(SERIAL_BOOT_BANNER_TEXT.to_string());
+
+            assert!(serial_contract_passed(&report));
+            assert!(guest_contract_passed(
+                &report,
+                crate::native::NativeGuestEntryMode::RealModeSerial
+            ));
+
+            report.serial_text = Some("wrong".to_string());
+            assert!(!serial_contract_passed(&report));
+        }
+
+        #[test]
+        fn linux_entry_probe_accepts_decoded_nonfatal_exit_without_serial_banner() {
+            let mut report = base_report();
+            report.exit_reason = Some(WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS);
+            report.exit_reason_label = Some("x64-io-port-access".to_string());
+
+            assert!(linux_entry_probe_passed(&report));
+            assert!(guest_contract_passed(
+                &report,
+                crate::native::NativeGuestEntryMode::LinuxProtectedMode32
+            ));
+            assert!(report.serial_expected_text.is_none());
+        }
+
+        #[test]
+        fn linux_entry_probe_rejects_invalid_vp_register_exit() {
+            let mut report = base_report();
+            report.exit_reason = Some(WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE);
+            report.exit_reason_label = Some("invalid-vp-register-value".to_string());
+
+            assert!(!linux_entry_probe_passed(&report));
+            assert!(!guest_contract_passed(
+                &report,
+                crate::native::NativeGuestEntryMode::LinuxProtectedMode32
+            ));
         }
     }
 }

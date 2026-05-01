@@ -1724,6 +1724,8 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
         boot_image.as_ref(),
         &host,
     );
+    let protected_linux_entry_requested =
+        partition_smoke.entry_mode.as_deref() == Some("linux-protected-mode-32");
     let ready_for_serial_kernel_spike = args.execute
         && run_guest_image
         && partition_smoke.status == crate::native::NativePartitionSmokeStatus::Pass
@@ -1733,7 +1735,8 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
         && runtime.artifacts.native_manifest_exists
         && (!args.run_fixture || runtime.artifacts.serial_boot_image_ready)
         && (!args.run_boot_loader || runtime.artifacts.boot_loader_image_verified)
-        && (!args.run_kernel_layout || runtime.artifacts.kernel_boot_layout_ready);
+        && (!args.run_kernel_layout || runtime.artifacts.kernel_boot_layout_ready)
+        && (!protected_linux_entry_requested || partition_smoke.serial_text.is_some());
 
     let mut blockers = Vec::new();
     if !args.execute {
@@ -1881,9 +1884,9 @@ fn native_boot_spike_next_steps(
 
     if run_kernel_layout {
         return vec![
-            "Use a real verified Linux bzImage to exercise Pane's protected-mode entry contract."
+            "Inspect the Linux protected-mode entry probe exit reason and serial output, if any."
                 .to_string(),
-            "Keep the serial/HALT candidate for certification while early Linux serial output is still being stabilized."
+            "Expand the guest memory map and CPU setup until a real bzImage produces deterministic early serial output."
                 .to_string(),
             "Only promote this to a real Arch boot milestone after protected-mode kernel entry produces deterministic serial output."
                 .to_string(),
@@ -3264,7 +3267,11 @@ fn load_kernel_layout_boot_image_artifact(
         },
         path: Some(layout.kernel_path),
         bytes: kernel_execution_bytes,
-        expected_serial_text: crate::native::SERIAL_BOOT_BANNER_TEXT.to_string(),
+        expected_serial_text: if layout.kernel_format == "linux-bzimage" {
+            String::new()
+        } else {
+            crate::native::SERIAL_BOOT_BANNER_TEXT.to_string()
+        },
         guest_entry_gpa: kernel_entry_gpa,
         entry_mode: if layout.kernel_format == "linux-bzimage" {
             crate::native::NativeGuestEntryMode::LinuxProtectedMode32

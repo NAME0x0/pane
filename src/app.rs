@@ -393,6 +393,7 @@ struct KernelBootLayout {
     linux_entry_point_gpa: Option<String>,
     linux_boot_params_register: Option<String>,
     linux_expected_entry_mode: Option<String>,
+    guest_memory_map: Vec<KernelGuestMemoryRange>,
     initramfs_path: Option<String>,
     initramfs_bytes: Option<u64>,
     initramfs_sha256: Option<String>,
@@ -400,6 +401,14 @@ struct KernelBootLayout {
     expected_serial_device: String,
     materialized_at_epoch_seconds: Option<u64>,
     notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct KernelGuestMemoryRange {
+    label: String,
+    start_gpa: String,
+    size_bytes: u64,
+    region_type: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3225,6 +3234,7 @@ fn load_kernel_layout_boot_image_artifact(
 
     let (kernel_execution_bytes, kernel_entry_gpa, mut extra_regions) =
         kernel_layout_execution_image(&layout, &bytes)?;
+    extra_regions.extend(linux_guest_ram_regions(&layout)?);
     let boot_params = build_linux_boot_params_page(&layout)?;
     extra_regions.push(crate::native::NativeGuestMemoryRegion {
         label: "linux-boot-params".to_string(),
@@ -3333,6 +3343,35 @@ fn kernel_layout_execution_image(
     Ok((protected_mode_payload, kernel_load_gpa, vec![setup_region]))
 }
 
+fn linux_guest_ram_regions(
+    layout: &KernelBootLayout,
+) -> AppResult<Vec<crate::native::NativeGuestMemoryRegion>> {
+    if layout.kernel_format != "linux-bzimage" {
+        return Ok(Vec::new());
+    }
+
+    layout
+        .guest_memory_map
+        .iter()
+        .filter(|range| range.region_type == "usable")
+        .map(|range| {
+            let size: usize = range.size_bytes.try_into().map_err(|_| {
+                AppError::message(format!(
+                    "Guest memory range `{}` is too large to map on this host.",
+                    range.label
+                ))
+            })?;
+            Ok(crate::native::NativeGuestMemoryRegion {
+                label: format!("linux-ram-{}", range.label),
+                guest_gpa: parse_guest_physical_address(&range.start_gpa)?,
+                bytes: vec![0_u8; size],
+                writable: true,
+                executable: true,
+            })
+        })
+        .collect()
+}
+
 fn build_linux_boot_params_page(layout: &KernelBootLayout) -> AppResult<Vec<u8>> {
     let mut boot_params = vec![0_u8; 4096];
     let cmdline_gpa = checked_u32_gpa(&layout.cmdline_gpa, "kernel cmdline")?;
@@ -3346,7 +3385,18 @@ fn build_linux_boot_params_page(layout: &KernelBootLayout) -> AppResult<Vec<u8>>
     write_u16_le(&mut boot_params, 0x206, protocol);
     boot_params[0x210] = 0xff;
     boot_params[0x211] = 0x80;
+    write_u32_le(
+        &mut boot_params,
+        0x214,
+        checked_u32_gpa(&layout.kernel_load_gpa, "kernel entry")?,
+    );
     write_u32_le(&mut boot_params, 0x228, cmdline_gpa);
+    write_u32_le(&mut boot_params, 0x22c, 0x7fff_ffff);
+    write_u32_le(
+        &mut boot_params,
+        0x238,
+        layout.cmdline.len().saturating_add(1) as u32,
+    );
 
     if layout.initramfs_path.is_some() {
         let initramfs_gpa = layout
@@ -3371,7 +3421,46 @@ fn build_linux_boot_params_page(layout: &KernelBootLayout) -> AppResult<Vec<u8>>
         );
     }
 
+    write_linux_e820_table(&mut boot_params, &layout.guest_memory_map)?;
+
     Ok(boot_params)
+}
+
+fn write_linux_e820_table(
+    boot_params: &mut [u8],
+    ranges: &[KernelGuestMemoryRange],
+) -> AppResult<()> {
+    if ranges.len() > u8::MAX as usize {
+        return Err(AppError::message(
+            "Linux E820 table cannot contain more than 255 entries.",
+        ));
+    }
+    if ranges.len() > 128 {
+        return Err(AppError::message(
+            "Linux E820 table exceeds the boot params table capacity.",
+        ));
+    }
+
+    boot_params[0x1e8] = ranges.len() as u8;
+    for (index, range) in ranges.iter().enumerate() {
+        let offset = 0x2d0 + index * 20;
+        let start = parse_guest_physical_address(&range.start_gpa)?;
+        let region_type = match range.region_type.as_str() {
+            "usable" => 1,
+            "reserved" => 2,
+            other => {
+                return Err(AppError::message(format!(
+                    "Unsupported Linux E820 range type `{other}` for `{}`.",
+                    range.label
+                )))
+            }
+        };
+        write_u64_le(boot_params, offset, start);
+        write_u64_le(boot_params, offset + 8, range.size_bytes);
+        write_u32_le(boot_params, offset + 16, region_type);
+    }
+
+    Ok(())
 }
 
 fn checked_u32_gpa(value: &str, label: &str) -> AppResult<u32> {
@@ -3390,6 +3479,10 @@ fn write_u16_le(bytes: &mut [u8], offset: usize, value: u16) {
 
 fn write_u32_le(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u64_le(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
 fn read_u16_le_at(bytes: &[u8], offset: usize) -> Option<u16> {
@@ -3625,6 +3718,11 @@ fn build_kernel_boot_layout(
     let linux_entry_point_gpa = is_linux_bzimage.then(|| metadata.kernel_load_gpa.clone());
     let linux_boot_params_register = is_linux_bzimage.then(|| "rsi".to_string());
     let linux_expected_entry_mode = is_linux_bzimage.then(|| "x86-protected-mode-32".to_string());
+    let guest_memory_map = if is_linux_bzimage {
+        default_linux_guest_memory_map(metadata.initramfs_bytes.unwrap_or(0))
+    } else {
+        Vec::new()
+    };
 
     let layout = KernelBootLayout {
         schema_version: 1,
@@ -3648,6 +3746,7 @@ fn build_kernel_boot_layout(
         linux_entry_point_gpa,
         linux_boot_params_register,
         linux_expected_entry_mode,
+        guest_memory_map,
         initramfs_path: metadata.initramfs_stored_path,
         initramfs_bytes: metadata.initramfs_bytes,
         initramfs_sha256: metadata.initramfs_sha256,
@@ -3667,6 +3766,53 @@ fn build_kernel_boot_layout(
     }
 
     Ok(layout)
+}
+
+fn default_linux_guest_memory_map(_initramfs_bytes: u64) -> Vec<KernelGuestMemoryRange> {
+    vec![
+        KernelGuestMemoryRange {
+            label: "boot-params".to_string(),
+            start_gpa: "0x00007000".to_string(),
+            size_bytes: 0x00001000,
+            region_type: "reserved".to_string(),
+        },
+        KernelGuestMemoryRange {
+            label: "cmdline".to_string(),
+            start_gpa: "0x00020000".to_string(),
+            size_bytes: 0x00001000,
+            region_type: "reserved".to_string(),
+        },
+        KernelGuestMemoryRange {
+            label: "low-ram".to_string(),
+            start_gpa: "0x00030000".to_string(),
+            size_bytes: 0x00060000,
+            region_type: "usable".to_string(),
+        },
+        KernelGuestMemoryRange {
+            label: "bzimage-setup".to_string(),
+            start_gpa: "0x00090000".to_string(),
+            size_bytes: 0x00010000,
+            region_type: "reserved".to_string(),
+        },
+        KernelGuestMemoryRange {
+            label: "bios-reserved".to_string(),
+            start_gpa: "0x000f0000".to_string(),
+            size_bytes: 0x00010000,
+            region_type: "reserved".to_string(),
+        },
+        KernelGuestMemoryRange {
+            label: "kernel-payload".to_string(),
+            start_gpa: "0x00100000".to_string(),
+            size_bytes: 0x02000000,
+            region_type: "reserved".to_string(),
+        },
+        KernelGuestMemoryRange {
+            label: "high-ram".to_string(),
+            start_gpa: "0x08000000".to_string(),
+            size_bytes: 0x04000000,
+            region_type: "usable".to_string(),
+        },
+    ]
 }
 
 fn inspect_kernel_image_artifact(path: &Path) -> AppResult<KernelImageInspection> {
@@ -4302,6 +4448,12 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
                 && layout.linux_expected_entry_mode
                     == (metadata.kernel_format == "linux-bzimage")
                         .then(|| "x86-protected-mode-32".to_string())
+                && layout.guest_memory_map
+                    == if metadata.kernel_format == "linux-bzimage" {
+                        default_linux_guest_memory_map(metadata.initramfs_bytes.unwrap_or(0))
+                    } else {
+                        Vec::new()
+                    }
                 && layout.initramfs_path == metadata.initramfs_stored_path
                 && layout.initramfs_bytes == metadata.initramfs_bytes
                 && layout.initramfs_sha256 == metadata.initramfs_sha256
@@ -7205,6 +7357,15 @@ fn print_native_kernel_plan_report(report: &NativeKernelPlanReport) {
         if let Some(mode) = &layout.linux_expected_entry_mode {
             println!("  Entry Mode     {}", mode);
         }
+        if !layout.guest_memory_map.is_empty() {
+            println!("Guest Memory Map");
+            for range in &layout.guest_memory_map {
+                println!(
+                    "  {:<16} {} +{} {}",
+                    range.label, range.start_gpa, range.size_bytes, range.region_type
+                );
+            }
+        }
         println!("  Serial Device  {}", layout.expected_serial_device);
         println!("  Cmdline        {:?}", layout.cmdline);
     }
@@ -7868,19 +8029,19 @@ mod tests {
         build_bundle_doctor_request, build_distro_health, build_environment_catalog_report,
         build_kernel_boot_layout, build_linux_boot_params_page, build_native_runtime_report,
         build_runtime_artifact_report, build_steps, build_update_steps,
-        create_serial_boot_image_artifact, create_user_disk_descriptor, determine_app_lifecycle,
-        ensure_wsl_conf_setting, format_doctor_blockers, initialize_managed_arch_environment,
-        inspect_kernel_image_artifact, inspect_workspace, inventory_contains_distro,
-        kernel_layout_execution_image, load_kernel_layout_boot_image_artifact,
-        parse_guest_physical_address, preferred_transport, read_json_file, register_base_os_image,
-        register_boot_loader_image, register_kernel_boot_plan, resolve_bundle_output_path,
-        resolve_init_source, resolve_launch_target, resolve_managed_environment_for_reset,
-        resolve_saved_launch, resolve_session_context, resolve_status_distro,
-        runtime_storage_budget, sha256_file, status_port_for, validate_setup_password,
-        validate_setup_username, windows_transport_check, AppLifecyclePhase, AppNextAction,
-        CheckStatus, DistroHealth, DoctorCheck, DoctorReport, InitSource, KernelBootLayout,
-        KernelBootMetadata, NativeRuntimeState, StatusReport, WorkspaceHealth, WslInventory,
-        EMBEDDED_APP_ASSETS,
+        create_serial_boot_image_artifact, create_user_disk_descriptor,
+        default_linux_guest_memory_map, determine_app_lifecycle, ensure_wsl_conf_setting,
+        format_doctor_blockers, initialize_managed_arch_environment, inspect_kernel_image_artifact,
+        inspect_workspace, inventory_contains_distro, kernel_layout_execution_image,
+        load_kernel_layout_boot_image_artifact, parse_guest_physical_address, preferred_transport,
+        read_json_file, register_base_os_image, register_boot_loader_image,
+        register_kernel_boot_plan, resolve_bundle_output_path, resolve_init_source,
+        resolve_launch_target, resolve_managed_environment_for_reset, resolve_saved_launch,
+        resolve_session_context, resolve_status_distro, runtime_storage_budget, sha256_file,
+        status_port_for, validate_setup_password, validate_setup_username, windows_transport_check,
+        AppLifecyclePhase, AppNextAction, CheckStatus, DistroHealth, DoctorCheck, DoctorReport,
+        InitSource, KernelBootLayout, KernelBootMetadata, NativeRuntimeState, StatusReport,
+        WorkspaceHealth, WslInventory, EMBEDDED_APP_ASSETS,
     };
 
     fn empty_workspace_health() -> WorkspaceHealth {
@@ -8287,6 +8448,11 @@ mod tests {
         assert_eq!(layout.cmdline_gpa, "0x00020000");
         assert_eq!(layout.kernel_load_gpa, "0x00100000");
         assert_eq!(layout.initramfs_load_gpa.as_deref(), Some("0x04000000"));
+        assert!(layout.guest_memory_map.iter().any(|range| {
+            range.label == "high-ram"
+                && range.start_gpa == "0x08000000"
+                && range.region_type == "usable"
+        }));
         assert!(layout.materialized_at_epoch_seconds.is_some());
 
         let artifacts = build_runtime_artifact_report(&paths);
@@ -8369,6 +8535,7 @@ mod tests {
             linux_entry_point_gpa: Some("0x00100000".to_string()),
             linux_boot_params_register: Some("rsi".to_string()),
             linux_expected_entry_mode: Some("x86-protected-mode-32".to_string()),
+            guest_memory_map: default_linux_guest_memory_map(1234),
             initramfs_path: Some("initramfs".to_string()),
             initramfs_bytes: Some(1234),
             initramfs_sha256: Some("1".repeat(64)),
@@ -8385,6 +8552,18 @@ mod tests {
         assert_eq!(&page[0x228..0x22c], &0x0002_0000_u32.to_le_bytes());
         assert_eq!(&page[0x218..0x21c], &0x0400_0000_u32.to_le_bytes());
         assert_eq!(&page[0x21c..0x220], &1234_u32.to_le_bytes());
+        assert_eq!(page[0x1e8], 7);
+        assert_eq!(&page[0x2d0..0x2d8], &0x0000_7000_u64.to_le_bytes());
+        assert_eq!(&page[0x2d0 + 16..0x2d0 + 20], &2_u32.to_le_bytes());
+        let high_ram_offset = 0x2d0 + 6 * 20;
+        assert_eq!(
+            &page[high_ram_offset..high_ram_offset + 8],
+            &0x0800_0000_u64.to_le_bytes()
+        );
+        assert_eq!(
+            &page[high_ram_offset + 16..high_ram_offset + 20],
+            &1_u32.to_le_bytes()
+        );
     }
 
     #[test]
@@ -8411,6 +8590,7 @@ mod tests {
             linux_entry_point_gpa: Some("0x00100000".to_string()),
             linux_boot_params_register: Some("rsi".to_string()),
             linux_expected_entry_mode: Some("x86-protected-mode-32".to_string()),
+            guest_memory_map: default_linux_guest_memory_map(0),
             initramfs_path: None,
             initramfs_bytes: None,
             initramfs_sha256: None,

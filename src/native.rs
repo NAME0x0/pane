@@ -609,10 +609,13 @@ mod windows_whp {
     const WHV_MAP_GPA_RANGE_FLAG_READ: u32 = 0x0000_0001;
     const WHV_MAP_GPA_RANGE_FLAG_WRITE: u32 = 0x0000_0002;
     const WHV_MAP_GPA_RANGE_FLAG_EXECUTE: u32 = 0x0000_0004;
+    const WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS: u32 = 0x0000_0001;
     const WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS: u32 = 0x0000_0002;
     const WHV_RUN_VP_EXIT_REASON_UNRECOVERABLE_EXCEPTION: u32 = 0x0000_0004;
     const WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE: u32 = 0x0000_0005;
     const WHV_RUN_VP_EXIT_REASON_X64_HALT: u32 = 0x0000_0008;
+    const WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS: u32 = 0x0000_1000;
+    const WHV_RUN_VP_EXIT_REASON_X64_CPUID: u32 = 0x0000_1001;
     const GUEST_PAGE_SIZE: usize = SERIAL_BOOT_TEST_IMAGE_SIZE;
     const SERIAL_COM1_PORT: u16 = 0x03f8;
     const VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET: usize = 10;
@@ -1789,8 +1792,11 @@ mod windows_whp {
             && !matches!(
                 report.exit_reason,
                 Some(
-                    WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE
+                    WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS
+                        | WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE
                         | WHV_RUN_VP_EXIT_REASON_UNRECOVERABLE_EXCEPTION
+                        | WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS
+                        | WHV_RUN_VP_EXIT_REASON_X64_CPUID
                 )
             )
     }
@@ -1813,8 +1819,26 @@ mod windows_whp {
                 .to_string()
         } else {
             let exit = report.exit_reason_label.as_deref().unwrap_or("unknown");
+            let next = match report.exit_reason {
+                Some(WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS) => {
+                    "map the missing guest memory range or correct the E820/boot params layout"
+                }
+                Some(WHV_RUN_VP_EXIT_REASON_X64_CPUID) => {
+                    "implement CPUID exit handling for the Linux boot CPU contract"
+                }
+                Some(WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS) => {
+                    "implement MSR exit handling for the Linux boot CPU contract"
+                }
+                Some(WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE) => {
+                    "correct the protected-mode register setup"
+                }
+                Some(WHV_RUN_VP_EXIT_REASON_UNRECOVERABLE_EXCEPTION) => {
+                    "inspect the guest exception path and boot params"
+                }
+                _ => "inspect CPU state, mapped memory, and boot params",
+            };
             format!(
-                "Linux protected-mode entry reached failing WHP exit `{exit}`; inspect CPU state, mapped memory, and boot params."
+                "Linux protected-mode entry reached failing WHP exit `{exit}`; next step: {next}."
             )
         }
     }
@@ -1840,7 +1864,17 @@ mod windows_whp {
         report.exit_reason = Some(exit_reason);
         report.exit_reason_label = Some(exit_reason_label(exit_reason).to_string());
 
-        if exit_reason == WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS {
+        if exit_reason == WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS {
+            report.calls.push(NativeWhpCallReport {
+                name: "DecodeMemoryAccess",
+                hresult: None,
+                ok: false,
+                detail:
+                    "Guest accessed memory outside the currently mapped Pane RAM/artifact regions."
+                        .to_string(),
+            });
+            DecodedExit::Other
+        } else if exit_reason == WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS {
             let instruction_length = exit_context[VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET] & 0x0f;
             let rip = read_u64(exit_context, VP_CONTEXT_RIP_OFFSET);
             let access_info = read_u32(exit_context, IO_ACCESS_INFO_OFFSET);
@@ -1874,6 +1908,26 @@ mod windows_whp {
                 detail: "The guest reached HLT.".to_string(),
             });
             DecodedExit::Halt
+        } else if exit_reason == WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS {
+            report.calls.push(NativeWhpCallReport {
+                name: "DecodeX64MsrAccess",
+                hresult: None,
+                ok: false,
+                detail:
+                    "Guest reached an MSR access exit; Pane does not emulate Linux boot MSRs yet."
+                        .to_string(),
+            });
+            DecodedExit::Other
+        } else if exit_reason == WHV_RUN_VP_EXIT_REASON_X64_CPUID {
+            report.calls.push(NativeWhpCallReport {
+                name: "DecodeX64Cpuid",
+                hresult: None,
+                ok: false,
+                detail:
+                    "Guest reached a CPUID exit; Pane does not emulate Linux boot CPUID leaves yet."
+                        .to_string(),
+            });
+            DecodedExit::Other
         } else {
             report.calls.push(NativeWhpCallReport {
                 name: "DecodeVpExit",
@@ -1888,7 +1942,7 @@ mod windows_whp {
     fn exit_reason_label(value: u32) -> &'static str {
         match value {
             0x0000_0000 => "none",
-            0x0000_0001 => "memory-access",
+            WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS => "memory-access",
             WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS => "x64-io-port-access",
             WHV_RUN_VP_EXIT_REASON_UNRECOVERABLE_EXCEPTION => "unrecoverable-exception",
             WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE => "invalid-vp-register-value",
@@ -1896,8 +1950,8 @@ mod windows_whp {
             0x0000_0007 => "x64-interrupt-window",
             WHV_RUN_VP_EXIT_REASON_X64_HALT => "x64-halt",
             0x0000_0009 => "x64-apic-eoi",
-            0x0000_1000 => "x64-msr-access",
-            0x0000_1001 => "x64-cpuid",
+            WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS => "x64-msr-access",
+            WHV_RUN_VP_EXIT_REASON_X64_CPUID => "x64-cpuid",
             0x0000_1002 => "exception",
             0x0000_2001 => "canceled",
             _ => "unknown",
@@ -1933,9 +1987,11 @@ mod windows_whp {
     #[cfg(test)]
     mod tests {
         use super::{
-            guest_contract_passed, linux_entry_probe_passed, serial_contract_passed,
-            WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE, WHV_RUN_VP_EXIT_REASON_X64_HALT,
-            WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS,
+            guest_contract_passed, linux_entry_probe_detail, linux_entry_probe_passed,
+            serial_contract_passed, WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE,
+            WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS, WHV_RUN_VP_EXIT_REASON_X64_CPUID,
+            WHV_RUN_VP_EXIT_REASON_X64_HALT, WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS,
+            WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS,
         };
         use crate::native::{
             serial_boot_test_image_bytes, NativePartitionSmokeReport, NativePartitionSmokeStatus,
@@ -2042,6 +2098,34 @@ mod windows_whp {
                 &report,
                 crate::native::NativeGuestEntryMode::LinuxProtectedMode32
             ));
+        }
+
+        #[test]
+        fn linux_entry_probe_rejects_unhandled_hardware_exits() {
+            for (reason, label, expected_next_step) in [
+                (
+                    WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS,
+                    "memory-access",
+                    "map the missing guest memory range",
+                ),
+                (
+                    WHV_RUN_VP_EXIT_REASON_X64_CPUID,
+                    "x64-cpuid",
+                    "implement CPUID exit handling",
+                ),
+                (
+                    WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS,
+                    "x64-msr-access",
+                    "implement MSR exit handling",
+                ),
+            ] {
+                let mut report = base_report();
+                report.exit_reason = Some(reason);
+                report.exit_reason_label = Some(label.to_string());
+
+                assert!(!linux_entry_probe_passed(&report));
+                assert!(linux_entry_probe_detail(&report).contains(expected_next_step));
+            }
         }
     }
 }

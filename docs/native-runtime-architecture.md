@@ -70,11 +70,12 @@ It must remain side-effect-free. It reports blockers; it does not enable Windows
 5. Kernel boot plan: register a verified Linux kernel, inspect its bzImage header for boot-protocol/setup metadata, register an optional verified initramfs, and require an explicit `console=ttyS0` cmdline under `kernel-boot.json` without claiming it executes yet.
 6. Kernel boot layout: materialize `kernel-boot-layout.json` with boot params, cmdline, bzImage setup bytes, protected-mode payload placement, explicit Linux entry metadata, an initial E820 guest memory map, and optional initramfs guest-physical addresses.
 7. Boot-to-serial spike: implement WHP kernel entry, boot parameters, initramfs placement, and serial output capture far enough to prove Linux boot progress.
-8. Runtime artifact boot: connect the kernel path to Pane's verified Arch base image and Pane user disk descriptor.
-9. Storage materialization: turn the descriptor into a durable block-device format with resize, snapshot, repair, export, and import semantics.
-10. Display milestone: add a Pane-owned framebuffer and input path inside the app window.
-11. Integration milestone: add clipboard, file exchange boundaries, audio, resize, recovery, logging, and diagnostics.
-12. Compatibility milestone: measure performance, hardware requirements, Windows feature requirements, and failure modes before exposing the native runtime as a default.
+8. CPU exit handling: classify unhandled memory-access, CPUID, and MSR exits as blockers before adding emulation for the Linux boot CPU contract.
+9. Runtime artifact boot: connect the kernel path to Pane's verified Arch base image and Pane user disk descriptor.
+10. Storage materialization: turn the descriptor into a durable block-device format with resize, snapshot, repair, export, and import semantics.
+11. Display milestone: add a Pane-owned framebuffer and input path inside the app window.
+12. Integration milestone: add clipboard, file exchange boundaries, audio, resize, recovery, logging, and diagnostics.
+13. Compatibility milestone: measure performance, hardware requirements, Windows feature requirements, and failure modes before exposing the native runtime as a default.
 
 ## Non-Negotiable Acceptance Gates
 

@@ -67,7 +67,7 @@ It must remain side-effect-free. It reports blockers; it does not enable Windows
 2. Partition smoke: create a WHP partition, configure one vCPU, create that vCPU, and tear everything down cleanly.
 3. Runtime-backed serial test image: materialize `serial-boot.paneimg` under the Pane runtime, map it as guest memory, configure vCPU registers, run it, decode the `PANE_BOOT_OK` COM1 banner across repeated I/O exits, observe HLT, unmap memory, and tear everything down cleanly.
 4. Runtime-provided boot-loader candidate: register a verified `boot-to-serial-loader.paneimg`, require a SHA-256 match and expected serial text, then execute that artifact through WHP with `--run-boot-loader`.
-5. Kernel boot plan: register a verified Linux kernel, optional verified initramfs, and an explicit `console=ttyS0` cmdline under `kernel-boot.json` without claiming it executes yet.
+5. Kernel boot plan: register a verified Linux kernel, inspect its bzImage header for boot-protocol/setup metadata, register an optional verified initramfs, and require an explicit `console=ttyS0` cmdline under `kernel-boot.json` without claiming it executes yet.
 6. Kernel boot layout: materialize `kernel-boot-layout.json` with boot params, cmdline, kernel, and optional initramfs guest-physical addresses.
 7. Boot-to-serial spike: implement WHP kernel entry, boot parameters, initramfs placement, and serial output capture far enough to prove Linux boot progress.
 8. Runtime artifact boot: connect the kernel path to Pane's verified Arch base image and Pane user disk descriptor.

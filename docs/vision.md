@@ -14,6 +14,7 @@ The current Arch-first MVP already has the shape of the product:
 - a guarded WHP guest execution milestone through `pane native-boot-spike --execute --run-fixture`,
 - a verified runtime-provided boot-loader candidate path through `pane runtime --register-boot-loader` and `pane native-boot-spike --execute --run-boot-loader`,
 - a verified kernel/initramfs boot-plan contract through `pane runtime --register-kernel`,
+- Linux bzImage header inspection before Pane attempts native kernel entry,
 - a materialized kernel boot-layout contract through `pane native-kernel-plan --materialize`,
 - guarded WHP execution of a controlled kernel-layout candidate through `pane native-boot-spike --run-kernel-layout`,
 - `pane init` as the first ownership slice for provisioning a managed `pane-arch` distro through WSL or adopting an existing Arch distro,

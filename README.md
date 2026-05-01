@@ -131,7 +131,7 @@ Register a controlled boot-to-serial loader candidate once you have a tiny loade
 cargo run -- runtime --register-boot-loader C:\path\to\loader.img --boot-loader-expected-sha256 <64-char-sha256> --boot-loader-expected-serial "PANE_BOOT_OK\n"
 ```
 
-Prepare the first kernel/initramfs boot-plan contract once you have a trusted kernel artifact. Pane requires an explicit serial console cmdline so the next WHP milestone can prove boot progress before any GUI work:
+Prepare the first kernel/initramfs boot-plan contract once you have a trusted kernel artifact. Pane now inspects real Linux bzImage headers and records the boot-protocol/setup metadata needed by the native runner. Pane requires an explicit serial console cmdline so the next WHP milestone can prove boot progress before any GUI work:
 
 ```powershell
 cargo run -- runtime --register-kernel C:\path\to\vmlinuz-linux --kernel-expected-sha256 <64-char-sha256> --kernel-cmdline "console=ttyS0 panic=-1"

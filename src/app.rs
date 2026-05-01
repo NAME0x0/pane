@@ -272,6 +272,10 @@ struct RuntimeArtifactReport {
     kernel_image_bytes: Option<u64>,
     kernel_image_sha256: Option<String>,
     kernel_image_verified: bool,
+    kernel_format: Option<String>,
+    kernel_linux_boot_protocol: Option<String>,
+    kernel_linux_protected_mode_offset: Option<u64>,
+    kernel_linux_protected_mode_bytes: Option<u64>,
     initramfs_image_exists: bool,
     initramfs_image_bytes: Option<u64>,
     initramfs_image_sha256: Option<String>,
@@ -344,6 +348,14 @@ struct KernelBootMetadata {
     kernel_sha256: String,
     kernel_expected_sha256: Option<String>,
     kernel_verified: bool,
+    kernel_format: String,
+    linux_boot_protocol: Option<String>,
+    linux_setup_sectors: Option<u8>,
+    linux_setup_bytes: Option<u64>,
+    linux_protected_mode_offset: Option<u64>,
+    linux_protected_mode_bytes: Option<u64>,
+    linux_loadflags: Option<u8>,
+    linux_preferred_load_address: Option<String>,
     initramfs_source_path: Option<String>,
     initramfs_stored_path: Option<String>,
     initramfs_bytes: Option<u64>,
@@ -370,6 +382,14 @@ struct KernelBootLayout {
     kernel_path: String,
     kernel_bytes: u64,
     kernel_sha256: String,
+    kernel_format: String,
+    linux_boot_protocol: Option<String>,
+    linux_setup_sectors: Option<u8>,
+    linux_setup_bytes: Option<u64>,
+    linux_protected_mode_offset: Option<u64>,
+    linux_protected_mode_bytes: Option<u64>,
+    linux_loadflags: Option<u8>,
+    linux_preferred_load_address: Option<String>,
     initramfs_path: Option<String>,
     initramfs_bytes: Option<u64>,
     initramfs_sha256: Option<String>,
@@ -3243,7 +3263,12 @@ fn build_linux_boot_params_page(layout: &KernelBootLayout) -> AppResult<Vec<u8>>
     let cmdline_gpa = checked_u32_gpa(&layout.cmdline_gpa, "kernel cmdline")?;
     write_u16_le(&mut boot_params, 0x1fe, 0xaa55);
     boot_params[0x202..0x206].copy_from_slice(b"HdrS");
-    write_u16_le(&mut boot_params, 0x206, 0x020f);
+    let protocol = layout
+        .linux_boot_protocol
+        .as_deref()
+        .and_then(parse_hex_u16)
+        .unwrap_or(0x020f);
+    write_u16_le(&mut boot_params, 0x206, protocol);
     boot_params[0x210] = 0xff;
     boot_params[0x211] = 0x80;
     write_u32_le(&mut boot_params, 0x228, cmdline_gpa);
@@ -3290,6 +3315,26 @@ fn write_u16_le(bytes: &mut [u8], offset: usize, value: u16) {
 
 fn write_u32_le(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn read_u16_le_at(bytes: &[u8], offset: usize) -> Option<u16> {
+    let slice = bytes.get(offset..offset + 2)?;
+    Some(u16::from_le_bytes([slice[0], slice[1]]))
+}
+
+fn read_u64_le_at(bytes: &[u8], offset: usize) -> Option<u64> {
+    let slice = bytes.get(offset..offset + 8)?;
+    Some(u64::from_le_bytes([
+        slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
+    ]))
+}
+
+fn parse_hex_u16(value: &str) -> Option<u16> {
+    let trimmed = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    u16::from_str_radix(trimmed, 16).ok()
 }
 
 fn parse_guest_physical_address(value: &str) -> AppResult<u64> {
@@ -3386,6 +3431,7 @@ fn register_kernel_boot_plan(
         .or_else(|| previous.as_ref().map(|metadata| metadata.cmdline.clone()))
         .unwrap_or_else(|| "console=ttyS0 earlyprintk=serial panic=-1".to_string());
     validate_kernel_cmdline(&cmdline)?;
+    let kernel_inspection = inspect_kernel_image_artifact(&paths.kernel_image)?;
 
     let metadata = KernelBootMetadata {
         schema_version: 1,
@@ -3396,6 +3442,14 @@ fn register_kernel_boot_plan(
         kernel_sha256: kernel_record.sha256,
         kernel_expected_sha256: kernel_record.expected_sha256,
         kernel_verified: kernel_record.verified,
+        kernel_format: kernel_inspection.format,
+        linux_boot_protocol: kernel_inspection.linux_boot_protocol,
+        linux_setup_sectors: kernel_inspection.linux_setup_sectors,
+        linux_setup_bytes: kernel_inspection.linux_setup_bytes,
+        linux_protected_mode_offset: kernel_inspection.linux_protected_mode_offset,
+        linux_protected_mode_bytes: kernel_inspection.linux_protected_mode_bytes,
+        linux_loadflags: kernel_inspection.linux_loadflags,
+        linux_preferred_load_address: kernel_inspection.linux_preferred_load_address,
         initramfs_source_path: initramfs_record
             .as_ref()
             .map(|record| record.source_path.clone()),
@@ -3416,16 +3470,18 @@ fn register_kernel_boot_plan(
         cmdline,
         expected_serial_device: "ttyS0".to_string(),
         kernel_load_gpa: "0x00100000".to_string(),
-        initramfs_load_gpa: initramfs_record
-            .as_ref()
-            .map(|_| "0x04000000".to_string()),
+        initramfs_load_gpa: initramfs_record.as_ref().map(|_| "0x04000000".to_string()),
         registered_at_epoch_seconds: current_epoch_seconds(),
-        notes: vec![
+        notes: {
+            let mut notes = vec![
             "This is Pane's first native kernel/initramfs boot-plan contract; it is not yet executed by WHP."
                 .to_string(),
             "The command line must keep serial console output enabled so the next WHP milestone can prove boot progress without a GUI."
                 .to_string(),
-        ],
+            ];
+            notes.extend(kernel_inspection.notes);
+            notes
+        },
     };
 
     write_json_file(&paths.kernel_boot_metadata, &metadata)
@@ -3501,6 +3557,14 @@ fn build_kernel_boot_layout(
         kernel_path: metadata.kernel_stored_path,
         kernel_bytes: metadata.kernel_bytes,
         kernel_sha256: metadata.kernel_sha256,
+        kernel_format: metadata.kernel_format,
+        linux_boot_protocol: metadata.linux_boot_protocol,
+        linux_setup_sectors: metadata.linux_setup_sectors,
+        linux_setup_bytes: metadata.linux_setup_bytes,
+        linux_protected_mode_offset: metadata.linux_protected_mode_offset,
+        linux_protected_mode_bytes: metadata.linux_protected_mode_bytes,
+        linux_loadflags: metadata.linux_loadflags,
+        linux_preferred_load_address: metadata.linux_preferred_load_address,
         initramfs_path: metadata.initramfs_stored_path,
         initramfs_bytes: metadata.initramfs_bytes,
         initramfs_sha256: metadata.initramfs_sha256,
@@ -3522,6 +3586,79 @@ fn build_kernel_boot_layout(
     Ok(layout)
 }
 
+fn inspect_kernel_image_artifact(path: &Path) -> AppResult<KernelImageInspection> {
+    let bytes = fs::read(path)?;
+    if bytes == crate::native::serial_boot_test_image_bytes() {
+        return Ok(KernelImageInspection {
+            format: "controlled-serial-candidate".to_string(),
+            linux_boot_protocol: None,
+            linux_setup_sectors: None,
+            linux_setup_bytes: None,
+            linux_protected_mode_offset: None,
+            linux_protected_mode_bytes: None,
+            linux_loadflags: None,
+            linux_preferred_load_address: None,
+            notes: vec![
+                "This artifact is Pane's controlled serial/HALT candidate, not a Linux bzImage. It is allowed only for deterministic WHP runner certification."
+                    .to_string(),
+            ],
+        });
+    }
+
+    if bytes.len() < 0x264 {
+        return Err(AppError::message(format!(
+            "Kernel artifact at {} is too small to be a Linux bzImage and is not Pane's controlled serial candidate.",
+            path.display()
+        )));
+    }
+    if read_u16_le_at(&bytes, 0x1fe) != Some(0xaa55) || bytes.get(0x202..0x206) != Some(b"HdrS") {
+        return Err(AppError::message(format!(
+            "Kernel artifact at {} is not a supported Linux bzImage. Expected boot flag 0xaa55 and setup header magic HdrS.",
+            path.display()
+        )));
+    }
+
+    let protocol = read_u16_le_at(&bytes, 0x206).ok_or_else(|| {
+        AppError::message("Linux kernel setup header is missing protocol version.")
+    })?;
+    if protocol < 0x0200 {
+        return Err(AppError::message(format!(
+            "Linux boot protocol {:#06x} is too old for Pane's native runner scaffold.",
+            protocol
+        )));
+    }
+
+    let setup_sectors = bytes[0x1f1];
+    let normalized_setup_sectors = if setup_sectors == 0 { 4 } else { setup_sectors };
+    let setup_bytes = (normalized_setup_sectors as usize + 1) * 512;
+    if setup_bytes >= bytes.len() {
+        return Err(AppError::message(format!(
+            "Linux bzImage setup area is {setup_bytes} bytes, but the artifact is only {} bytes.",
+            bytes.len()
+        )));
+    }
+    let protected_mode_bytes = bytes.len() - setup_bytes;
+    let preferred_load = (protocol >= 0x020a)
+        .then(|| read_u64_le_at(&bytes, 0x258))
+        .flatten()
+        .map(|value| format!("{value:#018x}"));
+
+    Ok(KernelImageInspection {
+        format: "linux-bzimage".to_string(),
+        linux_boot_protocol: Some(format!("{:#06x}", protocol)),
+        linux_setup_sectors: Some(normalized_setup_sectors),
+        linux_setup_bytes: Some(setup_bytes as u64),
+        linux_protected_mode_offset: Some(setup_bytes as u64),
+        linux_protected_mode_bytes: Some(protected_mode_bytes as u64),
+        linux_loadflags: bytes.get(0x211).copied(),
+        linux_preferred_load_address: preferred_load,
+        notes: vec![
+            "Linux bzImage header validated; Pane has not yet entered the real Linux boot protocol."
+                .to_string(),
+        ],
+    })
+}
+
 struct ArtifactRegistration {
     source_path: String,
     stored_path: String,
@@ -3529,6 +3666,19 @@ struct ArtifactRegistration {
     sha256: String,
     expected_sha256: Option<String>,
     verified: bool,
+}
+
+#[derive(Clone, Debug)]
+struct KernelImageInspection {
+    format: String,
+    linux_boot_protocol: Option<String>,
+    linux_setup_sectors: Option<u8>,
+    linux_setup_bytes: Option<u64>,
+    linux_protected_mode_offset: Option<u64>,
+    linux_protected_mode_bytes: Option<u64>,
+    linux_loadflags: Option<u8>,
+    linux_preferred_load_address: Option<String>,
+    notes: Vec<String>,
 }
 
 fn copy_verified_runtime_artifact(
@@ -4009,6 +4159,10 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
                 && metadata.kernel_bytes == bytes
                 && Some(metadata.kernel_sha256.as_str()) == kernel_actual_sha256.as_deref()
                 && metadata.kernel_stored_path == paths.kernel_image.display().to_string()
+                && matches!(
+                    metadata.kernel_format.as_str(),
+                    "linux-bzimage" | "controlled-serial-candidate"
+                )
         })
         .unwrap_or(false);
     let initramfs_image_verified = kernel_boot_metadata
@@ -4049,6 +4203,14 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
                 && layout.kernel_path == paths.kernel_image.display().to_string()
                 && layout.kernel_bytes == metadata.kernel_bytes
                 && layout.kernel_sha256 == metadata.kernel_sha256
+                && layout.kernel_format == metadata.kernel_format
+                && layout.linux_boot_protocol == metadata.linux_boot_protocol
+                && layout.linux_setup_sectors == metadata.linux_setup_sectors
+                && layout.linux_setup_bytes == metadata.linux_setup_bytes
+                && layout.linux_protected_mode_offset == metadata.linux_protected_mode_offset
+                && layout.linux_protected_mode_bytes == metadata.linux_protected_mode_bytes
+                && layout.linux_loadflags == metadata.linux_loadflags
+                && layout.linux_preferred_load_address == metadata.linux_preferred_load_address
                 && layout.initramfs_path == metadata.initramfs_stored_path
                 && layout.initramfs_bytes == metadata.initramfs_bytes
                 && layout.initramfs_sha256 == metadata.initramfs_sha256
@@ -4103,6 +4265,18 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
             .as_ref()
             .map(|metadata| metadata.kernel_sha256.clone()),
         kernel_image_verified,
+        kernel_format: kernel_boot_metadata
+            .as_ref()
+            .map(|metadata| metadata.kernel_format.clone()),
+        kernel_linux_boot_protocol: kernel_boot_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.linux_boot_protocol.clone()),
+        kernel_linux_protected_mode_offset: kernel_boot_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.linux_protected_mode_offset),
+        kernel_linux_protected_mode_bytes: kernel_boot_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.linux_protected_mode_bytes),
         initramfs_image_exists: paths.initramfs_image.is_file(),
         initramfs_image_bytes,
         initramfs_image_sha256: kernel_boot_metadata
@@ -6686,6 +6860,18 @@ fn print_runtime_report(report: &RuntimeReport) {
     if let Some(bytes) = report.artifacts.kernel_image_bytes {
         println!("  Kernel Bytes   {}", bytes);
     }
+    if let Some(format) = &report.artifacts.kernel_format {
+        println!("  Kernel Format  {}", format);
+    }
+    if let Some(protocol) = &report.artifacts.kernel_linux_boot_protocol {
+        println!("  Linux Protocol {}", protocol);
+    }
+    if let Some(offset) = report.artifacts.kernel_linux_protected_mode_offset {
+        println!("  Linux PM Offset {}", offset);
+    }
+    if let Some(bytes) = report.artifacts.kernel_linux_protected_mode_bytes {
+        println!("  Linux PM Bytes {}", bytes);
+    }
     println!(
         "  Initramfs      {}",
         yes_no(report.artifacts.initramfs_image_exists)
@@ -7578,15 +7764,16 @@ mod tests {
         build_runtime_artifact_report, build_steps, build_update_steps,
         create_serial_boot_image_artifact, create_user_disk_descriptor, determine_app_lifecycle,
         ensure_wsl_conf_setting, format_doctor_blockers, initialize_managed_arch_environment,
-        inspect_workspace, inventory_contains_distro, load_kernel_layout_boot_image_artifact,
-        parse_guest_physical_address, preferred_transport, register_base_os_image,
-        register_boot_loader_image, register_kernel_boot_plan, resolve_bundle_output_path,
-        resolve_init_source, resolve_launch_target, resolve_managed_environment_for_reset,
-        resolve_saved_launch, resolve_session_context, resolve_status_distro,
-        runtime_storage_budget, sha256_file, status_port_for, validate_setup_password,
-        validate_setup_username, windows_transport_check, AppLifecyclePhase, AppNextAction,
-        CheckStatus, DistroHealth, DoctorCheck, DoctorReport, InitSource, KernelBootLayout,
-        NativeRuntimeState, StatusReport, WorkspaceHealth, WslInventory, EMBEDDED_APP_ASSETS,
+        inspect_kernel_image_artifact, inspect_workspace, inventory_contains_distro,
+        load_kernel_layout_boot_image_artifact, parse_guest_physical_address, preferred_transport,
+        read_json_file, register_base_os_image, register_boot_loader_image,
+        register_kernel_boot_plan, resolve_bundle_output_path, resolve_init_source,
+        resolve_launch_target, resolve_managed_environment_for_reset, resolve_saved_launch,
+        resolve_session_context, resolve_status_distro, runtime_storage_budget, sha256_file,
+        status_port_for, validate_setup_password, validate_setup_username, windows_transport_check,
+        AppLifecyclePhase, AppNextAction, CheckStatus, DistroHealth, DoctorCheck, DoctorReport,
+        InitSource, KernelBootLayout, KernelBootMetadata, NativeRuntimeState, StatusReport,
+        WorkspaceHealth, WslInventory, EMBEDDED_APP_ASSETS,
     };
 
     fn empty_workspace_health() -> WorkspaceHealth {
@@ -7642,6 +7829,18 @@ mod tests {
             logs,
             root,
         }
+    }
+
+    fn fake_linux_bzimage() -> Vec<u8> {
+        let mut bytes = vec![0_u8; 4096];
+        bytes[0x1f1] = 4;
+        bytes[0x1fe..0x200].copy_from_slice(&0xaa55_u16.to_le_bytes());
+        bytes[0x202..0x206].copy_from_slice(b"HdrS");
+        bytes[0x206..0x208].copy_from_slice(&0x020f_u16.to_le_bytes());
+        bytes[0x211] = 0x80;
+        bytes[0x258..0x260].copy_from_slice(&0x0100_0000_u64.to_le_bytes());
+        bytes[2560..].fill(0xcc);
+        bytes
     }
 
     fn empty_doctor_report() -> DoctorReport {
@@ -7766,6 +7965,44 @@ mod tests {
     }
 
     #[test]
+    fn inspects_linux_bzimage_header_for_boot_protocol_metadata() {
+        let paths = temp_runtime_paths("inspect-bzimage");
+        std::fs::create_dir_all(&paths.root).unwrap();
+        let kernel = paths.root.join("vmlinuz-linux");
+        std::fs::write(&kernel, fake_linux_bzimage()).unwrap();
+
+        let inspection = inspect_kernel_image_artifact(&kernel).unwrap();
+        assert_eq!(inspection.format, "linux-bzimage");
+        assert_eq!(inspection.linux_boot_protocol.as_deref(), Some("0x020f"));
+        assert_eq!(inspection.linux_setup_sectors, Some(4));
+        assert_eq!(inspection.linux_setup_bytes, Some(2560));
+        assert_eq!(inspection.linux_protected_mode_offset, Some(2560));
+        assert_eq!(inspection.linux_protected_mode_bytes, Some(1536));
+        assert_eq!(inspection.linux_loadflags, Some(0x80));
+        assert_eq!(
+            inspection.linux_preferred_load_address.as_deref(),
+            Some("0x0000000001000000")
+        );
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn rejects_unknown_kernel_artifacts_before_native_execution() {
+        let paths = temp_runtime_paths("inspect-unknown-kernel");
+        std::fs::create_dir_all(&paths.root).unwrap();
+        let kernel = paths.root.join("not-a-kernel.bin");
+        std::fs::write(&kernel, b"not a kernel").unwrap();
+
+        let error = inspect_kernel_image_artifact(&kernel)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("too small"));
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
     fn creates_runtime_backed_serial_boot_image() {
         let paths = temp_runtime_paths("serial-boot-image");
         super::prepare_runtime_paths(&paths).unwrap();
@@ -7850,7 +8087,7 @@ mod tests {
         super::prepare_runtime_paths(&paths).unwrap();
         let kernel = paths.downloads.join("vmlinuz-linux");
         let initramfs = paths.downloads.join("initramfs-linux.img");
-        std::fs::write(&kernel, b"pane kernel").unwrap();
+        std::fs::write(&kernel, fake_linux_bzimage()).unwrap();
         std::fs::write(&initramfs, b"pane initramfs").unwrap();
         let kernel_sha = sha256_file(&kernel).unwrap();
         let initramfs_sha = sha256_file(&initramfs).unwrap();
@@ -7876,6 +8113,16 @@ mod tests {
             artifacts.kernel_cmdline.as_deref(),
             Some("console=ttyS0 root=/dev/pane0 rw")
         );
+        assert_eq!(artifacts.kernel_format.as_deref(), Some("linux-bzimage"));
+        assert_eq!(
+            artifacts.kernel_linux_boot_protocol.as_deref(),
+            Some("0x020f")
+        );
+        assert_eq!(artifacts.kernel_linux_protected_mode_offset, Some(2560));
+        let metadata = read_json_file::<KernelBootMetadata>(&paths.kernel_boot_metadata).unwrap();
+        assert_eq!(metadata.kernel_format, "linux-bzimage");
+        assert_eq!(metadata.linux_boot_protocol.as_deref(), Some("0x020f"));
+        assert_eq!(metadata.linux_protected_mode_offset, Some(2560));
 
         let _ = std::fs::remove_dir_all(&paths.root);
     }
@@ -7885,7 +8132,7 @@ mod tests {
         let paths = temp_runtime_paths("kernel-boot-plan-no-serial");
         super::prepare_runtime_paths(&paths).unwrap();
         let kernel = paths.downloads.join("vmlinuz-linux");
-        std::fs::write(&kernel, b"pane kernel").unwrap();
+        std::fs::write(&kernel, fake_linux_bzimage()).unwrap();
         let kernel_sha = sha256_file(&kernel).unwrap();
 
         let error = register_kernel_boot_plan(
@@ -7911,7 +8158,7 @@ mod tests {
         super::prepare_runtime_paths(&paths).unwrap();
         let kernel = paths.downloads.join("vmlinuz-linux");
         let initramfs = paths.downloads.join("initramfs-linux.img");
-        std::fs::write(&kernel, b"pane kernel").unwrap();
+        std::fs::write(&kernel, fake_linux_bzimage()).unwrap();
         std::fs::write(&initramfs, b"pane initramfs").unwrap();
         let kernel_sha = sha256_file(&kernel).unwrap();
         let initramfs_sha = sha256_file(&initramfs).unwrap();
@@ -8004,6 +8251,14 @@ mod tests {
             kernel_path: "kernel".to_string(),
             kernel_bytes: 4096,
             kernel_sha256: "0".repeat(64),
+            kernel_format: "linux-bzimage".to_string(),
+            linux_boot_protocol: Some("0x020f".to_string()),
+            linux_setup_sectors: Some(4),
+            linux_setup_bytes: Some(2560),
+            linux_protected_mode_offset: Some(2560),
+            linux_protected_mode_bytes: Some(1536),
+            linux_loadflags: Some(0x80),
+            linux_preferred_load_address: Some("0x0000000001000000".to_string()),
             initramfs_path: Some("initramfs".to_string()),
             initramfs_bytes: Some(1234),
             initramfs_sha256: Some("1".repeat(64)),
@@ -8037,7 +8292,7 @@ mod tests {
         let paths = temp_runtime_paths("kernel-boot-layout-unverified");
         super::prepare_runtime_paths(&paths).unwrap();
         let kernel = paths.downloads.join("vmlinuz-linux");
-        std::fs::write(&kernel, b"pane kernel").unwrap();
+        std::fs::write(&kernel, fake_linux_bzimage()).unwrap();
 
         register_kernel_boot_plan(
             &paths,

@@ -38,8 +38,10 @@ jobs:
         run: |
           set -euo pipefail
           test -f docs/index.html
+          test -f docs/doc.html
           test -f docs/style.css
           test -f docs/main.js
+          test -f docs/docs.js
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3

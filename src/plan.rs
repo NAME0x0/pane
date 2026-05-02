@@ -243,10 +243,29 @@ pub fn windows_to_wsl_path(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
     use super::{
         managed_distro_install_root, runtime_for, sanitize_session_name, shared_dir_for_workspace,
         windows_to_wsl_path, workspace_for, workspace_for_with_shared_storage,
     };
+
+    fn suffix(components: &[&str]) -> PathBuf {
+        let mut path = PathBuf::new();
+        for component in components {
+            path.push(component);
+        }
+        path
+    }
+
+    fn assert_path_ends_with(path: &Path, components: &[&str]) {
+        assert!(
+            path.ends_with(suffix(components)),
+            "expected path '{}' to end with '{}'",
+            path.display(),
+            suffix(components).display()
+        );
+    }
 
     #[test]
     fn normalizes_session_names() {
@@ -266,19 +285,24 @@ mod tests {
     #[test]
     fn workspace_includes_bootstrap_and_transport_log_paths() {
         let workspace = workspace_for("Pane Session");
-        assert!(workspace
-            .bootstrap_log
-            .ends_with("sessions\\pane-session\\bootstrap.log"));
-        assert!(workspace
-            .transport_log
-            .ends_with("sessions\\pane-session\\transport.log"));
-        assert!(workspace.shared_dir.ends_with("Pane\\shared\\pane-session"));
+        assert_path_ends_with(
+            &workspace.bootstrap_log,
+            &["sessions", "pane-session", "bootstrap.log"],
+        );
+        assert_path_ends_with(
+            &workspace.transport_log,
+            &["sessions", "pane-session", "transport.log"],
+        );
+        assert_path_ends_with(&workspace.shared_dir, &["Pane", "shared", "pane-session"]);
     }
 
     #[test]
     fn shared_directory_is_durable_by_default() {
         let workspace = workspace_for("Pane Session");
-        assert!(shared_dir_for_workspace(&workspace).ends_with("Pane\\shared\\pane-session"));
+        assert_path_ends_with(
+            &shared_dir_for_workspace(&workspace),
+            &["Pane", "shared", "pane-session"],
+        );
     }
 
     #[test]
@@ -287,59 +311,81 @@ mod tests {
             "Pane Session",
             crate::model::SharedStorageMode::Scratch,
         );
-        assert!(shared_dir_for_workspace(&workspace).ends_with("sessions\\pane-session\\shared"));
+        assert_path_ends_with(
+            &shared_dir_for_workspace(&workspace),
+            &["sessions", "pane-session", "shared"],
+        );
     }
 
     #[test]
     fn managed_distro_root_is_scoped_under_local_app_data() {
         let root = managed_distro_install_root("Pane Arch");
-        assert!(root.ends_with("Pane\\distros\\pane-arch"));
+        assert_path_ends_with(&root, &["Pane", "distros", "pane-arch"]);
     }
 
     #[test]
     fn runtime_paths_include_native_engine_boundaries() {
         let runtime = runtime_for("Pane Session");
 
-        assert!(runtime.root.ends_with("Pane\\runtime\\pane-session"));
-        assert!(runtime.base_os_image.ends_with("images\\arch-base.paneimg"));
-        assert!(runtime
-            .serial_boot_image
-            .ends_with("engines\\serial-boot.paneimg"));
-        assert!(runtime
-            .boot_loader_image
-            .ends_with("engines\\boot-to-serial-loader.paneimg"));
-        assert!(runtime
-            .kernel_image
-            .ends_with("engines\\linux-kernel.paneimg"));
-        assert!(runtime
-            .initramfs_image
-            .ends_with("engines\\initramfs.paneinitrd"));
-        assert!(runtime.user_disk.ends_with("disks\\user-data.panedisk"));
-        assert!(runtime
-            .runtime_config
-            .ends_with("runtime\\pane-session\\pane-runtime.config.json"));
-        assert!(runtime
-            .base_os_metadata
-            .ends_with("runtime\\pane-session\\state\\base-os-image.json"));
-        assert!(runtime
-            .serial_boot_metadata
-            .ends_with("runtime\\pane-session\\state\\serial-boot-image.json"));
-        assert!(runtime
-            .boot_loader_metadata
-            .ends_with("runtime\\pane-session\\state\\boot-to-serial-loader.json"));
-        assert!(runtime
-            .kernel_boot_metadata
-            .ends_with("runtime\\pane-session\\state\\kernel-boot.json"));
-        assert!(runtime
-            .user_disk_metadata
-            .ends_with("runtime\\pane-session\\state\\user-disk.json"));
-        assert!(runtime
-            .native_manifest
-            .ends_with("runtime\\pane-session\\pane-native-runtime.json"));
-        assert!(runtime
-            .kernel_boot_layout
-            .ends_with("runtime\\pane-session\\state\\kernel-boot-layout.json"));
-        assert!(runtime.engines.ends_with("runtime\\pane-session\\engines"));
-        assert!(runtime.logs.ends_with("runtime\\pane-session\\logs"));
+        assert_path_ends_with(&runtime.root, &["Pane", "runtime", "pane-session"]);
+        assert_path_ends_with(&runtime.base_os_image, &["images", "arch-base.paneimg"]);
+        assert_path_ends_with(
+            &runtime.serial_boot_image,
+            &["engines", "serial-boot.paneimg"],
+        );
+        assert_path_ends_with(
+            &runtime.boot_loader_image,
+            &["engines", "boot-to-serial-loader.paneimg"],
+        );
+        assert_path_ends_with(&runtime.kernel_image, &["engines", "linux-kernel.paneimg"]);
+        assert_path_ends_with(
+            &runtime.initramfs_image,
+            &["engines", "initramfs.paneinitrd"],
+        );
+        assert_path_ends_with(&runtime.user_disk, &["disks", "user-data.panedisk"]);
+        assert_path_ends_with(
+            &runtime.runtime_config,
+            &["runtime", "pane-session", "pane-runtime.config.json"],
+        );
+        assert_path_ends_with(
+            &runtime.base_os_metadata,
+            &["runtime", "pane-session", "state", "base-os-image.json"],
+        );
+        assert_path_ends_with(
+            &runtime.serial_boot_metadata,
+            &["runtime", "pane-session", "state", "serial-boot-image.json"],
+        );
+        assert_path_ends_with(
+            &runtime.boot_loader_metadata,
+            &[
+                "runtime",
+                "pane-session",
+                "state",
+                "boot-to-serial-loader.json",
+            ],
+        );
+        assert_path_ends_with(
+            &runtime.kernel_boot_metadata,
+            &["runtime", "pane-session", "state", "kernel-boot.json"],
+        );
+        assert_path_ends_with(
+            &runtime.user_disk_metadata,
+            &["runtime", "pane-session", "state", "user-disk.json"],
+        );
+        assert_path_ends_with(
+            &runtime.native_manifest,
+            &["runtime", "pane-session", "pane-native-runtime.json"],
+        );
+        assert_path_ends_with(
+            &runtime.kernel_boot_layout,
+            &[
+                "runtime",
+                "pane-session",
+                "state",
+                "kernel-boot-layout.json",
+            ],
+        );
+        assert_path_ends_with(&runtime.engines, &["runtime", "pane-session", "engines"]);
+        assert_path_ends_with(&runtime.logs, &["runtime", "pane-session", "logs"]);
     }
 }

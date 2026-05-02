@@ -92,13 +92,18 @@ jobs:
           foreach ($file in $files) {
             $text = Get-Content -LiteralPath $file -Raw
             $base = Split-Path -Parent $file
+            if ([string]::IsNullOrWhiteSpace($base)) {
+              $base = "."
+            }
             $markdownLinks = [regex]::Matches($text, '\[[^\]]+\]\(([^)#?][^)#?]*)(?:#[^)]+)?\)')
             $htmlLinks = [regex]::Matches($text, 'href="([^"#?:][^"#]*)"')
             foreach ($match in @($markdownLinks) + @($htmlLinks)) {
               $target = $match.Groups[1].Value
               if ([string]::IsNullOrWhiteSpace($target)) { continue }
               if ($target -match '^(https?://|mailto:|data:|#)') { continue }
-              $resolved = Join-Path $base $target
+              $localTarget = ($target -split '[?#]', 2)[0]
+              if ([string]::IsNullOrWhiteSpace($localTarget)) { continue }
+              $resolved = Join-Path $base $localTarget
               if (-not (Test-Path -LiteralPath $resolved)) {
                 $relativeFile = Resolve-Path -LiteralPath $file -Relative
                 $missing.Add("${relativeFile}: missing local link ${target}")
@@ -108,6 +113,25 @@ jobs:
           if ($missing.Count -gt 0) {
             $missing | ForEach-Object { Write-Error $_ }
             throw "Local documentation link validation failed."
+          }
+
+      - name: Validate deployed docs use HTML routes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $rawMarkdownLinks = New-Object System.Collections.Generic.List[string]
+          $siteFiles = Get-ChildItem docs -Recurse -Include *.html,*.js -File
+          foreach ($file in $siteFiles) {
+            $text = Get-Content -LiteralPath $file.FullName -Raw
+            $links = [regex]::Matches($text, 'href="([^"]+\.md(?:#[^"]*)?)"')
+            foreach ($link in $links) {
+              $relativeFile = Resolve-Path -LiteralPath $file.FullName -Relative
+              $rawMarkdownLinks.Add("${relativeFile}: raw deployed Markdown link $($link.Groups[1].Value)")
+            }
+          }
+          if ($rawMarkdownLinks.Count -gt 0) {
+            $rawMarkdownLinks | ForEach-Object { Write-Error $_ }
+            throw "Deployed docs should link to HTML reader routes, not raw Markdown files."
           }
 
   native-runtime-smoke:

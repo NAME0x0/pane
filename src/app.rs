@@ -8959,6 +8959,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&paths.root);
     }
 
+    #[cfg(windows)]
     #[test]
     fn app_lifecycle_requires_wsl_before_onboarding() {
         let status = empty_status_report(false);
@@ -8970,6 +8971,19 @@ mod tests {
         assert_eq!(next_action, AppNextAction::InstallWsl);
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn app_lifecycle_reports_unsupported_host_on_non_windows() {
+        let status = empty_status_report(false);
+        let doctor = empty_doctor_report();
+
+        let (phase, next_action, _, _) = determine_app_lifecycle(&status, &doctor, None);
+
+        assert_eq!(phase, AppLifecyclePhase::UnsupportedHost);
+        assert_eq!(next_action, AppNextAction::CollectSupportBundle);
+    }
+
+    #[cfg(windows)]
     #[test]
     fn app_lifecycle_launches_after_managed_arch_user_is_ready() {
         let mut status = empty_status_report(true);

@@ -632,6 +632,10 @@ mod windows_whp {
     const WHV_RUN_VP_EXIT_REASON_X64_CPUID: u32 = 0x0000_1001;
     const GUEST_PAGE_SIZE: usize = SERIAL_BOOT_TEST_IMAGE_SIZE;
     const SERIAL_COM1_PORT: u16 = 0x03f8;
+    const SERIAL_COM1_LAST_PORT: u16 = SERIAL_COM1_PORT + 7;
+    const SERIAL_LINE_STATUS_PORT: u16 = SERIAL_COM1_PORT + 5;
+    const SERIAL_INTERRUPT_ID_PORT: u16 = SERIAL_COM1_PORT + 2;
+    const SERIAL_MODEM_STATUS_PORT: u16 = SERIAL_COM1_PORT + 6;
     const VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET: usize = 10;
     const VP_CONTEXT_RIP_OFFSET: usize = 32;
     const MEMORY_CONTEXT_OFFSET: usize = 48;
@@ -1628,6 +1632,7 @@ mod windows_whp {
                     access_size,
                     port,
                     serial_byte,
+                    ..
                 } => {
                     let serial_ok = is_write
                         && access_size == 1
@@ -1727,6 +1732,7 @@ mod windows_whp {
         report.serial_expected_text = None;
         let max_guest_exits = 32;
         let mut msr_state = default_linux_msr_state();
+        let mut serial_state = Com1SerialState::default();
 
         for exit_index in 0..max_guest_exits {
             let mut exit_context = [0_u8; 1024];
@@ -1762,16 +1768,13 @@ mod windows_whp {
                     access_size,
                     port,
                     serial_byte,
+                    rax,
                 } => {
-                    if !(is_write && access_size == 1 && port == SERIAL_COM1_PORT) {
+                    if access_size != 1
+                        || !(SERIAL_COM1_PORT..=SERIAL_COM1_LAST_PORT).contains(&port)
+                    {
                         break;
                     }
-
-                    report.serial_bytes.push(serial_byte);
-                    report.serial_port = Some(port);
-                    report.serial_byte = Some(serial_byte);
-                    report.serial_text =
-                        Some(String::from_utf8_lossy(&report.serial_bytes).into_owned());
 
                     if instruction_length == 0 {
                         report.calls.push(NativeWhpCallReport {
@@ -1786,9 +1789,35 @@ mod windows_whp {
                     }
 
                     let next_rip = rip + u64::from(instruction_length);
-                    if !set_guest_rip(partition, set_virtual_processor_registers, next_rip, report)
-                    {
-                        break;
+                    if is_write {
+                        if serial_state.write(port, serial_byte) {
+                            report.serial_bytes.push(serial_byte);
+                            report.serial_port = Some(port);
+                            report.serial_byte = Some(serial_byte);
+                            report.serial_text =
+                                Some(String::from_utf8_lossy(&report.serial_bytes).into_owned());
+                        }
+
+                        if !set_guest_rip(
+                            partition,
+                            set_virtual_processor_registers,
+                            next_rip,
+                            report,
+                        ) {
+                            break;
+                        }
+                    } else {
+                        let value = serial_state.read(port);
+                        if !set_guest_rax_low_byte_and_rip(
+                            partition,
+                            set_virtual_processor_registers,
+                            rax,
+                            value,
+                            next_rip,
+                            report,
+                        ) {
+                            break;
+                        }
                     }
                 }
                 DecodedExit::Halt => {
@@ -1944,6 +1973,94 @@ mod windows_whp {
                 "Could not advance guest RIP after serial I/O exit."
             },
         ));
+        ok
+    }
+
+    #[derive(Default)]
+    struct Com1SerialState {
+        interrupt_enable: u8,
+        line_control: u8,
+        modem_control: u8,
+        divisor_latch_low: u8,
+        divisor_latch_high: u8,
+    }
+
+    impl Com1SerialState {
+        fn dlab_enabled(&self) -> bool {
+            self.line_control & 0x80 != 0
+        }
+
+        fn write(&mut self, port: u16, value: u8) -> bool {
+            match port - SERIAL_COM1_PORT {
+                0 if self.dlab_enabled() => self.divisor_latch_low = value,
+                0 => return true,
+                1 if self.dlab_enabled() => self.divisor_latch_high = value,
+                1 => self.interrupt_enable = value,
+                3 => self.line_control = value,
+                4 => self.modem_control = value,
+                _ => {}
+            }
+            false
+        }
+
+        fn read(&self, port: u16) -> u8 {
+            match port {
+                SERIAL_COM1_PORT if self.dlab_enabled() => self.divisor_latch_low,
+                SERIAL_COM1_PORT => 0,
+                port if port == SERIAL_COM1_PORT + 1 && self.dlab_enabled() => {
+                    self.divisor_latch_high
+                }
+                port if port == SERIAL_COM1_PORT + 1 => self.interrupt_enable,
+                SERIAL_INTERRUPT_ID_PORT => 0x01,
+                port if port == SERIAL_COM1_PORT + 3 => self.line_control,
+                port if port == SERIAL_COM1_PORT + 4 => self.modem_control,
+                SERIAL_LINE_STATUS_PORT => 0x60,
+                SERIAL_MODEM_STATUS_PORT => 0x30,
+                _ => 0,
+            }
+        }
+    }
+
+    fn set_guest_rax_low_byte_and_rip(
+        partition: *mut c_void,
+        set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
+        previous_rax: u64,
+        value: u8,
+        rip: u64,
+        report: &mut NativePartitionSmokeReport,
+    ) -> bool {
+        let register_names = [WHV_REGISTER_RAX, WHV_REGISTER_RIP];
+        let register_values = [
+            WhvRegisterValue {
+                reg64: (previous_rax & !0xff) | u64::from(value),
+            },
+            WhvRegisterValue { reg64: rip },
+        ];
+        let hresult = unsafe {
+            set_virtual_processor_registers(
+                partition,
+                0,
+                register_names.as_ptr(),
+                register_names.len() as u32,
+                register_values.as_ptr(),
+            )
+        };
+        let ok = hresult_succeeded(hresult);
+        report.calls.push(hresult_call(
+            "WHvSetVirtualProcessorRegisters(COM1)",
+            hresult,
+            if ok {
+                "Returned emulated COM1 input in AL and advanced RIP."
+            } else {
+                "Could not return emulated COM1 input to guest registers."
+            },
+        ));
+        report.calls.push(NativeWhpCallReport {
+            name: "Com1SerialInput",
+            hresult: None,
+            ok,
+            detail: format!("Returned COM1 byte 0x{value:02x} to guest AL."),
+        });
         ok
     }
 
@@ -2212,6 +2329,7 @@ mod windows_whp {
             access_size: u32,
             port: u16,
             serial_byte: u8,
+            rax: u64,
         },
         Halt,
         MsrAccess {
@@ -2283,7 +2401,7 @@ mod windows_whp {
             report.calls.push(NativeWhpCallReport {
                 name: "DecodeX64IoPortAccess",
                 hresult: None,
-                ok: is_write && access_size == 1 && port == SERIAL_COM1_PORT,
+                ok: access_size == 1 && (SERIAL_COM1_PORT..=SERIAL_COM1_LAST_PORT).contains(&port),
                 detail: format!(
                     "I/O exit write={is_write} size={access_size} port=0x{port:04x} byte=0x{serial_byte:02x} rip=0x{rip:016x} instruction_length={instruction_length}."
                 ),
@@ -2295,6 +2413,7 @@ mod windows_whp {
                 access_size,
                 port,
                 serial_byte,
+                rax,
             }
         } else if exit_reason == WHV_RUN_VP_EXIT_REASON_X64_HALT {
             report.calls.push(NativeWhpCallReport {
@@ -2426,18 +2545,18 @@ mod windows_whp {
         use super::{
             decode_exit_context, guest_contract_passed, linux_entry_probe_detail,
             linux_entry_probe_passed, linux_protected_mode_registers, serial_contract_passed,
-            DecodedExit, CPUID_DEFAULT_RAX_OFFSET, CPUID_DEFAULT_RBX_OFFSET,
+            Com1SerialState, DecodedExit, CPUID_DEFAULT_RAX_OFFSET, CPUID_DEFAULT_RBX_OFFSET,
             CPUID_DEFAULT_RCX_OFFSET, CPUID_DEFAULT_RDX_OFFSET, CPUID_RAX_OFFSET, CPUID_RCX_OFFSET,
-            MEMORY_ACCESS_INFO_OFFSET, MEMORY_GPA_OFFSET, MEMORY_GVA_OFFSET,
-            MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET, MSR_RAX_OFFSET, MSR_RDX_OFFSET,
-            VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET, VP_CONTEXT_RIP_OFFSET, WHV_REGISTER_CR0,
-            WHV_REGISTER_CR3, WHV_REGISTER_CR4, WHV_REGISTER_CS, WHV_REGISTER_DS, WHV_REGISTER_ES,
-            WHV_REGISTER_GDTR, WHV_REGISTER_IDTR, WHV_REGISTER_RBP, WHV_REGISTER_RBX,
-            WHV_REGISTER_RDI, WHV_REGISTER_RFLAGS, WHV_REGISTER_RIP, WHV_REGISTER_RSI,
-            WHV_REGISTER_SS, WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE,
-            WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS, WHV_RUN_VP_EXIT_REASON_X64_CPUID,
-            WHV_RUN_VP_EXIT_REASON_X64_HALT, WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS,
-            WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS,
+            IO_ACCESS_INFO_OFFSET, IO_PORT_OFFSET, IO_RAX_OFFSET, MEMORY_ACCESS_INFO_OFFSET,
+            MEMORY_GPA_OFFSET, MEMORY_GVA_OFFSET, MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET,
+            MSR_RAX_OFFSET, MSR_RDX_OFFSET, SERIAL_COM1_PORT, VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET,
+            VP_CONTEXT_RIP_OFFSET, WHV_REGISTER_CR0, WHV_REGISTER_CR3, WHV_REGISTER_CR4,
+            WHV_REGISTER_CS, WHV_REGISTER_DS, WHV_REGISTER_ES, WHV_REGISTER_GDTR,
+            WHV_REGISTER_IDTR, WHV_REGISTER_RBP, WHV_REGISTER_RBX, WHV_REGISTER_RDI,
+            WHV_REGISTER_RFLAGS, WHV_REGISTER_RIP, WHV_REGISTER_RSI, WHV_REGISTER_SS,
+            WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE, WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS,
+            WHV_RUN_VP_EXIT_REASON_X64_CPUID, WHV_RUN_VP_EXIT_REASON_X64_HALT,
+            WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS, WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS,
         };
         use crate::native::{
             linux_boot_gdt_page_bytes, serial_boot_test_image_bytes, NativePartitionSmokeReport,
@@ -2514,6 +2633,58 @@ mod windows_whp {
                 let idt = values[find(WHV_REGISTER_IDTR)].table;
                 assert_eq!(idt.base, 0);
                 assert_eq!(idt.limit, 0);
+            }
+        }
+
+        #[test]
+        fn com1_serial_model_handles_linux_uart_probe_reads() {
+            let mut serial = Com1SerialState::default();
+
+            assert_eq!(serial.read(SERIAL_COM1_PORT + 5), 0x60);
+            assert_eq!(serial.read(SERIAL_COM1_PORT + 2), 0x01);
+            assert_eq!(serial.read(SERIAL_COM1_PORT + 6), 0x30);
+            assert!(serial.write(SERIAL_COM1_PORT, b'P'));
+            assert!(!serial.write(SERIAL_COM1_PORT + 3, 0x80));
+            assert!(!serial.write(SERIAL_COM1_PORT, 0x01));
+            assert!(!serial.write(SERIAL_COM1_PORT + 1, 0x00));
+            assert_eq!(serial.read(SERIAL_COM1_PORT), 0x01);
+            assert_eq!(serial.read(SERIAL_COM1_PORT + 1), 0x00);
+        }
+
+        #[test]
+        fn decodes_io_port_reads_with_original_rax() {
+            let mut exit_context = [0_u8; 128];
+            exit_context[..4]
+                .copy_from_slice(&WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS.to_le_bytes());
+            exit_context[VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET] = 1;
+            exit_context[VP_CONTEXT_RIP_OFFSET..VP_CONTEXT_RIP_OFFSET + 8]
+                .copy_from_slice(&0x0010_0100_u64.to_le_bytes());
+            exit_context[IO_ACCESS_INFO_OFFSET..IO_ACCESS_INFO_OFFSET + 4]
+                .copy_from_slice(&(1_u32 << 1).to_le_bytes());
+            exit_context[IO_PORT_OFFSET..IO_PORT_OFFSET + 2]
+                .copy_from_slice(&(SERIAL_COM1_PORT + 5).to_le_bytes());
+            exit_context[IO_RAX_OFFSET..IO_RAX_OFFSET + 8]
+                .copy_from_slice(&0xffff_ffff_ffff_ff00_u64.to_le_bytes());
+            let mut report = base_report();
+
+            match decode_exit_context(&exit_context, &mut report) {
+                DecodedExit::IoPort {
+                    instruction_length,
+                    rip,
+                    is_write,
+                    access_size,
+                    port,
+                    rax,
+                    ..
+                } => {
+                    assert_eq!(instruction_length, 1);
+                    assert_eq!(rip, 0x0010_0100);
+                    assert!(!is_write);
+                    assert_eq!(access_size, 1);
+                    assert_eq!(port, SERIAL_COM1_PORT + 5);
+                    assert_eq!(rax, 0xffff_ffff_ffff_ff00);
+                }
+                _ => panic!("expected I/O port read exit"),
             }
         }
 

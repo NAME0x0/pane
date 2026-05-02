@@ -267,6 +267,7 @@ Pane should not be treated as a first public release until:
 - `pane native-kernel-plan --materialize` can persist the guest-memory boot layout that the WHP kernel-entry runner must execute next,
 - `pane native-boot-spike --run-kernel-layout` can consume that layout through the guarded WHP runner and preserve the selected guest-entry contract in reports,
 - controlled candidates enter with the real-mode serial/HALT register contract, while Linux bzImage payloads enter with the Linux 32-bit protected-mode probe contract, a boot-protocol GDT, zeroed `%ebx/%ebp/%edi`, and boot params in `rsi`,
+- Linux protected-mode probes emulate enough COM1 UART behavior to let early serial code configure and poll the port before deterministic serial text is required,
 - Linux protected-mode probes are not allowed to masquerade as a completed boot; they report the WHP exit boundary and only become serial-ready after deterministic early Linux serial output is observed,
 - `pane launch --runtime pane-owned --dry-run` can exercise the native-runtime path without invoking WSL, `mstsc.exe`, or XRDP, and reports concrete blockers instead of pretending the native engine is ready,
 - clean-machine validation proves the first-run Arch path outside the repo,

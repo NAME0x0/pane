@@ -40,6 +40,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - Linux kernel layouts now reserve the loaded initramfs range in E820 with page-aligned sizing, keeping the boot params memory contract consistent with the initramfs artifact mapping
 - Linux protected-mode entry now maps a Pane-owned boot GDT page and configures the WHP guest with Linux 32-bit boot-protocol selectors, zeroed `%ebx/%ebp/%edi`, disabled interrupts, and `rsi` pointing at boot params
 - Linux boot params now copy the original bzImage setup header into the zero page before Pane writes loader-owned fields, preserving kernel-declared boot metadata during WHP entry
+- Linux protected-mode entry probes now emulate the basic COM1 UART registers needed for early serial setup, including line-status reads and divisor/configuration writes, instead of stopping on the first serial-port input
 - Control Center base-image registration for copying local Arch images into Pane runtime storage with SHA-256 metadata
 - `pane native-preflight` for probing Windows Hypervisor Platform host readiness and runtime artifact blockers before the Pane-owned boot spike
 - `pane native-boot-spike --execute --run-fixture` for the guarded WHP guest execution milestone: temporary partition/vCPU creation, guest memory mapping, register setup, repeated COM1 serial I/O exit decoding for the `PANE_BOOT_OK` banner, final HLT observation, cleanup, and no Arch boot claim

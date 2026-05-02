@@ -243,6 +243,15 @@ pub(crate) fn run_partition_smoke(
         );
     }
 
+    if run_fixture && boot_image.is_none() {
+        return skipped_partition_smoke_report(
+            true,
+            run_fixture,
+            None,
+            "No runtime-backed boot image was available; resolve the requested runtime artifact blockers before executing WHP.",
+        );
+    }
+
     run_whp_partition_smoke(run_fixture, boot_image)
 }
 
@@ -537,7 +546,10 @@ fn skipped_partition_smoke_report(
         serial_byte: None,
         serial_bytes: Vec::new(),
         serial_text: None,
-        serial_expected_text: run_fixture.then(|| SERIAL_BOOT_BANNER_TEXT.to_string()),
+        serial_expected_text: boot_image.and_then(|image| {
+            (image.entry_mode == NativeGuestEntryMode::RealModeSerial)
+                .then(|| image.expected_serial_text.clone())
+        }),
         serial_io_exit_count: 0,
         halt_observed: false,
         calls: Vec::new(),

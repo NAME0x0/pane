@@ -1712,20 +1712,22 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
     let runtime_paths = crate::plan::runtime_for(&session_name);
     let runtime_budget = runtime_storage_budget(DEFAULT_RUNTIME_CAPACITY_GIB);
     let run_guest_image = args.run_fixture || args.run_boot_loader || args.run_kernel_layout;
+    let mut runtime = build_runtime_report(&session_name, DEFAULT_RUNTIME_CAPACITY_GIB, false)?;
     let boot_image = if args.execute && args.run_fixture {
         prepare_runtime_paths(&runtime_paths)?;
         write_runtime_config(&runtime_paths, &session_name, &runtime_budget)?;
         write_native_runtime_manifest(&runtime_paths, &session_name)?;
         create_serial_boot_image_artifact(&runtime_paths, false)?;
-        Some(load_serial_boot_image_artifact(&runtime_paths)?)
-    } else if args.execute && args.run_boot_loader {
+        let image = load_serial_boot_image_artifact(&runtime_paths)?;
+        runtime = build_runtime_report(&session_name, DEFAULT_RUNTIME_CAPACITY_GIB, false)?;
+        Some(image)
+    } else if args.execute && args.run_boot_loader && runtime.artifacts.boot_loader_image_verified {
         Some(load_boot_loader_image_artifact(&runtime_paths)?)
-    } else if args.execute && args.run_kernel_layout {
+    } else if args.execute && args.run_kernel_layout && runtime.artifacts.kernel_boot_layout_ready {
         Some(load_kernel_layout_boot_image_artifact(&runtime_paths)?)
     } else {
         None
     };
-    let runtime = build_runtime_report(&session_name, DEFAULT_RUNTIME_CAPACITY_GIB, false)?;
     let host = runtime.native_host.clone();
     let partition_smoke = crate::native::run_partition_smoke(
         args.execute,
@@ -3209,13 +3211,13 @@ fn load_boot_loader_image_artifact(
 fn load_kernel_layout_boot_image_artifact(
     paths: &RuntimePaths,
 ) -> AppResult<crate::native::NativeSerialBootImage> {
-    let layout = read_json_file::<KernelBootLayout>(&paths.kernel_boot_layout)?;
     let artifacts = build_runtime_artifact_report(paths);
     if !artifacts.kernel_boot_layout_ready {
         return Err(AppError::message(
             "Pane kernel boot layout is missing or stale. Run `pane native-kernel-plan --materialize` after registering a verified kernel plan.",
         ));
     }
+    let layout = read_json_file::<KernelBootLayout>(&paths.kernel_boot_layout)?;
     if layout.kernel_path != paths.kernel_image.display().to_string() {
         return Err(AppError::message(format!(
             "Kernel layout points at {}, but this runtime expects {}.",

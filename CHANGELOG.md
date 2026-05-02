@@ -39,6 +39,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - Linux kernel layouts now reserve and map IOAPIC/local APIC MMIO stub pages at `0xfec00000` and `0xfee00000` as non-executable guest pages, avoiding immediate unmapped APIC probes while keeping real APIC emulation explicit future work
 - Linux kernel layouts now reserve the loaded initramfs range in E820 with page-aligned sizing, keeping the boot params memory contract consistent with the initramfs artifact mapping
 - Linux protected-mode entry now maps a Pane-owned boot GDT page and configures the WHP guest with Linux 32-bit boot-protocol selectors, zeroed `%ebx/%ebp/%edi`, disabled interrupts, and `rsi` pointing at boot params
+- Linux boot params now copy the original bzImage setup header into the zero page before Pane writes loader-owned fields, preserving kernel-declared boot metadata during WHP entry
 - Control Center base-image registration for copying local Arch images into Pane runtime storage with SHA-256 metadata
 - `pane native-preflight` for probing Windows Hypervisor Platform host readiness and runtime artifact blockers before the Pane-owned boot spike
 - `pane native-boot-spike --execute --run-fixture` for the guarded WHP guest execution milestone: temporary partition/vCPU creation, guest memory mapping, register setup, repeated COM1 serial I/O exit decoding for the `PANE_BOOT_OK` banner, final HLT observation, cleanup, and no Arch boot claim

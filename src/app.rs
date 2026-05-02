@@ -3244,7 +3244,7 @@ fn load_kernel_layout_boot_image_artifact(
             executable: false,
         });
     }
-    let boot_params = build_linux_boot_params_page(&layout)?;
+    let boot_params = build_linux_boot_params_page(&layout, Some(&bytes))?;
     extra_regions.push(crate::native::NativeGuestMemoryRegion {
         label: "linux-boot-params".to_string(),
         guest_gpa: parse_guest_physical_address(&layout.boot_params_gpa)?,
@@ -3385,8 +3385,21 @@ fn linux_guest_mapped_regions(
         .collect()
 }
 
-fn build_linux_boot_params_page(layout: &KernelBootLayout) -> AppResult<Vec<u8>> {
+fn build_linux_boot_params_page(
+    layout: &KernelBootLayout,
+    kernel_bytes: Option<&[u8]>,
+) -> AppResult<Vec<u8>> {
     let mut boot_params = vec![0_u8; 4096];
+    if layout.kernel_format == "linux-bzimage" {
+        copy_linux_setup_header_to_boot_params(
+            &mut boot_params,
+            kernel_bytes.ok_or_else(|| {
+                AppError::message(
+                    "Linux boot params require the original bzImage setup header bytes.",
+                )
+            })?,
+        )?;
+    }
     let cmdline_gpa = checked_u32_gpa(&layout.cmdline_gpa, "kernel cmdline")?;
     write_u16_le(&mut boot_params, 0x1fe, 0xaa55);
     boot_params[0x202..0x206].copy_from_slice(b"HdrS");
@@ -3397,7 +3410,7 @@ fn build_linux_boot_params_page(layout: &KernelBootLayout) -> AppResult<Vec<u8>>
         .unwrap_or(0x020f);
     write_u16_le(&mut boot_params, 0x206, protocol);
     boot_params[0x210] = 0xff;
-    boot_params[0x211] = 0x80;
+    boot_params[0x211] |= 0x80;
     write_u32_le(
         &mut boot_params,
         0x214,
@@ -3437,6 +3450,42 @@ fn build_linux_boot_params_page(layout: &KernelBootLayout) -> AppResult<Vec<u8>>
     write_linux_e820_table(&mut boot_params, &layout.guest_memory_map)?;
 
     Ok(boot_params)
+}
+
+fn copy_linux_setup_header_to_boot_params(
+    boot_params: &mut [u8],
+    kernel_bytes: &[u8],
+) -> AppResult<()> {
+    if kernel_bytes.len() < 0x264 {
+        return Err(AppError::message(
+            "Linux bzImage is too small to copy its setup header into boot params.",
+        ));
+    }
+    if read_u16_le_at(kernel_bytes, 0x1fe) != Some(0xaa55)
+        || kernel_bytes.get(0x202..0x206) != Some(b"HdrS")
+    {
+        return Err(AppError::message(
+            "Linux bzImage setup header cannot be copied because boot flag or HdrS magic is missing.",
+        ));
+    }
+
+    let header_end = linux_setup_header_end(kernel_bytes)?;
+    boot_params[0x1f1..header_end].copy_from_slice(&kernel_bytes[0x1f1..header_end]);
+    Ok(())
+}
+
+fn linux_setup_header_end(kernel_bytes: &[u8]) -> AppResult<usize> {
+    let advertised_end = kernel_bytes
+        .get(0x201)
+        .map(|header_len| 0x202 + usize::from(*header_len))
+        .ok_or_else(|| AppError::message("Linux bzImage is missing setup header length."))?;
+    let header_end = advertised_end.max(0x264);
+    if header_end > kernel_bytes.len() || header_end > 4096 {
+        return Err(AppError::message(format!(
+            "Linux bzImage setup header end offset 0x{header_end:x} is outside the boot params scaffold."
+        )));
+    }
+    Ok(header_end)
 }
 
 fn write_linux_e820_table(
@@ -8154,9 +8203,12 @@ mod tests {
         let mut bytes = vec![0_u8; 4096];
         bytes[0x1f1] = 4;
         bytes[0x1fe..0x200].copy_from_slice(&0xaa55_u16.to_le_bytes());
+        bytes[0x201] = 0x62;
         bytes[0x202..0x206].copy_from_slice(b"HdrS");
         bytes[0x206..0x208].copy_from_slice(&0x020f_u16.to_le_bytes());
-        bytes[0x211] = 0x80;
+        bytes[0x211] = 0x01;
+        bytes[0x234] = 1;
+        bytes[0x236..0x238].copy_from_slice(&0x0001_u16.to_le_bytes());
         bytes[0x258..0x260].copy_from_slice(&0x0100_0000_u64.to_le_bytes());
         bytes[2560..].fill(0xcc);
         bytes
@@ -8297,7 +8349,7 @@ mod tests {
         assert_eq!(inspection.linux_setup_bytes, Some(2560));
         assert_eq!(inspection.linux_protected_mode_offset, Some(2560));
         assert_eq!(inspection.linux_protected_mode_bytes, Some(1536));
-        assert_eq!(inspection.linux_loadflags, Some(0x80));
+        assert_eq!(inspection.linux_loadflags, Some(0x01));
         assert_eq!(
             inspection.linux_preferred_load_address.as_deref(),
             Some("0x0000000001000000")
@@ -8617,10 +8669,15 @@ mod tests {
             notes: Vec::new(),
         };
 
-        let page = build_linux_boot_params_page(&layout).unwrap();
+        let kernel = fake_linux_bzimage();
+        let page = build_linux_boot_params_page(&layout, Some(&kernel)).unwrap();
         assert_eq!(&page[0x1fe..0x200], &0xaa55_u16.to_le_bytes());
         assert_eq!(&page[0x202..0x206], b"HdrS");
         assert_eq!(&page[0x206..0x208], &0x020f_u16.to_le_bytes());
+        assert_eq!(page[0x211], 0x81);
+        assert_eq!(page[0x234], 1);
+        assert_eq!(&page[0x236..0x238], &0x0001_u16.to_le_bytes());
+        assert_eq!(&page[0x258..0x260], &0x0100_0000_u64.to_le_bytes());
         assert_eq!(&page[0x228..0x22c], &0x0002_0000_u32.to_le_bytes());
         assert_eq!(&page[0x218..0x21c], &0x0400_0000_u32.to_le_bytes());
         assert_eq!(&page[0x21c..0x220], &1234_u32.to_le_bytes());

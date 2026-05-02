@@ -262,7 +262,7 @@ Pane should not be treated as a first public release until:
 - `pane runtime --register-boot-loader` and `pane native-boot-spike --execute --run-boot-loader` can verify and execute a runtime-provided boot-to-serial loader candidate under an explicit SHA-256 and serial-output contract,
 - `pane runtime --register-kernel` can persist a verified Linux kernel plus optional initramfs and serial-console cmdline as the first real kernel boot-plan contract,
 - registered Linux kernels are inspected as bzImage artifacts so Pane records boot-protocol/setup metadata before WHP entry work,
-- materialized Linux layouts split bzImage setup bytes from protected-mode payload bytes and declare the protected-mode entry contract,
+- materialized Linux layouts split bzImage setup bytes from protected-mode payload bytes, copy the original setup header into boot params, and declare the protected-mode entry contract,
 - materialized Linux layouts include an explicit E820 memory map, reserve boot params/GDT/initramfs/APIC stub ranges, and WHP maps the usable RAM plus boot-protocol support pages needed by protected-mode entry probes,
 - `pane native-kernel-plan --materialize` can persist the guest-memory boot layout that the WHP kernel-entry runner must execute next,
 - `pane native-boot-spike --run-kernel-layout` can consume that layout through the guarded WHP runner and preserve the selected guest-entry contract in reports,

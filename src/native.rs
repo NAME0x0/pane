@@ -16,6 +16,7 @@ const REQUIRED_WHP_EXPORTS: &[&str] = &[
 pub(crate) const SERIAL_BOOT_BANNER_TEXT: &str = "PANE_BOOT_OK\n";
 pub(crate) const SERIAL_BOOT_TEST_IMAGE_SIZE: usize = 4096;
 pub(crate) const LINUX_BOOT_GDT_GPA: u64 = 0x0000_8000;
+pub(crate) const LINUX_BOOT_STACK_GPA: u64 = 0x0008_0000;
 pub(crate) const LINUX_BOOT_CODE_SELECTOR: u16 = 0x10;
 pub(crate) const LINUX_BOOT_DATA_SELECTOR: u16 = 0x18;
 
@@ -626,7 +627,7 @@ mod windows_whp {
         base_export_checks, NativeExportCheck, NativeGuestEntryMode, NativeGuestMemoryRegion,
         NativeGuestRegionReport, NativePartitionSmokeReport, NativePartitionSmokeStatus,
         NativeSerialBootImage, NativeWhpCallReport, WhpPreflightReport, LINUX_BOOT_CODE_SELECTOR,
-        LINUX_BOOT_DATA_SELECTOR, LINUX_BOOT_GDT_GPA, REQUIRED_WHP_EXPORTS,
+        LINUX_BOOT_DATA_SELECTOR, LINUX_BOOT_GDT_GPA, LINUX_BOOT_STACK_GPA, REQUIRED_WHP_EXPORTS,
         SERIAL_BOOT_BANNER_TEXT, SERIAL_BOOT_TEST_IMAGE_SIZE,
     };
 
@@ -1547,7 +1548,9 @@ mod windows_whp {
             WhvRegisterValue { reg64: 0 },
             WhvRegisterValue { reg64: 0 },
             WhvRegisterValue { reg64: 0 },
-            WhvRegisterValue { reg64: 0x90000 },
+            WhvRegisterValue {
+                reg64: LINUX_BOOT_STACK_GPA,
+            },
             WhvRegisterValue { reg64: 0 },
             WhvRegisterValue {
                 reg64: boot_params_gpa,
@@ -2565,15 +2568,16 @@ mod windows_whp {
             VP_CONTEXT_RIP_OFFSET, WHV_REGISTER_CR0, WHV_REGISTER_CR3, WHV_REGISTER_CR4,
             WHV_REGISTER_CS, WHV_REGISTER_DS, WHV_REGISTER_ES, WHV_REGISTER_GDTR,
             WHV_REGISTER_IDTR, WHV_REGISTER_RBP, WHV_REGISTER_RBX, WHV_REGISTER_RDI,
-            WHV_REGISTER_RFLAGS, WHV_REGISTER_RIP, WHV_REGISTER_RSI, WHV_REGISTER_SS,
-            WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE, WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS,
-            WHV_RUN_VP_EXIT_REASON_X64_CPUID, WHV_RUN_VP_EXIT_REASON_X64_HALT,
-            WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS, WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS,
+            WHV_REGISTER_RFLAGS, WHV_REGISTER_RIP, WHV_REGISTER_RSI, WHV_REGISTER_RSP,
+            WHV_REGISTER_SS, WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE,
+            WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS, WHV_RUN_VP_EXIT_REASON_X64_CPUID,
+            WHV_RUN_VP_EXIT_REASON_X64_HALT, WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS,
+            WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS,
         };
         use crate::native::{
             linux_boot_gdt_page_bytes, serial_boot_test_image_bytes, NativePartitionSmokeReport,
             NativePartitionSmokeStatus, LINUX_BOOT_CODE_SELECTOR, LINUX_BOOT_DATA_SELECTOR,
-            LINUX_BOOT_GDT_GPA, SERIAL_BOOT_BANNER_TEXT,
+            LINUX_BOOT_GDT_GPA, LINUX_BOOT_STACK_GPA, SERIAL_BOOT_BANNER_TEXT,
         };
 
         #[test]
@@ -2619,6 +2623,7 @@ mod windows_whp {
 
             unsafe {
                 assert_eq!(values[find(WHV_REGISTER_RIP)].reg64, 0x0010_0000);
+                assert_eq!(values[find(WHV_REGISTER_RSP)].reg64, LINUX_BOOT_STACK_GPA);
                 assert_eq!(values[find(WHV_REGISTER_RSI)].reg64, 0x0000_7000);
                 assert_eq!(values[find(WHV_REGISTER_RBX)].reg64, 0);
                 assert_eq!(values[find(WHV_REGISTER_RBP)].reg64, 0);

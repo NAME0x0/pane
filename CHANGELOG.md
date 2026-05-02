@@ -42,6 +42,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - Linux boot params now copy the original bzImage setup header into the zero page before Pane writes loader-owned fields, preserving kernel-declared boot metadata during WHP entry
 - Linux protected-mode entry probes now emulate the basic COM1 UART registers needed for early serial setup, including line-status reads and divisor/configuration writes, instead of stopping on the first serial-port input
 - `pane native-boot-spike --execute --run-boot-loader` and `--run-kernel-layout` now skip WHP execution and report missing runtime artifacts as Pane blockers instead of aborting with raw filesystem errors or creating an empty partition smoke
+- Linux protected-mode entry now places the initial stack at `0x00080000` inside mapped low RAM instead of overlapping the bzImage setup mapping at `0x00090000`
 - Control Center base-image registration for copying local Arch images into Pane runtime storage with SHA-256 metadata
 - `pane native-preflight` for probing Windows Hypervisor Platform host readiness and runtime artifact blockers before the Pane-owned boot spike
 - `pane native-boot-spike --execute --run-fixture` for the guarded WHP guest execution milestone: temporary partition/vCPU creation, guest memory mapping, register setup, repeated COM1 serial I/O exit decoding for the `PANE_BOOT_OK` banner, final HLT observation, cleanup, and no Arch boot claim

@@ -3772,8 +3772,8 @@ fn build_kernel_boot_layout(
     Ok(layout)
 }
 
-fn default_linux_guest_memory_map(_initramfs_bytes: u64) -> Vec<KernelGuestMemoryRange> {
-    vec![
+fn default_linux_guest_memory_map(initramfs_bytes: u64) -> Vec<KernelGuestMemoryRange> {
+    let mut ranges = vec![
         KernelGuestMemoryRange {
             label: "boot-params".to_string(),
             start_gpa: "0x00007000".to_string(),
@@ -3810,6 +3810,18 @@ fn default_linux_guest_memory_map(_initramfs_bytes: u64) -> Vec<KernelGuestMemor
             size_bytes: 0x02000000,
             region_type: "reserved".to_string(),
         },
+    ];
+
+    if initramfs_bytes > 0 {
+        ranges.push(KernelGuestMemoryRange {
+            label: "initramfs".to_string(),
+            start_gpa: "0x04000000".to_string(),
+            size_bytes: page_align_guest_range(initramfs_bytes),
+            region_type: "reserved".to_string(),
+        });
+    }
+
+    ranges.extend([
         KernelGuestMemoryRange {
             label: "high-ram".to_string(),
             start_gpa: "0x08000000".to_string(),
@@ -3828,7 +3840,14 @@ fn default_linux_guest_memory_map(_initramfs_bytes: u64) -> Vec<KernelGuestMemor
             size_bytes: 0x00001000,
             region_type: "mmio-stub".to_string(),
         },
-    ]
+    ]);
+
+    ranges
+}
+
+fn page_align_guest_range(bytes: u64) -> u64 {
+    const PAGE_SIZE: u64 = 0x1000;
+    bytes.saturating_add(PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE
 }
 
 fn inspect_kernel_image_artifact(path: &Path) -> AppResult<KernelImageInspection> {
@@ -8480,6 +8499,12 @@ mod tests {
                 && range.start_gpa == "0xfee00000"
                 && range.region_type == "mmio-stub"
         }));
+        assert!(layout.guest_memory_map.iter().any(|range| {
+            range.label == "initramfs"
+                && range.start_gpa == "0x04000000"
+                && range.size_bytes == 0x00001000
+                && range.region_type == "reserved"
+        }));
         assert!(layout.materialized_at_epoch_seconds.is_some());
 
         let artifacts = build_runtime_artifact_report(&paths);
@@ -8579,10 +8604,23 @@ mod tests {
         assert_eq!(&page[0x228..0x22c], &0x0002_0000_u32.to_le_bytes());
         assert_eq!(&page[0x218..0x21c], &0x0400_0000_u32.to_le_bytes());
         assert_eq!(&page[0x21c..0x220], &1234_u32.to_le_bytes());
-        assert_eq!(page[0x1e8], 9);
+        assert_eq!(page[0x1e8], 10);
         assert_eq!(&page[0x2d0..0x2d8], &0x0000_7000_u64.to_le_bytes());
         assert_eq!(&page[0x2d0 + 16..0x2d0 + 20], &2_u32.to_le_bytes());
-        let high_ram_offset = 0x2d0 + 6 * 20;
+        let initramfs_offset = 0x2d0 + 6 * 20;
+        assert_eq!(
+            &page[initramfs_offset..initramfs_offset + 8],
+            &0x0400_0000_u64.to_le_bytes()
+        );
+        assert_eq!(
+            &page[initramfs_offset + 8..initramfs_offset + 16],
+            &0x0000_1000_u64.to_le_bytes()
+        );
+        assert_eq!(
+            &page[initramfs_offset + 16..initramfs_offset + 20],
+            &2_u32.to_le_bytes()
+        );
+        let high_ram_offset = 0x2d0 + 7 * 20;
         assert_eq!(
             &page[high_ram_offset..high_ram_offset + 8],
             &0x0800_0000_u64.to_le_bytes()
@@ -8591,7 +8629,7 @@ mod tests {
             &page[high_ram_offset + 16..high_ram_offset + 20],
             &1_u32.to_le_bytes()
         );
-        let local_apic_offset = 0x2d0 + 8 * 20;
+        let local_apic_offset = 0x2d0 + 9 * 20;
         assert_eq!(
             &page[local_apic_offset..local_apic_offset + 8],
             &0xfee0_0000_u64.to_le_bytes()

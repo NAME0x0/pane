@@ -37,6 +37,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - Linux entry probes now decode RDMSR/WRMSR exits, maintain a minimal guest MSR state for early Linux CPU setup, and advance RIP after handled MSR accesses
 - Memory-access exits now include access type, unmapped status, GPA, and GVA diagnostics so the next Arch boot blocker identifies the exact missing RAM/MMIO range
 - Linux kernel layouts now reserve and map IOAPIC/local APIC MMIO stub pages at `0xfec00000` and `0xfee00000` as non-executable guest pages, avoiding immediate unmapped APIC probes while keeping real APIC emulation explicit future work
+- Linux kernel layouts now reserve the loaded initramfs range in E820 with page-aligned sizing, keeping the boot params memory contract consistent with the initramfs artifact mapping
 - Control Center base-image registration for copying local Arch images into Pane runtime storage with SHA-256 metadata
 - `pane native-preflight` for probing Windows Hypervisor Platform host readiness and runtime artifact blockers before the Pane-owned boot spike
 - `pane native-boot-spike --execute --run-fixture` for the guarded WHP guest execution milestone: temporary partition/vCPU creation, guest memory mapping, register setup, repeated COM1 serial I/O exit decoding for the `PANE_BOOT_OK` banner, final HLT observation, cleanup, and no Arch boot claim

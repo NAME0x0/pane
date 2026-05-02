@@ -15,6 +15,9 @@ const REQUIRED_WHP_EXPORTS: &[&str] = &[
 ];
 pub(crate) const SERIAL_BOOT_BANNER_TEXT: &str = "PANE_BOOT_OK\n";
 pub(crate) const SERIAL_BOOT_TEST_IMAGE_SIZE: usize = 4096;
+pub(crate) const LINUX_BOOT_GDT_GPA: u64 = 0x0000_8000;
+pub(crate) const LINUX_BOOT_CODE_SELECTOR: u16 = 0x10;
+pub(crate) const LINUX_BOOT_DATA_SELECTOR: u16 = 0x18;
 
 #[derive(Clone, Debug)]
 pub(crate) struct NativeSerialBootImage {
@@ -56,6 +59,15 @@ pub(crate) fn serial_boot_test_image_bytes() -> Vec<u8> {
     let mut image = vec![0_u8; SERIAL_BOOT_TEST_IMAGE_SIZE];
     write_serial_boot_test_image(&mut image);
     image
+}
+
+pub(crate) fn linux_boot_gdt_page_bytes() -> Vec<u8> {
+    let mut page = vec![0_u8; SERIAL_BOOT_TEST_IMAGE_SIZE];
+    page[usize::from(LINUX_BOOT_CODE_SELECTOR)..usize::from(LINUX_BOOT_CODE_SELECTOR) + 8]
+        .copy_from_slice(&0x00cf_9a00_0000_ffff_u64.to_le_bytes());
+    page[usize::from(LINUX_BOOT_DATA_SELECTOR)..usize::from(LINUX_BOOT_DATA_SELECTOR) + 8]
+        .copy_from_slice(&0x00cf_9200_0000_ffff_u64.to_le_bytes());
+    page
 }
 
 fn write_serial_boot_test_image(page: &mut [u8]) {
@@ -601,7 +613,8 @@ mod windows_whp {
     use super::{
         base_export_checks, NativeExportCheck, NativeGuestEntryMode, NativeGuestMemoryRegion,
         NativeGuestRegionReport, NativePartitionSmokeReport, NativePartitionSmokeStatus,
-        NativeSerialBootImage, NativeWhpCallReport, WhpPreflightReport, REQUIRED_WHP_EXPORTS,
+        NativeSerialBootImage, NativeWhpCallReport, WhpPreflightReport, LINUX_BOOT_CODE_SELECTOR,
+        LINUX_BOOT_DATA_SELECTOR, LINUX_BOOT_GDT_GPA, REQUIRED_WHP_EXPORTS,
         SERIAL_BOOT_BANNER_TEXT, SERIAL_BOOT_TEST_IMAGE_SIZE,
     };
 
@@ -646,13 +659,17 @@ mod windows_whp {
     const WHV_REGISTER_RDX: u32 = 0x0000_0002;
     const WHV_REGISTER_RBX: u32 = 0x0000_0003;
     const WHV_REGISTER_RSP: u32 = 0x0000_0004;
+    const WHV_REGISTER_RBP: u32 = 0x0000_0005;
     const WHV_REGISTER_RSI: u32 = 0x0000_0006;
+    const WHV_REGISTER_RDI: u32 = 0x0000_0007;
     const WHV_REGISTER_RIP: u32 = 0x0000_0010;
     const WHV_REGISTER_RFLAGS: u32 = 0x0000_0011;
     const WHV_REGISTER_ES: u32 = 0x0000_0012;
     const WHV_REGISTER_CS: u32 = 0x0000_0013;
     const WHV_REGISTER_SS: u32 = 0x0000_0014;
     const WHV_REGISTER_DS: u32 = 0x0000_0015;
+    const WHV_REGISTER_IDTR: u32 = 0x0000_001a;
+    const WHV_REGISTER_GDTR: u32 = 0x0000_001b;
     const WHV_REGISTER_CR0: u32 = 0x0000_001c;
     const WHV_REGISTER_CR3: u32 = 0x0000_001e;
     const WHV_REGISTER_CR4: u32 = 0x0000_001f;
@@ -685,11 +702,20 @@ mod windows_whp {
         attributes: u16,
     }
 
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct WhvX64TableRegister {
+        pad: [u16; 3],
+        limit: u16,
+        base: u64,
+    }
+
     #[repr(C, align(16))]
     #[derive(Copy, Clone)]
     union WhvRegisterValue {
         reg64: u64,
         segment: WhvX64SegmentRegister,
+        table: WhvX64TableRegister,
     }
 
     #[link(name = "kernel32")]
@@ -1462,26 +1488,41 @@ mod windows_whp {
         let code_segment = WhvX64SegmentRegister {
             base: 0,
             limit: 0xffff_ffff,
-            selector: 0x08,
+            selector: LINUX_BOOT_CODE_SELECTOR,
             attributes: 0x0000_cf9b,
         };
         let data_segment = WhvX64SegmentRegister {
             base: 0,
             limit: 0xffff_ffff,
-            selector: 0x10,
+            selector: LINUX_BOOT_DATA_SELECTOR,
             attributes: 0x0000_cf93,
+        };
+        let gdt = WhvX64TableRegister {
+            pad: [0; 3],
+            limit: 0x1f,
+            base: LINUX_BOOT_GDT_GPA,
+        };
+        let idt = WhvX64TableRegister {
+            pad: [0; 3],
+            limit: 0,
+            base: 0,
         };
         let register_names = vec![
             WHV_REGISTER_RAX,
             WHV_REGISTER_RDX,
+            WHV_REGISTER_RBX,
             WHV_REGISTER_RSP,
+            WHV_REGISTER_RBP,
             WHV_REGISTER_RSI,
+            WHV_REGISTER_RDI,
             WHV_REGISTER_RIP,
             WHV_REGISTER_RFLAGS,
             WHV_REGISTER_CS,
             WHV_REGISTER_DS,
             WHV_REGISTER_ES,
             WHV_REGISTER_SS,
+            WHV_REGISTER_GDTR,
+            WHV_REGISTER_IDTR,
             WHV_REGISTER_CR0,
             WHV_REGISTER_CR3,
             WHV_REGISTER_CR4,
@@ -1489,10 +1530,13 @@ mod windows_whp {
         let register_values = vec![
             WhvRegisterValue { reg64: 0 },
             WhvRegisterValue { reg64: 0 },
+            WhvRegisterValue { reg64: 0 },
             WhvRegisterValue { reg64: 0x90000 },
+            WhvRegisterValue { reg64: 0 },
             WhvRegisterValue {
                 reg64: boot_params_gpa,
             },
+            WhvRegisterValue { reg64: 0 },
             WhvRegisterValue { reg64: entry_gpa },
             WhvRegisterValue { reg64: 0x0002 },
             WhvRegisterValue {
@@ -1507,6 +1551,8 @@ mod windows_whp {
             WhvRegisterValue {
                 segment: data_segment,
             },
+            WhvRegisterValue { table: gdt },
+            WhvRegisterValue { table: idt },
             WhvRegisterValue { reg64: 0x0011 },
             WhvRegisterValue { reg64: 0 },
             WhvRegisterValue { reg64: 0 },
@@ -2379,19 +2425,24 @@ mod windows_whp {
     mod tests {
         use super::{
             decode_exit_context, guest_contract_passed, linux_entry_probe_detail,
-            linux_entry_probe_passed, serial_contract_passed, DecodedExit,
-            CPUID_DEFAULT_RAX_OFFSET, CPUID_DEFAULT_RBX_OFFSET, CPUID_DEFAULT_RCX_OFFSET,
-            CPUID_DEFAULT_RDX_OFFSET, CPUID_RAX_OFFSET, CPUID_RCX_OFFSET,
+            linux_entry_probe_passed, linux_protected_mode_registers, serial_contract_passed,
+            DecodedExit, CPUID_DEFAULT_RAX_OFFSET, CPUID_DEFAULT_RBX_OFFSET,
+            CPUID_DEFAULT_RCX_OFFSET, CPUID_DEFAULT_RDX_OFFSET, CPUID_RAX_OFFSET, CPUID_RCX_OFFSET,
             MEMORY_ACCESS_INFO_OFFSET, MEMORY_GPA_OFFSET, MEMORY_GVA_OFFSET,
             MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET, MSR_RAX_OFFSET, MSR_RDX_OFFSET,
-            VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET, VP_CONTEXT_RIP_OFFSET,
-            WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE, WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS,
-            WHV_RUN_VP_EXIT_REASON_X64_CPUID, WHV_RUN_VP_EXIT_REASON_X64_HALT,
-            WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS, WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS,
+            VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET, VP_CONTEXT_RIP_OFFSET, WHV_REGISTER_CR0,
+            WHV_REGISTER_CR3, WHV_REGISTER_CR4, WHV_REGISTER_CS, WHV_REGISTER_DS, WHV_REGISTER_ES,
+            WHV_REGISTER_GDTR, WHV_REGISTER_IDTR, WHV_REGISTER_RBP, WHV_REGISTER_RBX,
+            WHV_REGISTER_RDI, WHV_REGISTER_RFLAGS, WHV_REGISTER_RIP, WHV_REGISTER_RSI,
+            WHV_REGISTER_SS, WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE,
+            WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS, WHV_RUN_VP_EXIT_REASON_X64_CPUID,
+            WHV_RUN_VP_EXIT_REASON_X64_HALT, WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS,
+            WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS,
         };
         use crate::native::{
-            serial_boot_test_image_bytes, NativePartitionSmokeReport, NativePartitionSmokeStatus,
-            SERIAL_BOOT_BANNER_TEXT,
+            linux_boot_gdt_page_bytes, serial_boot_test_image_bytes, NativePartitionSmokeReport,
+            NativePartitionSmokeStatus, LINUX_BOOT_CODE_SELECTOR, LINUX_BOOT_DATA_SELECTOR,
+            LINUX_BOOT_GDT_GPA, SERIAL_BOOT_BANNER_TEXT,
         };
 
         #[test]
@@ -2407,6 +2458,63 @@ mod windows_whp {
             }
             assert_eq!(page[offset], 0xf4);
             assert!(page[offset + 1..].iter().all(|byte| *byte == 0));
+        }
+
+        #[test]
+        fn linux_boot_gdt_contains_boot_protocol_descriptors() {
+            let page = linux_boot_gdt_page_bytes();
+
+            assert_eq!(
+                &page[usize::from(LINUX_BOOT_CODE_SELECTOR)
+                    ..usize::from(LINUX_BOOT_CODE_SELECTOR) + 8],
+                &0x00cf_9a00_0000_ffff_u64.to_le_bytes()
+            );
+            assert_eq!(
+                &page[usize::from(LINUX_BOOT_DATA_SELECTOR)
+                    ..usize::from(LINUX_BOOT_DATA_SELECTOR) + 8],
+                &0x00cf_9200_0000_ffff_u64.to_le_bytes()
+            );
+        }
+
+        #[test]
+        fn linux_protected_mode_registers_match_boot_protocol() {
+            let (names, values) = linux_protected_mode_registers(0x0010_0000, 0x0000_7000);
+            let find = |register| {
+                names
+                    .iter()
+                    .position(|name| *name == register)
+                    .expect("register is present")
+            };
+
+            unsafe {
+                assert_eq!(values[find(WHV_REGISTER_RIP)].reg64, 0x0010_0000);
+                assert_eq!(values[find(WHV_REGISTER_RSI)].reg64, 0x0000_7000);
+                assert_eq!(values[find(WHV_REGISTER_RBX)].reg64, 0);
+                assert_eq!(values[find(WHV_REGISTER_RBP)].reg64, 0);
+                assert_eq!(values[find(WHV_REGISTER_RDI)].reg64, 0);
+                assert_eq!(values[find(WHV_REGISTER_RFLAGS)].reg64, 0x0002);
+                assert_eq!(values[find(WHV_REGISTER_CR0)].reg64, 0x0011);
+                assert_eq!(values[find(WHV_REGISTER_CR3)].reg64, 0);
+                assert_eq!(values[find(WHV_REGISTER_CR4)].reg64, 0);
+
+                assert_eq!(
+                    values[find(WHV_REGISTER_CS)].segment.selector,
+                    LINUX_BOOT_CODE_SELECTOR
+                );
+                for register in [WHV_REGISTER_DS, WHV_REGISTER_ES, WHV_REGISTER_SS] {
+                    let segment = values[find(register)].segment;
+                    assert_eq!(segment.selector, LINUX_BOOT_DATA_SELECTOR);
+                    assert_eq!(segment.base, 0);
+                    assert_eq!(segment.limit, 0xffff_ffff);
+                }
+
+                let gdt = values[find(WHV_REGISTER_GDTR)].table;
+                assert_eq!(gdt.base, LINUX_BOOT_GDT_GPA);
+                assert_eq!(gdt.limit, 0x1f);
+                let idt = values[find(WHV_REGISTER_IDTR)].table;
+                assert_eq!(idt.base, 0);
+                assert_eq!(idt.limit, 0);
+            }
         }
 
         fn base_report() -> NativePartitionSmokeReport {

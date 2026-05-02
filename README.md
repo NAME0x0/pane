@@ -138,7 +138,7 @@ cargo run -- runtime --register-kernel C:\path\to\vmlinuz-linux --kernel-expecte
 cargo run -- runtime --register-initramfs C:\path\to\initramfs-linux.img --initramfs-expected-sha256 <64-char-sha256> --kernel-cmdline "console=ttyS0 panic=-1"
 ```
 
-Materialize the native kernel boot layout after the kernel plan is verified. This writes the guest-physical-address contract for boot params, cmdline, kernel, optional initramfs, real bzImage setup/protected-mode payload placement, and the initial E820 guest memory map. `--run-kernel-layout` consumes that contract by mapping those regions under WHP and selecting the matching guest-entry mode: the controlled serial candidate still uses the real-mode serial/HALT contract, while a Linux bzImage uses a protected-mode entry probe with boot params in `rsi`. It still does not boot Arch until early Linux serial output is deterministic:
+Materialize the native kernel boot layout after the kernel plan is verified. This writes the guest-physical-address contract for boot params, cmdline, kernel, optional initramfs, real bzImage setup/protected-mode payload placement, boot-protocol GDT, APIC stubs, and the initial E820 guest memory map. `--run-kernel-layout` consumes that contract by mapping those regions under WHP and selecting the matching guest-entry mode: the controlled serial candidate still uses the real-mode serial/HALT contract, while a Linux bzImage uses a Linux 32-bit protected-mode entry probe with boot params in `rsi`. It still does not boot Arch until early Linux serial output is deterministic:
 
 ```powershell
 cargo run -- native-kernel-plan --materialize

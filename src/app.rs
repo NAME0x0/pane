@@ -3235,6 +3235,15 @@ fn load_kernel_layout_boot_image_artifact(
     let (kernel_execution_bytes, kernel_entry_gpa, mut extra_regions) =
         kernel_layout_execution_image(&layout, &bytes)?;
     extra_regions.extend(linux_guest_mapped_regions(&layout)?);
+    if layout.kernel_format == "linux-bzimage" {
+        extra_regions.push(crate::native::NativeGuestMemoryRegion {
+            label: "linux-boot-gdt".to_string(),
+            guest_gpa: crate::native::LINUX_BOOT_GDT_GPA,
+            bytes: crate::native::linux_boot_gdt_page_bytes(),
+            writable: false,
+            executable: false,
+        });
+    }
     let boot_params = build_linux_boot_params_page(&layout)?;
     extra_regions.push(crate::native::NativeGuestMemoryRegion {
         label: "linux-boot-params".to_string(),
@@ -3777,6 +3786,12 @@ fn default_linux_guest_memory_map(initramfs_bytes: u64) -> Vec<KernelGuestMemory
         KernelGuestMemoryRange {
             label: "boot-params".to_string(),
             start_gpa: "0x00007000".to_string(),
+            size_bytes: 0x00001000,
+            region_type: "reserved".to_string(),
+        },
+        KernelGuestMemoryRange {
+            label: "boot-gdt".to_string(),
+            start_gpa: "0x00008000".to_string(),
             size_bytes: 0x00001000,
             region_type: "reserved".to_string(),
         },
@@ -8490,6 +8505,11 @@ mod tests {
                 && range.region_type == "usable"
         }));
         assert!(layout.guest_memory_map.iter().any(|range| {
+            range.label == "boot-gdt"
+                && range.start_gpa == "0x00008000"
+                && range.region_type == "reserved"
+        }));
+        assert!(layout.guest_memory_map.iter().any(|range| {
             range.label == "io-apic-mmio"
                 && range.start_gpa == "0xfec00000"
                 && range.region_type == "mmio-stub"
@@ -8604,10 +8624,19 @@ mod tests {
         assert_eq!(&page[0x228..0x22c], &0x0002_0000_u32.to_le_bytes());
         assert_eq!(&page[0x218..0x21c], &0x0400_0000_u32.to_le_bytes());
         assert_eq!(&page[0x21c..0x220], &1234_u32.to_le_bytes());
-        assert_eq!(page[0x1e8], 10);
+        assert_eq!(page[0x1e8], 11);
         assert_eq!(&page[0x2d0..0x2d8], &0x0000_7000_u64.to_le_bytes());
         assert_eq!(&page[0x2d0 + 16..0x2d0 + 20], &2_u32.to_le_bytes());
-        let initramfs_offset = 0x2d0 + 6 * 20;
+        let boot_gdt_offset = 0x2d0 + 1 * 20;
+        assert_eq!(
+            &page[boot_gdt_offset..boot_gdt_offset + 8],
+            &0x0000_8000_u64.to_le_bytes()
+        );
+        assert_eq!(
+            &page[boot_gdt_offset + 16..boot_gdt_offset + 20],
+            &2_u32.to_le_bytes()
+        );
+        let initramfs_offset = 0x2d0 + 7 * 20;
         assert_eq!(
             &page[initramfs_offset..initramfs_offset + 8],
             &0x0400_0000_u64.to_le_bytes()
@@ -8620,7 +8649,7 @@ mod tests {
             &page[initramfs_offset + 16..initramfs_offset + 20],
             &2_u32.to_le_bytes()
         );
-        let high_ram_offset = 0x2d0 + 7 * 20;
+        let high_ram_offset = 0x2d0 + 8 * 20;
         assert_eq!(
             &page[high_ram_offset..high_ram_offset + 8],
             &0x0800_0000_u64.to_le_bytes()
@@ -8629,7 +8658,7 @@ mod tests {
             &page[high_ram_offset + 16..high_ram_offset + 20],
             &1_u32.to_le_bytes()
         );
-        let local_apic_offset = 0x2d0 + 9 * 20;
+        let local_apic_offset = 0x2d0 + 10 * 20;
         assert_eq!(
             &page[local_apic_offset..local_apic_offset + 8],
             &0xfee0_0000_u64.to_le_bytes()

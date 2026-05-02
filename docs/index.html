@@ -3,61 +3,224 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Pane - Arch-first Linux environment app for Windows</title>
-  <meta name="description" content="Pane is a pre-release Arch-first Linux environment app for Windows with a control center, PaneShared storage, diagnostics, runtime-space ownership, and WHP native-runtime preflight.">
-  <meta property="og:title" content="Pane - Arch-first Linux environment app for Windows">
-  <meta property="og:description" content="Launch Arch + XFCE today from a packaged Windows app while Pane builds toward a WHP-backed contained OS runtime.">
+  <title>Pane - Arch Linux for Windows, without the setup spiral</title>
+  <meta name="description" content="Pane is a Windows app that makes a fresh Arch Linux desktop easier to launch, repair, reset, and understand. Arch + XFCE is supported today while Pane builds toward its own native runtime.">
+  <meta property="og:title" content="Pane - Arch Linux for Windows, without the setup spiral">
+  <meta property="og:description" content="A Windows app for launching and managing an Arch Linux desktop today, with a clear path toward a Pane-owned native runtime.">
   <meta property="og:type" content="website">
-  <meta name="theme-color" content="#0a0a0a">
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>P</text></svg>">
+  <meta name="theme-color" content="#f3efe7">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' fill='black'/><text x='50' y='64' text-anchor='middle' font-size='58' fill='white'>▢</text></svg>">
   <link rel="stylesheet" href="style.css">
 </head>
-<body>
-  <div class="scanlines"></div>
-  <main class="terminal" id="terminal">
-    <div class="terminal-chrome">
-      <div class="terminal-dots">
-        <span class="dot dot-red"></span>
-        <span class="dot dot-yellow"></span>
-        <span class="dot dot-green"></span>
+<body class="landing">
+  <header class="site-header" data-reveal>
+    <a class="brand" href="index.html" aria-label="Pane home">
+      <span class="brand-mark">▢</span>
+      <span>Pane</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary navigation">
+      <a href="#what-it-is">What It Is</a>
+      <a href="#mvp">MVP</a>
+      <a href="#roadmap">Roadmap</a>
+      <a href="doc.html?doc=mvp-arch">Docs</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero-section">
+      <div class="hero-copy" data-reveal>
+        <p class="eyebrow">Pre-release MVP · Arch first · Windows first</p>
+        <h1>Arch Linux on Windows, without becoming your own support team.</h1>
+        <p class="hero-lede">
+          Pane is a Windows app for people who want a real Linux desktop they can customize,
+          launch, repair, reset, and understand from one place.
+        </p>
+        <div class="hero-actions" aria-label="Primary actions">
+          <a class="button button-primary" href="https://github.com/NAME0x0/pane/releases">Get the Windows package</a>
+          <a class="button button-secondary" href="https://github.com/NAME0x0/pane">View source</a>
+        </div>
+        <p class="truth-note">
+          Today, Pane supports Arch + XFCE through a managed WSL2/XRDP bridge. The native
+          Pane-owned runtime is under active development and is not marketed as complete yet.
+        </p>
       </div>
-      <span class="terminal-title">pane</span>
-    </div>
-    <div class="terminal-body">
-      <div id="output"></div>
-      <div id="prompt" class="hidden">
-        <span class="prompt-symbol">$</span>
-        <span id="prompt-text"></span>
-        <span class="cursor">_</span>
-      </div>
-      <div id="choices" class="hidden">
-        <button class="choice" data-key="y" id="btn-yes">[Y] Yes</button>
-        <button class="choice" data-key="n" id="btn-no">[N] No</button>
-      </div>
-      <div id="hero" class="hidden">
-        <div id="hero-text"></div>
-        <div id="hero-links" class="hidden">
-          <a href="https://github.com/NAME0x0/pane" class="link" id="repo-link">
-            <span class="link-icon">*</span> Source
-          </a>
-          <a href="doc.html?doc=mvp-arch" class="link" id="guide-link">
-            <span class="link-icon">></span> Arch MVP Guide
-          </a>
-          <a href="doc.html?doc=native-runtime-architecture" class="link" id="native-link">
-            <span class="link-icon">#</span> Native Runtime
-          </a>
+
+      <div class="app-card" aria-label="Pane product snapshot" data-reveal>
+        <div class="app-card-top">
+          <span class="app-dot"></span>
+          <span>Pane Control Center</span>
+        </div>
+        <div class="launch-panel">
+          <div>
+            <p class="panel-label">Selected environment</p>
+            <h2>Arch Linux + XFCE</h2>
+          </div>
+          <span class="status-pill">Supported MVP</span>
+        </div>
+        <div class="panel-grid">
+          <div>
+            <span>Launch</span>
+            <strong>Desktop session</strong>
+          </div>
+          <div>
+            <span>Storage</span>
+            <strong>PaneShared</strong>
+          </div>
+          <div>
+            <span>Recovery</span>
+            <strong>Doctor + repair</strong>
+          </div>
+          <div>
+            <span>Future runtime</span>
+            <strong>WHP boot path</strong>
+          </div>
+        </div>
+        <div class="runtime-strip">
+          <span>Windows app</span>
+          <span>Managed Arch</span>
+          <span>GUI handoff</span>
         </div>
       </div>
-      <div id="no-response" class="hidden"></div>
-    </div>
+    </section>
+
+    <section class="section split-section" id="what-it-is">
+      <div data-reveal>
+        <p class="eyebrow">The target user</p>
+        <h2>Pane is for Windows users who want Linux as an app, not a weekend project.</h2>
+      </div>
+      <div class="copy-stack" data-reveal>
+        <p>
+          The first audience is not distro-hoppers who already enjoy hand-wiring every service.
+          It is students, developers, tinkerers, creators, and Linux-curious Windows users who
+          want a fresh Arch environment with a real GUI and clear recovery paths.
+        </p>
+        <p>
+          Pane should make Arch feel approachable without pretending Arch is no longer Arch.
+          Users still customize, install packages, break things, and learn. Pane owns the boring
+          lifecycle work around launch, reconnect, repair, storage, reset, and support.
+        </p>
+      </div>
+    </section>
+
+    <section class="section cards-section" aria-labelledby="what-pane-does">
+      <div class="section-heading" data-reveal>
+        <p class="eyebrow">What Pane owns</p>
+        <h2 id="what-pane-does">The app wraps the Linux lifecycle people usually get stuck on.</h2>
+      </div>
+      <div class="feature-grid">
+        <article class="feature-card" data-reveal>
+          <span class="feature-number">01</span>
+          <h3>First-run onboarding</h3>
+          <p>Create or adopt the managed Arch environment, configure a normal Linux user, and get to a launchable desktop path.</p>
+        </article>
+        <article class="feature-card" data-reveal>
+          <span class="feature-number">02</span>
+          <h3>Desktop launch</h3>
+          <p>Open the supported Arch + XFCE session through Pane instead of manually juggling WSL state, XRDP, and connection files.</p>
+        </article>
+        <article class="feature-card" data-reveal>
+          <span class="feature-number">03</span>
+          <h3>Durable shared files</h3>
+          <p>PaneShared gives users a predictable bridge for files, with durable storage by default and scratch storage for disposable sessions.</p>
+        </article>
+        <article class="feature-card" data-reveal>
+          <span class="feature-number">04</span>
+          <h3>Repair before support</h3>
+          <p>Doctor checks, repair, update, logs, reset, and support bundles reduce the chance that users hit a dead end and ask for help.</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="section mvp-section" id="mvp">
+      <div class="mvp-copy" data-reveal>
+        <p class="eyebrow">Current release boundary</p>
+        <h2>The MVP is intentionally narrow so it can be reliable.</h2>
+        <p>
+          Pane starts with one supported path: Arch Linux, XFCE, WSL2, XRDP, and a packaged
+          Windows app entrypoint. That is the supportable bridge while the native runtime is built.
+        </p>
+      </div>
+      <div class="status-table" data-reveal>
+        <div><span>Supported today</span><strong>Arch + XFCE desktop bridge</strong></div>
+        <div><span>App entrypoint</span><strong>Packaged pane.exe</strong></div>
+        <div><span>User files</span><strong>PaneShared durable or scratch</strong></div>
+        <div><span>Recovery</span><strong>Doctor, repair, reset, bundle</strong></div>
+        <div><span>Not claimed yet</span><strong>Native booted Arch GUI inside Pane</strong></div>
+      </div>
+    </section>
+
+    <section class="section audience-section">
+      <div class="audience-card good" data-reveal>
+        <p class="eyebrow">Good fit</p>
+        <h2>Use Pane if you want...</h2>
+        <ul>
+          <li>A fresh Arch desktop on Windows without hand-building the integration path.</li>
+          <li>A GUI-first control surface for launch, repair, reset, logs, and shared files.</li>
+          <li>A project that is moving from a WSL bridge toward a true app-owned runtime.</li>
+        </ul>
+      </div>
+      <div class="audience-card caution" data-reveal>
+        <p class="eyebrow">Not yet</p>
+        <h2>Wait if you need...</h2>
+        <ul>
+          <li>A production VM replacement with mature snapshots, networking, audio, and GPU behavior.</li>
+          <li>KDE, GNOME, Niri, Ubuntu, Debian, Kali, or multi-distro support today.</li>
+          <li>A native framebuffer Arch desktop rendered inside Pane without WSL or XRDP.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="section roadmap-section" id="roadmap">
+      <div class="section-heading" data-reveal>
+        <p class="eyebrow">Where this is going</p>
+        <h2>The bridge is a product stage, not the final architecture.</h2>
+      </div>
+      <div class="roadmap">
+        <div class="roadmap-item done" data-reveal>
+          <span>Now</span>
+          <h3>Supportable Arch desktop bridge</h3>
+          <p>Package, launch, diagnose, repair, reset, share files, and collect support data.</p>
+        </div>
+        <div class="roadmap-item active" data-reveal>
+          <span>Next</span>
+          <h3>Pane-owned native boot path</h3>
+          <p>Move from WHP preflight and boot probes toward deterministic Linux serial output and rootfs startup.</p>
+        </div>
+        <div class="roadmap-item" data-reveal>
+          <span>Later</span>
+          <h3>Embedded display and input</h3>
+          <p>Render the Linux GUI inside Pane, then build toward networking, audio, snapshots, and desktop choices.</p>
+        </div>
+        <div class="roadmap-item" data-reveal>
+          <span>Expansion</span>
+          <h3>More distros, same lifecycle bar</h3>
+          <p>Ubuntu, Debian, Kali, KDE, GNOME, and Niri should only ship when their support path matches Arch.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="section cta-section" data-reveal>
+      <p class="eyebrow">Build with the truth boundary intact</p>
+      <h2>Pane should become the portal for Linux on Windows, but it earns that one reliable path at a time.</h2>
+      <div class="hero-actions">
+        <a class="button button-primary" href="doc.html?doc=mvp-arch">Read the Arch MVP guide</a>
+        <a class="button button-secondary" href="doc.html?doc=native-runtime-architecture">Native runtime architecture</a>
+      </div>
+    </section>
   </main>
-  <footer class="footer hidden" id="footer">
-    <a href="https://github.com/NAME0x0/pane">GitHub</a>
-    <span class="separator">.</span>
-    <a href="doc.html?doc=phase-1-audit">Phase 1 Audit</a>
-    <span class="separator">.</span>
-    <a href="doc.html?doc=product-contract">Product Contract</a>
+
+  <footer class="site-footer">
+    <a class="brand" href="index.html">
+      <span class="brand-mark">▢</span>
+      <span>Pane</span>
+    </a>
+    <nav aria-label="Footer navigation">
+      <a href="doc.html?doc=product-contract">Product Contract</a>
+      <a href="doc.html?doc=phase-1-audit">Phase 1 Audit</a>
+      <a href="https://github.com/NAME0x0/pane">GitHub</a>
+    </nav>
   </footer>
+
   <script src="main.js"></script>
 </body>
 </html>

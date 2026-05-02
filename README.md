@@ -1,347 +1,413 @@
 <p align="center">
   <img src="assets/pane-icon.png" alt="Pane icon" width="96" height="96">
 </p>
+
+<h1 align="center">Pane</h1>
+
 <p align="center">
-  <strong>Pane</strong>
+  A Windows-native Linux environment platform, starting with a deeply supported Arch desktop.
 </p>
 
 <p align="center">
-  Windows-native Linux environment platform, starting with Arch.
+  <a href="https://github.com/NAME0x0/pane/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/NAME0x0/pane/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/NAME0x0/pane/actions/workflows/release.yml"><img alt="Release" src="https://github.com/NAME0x0/pane/actions/workflows/release.yml/badge.svg"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-black.svg"></a>
+  <a href="https://github.com/NAME0x0/pane/releases"><img alt="Downloads" src="https://img.shields.io/badge/downloads-GitHub%20Releases-black.svg"></a>
 </p>
 
 <p align="center">
-  <a href="#what-pane-is">What Pane Is</a> · <a href="#supported-mvp">Supported MVP</a> · <a href="#quick-start">Quick Start</a> · <a href="#roadmap">Roadmap</a> · <a href="docs/mvp-arch.md">Arch MVP Guide</a> · <a href="docs/vision.md">Vision</a> · <a href="docs/product-contract.md">Product Contract</a> · <a href="docs/native-runtime-architecture.md">Native Runtime</a>
+  <a href="#status">Status</a> ·
+  <a href="#quick-start">Quick Start</a> ·
+  <a href="#supported-mvp">Supported MVP</a> ·
+  <a href="#native-runtime">Native Runtime</a> ·
+  <a href="#development">Development</a> ·
+  <a href="#roadmap">Roadmap</a>
 </p>
 
 ---
 
-Pane is a Windows-native app for creating, launching, and supporting real Linux environments on Windows. It is not just a WSL helper, a script packager, or a thin RDP wrapper. The product goal is simple: open Pane, get a real Linux environment with a real GUI desktop, customize it freely, and let Pane own the setup, launch, reconnect, repair, reset, file sharing, and support flows.
+Pane is building toward a simple product promise: open one Windows app, get a real Linux environment with a real GUI, customize it freely, and let the app own setup, launch, reconnect, repair, reset, file sharing, diagnostics, and support.
 
-Today Pane is a pre-release Arch-first MVP on top of the completed Phase 1 foundation. It already provides a packaged `pane.exe`, a Windows-side Control Center, a managed `pane-arch` path, first-run onboarding for Arch user creation and WSL defaults, PaneShared storage, diagnostics, repair/update/reset flows, support bundles, and a real Linux GUI handoff through `mstsc.exe`. The product is already app-shaped and supportable, but it still uses XRDP under the hood and is not yet the final contained display architecture.
+The current product is intentionally narrower than the long-term vision. Pane is Arch-first, XFCE-first, and support-first. It already ships a packaged `pane.exe`, a Windows Control Center, managed Arch onboarding, account setup, PaneShared storage, diagnostics, repair/update/reset flows, support bundles, and a real GUI handoff. It still uses WSL2, XRDP, and `mstsc.exe` for the visible desktop while the Pane-owned native runtime is being built behind a clear contract.
 
-## What Pane Is
+## Status
 
-- a Windows-native Linux environment platform
-- an app-shaped control surface for creating, launching, and supporting Linux environments
-- Arch-first today, with Ubuntu LTS next and Debian later
-- a product for real Linux use and real user customization, not a fake sandbox
-- a managed integration layer that owns onboarding, launch, reconnect, repair, reset, updates, shared files, and support workflows
+Pane is a pre-release MVP. It is usable for the supported Arch + XFCE bridge path, but it is not yet the final contained runtime/display architecture.
 
-## What Pane Is Not Yet
+| Area | Current State |
+|------|---------------|
+| App entrypoint | Packaged `pane.exe` opens the Control Center when launched without CLI arguments. |
+| Supported Linux path | Managed Arch Linux on WSL2 with XFCE. |
+| Display path | External Windows RDP client over XRDP, with Pane-managed connection assets and fallback handling. |
+| Shared files | PaneShared, durable by default and scratchable for disposable sessions. |
+| Supportability | Doctor checks, logs, repair/update/reset commands, and support bundles. |
+| Native runtime | WHP host preflight, serial boot fixture, boot-loader contract, kernel/initramfs plan, kernel layout, protected-mode entry probe, E820 map, COM1 probe model. |
+| Not complete yet | Pane-owned Arch disk boot, native framebuffer/window, input, networking, audio, snapshots, and full GUI inside Pane's own renderer. |
 
-- not a broad distro picker with equal support for everything
-- not a desktop-profile matrix full of half-supported options
-- not an embedded display window yet
-- not honest to market as zero-latency while `mstsc.exe` + XRDP still carry the visible session
-- not yet a bootable Pane-owned OS runtime, though Pane now owns the dedicated runtime storage/config contract and WHP native-runtime preflight path
+The project deliberately avoids claiming "zero latency", "full compatibility", or "contained VM" until the native boot, storage, and display milestones prove those properties.
 
-## Why
+## Why Pane Exists
 
-The hard part of a real WSL desktop workflow is not drawing a window. It is making first-run setup, account creation, launch, reconnect, recovery, and support predictable enough that normal users do not need tribal knowledge. Pane narrows the current MVP to one supported distro and one desktop environment so the recovery and diagnostics can be explicit instead of aspirational. That discipline is what lets Pane grow into a real Linux-on-Windows product instead of a fragile pile of toggles.
+Running a Linux GUI on Windows is possible today, but the user experience is fragmented. A normal user should not have to understand WSL distro state, XRDP services, Linux account passwords, `.rdp` profiles, systemd settings, reconnect failure modes, support logs, or reset semantics.
+
+Pane's thesis is that the product has to own the lifecycle, not just launch a terminal:
+
+- create or adopt the Linux environment,
+- create a normal Linux user safely,
+- prepare the desktop session,
+- launch and reconnect predictably,
+- expose user files clearly,
+- repair common breakages,
+- collect useful support bundles,
+- reset without deleting durable user data by accident,
+- then progressively replace the bridge with a Pane-owned runtime.
 
 ## Supported MVP
 
-Pane currently supports one blessed path only:
+The current supported path is intentionally strict:
 
-- Windows 10 or 11
-- WSL2 installed and working
-- Arch Linux as the target distro
-- XFCE as the desktop environment
-- `systemd=true` in `/etc/wsl.conf`
-- a non-root default WSL user with a usable password
-- PaneShared storage exposed inside Arch as `~/PaneShared`, durable by default and scratchable when requested
-- RDP handoff through `mstsc.exe` with a localhost-first path plus an automatic Pane relay fallback
-- a Windows-side Pane Control Center for launch, update, repair, reconnect, support, and recovery actions
+| Requirement | Supported Value |
+|-------------|-----------------|
+| Host OS | Windows 10 or Windows 11 |
+| Linux backend | WSL2 |
+| Distro | Arch Linux |
+| Desktop | XFCE |
+| Login | Non-root Linux user with a usable password |
+| Init | `systemd=true` in `/etc/wsl.conf` |
+| Shared storage | PaneShared mounted inside Arch as `~/PaneShared` |
+| Display | XRDP session opened through `mstsc.exe` |
 
-Everything else is intentionally deferred until after the MVP. Ubuntu, Debian, Fedora, KDE, GNOME, Niri, embedded RDP, GPU tuning, and custom transports are not part of the current support boundary. The current XRDP path now prefers direct localhost and falls back to Pane relay when Windows loopback cannot reach WSL directly, but true zero-latency still depends on the later non-RDP transport phase described in [docs/vision.md](docs/vision.md).
+Deferred until later:
+
+- Ubuntu LTS and Debian managed environments,
+- KDE, GNOME, Niri, and other desktop profiles,
+- embedded display rendering,
+- Pane-owned block device boot,
+- GPU/display acceleration work,
+- networking/audio/clipboard integration for the native runtime.
 
 ## Quick Start
 
-If you are using the packaged build, double-click `pane.exe` to open the Control Center. When sidecar scripts are missing, `pane.exe` hydrates the app entrypoint into `%LOCALAPPDATA%\Pane\app` first. You can also double-click `Install Pane Shortcuts.cmd` once, then launch `Pane` from the Desktop or Start Menu.
+### Option 1: Use The Packaged App
 
-The control center is the intended app surface. It exposes initialization, user setup, launch, terminal access, update, repair, reconnect, logs, PaneShared access, support-bundle generation, reset, and shortcut installation without forcing users into the CLI.
+Download the latest package from [GitHub Releases](https://github.com/NAME0x0/pane/releases), extract it, then run:
 
-Inspect the managed-environment roadmap first when you want the platform view:
+```powershell
+.\pane.exe
+```
 
-```bash
+The no-argument app entrypoint opens the Pane Control Center. If the sidecar app scripts are missing, the standalone executable hydrates them into `%LOCALAPPDATA%\Pane\app`.
+
+To install Windows shortcuts from the package:
+
+```powershell
+.\Install Pane Shortcuts.ps1
+```
+
+### Option 2: Run From Source
+
+Prerequisites:
+
+- Windows 10 or 11
+- Rust stable, compatible with `rust-version = "1.75"`
+- WSL2 installed for the current bridge path
+- Windows Hypervisor Platform enabled for native-runtime experiments
+
+From the repository root:
+
+```powershell
+cargo run -- app-status
 cargo run -- environments
 ```
 
-Initialize and onboard Pane-managed Arch in one first-run flow. By default Pane provisions the official Arch WSL image into a managed `pane-arch` distro, creates the Arch login user, enables the required WSL settings, and verifies launch readiness:
+Run the preferred first-run Arch onboarding flow:
 
 ```powershell
 "strong-password" | cargo run -- onboard --username archuser --password-stdin
 ```
 
-The split lifecycle commands still exist when you want more control:
-
-```bash
-cargo run -- init
-```
+Launch the supported Arch + XFCE desktop path:
 
 ```powershell
-"strong-password" | cargo run -- setup-user --username archuser --password-stdin
+cargo run -- launch --de xfce
 ```
 
-Open an interactive shell inside the managed Arch distro when you want to customize the environment, edit dotfiles, or change passwords later:
+Open an Arch shell for customization:
 
-```bash
+```powershell
 cargo run -- terminal
 ```
 
-Use `--user root` for package installation, repair work, or other admin tasks unless you configure sudo yourself inside Arch:
+Use root only when you explicitly need administrative package or repair work:
 
-```bash
+```powershell
 cargo run -- terminal --user root
 ```
 
-If you already have an Arch distro you want Pane to adopt instead:
+## Core Workflows
 
-```bash
-cargo run -- init --existing-distro archlinux
-```
+### Diagnose Before Launch
 
-Advanced fallback: import a rootfs tar manually only when you do not want the online provisioning path:
-
-```bash
-cargo run -- init --rootfs-tar C:\path\to\archlinux.tar
-```
-
-Validate the machine and the selected Arch distro from the operator view:
-
-```bash
+```powershell
 cargo run -- doctor --de xfce
 ```
 
-Inspect the app-facing phase, next action, storage policy, and display-transport boundary:
+Use a side-effect-free support pass when you do not want Pane to create workspace state:
 
-```bash
-cargo run -- app-status --json
+```powershell
+cargo run -- doctor --de xfce --no-write --no-connect
 ```
 
-Prepare the dedicated Pane runtime space, create the app-owned user disk descriptor that will eventually hold package/account/customization data, and write the deterministic serial boot image used by the WHP boot-spike runner:
+### Preview Without Touching WSL Services
 
-```bash
+```powershell
+cargo run -- launch --dry-run --de xfce
+```
+
+### Reconnect To An Existing Session
+
+```powershell
+cargo run -- doctor --de xfce --skip-bootstrap
+cargo run -- connect
+```
+
+### Repair Or Update The Managed Arch Path
+
+```powershell
+cargo run -- repair --de xfce
+cargo run -- update --de xfce
+```
+
+### Open PaneShared
+
+```powershell
+cargo run -- share
+```
+
+PaneShared is durable by default and survives `pane reset`. For disposable sessions:
+
+```powershell
+cargo run -- launch --de xfce --shared-storage scratch
+```
+
+### Collect Support Data
+
+```powershell
+cargo run -- logs
+cargo run -- bundle
+```
+
+## Native Runtime
+
+Pane's long-term runtime target is not WSL, XRDP, `mstsc.exe`, QEMU, VirtualBox, or Hyper-V Manager. The target is a Pane-owned Windows app that creates the guest runtime, owns the storage boundary, boots Linux through Windows Hypervisor Platform, and renders the guest through its own app surface.
+
+What exists today:
+
+- runtime storage reservation under `%LOCALAPPDATA%\Pane\runtime\<session>`,
+- verified base-image metadata slot,
+- user-disk descriptor,
+- runtime-backed serial boot image,
+- verified boot-to-serial loader candidate slot,
+- verified kernel/initramfs boot-plan metadata,
+- materialized Linux kernel boot layout,
+- Linux bzImage setup header copying into boot params,
+- E820 memory map including boot params, GDT, initramfs, RAM, and APIC stubs,
+- protected-mode register handoff with boot params in `rsi`,
+- minimal COM1 UART behavior for early serial setup,
+- guarded WHP partition/vCPU execution with deterministic fixture validation.
+
+Prepare native-runtime state:
+
+```powershell
 cargo run -- runtime --prepare --create-user-disk --create-serial-boot-image --capacity-gib 8
 ```
 
-Register a controlled boot-to-serial loader candidate once you have a tiny loader image that emits a known COM1 serial banner and halts. This does not boot Arch yet; it proves Pane can execute a verified runtime-provided boot artifact instead of only its built-in fixture:
+Check WHP host and runtime readiness:
+
+```powershell
+cargo run -- native-preflight --json
+```
+
+Run the safe plan-only boot-spike report:
+
+```powershell
+cargo run -- native-boot-spike --json
+```
+
+Run the deterministic WHP fixture:
+
+```powershell
+cargo run -- native-boot-spike --json --execute --run-fixture
+```
+
+Register a verified boot-to-serial candidate:
 
 ```powershell
 cargo run -- runtime --register-boot-loader C:\path\to\loader.img --boot-loader-expected-sha256 <64-char-sha256> --boot-loader-expected-serial "PANE_BOOT_OK\n"
+cargo run -- native-boot-spike --json --execute --run-boot-loader
 ```
 
-Prepare the first kernel/initramfs boot-plan contract once you have a trusted kernel artifact. Pane now inspects real Linux bzImage headers and records the boot-protocol/setup metadata needed by the native runner. Pane requires an explicit serial console cmdline so the next WHP milestone can prove boot progress before any GUI work:
+Register a verified Linux kernel and optional initramfs:
 
 ```powershell
 cargo run -- runtime --register-kernel C:\path\to\vmlinuz-linux --kernel-expected-sha256 <64-char-sha256> --kernel-cmdline "console=ttyS0 panic=-1"
 cargo run -- runtime --register-initramfs C:\path\to\initramfs-linux.img --initramfs-expected-sha256 <64-char-sha256> --kernel-cmdline "console=ttyS0 panic=-1"
-```
-
-Materialize the native kernel boot layout after the kernel plan is verified. This writes the guest-physical-address contract for boot params copied from the bzImage setup header plus Pane-owned loader fields, cmdline, kernel, optional initramfs, real bzImage setup/protected-mode payload placement, boot-protocol GDT, APIC stubs, and the initial E820 guest memory map. `--run-kernel-layout` consumes that contract by mapping those regions under WHP and selecting the matching guest-entry mode: the controlled serial candidate still uses the real-mode serial/HALT contract, while a Linux bzImage uses a Linux 32-bit protected-mode entry probe with boot params in `rsi`. It still does not boot Arch until early Linux serial output is deterministic:
-
-```powershell
 cargo run -- native-kernel-plan --materialize
 cargo run -- native-boot-spike --execute --run-kernel-layout
 ```
 
-Probe whether the Windows host and Pane runtime artifacts are ready for the first Pane-owned WHP boot spike:
+That path is still a kernel-entry probe. It is not a completed Arch boot until Pane proves deterministic early Linux serial output, root filesystem mounting, userspace start, and eventually display.
 
-```bash
-cargo run -- native-preflight --json
+## Command Reference
+
+| Command | Purpose |
+|---------|---------|
+| `pane` | Opens the Control Center when no CLI arguments are supplied. |
+| `pane app-status` | Prints app lifecycle phase, next action, PaneShared policy, and display boundary. |
+| `pane environments` | Shows the managed environment roadmap and support tiers. |
+| `pane init` | Creates, imports, or adopts the Arch WSL distro. |
+| `pane onboard` | Preferred first-run flow: init/adopt Arch, configure user, verify readiness. |
+| `pane setup-user` | Creates or repairs the Linux login without granting passwordless sudo. |
+| `pane launch` | Builds launch assets, runs bootstrap when requested, and opens the current desktop handoff. |
+| `pane connect` | Reopens the saved RDP profile after readiness checks. |
+| `pane doctor` | Validates host, distro, desktop, account, and transport readiness. |
+| `pane repair` | Reapplies managed Arch bootstrap/session wiring. |
+| `pane update` | Refreshes Arch packages and reapplies integration. |
+| `pane terminal` | Opens a shell inside the resolved Arch distro. |
+| `pane share` | Opens or prints PaneShared. |
+| `pane logs` | Prints saved bootstrap and XRDP logs when available. |
+| `pane bundle` | Creates a diagnostic support zip. |
+| `pane reset` | Removes Pane-managed session state while preserving durable PaneShared by default. |
+| `pane runtime` | Manages the future Pane-owned runtime storage and artifact contract. |
+| `pane native-preflight` | Checks WHP host/runtime readiness without side effects. |
+| `pane native-kernel-plan` | Materializes the verified kernel boot layout. |
+| `pane native-boot-spike` | Runs or previews guarded WHP boot-spike milestones. |
+
+Run any command with `--help` for the current argument list:
+
+```powershell
+cargo run -- --help
+cargo run -- launch --help
 ```
 
-Preview the first WHP boot-spike step. This is plan-only by default; add `--execute` to create and tear down a temporary WHP partition/vCPU, and add `--run-fixture` when you intentionally want Pane to map guest memory, set vCPU registers, run a deterministic serial test image, observe the `PANE_BOOT_OK` COM1 banner, and halt cleanly:
-
-```bash
-cargo run -- native-boot-spike --json
-cargo run -- native-boot-spike --json --execute --run-fixture
-cargo run -- native-boot-spike --json --execute --run-boot-loader
-```
-
-Register a local Arch base OS image into Pane's runtime image store. Pass the expected SHA-256 whenever you have it; without that digest Pane records the image but keeps it untrusted:
-
-```bash
-cargo run -- runtime --register-base-image C:\path\to\arch-base.img --expected-sha256 <64-char-sha256>
-```
-
-Preview the Pane-owned runtime launch path without invoking WSL, `mstsc.exe`, or XRDP:
-
-```bash
-cargo run -- launch --runtime pane-owned --dry-run
-```
-
-Run a side-effect-free diagnostic pass before creating any Pane workspace state:
-
-```bash
-cargo run -- doctor --de xfce --no-write --no-connect
-```
-
-Preview the generated assets without touching WSL services:
-
-```bash
-cargo run -- launch --dry-run --de xfce
-```
-
-Run the real bootstrap and open the Windows RDP client:
-
-```bash
-cargo run -- launch --de xfce
-```
-
-Open or print PaneShared, the Windows-side storage that appears inside Arch as `~/PaneShared`:
-
-```bash
-cargo run -- share --print-only
-```
-
-PaneShared is durable user storage by default and survives `pane reset`. Use scratch storage for disposable sessions:
-
-```bash
-cargo run -- launch --de xfce --shared-storage scratch
-```
-
-Check whether an already-bootstrapped distro is actually reconnect-ready:
-
-```bash
-cargo run -- doctor --de xfce --skip-bootstrap
-```
-
-That reconnect view now verifies both the Pane-managed session assets and the default user's XFCE home/config layout, so it catches the exact blank-desktop and stale-session failures Pane now repairs automatically.
-
-If bootstrap or reconnect still fails, package the diagnostics before asking for help:
-
-```bash
-cargo run -- bundle
-```
-## Commands
-
-- `pane init` provisions the official Arch WSL image by default, adopts an existing Arch distro with `--existing-distro`, or imports a rootfs tar with `--rootfs-tar` as an advanced fallback.
-- `pane onboard` is the preferred first-run path: it initializes or reuses the managed Arch distro, configures the Arch login user, and verifies launch readiness in one command.
-- `pane environments` prints Pane's managed Linux environment roadmap and support tiers.
-- `pane app-status` reports the Control Center lifecycle phase, recommended next action, PaneShared policy, and current-vs-planned display transport.
-- `pane runtime` inspects or prepares dedicated Pane-owned runtime storage, config, native-runtime manifest, verified base-image metadata, the user-disk descriptor, the runtime-backed serial boot image, an optional verified boot-to-serial loader candidate, and the first verified kernel/initramfs boot plan for the future contained OS engine. This is separate from PaneShared and does not boot Arch yet.
-- `pane native-preflight` checks the Windows Hypervisor Platform host boundary plus runtime artifacts for the future Pane-owned boot-to-serial spike. It is side-effect-free and does not claim the OS is bootable.
-- `pane native-boot-spike` is the first executable WHP host milestone. By default it prints the safe plan; with `--execute` it creates one temporary WHP partition and vCPU; with `--execute --run-fixture` it also maps guest memory, configures registers, runs a deterministic serial test image, decodes the `PANE_BOOT_OK` COM1 banner across repeated I/O exits, observes HLT, and tears everything down. With `--execute --run-boot-loader`, it runs the verified runtime-provided boot-loader candidate under the same serial/HALT contract.
-- `pane doctor` validates the supported MVP path and prints actionable fixes before launch or reconnect. Use `--no-write --no-connect` for support diagnostics that must not create the Pane workspace or PaneShared.
-- `pane setup-user` creates or repairs the Arch login user, writes the default-user/systemd WSL config, and can restart WSL so the change takes effect immediately when you do not need the full onboarding flow. It does not grant passwordless sudo or edit `/etc/sudoers`.
-- `pane launch` writes the bootstrap script, `.rdp` profile, persisted launch state, and optionally executes the Arch bootstrap. `--shared-storage durable` is the default; `--shared-storage scratch` scopes PaneShared to the disposable session workspace. `--runtime pane-owned --dry-run` exercises the native runtime contract without touching WSL/RDP.
-- `pane update` refreshes Arch packages and reapplies the Pane-managed integration without opening `mstsc.exe`.
-- `pane repair` reapplies the Pane-managed Arch bootstrap and session wiring without opening `mstsc.exe`.
-- `pane connect` reopens the saved `.rdp` profile after readiness checks pass.
-- `pane share` opens or prints PaneShared storage for the active session.
-- `pane terminal` opens an interactive shell inside the resolved Arch distro, with `--user root` available for first-run repair or password work.
-- `pane stop` stops XRDP inside the selected distro.
-- `pane reset` removes Pane-managed local session assets while preserving durable PaneShared storage by default. Use `--purge-shared` only when that user data should be deleted too.
-- `pane reset --release-managed-environment` detaches Pane from the managed distro without deleting it.
-- `pane reset --factory-reset` unregisters a Pane-provisioned distro from WSL, removes its install root, and clears Pane ownership.
-- `pane reset --dry-run` prints the reset plan without changing WSL, workspaces, or Pane state.
-- `pane logs` prints the saved bootstrap transcript and the live XRDP logs from WSL when available.
-- `pane bundle` writes a zip archive with status, doctor output, state, workspace assets, and live XRDP logs when they can be collected.
-- `pane status` reports WSL inventory, MVP support status, readiness state, and the last generated Pane workspace.
 ## Packaging
 
-Build a Windows package directory and zip archive with:
+Build the Windows package:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/package.ps1
 ```
 
-The script builds `pane.exe`, copies the core docs, and ships these app-like entrypoints in the package root:
+Build offline when dependencies are already cached:
 
-- `pane.exe`, which opens the Control Center when launched without CLI arguments and can hydrate the bundled app scripts when run alone
-- `Pane Control Center.cmd` and `Pane Control Center.ps1`
-- `Launch Pane Arch.cmd` and `Launch Pane Arch.ps1`
-- `Open Pane Arch Terminal.cmd` and `Open Pane Arch Terminal.ps1`
-- `Open Pane Shared Folder.cmd` and `Open Pane Shared Folder.ps1`
-- `Collect Pane Support Bundle.cmd` and `Collect Pane Support Bundle.ps1`
-- `Install Pane Shortcuts.cmd` and `Install Pane Shortcuts.ps1`
-- `certify-fresh-machine.ps1`
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/package.ps1 -Offline
+```
 
-You can smoke-test the packaged bundle itself with:
+Package outputs:
+
+- `dist\pane-windows-x86_64.exe`
+- `dist\pane-windows-x86_64.zip`
+- `dist\pane-windows-x86_64\pane.exe`
+- app launcher scripts,
+- shortcut installer,
+- support-bundle entrypoint,
+- package validation and certification scripts,
+- core docs and icon assets.
+
+Certify the package without requiring a live Arch session:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/certify-fresh-machine.ps1 -PackagePath .\dist\pane-windows-x86_64 -Mode PackageOnly
 ```
 
-Use the stronger live Arch gate only on a machine where the managed Arch session is expected to work:
+Run the live Arch gate only on a machine where the managed Arch session is expected to work:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/certify-fresh-machine.ps1 -PackagePath .\dist\pane-windows-x86_64 -Mode LiveArchSession
 ```
 
-`PackageOnly` validates package contents, standalone `pane.exe` hydration, Control Center self-test, native-runtime preflight reporting, dry-run onboarding, dry-run launch asset generation, shortcut creation, and the latency-oriented RDP profile without requiring a live Arch session. `LiveArchSession` also runs the full Arch package validator and verifies the generated support zip. The standalone guides are in [docs/clean-machine-validation.md](docs/clean-machine-validation.md), [docs/vision.md](docs/vision.md), and [docs/native-runtime-architecture.md](docs/native-runtime-architecture.md).
+## Development
 
-If you regenerate the app icon, install the Python development dependency first with `pip install -r requirements-dev.txt`.
+Core local checks:
 
-## Validation
+```powershell
+cargo fmt --check
+cargo check --offline
+cargo test --offline
+cargo clippy --offline -- -D warnings
+```
 
-```bash
-cargo fmt
-cargo clippy -- -D warnings
-cargo test
-cargo run -- status --json
+Useful smoke checks:
+
+```powershell
 cargo run -- app-status --json
-cargo run -- runtime --json --prepare --create-user-disk --create-serial-boot-image --capacity-gib 8
-cargo run -- runtime --json --register-boot-loader C:\path\to\loader.img --boot-loader-expected-sha256 <64-char-sha256> --boot-loader-expected-serial "PANE_BOOT_OK\n"
-cargo run -- runtime --json --register-kernel C:\path\to\vmlinuz-linux --kernel-expected-sha256 <64-char-sha256> --kernel-cmdline "console=ttyS0 panic=-1"
-cargo run -- native-kernel-plan --json --materialize
+cargo run -- runtime --json
 cargo run -- native-preflight --json
 cargo run -- native-boot-spike --json
-cargo run -- native-boot-spike --json --run-kernel-layout
-cargo run -- native-boot-spike --json --execute --run-fixture
-cargo run -- native-boot-spike --json --execute --run-boot-loader
-cargo run -- doctor --json --distro pane-arch --de xfce --no-write --no-connect
-cargo run -- doctor --json --distro pane-arch --de xfce
-cargo run -- doctor --json --distro pane-arch --de xfce --skip-bootstrap
+cargo run -- launch --dry-run --de xfce
 ```
+
+Package validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/package.ps1 -Profile release -Offline
+powershell -ExecutionPolicy Bypass -File scripts/certify-fresh-machine.ps1 -Mode PackageOnly
+```
+
+Project docs:
+
+- [Arch MVP Guide](docs/mvp-arch.md)
+- [Product Contract](docs/product-contract.md)
+- [Native Runtime Architecture](docs/native-runtime-architecture.md)
+- [Clean Machine Validation](docs/clean-machine-validation.md)
+- [Vision](docs/vision.md)
+- [Phase 1 Audit](docs/phase-1-audit.md)
+
+## CI/CD
+
+Pane's GitHub Actions pipeline is designed around release trust, not only compilation:
+
+- Rust formatting, check, clippy, and tests on every push and pull request.
+- Cross-platform Rust checks where useful, with Windows as the packaging authority.
+- Native runtime plan/preflight smoke checks.
+- PowerShell parser checks for shipped scripts.
+- README/docs local-link validation.
+- Windows package build and package-only certification.
+- Draft prerelease workflow with SHA-256 checksums and artifact upload.
+- Security workflow for dependency review and CodeQL analysis.
+- GitHub Pages deployment for the docs site.
+
+Release artifacts are intentionally draft/prerelease until the public-release gate is met.
+
+## Security
+
+Pane touches local runtime storage, WSL state, Windows launchers, support bundles, and eventually a native virtualization boundary. Treat issues in these areas as security-sensitive:
+
+- path traversal or unsafe file deletion,
+- accidental deletion of durable PaneShared data,
+- privilege escalation inside the Linux environment,
+- unsafe handling of support bundles or logs,
+- unsigned or unverified runtime images,
+- native-runtime host/guest isolation mistakes.
+
+Report security issues using [SECURITY.md](SECURITY.md). Do not publish exploitable details in public issues.
 
 ## Roadmap
 
-### Managed Environments
-
-| Environment | Role | Status |
-|-------------|------|--------|
-| **Arch Linux** | Flagship first-class managed environment | Current |
-| **Ubuntu LTS** | Second first-class managed environment | Next |
-| **Debian** | Curated preview managed environment | Later |
-
-Kali, Fedora, and other distros are intentionally not in the first support wave. Pane is trying to become the place where Windows users can use Linux without hassle, but it has to earn breadth slowly enough that support quality stays real.
-
-### Platform Development Order
-
-| Stage | Focus | Why it matters |
-|-------|-------|----------------|
-| **Now** | Finish the Pane-owned Arch path: managed `pane-arch`, onboarding, account setup, repair/reset/update, support bundles, PaneShared storage, 8 GiB runtime-space reservation, base-image registration, user-disk descriptor creation, native-runtime preflight, and the Windows control surface. | Make first-run, recovery, and data boundaries boring enough to trust. |
-| **Next** | Move from the verified runtime-provided boot-to-serial loader to a verified kernel/initramfs boot plan, then implement WHP kernel entry, boot parameters, initramfs placement, and serial boot-progress capture. | Make Pane behave more like an app-owned Linux appliance instead of a WSL helper. |
-| **Later** | Embed the display into a Pane-owned window, then add Ubuntu LTS, Debian, and curated desktop profiles only when their lifecycle, reconnect, repair, and support path are real. | Expand honestly instead of cosmetically. |
-| **Final Architecture** | Replace the XRDP handoff with a Pane-owned runtime/display transport. | Make the contained app and near-native responsiveness vision real. |
-
-## Development
-
-```bash
-cargo check
-cargo test
-cargo run -- launch --dry-run --print-script --distro pane-arch --de xfce
-```
-
-See [docs/mvp-arch.md](docs/mvp-arch.md) for the operator guide, [docs/product-contract.md](docs/product-contract.md) for the long-term product contract, [docs/native-runtime-architecture.md](docs/native-runtime-architecture.md) for the WHP runtime path, and [docs/phase-1-audit.md](docs/phase-1-audit.md) for the closure checklist that marked the Phase 1 foundation complete.
+| Stage | Focus | Exit Criteria |
+|-------|-------|---------------|
+| Current MVP | Arch + XFCE through managed WSL2/XRDP bridge. | First-run, reconnect, repair, reset, PaneShared, support bundles, package certification. |
+| Native Boot | WHP kernel-entry to deterministic Linux serial output. | Verified kernel/initramfs layout reaches early Linux serial output without WSL/RDP. |
+| Native Storage | App-owned bootable Arch root disk. | Rootfs mounts, userspace starts, package/user customizations persist. |
+| Native Display | Pane-owned framebuffer/window/input path. | Linux desktop appears inside Pane without `mstsc.exe` or XRDP. |
+| Platform Expansion | Ubuntu LTS, Debian, and curated desktops. | Each environment has onboarding, repair, reset, diagnostics, and support parity. |
+| Release Quality | Public release gate. | Clean-machine certification, signed/reproducible packages where available, documented recovery, known limitations, and support process. |
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR. Keep claims precise: if Pane does not boot, render, accelerate, or support something end to end yet, document it as a future milestone rather than product reality.
 
 ## License
 
-[MIT](LICENSE)
-
-
-
-
-
-
-
-
-
-
-
+Pane is licensed under the [MIT License](LICENSE).

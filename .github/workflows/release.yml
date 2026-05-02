@@ -19,6 +19,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 concurrency:
   group: release-${{ github.ref }}
@@ -26,43 +28,104 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "short"
 
 jobs:
-  package:
-    name: Build Release Package
-    runs-on: windows-latest
+  validate-inputs:
+    name: Validate Release Inputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - name: Validate tag format
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag_name }}"
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "Invalid tag_name: $tag"
+            echo "Expected format like v0.1.0 or v0.1.0-pre.1"
+            exit 1
+          fi
 
-      - uses: ./.github/actions/setup-rust
+  package:
+    name: Build, Certify, and Package
+    runs-on: windows-latest
+    timeout-minutes: 35
+    needs: validate-inputs
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Verify release quality gates
+        shell: pwsh
+        run: |
+          cargo fmt --check
+          cargo check --locked
+          cargo test --locked
+          cargo clippy --locked -- -D warnings
 
       - name: Build packaged release
         shell: pwsh
         run: ./scripts/package.ps1 -Profile release
 
-      - name: Smoke packaged entrypoints
+      - name: Certify packaged release
         shell: pwsh
         run: ./dist/pane-windows-x86_64/certify-fresh-machine.ps1 -Mode PackageOnly
 
-      - name: Generate checksums
+      - name: Generate checksums and manifest
         shell: pwsh
         run: |
-          $exe = Join-Path $PWD "dist\pane-windows-x86_64.exe"
-          $zip = Join-Path $PWD "dist\pane-windows-x86_64.zip"
-          $exeHash = Get-FileHash $exe -Algorithm SHA256
-          $zipHash = Get-FileHash $zip -Algorithm SHA256
-          "SHA256  $($exeHash.Hash)  pane-windows-x86_64.exe" | Set-Content (Join-Path $PWD "dist\pane-windows-x86_64.exe.sha256") -Encoding utf8
-          "SHA256  $($zipHash.Hash)  pane-windows-x86_64.zip" | Set-Content (Join-Path $PWD "dist\pane-windows-x86_64.zip.sha256") -Encoding utf8
+          $ErrorActionPreference = "Stop"
+          $dist = Join-Path $PWD "dist"
+          $files = @(
+            "pane-windows-x86_64.exe",
+            "pane-windows-x86_64.zip"
+          )
+          $manifest = [ordered]@{
+            name = "pane"
+            tag = "${{ inputs.tag_name }}"
+            prerelease = $true
+            generated_at = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            artifacts = @()
+          }
+          foreach ($file in $files) {
+            $path = Join-Path $dist $file
+            if (-not (Test-Path $path)) {
+              throw "Missing release artifact: $path"
+            }
+            $hash = Get-FileHash $path -Algorithm SHA256
+            "SHA256  $($hash.Hash)  $file" | Set-Content (Join-Path $dist "$file.sha256") -Encoding utf8
+            $manifest.artifacts += [ordered]@{
+              file = $file
+              sha256 = $hash.Hash
+              bytes = (Get-Item $path).Length
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $dist "pane-release-manifest.json") -Encoding utf8
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
           name: pane-release
+          retention-days: 30
+          if-no-files-found: error
           path: |
             dist/pane-windows-x86_64.exe
             dist/pane-windows-x86_64.exe.sha256
             dist/pane-windows-x86_64.zip
             dist/pane-windows-x86_64.zip.sha256
+            dist/pane-release-manifest.json
+
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/pane-windows-x86_64.exe
+            dist/pane-windows-x86_64.zip
+            dist/pane-release-manifest.json
 
       - name: Publish GitHub release
         if: ${{ inputs.publish_release == 'true' }}
@@ -73,8 +136,10 @@ jobs:
             dist/pane-windows-x86_64.exe.sha256
             dist/pane-windows-x86_64.zip
             dist/pane-windows-x86_64.zip.sha256
+            dist/pane-release-manifest.json
           tag_name: ${{ inputs.tag_name }}
           name: Pane ${{ inputs.tag_name }}
           draft: true
           prerelease: true
           generate_release_notes: true
+          fail_on_unmatched_files: true

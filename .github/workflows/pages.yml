@@ -5,6 +5,8 @@ on:
     branches: [main]
     paths:
       - "docs/**"
+      - "README.md"
+      - ".github/workflows/pages.yml"
 
   workflow_dispatch:
 
@@ -19,15 +21,25 @@ concurrency:
 
 jobs:
   deploy:
+    name: Deploy Documentation Site
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
+
+      - name: Validate docs payload
+        run: |
+          set -euo pipefail
+          test -f docs/index.html
+          test -f docs/style.css
+          test -f docs/main.js
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3

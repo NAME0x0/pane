@@ -16,48 +16,144 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "short"
 
 jobs:
   rust-quality:
     name: Rust Quality
     runs-on: windows-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: ./.github/actions/setup-rust
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
 
       - name: Format
         run: cargo fmt --check
 
       - name: Check
-        run: cargo check
-
-      - name: Clippy
-        run: cargo clippy -- -D warnings
+        run: cargo check --locked
 
       - name: Test
-        run: cargo test
+        run: cargo test --locked
 
-      - name: Native runtime preflight smoke
-        run: cargo run -- native-preflight --json --session-name ci-native-preflight
+      - name: Clippy
+        run: cargo clippy --locked -- -D warnings
 
-      - name: Native boot spike plan smoke
-        run: cargo run -- native-boot-spike --json --session-name ci-native-preflight
+  cross-platform-check:
+    name: Cross-Platform Rust Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Check non-Windows build surface
+        run: cargo check --locked
+
+      - name: Test non-Windows portable units
+        run: cargo test --locked
+
+  docs-and-scripts:
+    name: Docs and Script Hygiene
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Parse PowerShell scripts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $scripts = Get-ChildItem -Path scripts, .github -Recurse -Include *.ps1,*.psm1 -File
+          foreach ($script in $scripts) {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($script.FullName, [ref]$null, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error "$($script.FullName): $($_.Message)" }
+              throw "PowerShell parse failed for $($script.FullName)"
+            }
+          }
+
+      - name: Validate local Markdown and HTML links
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = (Get-Location).Path
+          $files = @("README.md") + (Get-ChildItem docs -Recurse -Include *.md,*.html -File | ForEach-Object { $_.FullName })
+          $missing = New-Object System.Collections.Generic.List[string]
+          foreach ($file in $files) {
+            $text = Get-Content -LiteralPath $file -Raw
+            $base = Split-Path -Parent $file
+            $markdownLinks = [regex]::Matches($text, '\[[^\]]+\]\(([^)#?][^)#?]*)(?:#[^)]+)?\)')
+            $htmlLinks = [regex]::Matches($text, 'href="([^"#?:][^"#]*)"')
+            foreach ($match in @($markdownLinks) + @($htmlLinks)) {
+              $target = $match.Groups[1].Value
+              if ([string]::IsNullOrWhiteSpace($target)) { continue }
+              if ($target -match '^(https?://|mailto:|data:|#)') { continue }
+              $resolved = Join-Path $base $target
+              if (-not (Test-Path -LiteralPath $resolved)) {
+                $relativeFile = Resolve-Path -LiteralPath $file -Relative
+                $missing.Add("${relativeFile}: missing local link ${target}")
+              }
+            }
+          }
+          if ($missing.Count -gt 0) {
+            $missing | ForEach-Object { Write-Error $_ }
+            throw "Local documentation link validation failed."
+          }
+
+  native-runtime-smoke:
+    name: Native Runtime Smoke
+    runs-on: windows-latest
+    timeout-minutes: 20
+    needs: rust-quality
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Native preflight JSON
+        run: cargo run --locked -- native-preflight --json --session-name ci-native-preflight
+
+      - name: Native boot-spike plan JSON
+        run: cargo run --locked -- native-boot-spike --json --session-name ci-native-preflight
+
+      - name: Native kernel-layout plan JSON
+        run: cargo run --locked -- native-boot-spike --json --run-kernel-layout --session-name ci-native-preflight
+
+      - name: Pane-owned launch dry run
+        run: cargo run --locked -- launch --runtime pane-owned --dry-run --session-name ci-native-preflight
 
   package-windows:
     name: Package Windows Build
     runs-on: windows-latest
-    needs: rust-quality
+    timeout-minutes: 30
+    needs:
+      - rust-quality
+      - docs-and-scripts
+      - native-runtime-smoke
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: ./.github/actions/setup-rust
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
 
       - name: Build packaged release
         shell: pwsh
         run: ./scripts/package.ps1 -Profile release
 
-      - name: Smoke packaged entrypoints
+      - name: Certify packaged entrypoints
         shell: pwsh
         run: ./dist/pane-windows-x86_64/certify-fresh-machine.ps1 -Mode PackageOnly
 
@@ -65,34 +161,37 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: pane-windows-package
+          retention-days: 14
+          if-no-files-found: error
           path: |
             dist/pane-windows-x86_64.exe
             dist/pane-windows-x86_64.zip
             dist/pane-windows-x86_64/**
 
-  docs-check:
-    name: Docs Check
+  ci-summary:
+    name: CI Summary
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs:
+      - rust-quality
+      - cross-platform-check
+      - docs-and-scripts
+      - native-runtime-smoke
+      - package-windows
+    if: always()
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Validate HTML
+      - name: Verify required jobs
         run: |
-          for f in docs/*.html; do
-            echo "Checking $f..."
-            if grep -qP '[\x80-\xff]' "$f" 2>/dev/null; then
-              echo "Warning: non-ASCII characters in $f"
-            fi
-            echo "OK"
-          done
-
-      - name: Check for broken local links
-        run: |
-          cd docs
-          for href in $(grep -oP 'href="(?!http|data:|#)([^"]+)"' *.html | grep -oP '"[^"]+"' | tr -d '"'); do
-            if [ ! -f "$href" ]; then
-              echo "Broken link: $href"
+          set -euo pipefail
+          for result in \
+            "${{ needs.rust-quality.result }}" \
+            "${{ needs.cross-platform-check.result }}" \
+            "${{ needs.docs-and-scripts.result }}" \
+            "${{ needs.native-runtime-smoke.result }}" \
+            "${{ needs.package-windows.result }}"; do
+            if [ "$result" != "success" ]; then
+              echo "A required CI job failed or was skipped: $result"
               exit 1
             fi
           done
-          echo "All local links valid"
+          echo "All required CI jobs passed."

@@ -3234,7 +3234,7 @@ fn load_kernel_layout_boot_image_artifact(
 
     let (kernel_execution_bytes, kernel_entry_gpa, mut extra_regions) =
         kernel_layout_execution_image(&layout, &bytes)?;
-    extra_regions.extend(linux_guest_ram_regions(&layout)?);
+    extra_regions.extend(linux_guest_mapped_regions(&layout)?);
     let boot_params = build_linux_boot_params_page(&layout)?;
     extra_regions.push(crate::native::NativeGuestMemoryRegion {
         label: "linux-boot-params".to_string(),
@@ -3343,7 +3343,7 @@ fn kernel_layout_execution_image(
     Ok((protected_mode_payload, kernel_load_gpa, vec![setup_region]))
 }
 
-fn linux_guest_ram_regions(
+fn linux_guest_mapped_regions(
     layout: &KernelBootLayout,
 ) -> AppResult<Vec<crate::native::NativeGuestMemoryRegion>> {
     if layout.kernel_format != "linux-bzimage" {
@@ -3353,7 +3353,7 @@ fn linux_guest_ram_regions(
     layout
         .guest_memory_map
         .iter()
-        .filter(|range| range.region_type == "usable")
+        .filter(|range| matches!(range.region_type.as_str(), "usable" | "mmio-stub"))
         .map(|range| {
             let size: usize = range.size_bytes.try_into().map_err(|_| {
                 AppError::message(format!(
@@ -3362,11 +3362,15 @@ fn linux_guest_ram_regions(
                 ))
             })?;
             Ok(crate::native::NativeGuestMemoryRegion {
-                label: format!("linux-ram-{}", range.label),
+                label: if range.region_type == "usable" {
+                    format!("linux-ram-{}", range.label)
+                } else {
+                    format!("linux-{}", range.label)
+                },
                 guest_gpa: parse_guest_physical_address(&range.start_gpa)?,
                 bytes: vec![0_u8; size],
                 writable: true,
-                executable: true,
+                executable: range.region_type == "usable",
             })
         })
         .collect()
@@ -3447,7 +3451,7 @@ fn write_linux_e820_table(
         let start = parse_guest_physical_address(&range.start_gpa)?;
         let region_type = match range.region_type.as_str() {
             "usable" => 1,
-            "reserved" => 2,
+            "reserved" | "mmio-stub" => 2,
             other => {
                 return Err(AppError::message(format!(
                     "Unsupported Linux E820 range type `{other}` for `{}`.",
@@ -3811,6 +3815,18 @@ fn default_linux_guest_memory_map(_initramfs_bytes: u64) -> Vec<KernelGuestMemor
             start_gpa: "0x08000000".to_string(),
             size_bytes: 0x04000000,
             region_type: "usable".to_string(),
+        },
+        KernelGuestMemoryRange {
+            label: "io-apic-mmio".to_string(),
+            start_gpa: "0xfec00000".to_string(),
+            size_bytes: 0x00001000,
+            region_type: "mmio-stub".to_string(),
+        },
+        KernelGuestMemoryRange {
+            label: "local-apic-mmio".to_string(),
+            start_gpa: "0xfee00000".to_string(),
+            size_bytes: 0x00001000,
+            region_type: "mmio-stub".to_string(),
         },
     ]
 }
@@ -8033,15 +8049,16 @@ mod tests {
         default_linux_guest_memory_map, determine_app_lifecycle, ensure_wsl_conf_setting,
         format_doctor_blockers, initialize_managed_arch_environment, inspect_kernel_image_artifact,
         inspect_workspace, inventory_contains_distro, kernel_layout_execution_image,
-        load_kernel_layout_boot_image_artifact, parse_guest_physical_address, preferred_transport,
-        read_json_file, register_base_os_image, register_boot_loader_image,
-        register_kernel_boot_plan, resolve_bundle_output_path, resolve_init_source,
-        resolve_launch_target, resolve_managed_environment_for_reset, resolve_saved_launch,
-        resolve_session_context, resolve_status_distro, runtime_storage_budget, sha256_file,
-        status_port_for, validate_setup_password, validate_setup_username, windows_transport_check,
-        AppLifecyclePhase, AppNextAction, CheckStatus, DistroHealth, DoctorCheck, DoctorReport,
-        InitSource, KernelBootLayout, KernelBootMetadata, NativeRuntimeState, StatusReport,
-        WorkspaceHealth, WslInventory, EMBEDDED_APP_ASSETS,
+        linux_guest_mapped_regions, load_kernel_layout_boot_image_artifact,
+        parse_guest_physical_address, preferred_transport, read_json_file, register_base_os_image,
+        register_boot_loader_image, register_kernel_boot_plan, resolve_bundle_output_path,
+        resolve_init_source, resolve_launch_target, resolve_managed_environment_for_reset,
+        resolve_saved_launch, resolve_session_context, resolve_status_distro,
+        runtime_storage_budget, sha256_file, status_port_for, validate_setup_password,
+        validate_setup_username, windows_transport_check, AppLifecyclePhase, AppNextAction,
+        CheckStatus, DistroHealth, DoctorCheck, DoctorReport, InitSource, KernelBootLayout,
+        KernelBootMetadata, NativeRuntimeState, StatusReport, WorkspaceHealth, WslInventory,
+        EMBEDDED_APP_ASSETS,
     };
 
     fn empty_workspace_health() -> WorkspaceHealth {
@@ -8453,6 +8470,16 @@ mod tests {
                 && range.start_gpa == "0x08000000"
                 && range.region_type == "usable"
         }));
+        assert!(layout.guest_memory_map.iter().any(|range| {
+            range.label == "io-apic-mmio"
+                && range.start_gpa == "0xfec00000"
+                && range.region_type == "mmio-stub"
+        }));
+        assert!(layout.guest_memory_map.iter().any(|range| {
+            range.label == "local-apic-mmio"
+                && range.start_gpa == "0xfee00000"
+                && range.region_type == "mmio-stub"
+        }));
         assert!(layout.materialized_at_epoch_seconds.is_some());
 
         let artifacts = build_runtime_artifact_report(&paths);
@@ -8552,7 +8579,7 @@ mod tests {
         assert_eq!(&page[0x228..0x22c], &0x0002_0000_u32.to_le_bytes());
         assert_eq!(&page[0x218..0x21c], &0x0400_0000_u32.to_le_bytes());
         assert_eq!(&page[0x21c..0x220], &1234_u32.to_le_bytes());
-        assert_eq!(page[0x1e8], 7);
+        assert_eq!(page[0x1e8], 9);
         assert_eq!(&page[0x2d0..0x2d8], &0x0000_7000_u64.to_le_bytes());
         assert_eq!(&page[0x2d0 + 16..0x2d0 + 20], &2_u32.to_le_bytes());
         let high_ram_offset = 0x2d0 + 6 * 20;
@@ -8563,6 +8590,15 @@ mod tests {
         assert_eq!(
             &page[high_ram_offset + 16..high_ram_offset + 20],
             &1_u32.to_le_bytes()
+        );
+        let local_apic_offset = 0x2d0 + 8 * 20;
+        assert_eq!(
+            &page[local_apic_offset..local_apic_offset + 8],
+            &0xfee0_0000_u64.to_le_bytes()
+        );
+        assert_eq!(
+            &page[local_apic_offset + 16..local_apic_offset + 20],
+            &2_u32.to_le_bytes()
         );
     }
 
@@ -8617,6 +8653,55 @@ mod tests {
         assert_eq!(entry_gpa, 0x0010_0000);
         assert_eq!(payload, kernel);
         assert!(extra_regions.is_empty());
+    }
+
+    #[test]
+    fn linux_guest_mapped_regions_include_ram_and_apic_stubs() {
+        let layout = KernelBootLayout {
+            schema_version: 1,
+            layout_kind: "pane-linux-kernel-boot-layout-v1".to_string(),
+            session_name: "pane".to_string(),
+            boot_params_gpa: "0x00007000".to_string(),
+            cmdline_gpa: "0x00020000".to_string(),
+            kernel_load_gpa: "0x00100000".to_string(),
+            initramfs_load_gpa: None,
+            kernel_path: "kernel".to_string(),
+            kernel_bytes: 4096,
+            kernel_sha256: "0".repeat(64),
+            kernel_format: "linux-bzimage".to_string(),
+            linux_boot_protocol: Some("0x020f".to_string()),
+            linux_setup_sectors: Some(4),
+            linux_setup_bytes: Some(2560),
+            linux_protected_mode_offset: Some(2560),
+            linux_protected_mode_bytes: Some(1536),
+            linux_loadflags: Some(0x80),
+            linux_preferred_load_address: Some("0x0000000001000000".to_string()),
+            linux_entry_point_gpa: Some("0x00100000".to_string()),
+            linux_boot_params_register: Some("rsi".to_string()),
+            linux_expected_entry_mode: Some("x86-protected-mode-32".to_string()),
+            guest_memory_map: default_linux_guest_memory_map(0),
+            initramfs_path: None,
+            initramfs_bytes: None,
+            initramfs_sha256: None,
+            cmdline: "console=ttyS0 panic=-1".to_string(),
+            expected_serial_device: "ttyS0".to_string(),
+            materialized_at_epoch_seconds: Some(1),
+            notes: Vec::new(),
+        };
+
+        let regions = linux_guest_mapped_regions(&layout).unwrap();
+        assert!(regions.iter().any(|region| {
+            region.label == "linux-ram-high-ram"
+                && region.guest_gpa == 0x0800_0000
+                && region.writable
+                && region.executable
+        }));
+        assert!(regions.iter().any(|region| {
+            region.label == "linux-local-apic-mmio"
+                && region.guest_gpa == 0xfee0_0000
+                && region.writable
+                && !region.executable
+        }));
     }
 
     #[test]

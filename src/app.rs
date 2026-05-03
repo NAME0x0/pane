@@ -479,10 +479,19 @@ struct UserDiskMetadata {
     format: String,
     disk_path: String,
     capacity_gib: u64,
+    logical_size_bytes: u64,
+    block_size_bytes: u64,
+    sparse_backing: bool,
+    allocated_header_bytes: u64,
+    header_sha256: String,
     materialized_block_device: bool,
     created_at_epoch_seconds: u64,
     notes: Vec<String>,
 }
+
+const PANE_USER_DISK_FORMAT: &str = "pane-sparse-user-disk-v1";
+const PANE_USER_DISK_MAGIC: &str = "PANE_USER_DISK_V1\n";
+const PANE_USER_DISK_BLOCK_SIZE_BYTES: u64 = 4096;
 
 #[derive(Debug, Serialize)]
 struct NativeRuntimeReport {
@@ -2859,7 +2868,7 @@ fn build_runtime_report(
                 .to_string(),
             "Register a Pane-approved Arch base OS image with `pane runtime --register-base-image <path> --expected-sha256 <sha256>`."
                 .to_string(),
-            "Create the Pane-owned user disk descriptor with `pane runtime --create-user-disk`."
+            "Create the Pane-owned sparse user disk with `pane runtime --create-user-disk`."
                 .to_string(),
             "Create the runtime-backed serial boot image with `pane runtime --create-serial-boot-image`."
                 .to_string(),
@@ -3079,14 +3088,19 @@ fn create_user_disk_descriptor(
     force: bool,
 ) -> AppResult<()> {
     if paths.user_disk.exists() && !force {
-        if read_json_file::<UserDiskMetadata>(&paths.user_disk_metadata).is_ok() {
+        if user_disk_artifact_ready(
+            paths,
+            &read_json_file::<UserDiskMetadata>(&paths.user_disk_metadata).ok(),
+        ) {
             return Ok(());
         }
 
-        return Err(AppError::message(format!(
-            "A user disk artifact already exists at {}, but its metadata is missing or invalid. Pass --force to replace it.",
-            paths.user_disk.display()
-        )));
+        if !legacy_user_disk_descriptor_exists(paths) {
+            return Err(AppError::message(format!(
+                "A user disk artifact already exists at {}, but its sparse-disk metadata is missing or invalid. Pass --force to replace it.",
+                paths.user_disk.display()
+            )));
+        }
     }
 
     if let Some(parent) = paths.user_disk.parent() {
@@ -3097,23 +3111,90 @@ fn create_user_disk_descriptor(
     }
 
     let capacity_gib = budget.user_packages_and_customizations_gib.max(1);
+    let logical_size_bytes = user_disk_logical_size_bytes(capacity_gib)?;
+    let header = user_disk_header_bytes(logical_size_bytes);
+    let header_sha256 = sha256_bytes(&header);
     let metadata = UserDiskMetadata {
         schema_version: 1,
-        format: "pane-user-disk-descriptor-v1".to_string(),
+        format: PANE_USER_DISK_FORMAT.to_string(),
         disk_path: paths.user_disk.display().to_string(),
         capacity_gib,
-        materialized_block_device: false,
+        logical_size_bytes,
+        block_size_bytes: PANE_USER_DISK_BLOCK_SIZE_BYTES,
+        sparse_backing: true,
+        allocated_header_bytes: header.len() as u64,
+        header_sha256,
+        materialized_block_device: true,
         created_at_epoch_seconds: current_epoch_seconds(),
         notes: vec![
-            "This descriptor reserves Pane-owned Linux user/package/customization storage semantics."
+            "This sparse Pane disk is the durable Linux user/package/customization storage artifact."
                 .to_string(),
-            "The native boot engine will materialize this descriptor into its actual block-device format."
+            "Only the header is allocated now; unallocated logical blocks are zero-filled by the future block-device engine."
                 .to_string(),
         ],
     };
 
-    write_json_file(&paths.user_disk, &metadata)?;
+    fs::write(&paths.user_disk, header)?;
     write_json_file(&paths.user_disk_metadata, &metadata)
+}
+
+fn user_disk_logical_size_bytes(capacity_gib: u64) -> AppResult<u64> {
+    capacity_gib
+        .checked_mul(1024)
+        .and_then(|value| value.checked_mul(1024))
+        .and_then(|value| value.checked_mul(1024))
+        .ok_or_else(|| AppError::message("Pane user disk capacity overflows u64 byte sizing."))
+}
+
+fn user_disk_header_bytes(logical_size_bytes: u64) -> Vec<u8> {
+    format!(
+        "{PANE_USER_DISK_MAGIC}format={PANE_USER_DISK_FORMAT}\nlogical_size_bytes={logical_size_bytes}\nblock_size_bytes={PANE_USER_DISK_BLOCK_SIZE_BYTES}\nzero_fill_unallocated=true\n\n"
+    )
+    .into_bytes()
+}
+
+fn legacy_user_disk_descriptor_exists(paths: &RuntimePaths) -> bool {
+    [&paths.user_disk, &paths.user_disk_metadata]
+        .into_iter()
+        .filter_map(|path| fs::read_to_string(path).ok())
+        .filter_map(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .any(|value| {
+            value.get("format").and_then(|format| format.as_str())
+                == Some("pane-user-disk-descriptor-v1")
+        })
+}
+
+fn user_disk_artifact_ready(paths: &RuntimePaths, metadata: &Option<UserDiskMetadata>) -> bool {
+    let Some(metadata) = metadata else {
+        return false;
+    };
+    if !paths.user_disk.is_file()
+        || metadata.schema_version != 1
+        || metadata.format != PANE_USER_DISK_FORMAT
+        || metadata.disk_path != paths.user_disk.display().to_string()
+        || metadata.capacity_gib == 0
+        || metadata.block_size_bytes != PANE_USER_DISK_BLOCK_SIZE_BYTES
+        || !metadata.sparse_backing
+        || !metadata.materialized_block_device
+        || metadata.allocated_header_bytes == 0
+    {
+        return false;
+    }
+
+    let Ok(expected_logical_size) = user_disk_logical_size_bytes(metadata.capacity_gib) else {
+        return false;
+    };
+    if metadata.logical_size_bytes != expected_logical_size {
+        return false;
+    }
+
+    let Ok(header) = fs::read(&paths.user_disk) else {
+        return false;
+    };
+
+    header.len() as u64 == metadata.allocated_header_bytes
+        && header.starts_with(PANE_USER_DISK_MAGIC.as_bytes())
+        && sha256_bytes(&header) == metadata.header_sha256
 }
 
 fn create_serial_boot_image_artifact(paths: &RuntimePaths, force: bool) -> AppResult<()> {
@@ -4643,7 +4724,7 @@ fn write_native_runtime_manifest(paths: &RuntimePaths, session_name: &str) -> Ap
             "verified boot-to-serial loader must exist before runtime-provided boot-candidate execution",
             "verified kernel boot plan must exist before WHP kernel-entry execution",
             "kernel boot layout must be materialized before WHP kernel-entry execution",
-            "Pane user disk descriptor must exist before native boot",
+            "Pane sparse user disk must exist before native boot",
             "Pane framebuffer contract must exist before native display work",
             "Pane input contract must exist before native display work",
             "Windows Hypervisor Platform host preflight must pass before the boot spike",
@@ -4861,15 +4942,7 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
         .unwrap_or(false);
 
     let user_disk_metadata = read_json_file::<UserDiskMetadata>(&paths.user_disk_metadata).ok();
-    let user_disk_ready = user_disk_metadata
-        .as_ref()
-        .map(|metadata| {
-            paths.user_disk.is_file()
-                && metadata.schema_version == 1
-                && metadata.format == "pane-user-disk-descriptor-v1"
-                && metadata.capacity_gib > 0
-        })
-        .unwrap_or(false);
+    let user_disk_ready = user_disk_artifact_ready(paths, &user_disk_metadata);
 
     RuntimeArtifactReport {
         base_os_image_exists: paths.base_os_image.is_file(),
@@ -4978,7 +5051,7 @@ fn build_native_runtime_report(
         }
         if !artifacts.user_disk_ready {
             blockers.push(
-                "No valid Pane-owned user disk descriptor exists for packages, user accounts, and customization data. Run `pane runtime --create-user-disk`."
+                "No valid Pane-owned sparse user disk exists for packages, user accounts, and customization data. Run `pane runtime --create-user-disk`."
                     .to_string(),
             );
         }
@@ -8493,11 +8566,11 @@ mod tests {
         register_kernel_boot_plan, resolve_bundle_output_path, resolve_init_source,
         resolve_launch_target, resolve_managed_environment_for_reset, resolve_saved_launch,
         resolve_session_context, resolve_status_distro, runtime_contract_guest_memory_ranges,
-        runtime_storage_budget, sha256_file, status_port_for, validate_setup_password,
-        validate_setup_username, windows_transport_check, AppLifecyclePhase, AppNextAction,
-        CheckStatus, DistroHealth, DoctorCheck, DoctorReport, FramebufferContract, InitSource,
-        KernelBootLayout, KernelBootMetadata, NativeRuntimeState, StatusReport, WorkspaceHealth,
-        WslInventory, EMBEDDED_APP_ASSETS,
+        runtime_storage_budget, sha256_file, status_port_for, user_disk_artifact_ready,
+        validate_setup_password, validate_setup_username, windows_transport_check, write_json_file,
+        AppLifecyclePhase, AppNextAction, CheckStatus, DistroHealth, DoctorCheck, DoctorReport,
+        FramebufferContract, InitSource, KernelBootLayout, KernelBootMetadata, NativeRuntimeState,
+        StatusReport, UserDiskMetadata, WorkspaceHealth, WslInventory, EMBEDDED_APP_ASSETS,
     };
 
     fn empty_workspace_health() -> WorkspaceHealth {
@@ -9294,6 +9367,24 @@ mod tests {
         assert!(artifacts.user_disk_exists);
         assert!(artifacts.user_disk_ready);
         assert_eq!(artifacts.user_disk_capacity_gib, Some(3));
+        assert_eq!(
+            artifacts.user_disk_format.as_deref(),
+            Some("pane-sparse-user-disk-v1")
+        );
+        let user_disk_metadata =
+            read_json_file::<UserDiskMetadata>(&paths.user_disk_metadata).unwrap();
+        let user_disk_bytes = std::fs::read(&paths.user_disk).unwrap();
+        assert!(user_disk_metadata.materialized_block_device);
+        assert!(user_disk_metadata.sparse_backing);
+        assert_eq!(
+            user_disk_metadata.logical_size_bytes,
+            3 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            user_disk_metadata.allocated_header_bytes,
+            user_disk_bytes.len() as u64
+        );
+        assert!(user_disk_bytes.starts_with(b"PANE_USER_DISK_V1\n"));
         assert!(artifacts.framebuffer_contract_ready);
         assert!(artifacts.input_contract_ready);
         assert!(artifacts.serial_boot_image_exists);
@@ -9311,6 +9402,34 @@ mod tests {
             .blockers
             .iter()
             .any(|blocker| blocker.contains("No valid Pane-owned user disk")));
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn create_user_disk_upgrades_legacy_descriptor_to_sparse_artifact() {
+        let paths = temp_runtime_paths("runtime-user-disk-upgrade");
+        super::prepare_runtime_paths(&paths).unwrap();
+        let legacy = serde_json::json!({
+            "schema_version": 1,
+            "format": "pane-user-disk-descriptor-v1",
+            "disk_path": paths.user_disk.display().to_string(),
+            "capacity_gib": 3,
+            "materialized_block_device": false,
+            "created_at_epoch_seconds": 1,
+            "notes": []
+        });
+        write_json_file(&paths.user_disk, &legacy).unwrap();
+        write_json_file(&paths.user_disk_metadata, &legacy).unwrap();
+
+        create_user_disk_descriptor(&paths, &runtime_storage_budget(8), false).unwrap();
+
+        let metadata = read_json_file::<UserDiskMetadata>(&paths.user_disk_metadata).unwrap();
+        let user_disk_bytes = std::fs::read(&paths.user_disk).unwrap();
+        assert_eq!(metadata.format, "pane-sparse-user-disk-v1");
+        assert!(metadata.materialized_block_device);
+        assert!(user_disk_bytes.starts_with(b"PANE_USER_DISK_V1\n"));
+        assert!(user_disk_artifact_ready(&paths, &Some(metadata)));
 
         let _ = std::fs::remove_dir_all(&paths.root);
     }

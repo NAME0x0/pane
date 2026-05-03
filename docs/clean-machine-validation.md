@@ -11,7 +11,7 @@ A clean-machine pass should prove all of the following from the shipped package:
 - the package contains the docs and launcher files a user needs,
 - the packaged control center entrypoint exists and self-identifies correctly,
 - `app-status` reports the app lifecycle and current display-transport boundary without claiming a contained window,
-- `runtime` can prepare the dedicated app-owned runtime-space layout, config, native-runtime manifest, serial boot image, verified boot-loader metadata, verified kernel boot-plan metadata, materialized kernel boot-layout metadata, mapped framebuffer/input queue contracts, and user-disk descriptor without requiring a live WSL install,
+- `runtime` can prepare the dedicated app-owned runtime-space layout, config, native-runtime manifest, serial boot image, verified boot-loader metadata, verified kernel boot-plan metadata, materialized kernel boot-layout metadata, mapped framebuffer/input queue contracts, and sparse user-disk artifact without requiring a live WSL install,
 - `native-preflight` reports Windows Hypervisor Platform host checks and runtime artifact blockers without requiring a live WSL install,
 - `native-boot-spike` reports its safe plan by default without creating a WHP partition unless `--execute` is passed, and its explicit fixture plus registered boot-loader modes can run controlled guest code without WSL, XRDP, or `mstsc.exe`,
 - `status` and `doctor` run from the packaged binary,

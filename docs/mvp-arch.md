@@ -40,7 +40,7 @@ The package intentionally does not expose KDE, GNOME, Niri, or other desktop pro
 
 1. Prefer the packaged Control Center and its Start First Run flow when using Pane as an app.
 2. Run `pane app-status --json` when you need the same app-facing lifecycle phase and next-action recommendation from the CLI.
-3. Run `pane runtime --prepare --create-user-disk --create-serial-boot-image --capacity-gib 8` when you want to prepare Pane's dedicated future runtime space, user-disk descriptor, and WHP serial boot image artifact. This does not boot Arch yet.
+3. Run `pane runtime --prepare --create-user-disk --create-serial-boot-image --capacity-gib 8` when you want to prepare Pane's dedicated future runtime space, sparse user-disk artifact, and WHP serial boot image artifact. This does not boot Arch yet.
 4. Run `pane native-preflight --json` when you want to inspect Windows Hypervisor Platform readiness plus the runtime artifact blockers for the future boot-to-serial spike.
 5. Run `pane runtime --register-boot-loader C:\path\to\loader.img --boot-loader-expected-sha256 <64-char-sha256> --boot-loader-expected-serial "PANE_BOOT_OK\n"` when you have a controlled loader candidate that should be executed from Pane runtime storage.
 6. Run `pane runtime --register-kernel C:\path\to\vmlinuz-linux --kernel-expected-sha256 <64-char-sha256> --kernel-cmdline "console=ttyS0 panic=-1"` when you have a trusted kernel artifact for the first native kernel boot plan. Add `--register-initramfs` and `--initramfs-expected-sha256` when your boot path needs an initramfs.

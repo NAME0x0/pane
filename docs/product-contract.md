@@ -84,7 +84,7 @@ The current implementation:
 
 This means the current product is already app-shaped, but it is not yet the final contained display architecture.
 
-Pane is now reserving a future runtime boundary: a dedicated 8 GiB default app-owned space for downloaded OS images, the base system image, an expandable user disk, snapshots, package/customization data, runtime state, runtime config, base-image verification metadata, user-disk metadata, native-runtime manifest, Windows Hypervisor Platform host preflight, a guarded WHP partition/vCPU smoke step, a runtime-backed WHP serial test image that runs controlled guest code and emits a deterministic boot banner, a verified boot-to-serial loader candidate slot, a verified kernel/initramfs boot-plan slot, and a materialized kernel boot-layout slot. That reserved space is not a bootable runtime yet; it is the contract that lets Pane move toward an app-owned OS engine without confusing it with PaneShared or the current WSL bridge.
+Pane is now reserving a future runtime boundary: a dedicated 8 GiB default app-owned space for downloaded OS images, the base system image, an expandable user disk, snapshots, package/customization data, runtime state, runtime config, base-image verification metadata, user-disk metadata, native-runtime manifest, Windows Hypervisor Platform host preflight, a guarded WHP partition/vCPU smoke step, a runtime-backed WHP serial test image that runs controlled guest code and emits a deterministic boot banner, a verified boot-to-serial loader candidate slot, a verified kernel/initramfs boot-plan slot, a materialized kernel boot-layout slot, and mapped framebuffer/input queue contracts. That reserved space is not a bootable runtime yet; it is the contract that lets Pane move toward an app-owned OS engine without confusing it with PaneShared or the current WSL bridge.
 
 ## End-State Vision
 
@@ -263,7 +263,7 @@ Pane should not be treated as a first public release until:
 - `pane runtime --register-kernel` can persist a verified Linux kernel plus optional initramfs and serial-console cmdline as the first real kernel boot-plan contract,
 - registered Linux kernels are inspected as bzImage artifacts so Pane records boot-protocol/setup metadata before WHP entry work,
 - materialized Linux layouts split bzImage setup bytes from protected-mode payload bytes, copy the original setup header into boot params, and declare the protected-mode entry contract,
-- materialized Linux layouts include an explicit E820 memory map, reserve boot params/GDT/initramfs/APIC stub ranges, and WHP maps the usable RAM plus boot-protocol support pages needed by protected-mode entry probes,
+- materialized Linux layouts include an explicit E820 memory map, reserve boot params/GDT/initramfs/APIC stub ranges, and WHP maps the usable RAM, framebuffer memory, input queue memory, plus boot-protocol support pages needed by protected-mode entry probes,
 - `pane native-kernel-plan --materialize` can persist the guest-memory boot layout that the WHP kernel-entry runner must execute next,
 - `pane native-boot-spike --run-kernel-layout` can consume that layout through the guarded WHP runner and preserve the selected guest-entry contract in reports,
 - controlled candidates enter with the real-mode serial/HALT register contract, while Linux bzImage payloads enter with the Linux 32-bit protected-mode probe contract, a boot-protocol GDT, zeroed `%ebx/%ebp/%edi`, and boot params in `rsi`,

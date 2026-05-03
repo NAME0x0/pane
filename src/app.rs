@@ -468,6 +468,9 @@ struct InputContract {
     pointer_device: String,
     transport: String,
     coordinate_space: String,
+    guest_queue_gpa: String,
+    queue_size_bytes: u64,
+    event_record_bytes: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2965,6 +2968,9 @@ fn default_input_contract() -> InputContract {
         pointer_device: "pane-absolute-pointer-v1".to_string(),
         transport: "pane-host-event-queue".to_string(),
         coordinate_space: "framebuffer-pixels".to_string(),
+        guest_queue_gpa: "0x0dff0000".to_string(),
+        queue_size_bytes: 0x00001000,
+        event_record_bytes: 32,
     }
 }
 
@@ -3487,7 +3493,12 @@ fn linux_guest_mapped_regions(
     layout
         .guest_memory_map
         .iter()
-        .filter(|range| matches!(range.region_type.as_str(), "usable" | "mmio-stub"))
+        .filter(|range| {
+            matches!(
+                range.region_type.as_str(),
+                "usable" | "mmio-stub" | "framebuffer" | "input-queue"
+            )
+        })
         .map(|range| {
             let size: usize = range.size_bytes.try_into().map_err(|_| {
                 AppError::message(format!(
@@ -3495,12 +3506,13 @@ fn linux_guest_mapped_regions(
                     range.label
                 ))
             })?;
+            let label = match range.region_type.as_str() {
+                "usable" => format!("linux-ram-{}", range.label),
+                "framebuffer" | "input-queue" => range.label.clone(),
+                _ => format!("linux-{}", range.label),
+            };
             Ok(crate::native::NativeGuestMemoryRegion {
-                label: if range.region_type == "usable" {
-                    format!("linux-ram-{}", range.label)
-                } else {
-                    format!("linux-{}", range.label)
-                },
+                label,
                 guest_gpa: parse_guest_physical_address(&range.start_gpa)?,
                 bytes: vec![0_u8; size],
                 writable: true,
@@ -3634,7 +3646,7 @@ fn write_linux_e820_table(
         let start = parse_guest_physical_address(&range.start_gpa)?;
         let region_type = match range.region_type.as_str() {
             "usable" => 1,
-            "reserved" | "mmio-stub" => 2,
+            "reserved" | "mmio-stub" | "framebuffer" | "input-queue" => 2,
             other => {
                 return Err(AppError::message(format!(
                     "Unsupported Linux E820 range type `{other}` for `{}`.",
@@ -3706,6 +3718,10 @@ fn parse_guest_physical_address(value: &str) -> AppResult<u64> {
             "Guest physical address `{value}` is not valid hexadecimal."
         ))
     })
+}
+
+fn format_guest_physical_address(value: u64) -> String {
+    format!("0x{value:08x}")
 }
 
 fn register_kernel_boot_plan(
@@ -3905,7 +3921,7 @@ fn build_kernel_boot_layout(
     let linux_entry_point_gpa = is_linux_bzimage.then(|| metadata.kernel_load_gpa.clone());
     let linux_boot_params_register = is_linux_bzimage.then(|| "rsi".to_string());
     let linux_expected_entry_mode = is_linux_bzimage.then(|| "x86-protected-mode-32".to_string());
-    let guest_memory_map = if is_linux_bzimage {
+    let mut guest_memory_map = if is_linux_bzimage {
         default_linux_guest_memory_map(metadata.initramfs_bytes.unwrap_or(0))
     } else {
         Vec::new()
@@ -3916,6 +3932,10 @@ fn build_kernel_boot_layout(
         .unwrap_or_else(|_| default_framebuffer_contract());
     let input = read_json_file::<InputContract>(&paths.input_contract)
         .unwrap_or_else(|_| default_input_contract());
+    if is_linux_bzimage {
+        guest_memory_map.extend(runtime_contract_guest_memory_ranges(&framebuffer, &input)?);
+        validate_guest_memory_ranges_do_not_overlap(&guest_memory_map)?;
+    }
 
     let layout = KernelBootLayout {
         schema_version: 1,
@@ -3954,7 +3974,7 @@ fn build_kernel_boot_layout(
                 .to_string(),
             "When base OS and user disk artifacts are verified, this layout carries their root/user storage attachment into the boot contract."
                 .to_string(),
-            "The framebuffer and input contracts are metadata only until the WHP runner exposes those devices to the guest."
+            "The framebuffer and input contracts are mapped into guest memory by the WHP kernel-layout runner; they are not a full desktop device model yet."
                 .to_string(),
             "The next native milestone must map these guest physical addresses and prove serial boot output before GUI/display work."
                 .to_string(),
@@ -3997,6 +4017,55 @@ fn build_kernel_storage_attachment(
         readonly_base: true,
         writable_user_disk: true,
     }))
+}
+
+fn runtime_contract_guest_memory_ranges(
+    framebuffer: &FramebufferContract,
+    input: &InputContract,
+) -> AppResult<Vec<KernelGuestMemoryRange>> {
+    let framebuffer_gpa = parse_guest_physical_address(&framebuffer.guest_gpa)?;
+    let input_gpa = parse_guest_physical_address(&input.guest_queue_gpa)?;
+
+    Ok(vec![
+        KernelGuestMemoryRange {
+            label: "pane-framebuffer".to_string(),
+            start_gpa: format_guest_physical_address(framebuffer_gpa),
+            size_bytes: page_align_guest_range(framebuffer.size_bytes),
+            region_type: "framebuffer".to_string(),
+        },
+        KernelGuestMemoryRange {
+            label: "pane-input-queue".to_string(),
+            start_gpa: format_guest_physical_address(input_gpa),
+            size_bytes: page_align_guest_range(input.queue_size_bytes),
+            region_type: "input-queue".to_string(),
+        },
+    ])
+}
+
+fn validate_guest_memory_ranges_do_not_overlap(ranges: &[KernelGuestMemoryRange]) -> AppResult<()> {
+    let mut parsed = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        let start = parse_guest_physical_address(&range.start_gpa)?;
+        let end = start.checked_add(range.size_bytes).ok_or_else(|| {
+            AppError::message(format!("Guest range `{}` overflows.", range.label))
+        })?;
+        parsed.push((start, end, range.label.as_str()));
+    }
+
+    parsed.sort_by_key(|(start, _, _)| *start);
+    for window in parsed.windows(2) {
+        let [left, right] = window else {
+            continue;
+        };
+        if left.1 > right.0 {
+            return Err(AppError::message(format!(
+                "Guest memory ranges `{}` and `{}` overlap.",
+                left.2, right.2
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 fn default_linux_guest_memory_map(initramfs_bytes: u64) -> Vec<KernelGuestMemoryRange> {
@@ -4690,62 +4759,6 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
         })
         .unwrap_or(false);
     let kernel_boot_layout = read_json_file::<KernelBootLayout>(&paths.kernel_boot_layout).ok();
-    let kernel_boot_layout_ready = kernel_boot_layout
-        .as_ref()
-        .zip(kernel_boot_metadata.as_ref())
-        .map(|(layout, metadata)| {
-            kernel_boot_plan_ready
-                && layout.schema_version == 1
-                && layout.layout_kind == "pane-linux-kernel-boot-layout-v1"
-                && layout.boot_params_gpa == "0x00007000"
-                && layout.cmdline_gpa == "0x00020000"
-                && layout.kernel_load_gpa == metadata.kernel_load_gpa
-                && layout.initramfs_load_gpa == metadata.initramfs_load_gpa
-                && layout.kernel_path == paths.kernel_image.display().to_string()
-                && layout.kernel_bytes == metadata.kernel_bytes
-                && layout.kernel_sha256 == metadata.kernel_sha256
-                && layout.kernel_format == metadata.kernel_format
-                && layout.linux_boot_protocol == metadata.linux_boot_protocol
-                && layout.linux_setup_sectors == metadata.linux_setup_sectors
-                && layout.linux_setup_bytes == metadata.linux_setup_bytes
-                && layout.linux_protected_mode_offset == metadata.linux_protected_mode_offset
-                && layout.linux_protected_mode_bytes == metadata.linux_protected_mode_bytes
-                && layout.linux_loadflags == metadata.linux_loadflags
-                && layout.linux_preferred_load_address == metadata.linux_preferred_load_address
-                && layout.linux_entry_point_gpa
-                    == (metadata.kernel_format == "linux-bzimage")
-                        .then(|| metadata.kernel_load_gpa.clone())
-                && layout.linux_boot_params_register
-                    == (metadata.kernel_format == "linux-bzimage").then(|| "rsi".to_string())
-                && layout.linux_expected_entry_mode
-                    == (metadata.kernel_format == "linux-bzimage")
-                        .then(|| "x86-protected-mode-32".to_string())
-                && layout.guest_memory_map
-                    == if metadata.kernel_format == "linux-bzimage" {
-                        default_linux_guest_memory_map(metadata.initramfs_bytes.unwrap_or(0))
-                    } else {
-                        Vec::new()
-                    }
-                && layout.initramfs_path == metadata.initramfs_stored_path
-                && layout.initramfs_bytes == metadata.initramfs_bytes
-                && layout.initramfs_sha256 == metadata.initramfs_sha256
-                && layout.cmdline == metadata.cmdline
-                && layout.cmdline.contains("console=ttyS0")
-                && layout.expected_serial_device == "ttyS0"
-                && layout.framebuffer.as_ref().is_some_and(|contract| {
-                    contract.schema_version == 1
-                        && contract.device == "pane-linear-framebuffer-v1"
-                        && contract.size_bytes
-                            == u64::from(contract.stride_bytes) * u64::from(contract.height)
-                })
-                && layout.input.as_ref().is_some_and(|contract| {
-                    contract.schema_version == 1
-                        && contract.keyboard_device == "pane-ps2-keyboard-v1"
-                        && contract.pointer_device == "pane-absolute-pointer-v1"
-                })
-        })
-        .unwrap_or(false);
-
     let framebuffer_contract =
         read_json_file::<FramebufferContract>(&paths.framebuffer_contract).ok();
     let framebuffer_contract_ready = framebuffer_contract
@@ -4772,6 +4785,78 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
                 && contract.pointer_device == "pane-absolute-pointer-v1"
                 && contract.transport == "pane-host-event-queue"
                 && contract.coordinate_space == "framebuffer-pixels"
+                && contract.queue_size_bytes >= u64::from(contract.event_record_bytes)
+                && contract.event_record_bytes > 0
+                && parse_guest_physical_address(&contract.guest_queue_gpa).is_ok()
+        })
+        .unwrap_or(false);
+
+    let kernel_boot_layout_ready = kernel_boot_layout
+        .as_ref()
+        .zip(kernel_boot_metadata.as_ref())
+        .map(|(layout, metadata)| {
+            let expected_guest_memory_map = if metadata.kernel_format == "linux-bzimage" {
+                framebuffer_contract
+                    .as_ref()
+                    .zip(input_contract.as_ref())
+                    .and_then(|(framebuffer, input)| {
+                        let mut ranges =
+                            default_linux_guest_memory_map(metadata.initramfs_bytes.unwrap_or(0));
+                        ranges
+                            .extend(runtime_contract_guest_memory_ranges(framebuffer, input).ok()?);
+                        Some(ranges)
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+
+            kernel_boot_plan_ready
+                && layout.schema_version == 1
+                && layout.layout_kind == "pane-linux-kernel-boot-layout-v1"
+                && layout.boot_params_gpa == "0x00007000"
+                && layout.cmdline_gpa == "0x00020000"
+                && layout.kernel_load_gpa == metadata.kernel_load_gpa
+                && layout.initramfs_load_gpa == metadata.initramfs_load_gpa
+                && layout.kernel_path == paths.kernel_image.display().to_string()
+                && layout.kernel_bytes == metadata.kernel_bytes
+                && layout.kernel_sha256 == metadata.kernel_sha256
+                && layout.kernel_format == metadata.kernel_format
+                && layout.linux_boot_protocol == metadata.linux_boot_protocol
+                && layout.linux_setup_sectors == metadata.linux_setup_sectors
+                && layout.linux_setup_bytes == metadata.linux_setup_bytes
+                && layout.linux_protected_mode_offset == metadata.linux_protected_mode_offset
+                && layout.linux_protected_mode_bytes == metadata.linux_protected_mode_bytes
+                && layout.linux_loadflags == metadata.linux_loadflags
+                && layout.linux_preferred_load_address == metadata.linux_preferred_load_address
+                && layout.linux_entry_point_gpa
+                    == (metadata.kernel_format == "linux-bzimage")
+                        .then(|| metadata.kernel_load_gpa.clone())
+                && layout.linux_boot_params_register
+                    == (metadata.kernel_format == "linux-bzimage").then(|| "rsi".to_string())
+                && layout.linux_expected_entry_mode
+                    == (metadata.kernel_format == "linux-bzimage")
+                        .then(|| "x86-protected-mode-32".to_string())
+                && layout.guest_memory_map == expected_guest_memory_map
+                && layout.initramfs_path == metadata.initramfs_stored_path
+                && layout.initramfs_bytes == metadata.initramfs_bytes
+                && layout.initramfs_sha256 == metadata.initramfs_sha256
+                && layout.cmdline == metadata.cmdline
+                && layout.cmdline.contains("console=ttyS0")
+                && layout.expected_serial_device == "ttyS0"
+                && layout.framebuffer.as_ref().is_some_and(|contract| {
+                    contract.schema_version == 1
+                        && contract.device == "pane-linear-framebuffer-v1"
+                        && contract.size_bytes
+                            == u64::from(contract.stride_bytes) * u64::from(contract.height)
+                })
+                && layout.input.as_ref().is_some_and(|contract| {
+                    contract.schema_version == 1
+                        && contract.keyboard_device == "pane-ps2-keyboard-v1"
+                        && contract.pointer_device == "pane-absolute-pointer-v1"
+                        && contract.guest_queue_gpa == "0x0dff0000"
+                        && contract.queue_size_bytes == 0x00001000
+                })
         })
         .unwrap_or(false);
 
@@ -7732,6 +7817,8 @@ fn print_native_kernel_plan_report(report: &NativeKernelPlanReport) {
             println!("Input Contract");
             println!("  Keyboard       {}", input.keyboard_device);
             println!("  Pointer        {}", input.pointer_device);
+            println!("  Queue GPA      {}", input.guest_queue_gpa);
+            println!("  Queue Bytes    {}", input.queue_size_bytes);
         }
         println!("  Serial Device  {}", layout.expected_serial_device);
         println!("  Cmdline        {:?}", layout.cmdline);
@@ -8405,11 +8492,12 @@ mod tests {
         read_json_file, register_base_os_image, register_boot_loader_image,
         register_kernel_boot_plan, resolve_bundle_output_path, resolve_init_source,
         resolve_launch_target, resolve_managed_environment_for_reset, resolve_saved_launch,
-        resolve_session_context, resolve_status_distro, runtime_storage_budget, sha256_file,
-        status_port_for, validate_setup_password, validate_setup_username, windows_transport_check,
-        AppLifecyclePhase, AppNextAction, CheckStatus, DistroHealth, DoctorCheck, DoctorReport,
-        FramebufferContract, InitSource, KernelBootLayout, KernelBootMetadata, NativeRuntimeState,
-        StatusReport, WorkspaceHealth, WslInventory, EMBEDDED_APP_ASSETS,
+        resolve_session_context, resolve_status_distro, runtime_contract_guest_memory_ranges,
+        runtime_storage_budget, sha256_file, status_port_for, validate_setup_password,
+        validate_setup_username, windows_transport_check, AppLifecyclePhase, AppNextAction,
+        CheckStatus, DistroHealth, DoctorCheck, DoctorReport, FramebufferContract, InitSource,
+        KernelBootLayout, KernelBootMetadata, NativeRuntimeState, StatusReport, WorkspaceHealth,
+        WslInventory, EMBEDDED_APP_ASSETS,
     };
 
     fn empty_workspace_health() -> WorkspaceHealth {
@@ -8855,6 +8943,18 @@ mod tests {
                 && range.size_bytes == 0x00001000
                 && range.region_type == "reserved"
         }));
+        assert!(layout.guest_memory_map.iter().any(|range| {
+            range.label == "pane-framebuffer"
+                && range.start_gpa == "0x0e000000"
+                && range.size_bytes == 0x00300000
+                && range.region_type == "framebuffer"
+        }));
+        assert!(layout.guest_memory_map.iter().any(|range| {
+            range.label == "pane-input-queue"
+                && range.start_gpa == "0x0dff0000"
+                && range.size_bytes == 0x00001000
+                && range.region_type == "input-queue"
+        }));
         assert!(layout.materialized_at_epoch_seconds.is_some());
 
         let artifacts = build_runtime_artifact_report(&paths);
@@ -9065,6 +9165,11 @@ mod tests {
 
     #[test]
     fn linux_guest_mapped_regions_include_ram_and_apic_stubs() {
+        let framebuffer = default_framebuffer_contract();
+        let input = default_input_contract();
+        let mut guest_memory_map = default_linux_guest_memory_map(0);
+        guest_memory_map
+            .extend(runtime_contract_guest_memory_ranges(&framebuffer, &input).unwrap());
         let layout = KernelBootLayout {
             schema_version: 1,
             layout_kind: "pane-linux-kernel-boot-layout-v1".to_string(),
@@ -9087,7 +9192,7 @@ mod tests {
             linux_entry_point_gpa: Some("0x00100000".to_string()),
             linux_boot_params_register: Some("rsi".to_string()),
             linux_expected_entry_mode: Some("x86-protected-mode-32".to_string()),
-            guest_memory_map: default_linux_guest_memory_map(0),
+            guest_memory_map,
             initramfs_path: None,
             initramfs_bytes: None,
             initramfs_sha256: None,
@@ -9110,6 +9215,20 @@ mod tests {
         assert!(regions.iter().any(|region| {
             region.label == "linux-local-apic-mmio"
                 && region.guest_gpa == 0xfee0_0000
+                && region.writable
+                && !region.executable
+        }));
+        assert!(regions.iter().any(|region| {
+            region.label == "pane-framebuffer"
+                && region.guest_gpa == 0x0e00_0000
+                && region.bytes.len() == 0x0030_0000
+                && region.writable
+                && !region.executable
+        }));
+        assert!(regions.iter().any(|region| {
+            region.label == "pane-input-queue"
+                && region.guest_gpa == 0x0dff_0000
+                && region.bytes.len() == 0x0000_1000
                 && region.writable
                 && !region.executable
         }));

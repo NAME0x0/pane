@@ -20,8 +20,8 @@ Pane currently owns:
 - a verified kernel/initramfs boot-plan contract with a serial-console cmdline for the next WHP kernel-entry milestone,
 - a materialized kernel boot-layout contract for boot params, cmdline, kernel, and optional initramfs guest-memory placement,
 - a materialized storage attachment in the kernel layout when the verified Arch base image and Pane user disk are present,
-- a first Pane-owned framebuffer contract for the future app-rendered display boundary,
-- a first keyboard/pointer input contract for the future app-owned input path,
+- a first Pane-owned framebuffer contract mapped into guest memory for the future app-rendered display boundary,
+- a first keyboard/pointer input queue contract mapped into guest memory for the future app-owned input path,
 - native host preflight through `pane native-preflight`,
 - a guarded WHP partition/vCPU lifecycle smoke through `pane native-boot-spike --execute`,
 - a guarded WHP guest-memory/register/vCPU execution test image through `pane native-boot-spike --execute --run-fixture`,
@@ -71,12 +71,12 @@ It must remain side-effect-free. It reports blockers; it does not enable Windows
 3. Runtime-backed serial test image: materialize `serial-boot.paneimg` under the Pane runtime, map it as guest memory, configure vCPU registers, run it, decode the `PANE_BOOT_OK` COM1 banner across repeated I/O exits, observe HLT, unmap memory, and tear everything down cleanly.
 4. Runtime-provided boot-loader candidate: register a verified `boot-to-serial-loader.paneimg`, require a SHA-256 match and expected serial text, then execute that artifact through WHP with `--run-boot-loader`.
 5. Kernel boot plan: register a verified Linux kernel, inspect its bzImage header for boot-protocol/setup metadata, register an optional verified initramfs, and require an explicit `console=ttyS0` cmdline under `kernel-boot.json` without claiming it executes yet.
-6. Kernel boot layout: materialize `kernel-boot-layout.json` with boot params built from the original bzImage setup header plus Pane-owned loader fields, cmdline, bzImage setup bytes, protected-mode payload placement, explicit Linux entry metadata, an initial E820 guest memory map, and optional initramfs guest-physical addresses with the loaded initramfs range reserved in E820.
+6. Kernel boot layout: materialize `kernel-boot-layout.json` with boot params built from the original bzImage setup header plus Pane-owned loader fields, cmdline, bzImage setup bytes, protected-mode payload placement, explicit Linux entry metadata, an initial E820 guest memory map, mapped framebuffer/input queue ranges, and optional initramfs guest-physical addresses with the loaded initramfs range reserved in E820.
 7. Boot-to-serial spike: implement WHP kernel entry, boot parameters, initramfs placement, and serial output capture far enough to prove Linux boot progress.
 8. CPU and MMIO exit handling: configure the Linux 32-bit boot-protocol register contract with a stack in mapped low RAM, map a Pane-owned boot GDT, classify unhandled memory-access exits as blockers with exact access type/GPA/GVA diagnostics, pass WHP default CPUID results back to the guest, maintain a minimal guest MSR state for RDMSR/WRMSR, emulate the basic COM1 UART register behavior needed for early serial setup, map reserved IOAPIC/local APIC MMIO stub pages for early probes, and keep expanding the Linux boot CPU/device contract only when the next real exit demands it.
 9. Runtime artifact boot: connect the kernel path to Pane's verified Arch base image and Pane user disk descriptor. The layout now carries `/dev/pane0` as the read-only base OS device and `/dev/pane1` as writable user/package/customization storage when both artifacts are verified.
 10. Storage materialization: turn the descriptor into a durable block-device format with resize, snapshot, repair, export, and import semantics.
-11. Display milestone: add a Pane-owned framebuffer and input path inside the app window. The runtime now records the first fixed linear framebuffer and keyboard/pointer contracts; the WHP runner still has to expose them as real guest-visible devices.
+11. Display milestone: add a Pane-owned framebuffer and input path inside the app window. The runtime now records the first fixed linear framebuffer and keyboard/pointer contracts, and the WHP kernel-layout runner maps those memory ranges. The remaining work is making them active guest-visible devices and rendering the framebuffer in Pane's app surface.
 12. Integration milestone: add clipboard, file exchange boundaries, audio, resize, recovery, logging, and diagnostics.
 13. Compatibility milestone: measure performance, hardware requirements, Windows feature requirements, and failure modes before exposing the native runtime as a default.
 
@@ -92,7 +92,7 @@ Pane cannot claim the native runtime is real until:
 - `pane native-kernel-plan --materialize` can write and re-validate the deterministic kernel boot layout before the WHP runner maps those guest addresses,
 - materialized kernel layouts attach the verified base OS image and Pane user disk when both exist, instead of treating the kernel entry path as detached from future Arch storage,
 - runtime preparation writes explicit framebuffer and input contracts so display work has a stable guest/device boundary instead of an undefined "draw pixels somehow" milestone,
-- `pane native-boot-spike --execute --run-kernel-layout` can consume that layout, map boot params, cmdline, kernel, optional initramfs, non-overlapping RAM regions, reserved initramfs E820 placement, a boot-protocol GDT, and reserved APIC MMIO stub pages, then select the correct guest-entry contract: real-mode serial/HALT validation for the controlled candidate or a protected-mode Linux entry probe with boot params in `rsi` for a bzImage payload,
+- `pane native-boot-spike --execute --run-kernel-layout` can consume that layout, map boot params, cmdline, kernel, optional initramfs, non-overlapping RAM regions, reserved initramfs E820 placement, a boot-protocol GDT, reserved APIC MMIO stub pages, framebuffer memory, and input queue memory, then select the correct guest-entry contract: real-mode serial/HALT validation for the controlled candidate or a protected-mode Linux entry probe with boot params in `rsi` for a bzImage payload,
 - a test image can boot under a Pane-owned WHP host without WSL, XRDP, `mstsc.exe`, QEMU, VirtualBox, or Hyper-V Manager,
 - Pane can boot a verified Arch base image plus a Pane-owned user disk,
 - Pane renders the guest through its own app surface,

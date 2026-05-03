@@ -436,6 +436,7 @@ struct KernelStorageAttachment {
     user_disk_format: String,
     root_device: String,
     user_device: String,
+    contract_gpa: String,
     readonly_base: bool,
     writable_user_disk: bool,
 }
@@ -3581,7 +3582,7 @@ fn linux_guest_mapped_regions(
         .filter(|range| {
             matches!(
                 range.region_type.as_str(),
-                "usable" | "mmio-stub" | "framebuffer" | "input-queue"
+                "usable" | "mmio-stub" | "storage-contract" | "framebuffer" | "input-queue"
             )
         })
         .map(|range| {
@@ -3593,18 +3594,41 @@ fn linux_guest_mapped_regions(
             })?;
             let label = match range.region_type.as_str() {
                 "usable" => format!("linux-ram-{}", range.label),
-                "framebuffer" | "input-queue" => range.label.clone(),
+                "storage-contract" | "framebuffer" | "input-queue" => range.label.clone(),
                 _ => format!("linux-{}", range.label),
+            };
+            let bytes = if range.region_type == "storage-contract" {
+                layout
+                    .storage
+                    .as_ref()
+                    .map(storage_contract_page_bytes)
+                    .transpose()?
+                    .unwrap_or_else(|| vec![0_u8; size])
+            } else {
+                vec![0_u8; size]
             };
             Ok(crate::native::NativeGuestMemoryRegion {
                 label,
                 guest_gpa: parse_guest_physical_address(&range.start_gpa)?,
-                bytes: vec![0_u8; size],
+                bytes,
                 writable: true,
                 executable: range.region_type == "usable",
             })
         })
         .collect()
+}
+
+fn storage_contract_page_bytes(storage: &KernelStorageAttachment) -> AppResult<Vec<u8>> {
+    let mut page = vec![0_u8; 0x1000];
+    let mut payload = serde_json::to_vec(storage)?;
+    payload.push(0);
+    if payload.len() > page.len() {
+        return Err(AppError::message(
+            "Pane storage contract is too large for its guest discovery page.",
+        ));
+    }
+    page[..payload.len()].copy_from_slice(&payload);
+    Ok(page)
 }
 
 fn build_linux_boot_params_page(
@@ -3731,7 +3755,7 @@ fn write_linux_e820_table(
         let start = parse_guest_physical_address(&range.start_gpa)?;
         let region_type = match range.region_type.as_str() {
             "usable" => 1,
-            "reserved" | "mmio-stub" | "framebuffer" | "input-queue" => 2,
+            "reserved" | "mmio-stub" | "storage-contract" | "framebuffer" | "input-queue" => 2,
             other => {
                 return Err(AppError::message(format!(
                     "Unsupported Linux E820 range type `{other}` for `{}`.",
@@ -4018,6 +4042,9 @@ fn build_kernel_boot_layout(
     let input = read_json_file::<InputContract>(&paths.input_contract)
         .unwrap_or_else(|_| default_input_contract());
     if is_linux_bzimage {
+        if let Some(storage) = &storage {
+            guest_memory_map.push(storage_contract_guest_memory_range(storage)?);
+        }
         guest_memory_map.extend(runtime_contract_guest_memory_ranges(&framebuffer, &input)?);
         validate_guest_memory_ranges_do_not_overlap(&guest_memory_map)?;
     }
@@ -4103,9 +4130,22 @@ fn build_kernel_storage_attachment(
         user_disk_format: user_disk_metadata.format,
         root_device: "/dev/pane0".to_string(),
         user_device: "/dev/pane1".to_string(),
+        contract_gpa: "0x0dfe0000".to_string(),
         readonly_base: true,
         writable_user_disk: true,
     }))
+}
+
+fn storage_contract_guest_memory_range(
+    storage: &KernelStorageAttachment,
+) -> AppResult<KernelGuestMemoryRange> {
+    let storage_gpa = parse_guest_physical_address(&storage.contract_gpa)?;
+    Ok(KernelGuestMemoryRange {
+        label: "pane-storage-contract".to_string(),
+        start_gpa: format_guest_physical_address(storage_gpa),
+        size_bytes: 0x00001000,
+        region_type: "storage-contract".to_string(),
+    })
 }
 
 fn runtime_contract_guest_memory_ranges(
@@ -4891,6 +4931,9 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
                     .and_then(|(framebuffer, input)| {
                         let mut ranges =
                             default_linux_guest_memory_map(metadata.initramfs_bytes.unwrap_or(0));
+                        if let Some(storage) = &layout.storage {
+                            ranges.push(storage_contract_guest_memory_range(storage).ok()?);
+                        }
                         ranges
                             .extend(runtime_contract_guest_memory_ranges(framebuffer, input).ok()?);
                         Some(ranges)
@@ -7887,6 +7930,7 @@ fn print_native_kernel_plan_report(report: &NativeKernelPlanReport) {
             println!("  Base Image     {}", storage.base_os_path);
             println!("  User Device    {}", storage.user_device);
             println!("  User Disk      {}", storage.user_disk_path);
+            println!("  Contract GPA   {}", storage.contract_gpa);
             println!("  User Disk GiB  {}", storage.user_disk_capacity_gib);
             println!("  Block Size     {}", storage.user_disk_block_size_bytes);
             println!(
@@ -9476,6 +9520,7 @@ mod tests {
         let storage = layout.storage.as_ref().expect("storage attachment");
         assert_eq!(storage.root_device, "/dev/pane0");
         assert_eq!(storage.user_device, "/dev/pane1");
+        assert_eq!(storage.contract_gpa, "0x0dfe0000");
         assert!(storage.readonly_base);
         assert!(storage.writable_user_disk);
         assert_eq!(storage.base_os_sha256, base_sha);
@@ -9485,6 +9530,22 @@ mod tests {
         assert!(storage.user_disk_sparse_backing);
         assert_eq!(storage.user_disk_format, "pane-sparse-user-disk-v1");
         assert_eq!(storage.user_disk_header_sha256.len(), 64);
+        assert!(layout.guest_memory_map.iter().any(|range| {
+            range.label == "pane-storage-contract"
+                && range.start_gpa == "0x0dfe0000"
+                && range.region_type == "storage-contract"
+        }));
+        let mapped_regions = linux_guest_mapped_regions(&layout).unwrap();
+        let storage_contract = mapped_regions
+            .iter()
+            .find(|region| region.label == "pane-storage-contract")
+            .expect("storage contract region");
+        assert_eq!(storage_contract.guest_gpa, 0x0dfe_0000);
+        assert!(storage_contract.bytes.starts_with(b"{\"schema_version\":1"));
+        assert!(storage_contract
+            .bytes
+            .windows("/dev/pane1".len())
+            .any(|window| window == b"/dev/pane1"));
         assert_eq!(
             layout
                 .framebuffer

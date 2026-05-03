@@ -210,7 +210,7 @@ What exists today:
 - verified boot-to-serial loader candidate slot,
 - verified kernel/initramfs boot-plan metadata,
 - materialized Linux kernel boot layout,
-- kernel-layout attachment for the verified Arch base image plus Pane user disk,
+- kernel-layout attachment for the verified Arch base image plus Pane sparse user disk geometry,
 - fixed linear framebuffer contract mapped into guest memory for the future Pane-rendered display path,
 - keyboard/pointer input queue contract mapped into guest memory for the future app-owned input path,
 - Linux bzImage setup header copying into boot params,

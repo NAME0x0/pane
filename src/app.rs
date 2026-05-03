@@ -429,6 +429,10 @@ struct KernelStorageAttachment {
     base_os_bytes: u64,
     user_disk_path: String,
     user_disk_capacity_gib: u64,
+    user_disk_logical_size_bytes: u64,
+    user_disk_block_size_bytes: u64,
+    user_disk_sparse_backing: bool,
+    user_disk_header_sha256: String,
     user_disk_format: String,
     root_device: String,
     user_device: String,
@@ -4092,6 +4096,10 @@ fn build_kernel_storage_attachment(
         base_os_bytes: base_bytes,
         user_disk_path: user_disk_metadata.disk_path,
         user_disk_capacity_gib: user_disk_metadata.capacity_gib,
+        user_disk_logical_size_bytes: user_disk_metadata.logical_size_bytes,
+        user_disk_block_size_bytes: user_disk_metadata.block_size_bytes,
+        user_disk_sparse_backing: user_disk_metadata.sparse_backing,
+        user_disk_header_sha256: user_disk_metadata.header_sha256,
         user_disk_format: user_disk_metadata.format,
         root_device: "/dev/pane0".to_string(),
         user_device: "/dev/pane1".to_string(),
@@ -7879,6 +7887,12 @@ fn print_native_kernel_plan_report(report: &NativeKernelPlanReport) {
             println!("  Base Image     {}", storage.base_os_path);
             println!("  User Device    {}", storage.user_device);
             println!("  User Disk      {}", storage.user_disk_path);
+            println!("  User Disk GiB  {}", storage.user_disk_capacity_gib);
+            println!("  Block Size     {}", storage.user_disk_block_size_bytes);
+            println!(
+                "  Sparse Backing {}",
+                yes_no(storage.user_disk_sparse_backing)
+            );
         }
         if let Some(framebuffer) = &layout.framebuffer {
             println!("Display Contract");
@@ -9466,6 +9480,11 @@ mod tests {
         assert!(storage.writable_user_disk);
         assert_eq!(storage.base_os_sha256, base_sha);
         assert_eq!(storage.user_disk_capacity_gib, 3);
+        assert_eq!(storage.user_disk_logical_size_bytes, 3 * 1024 * 1024 * 1024);
+        assert_eq!(storage.user_disk_block_size_bytes, 4096);
+        assert!(storage.user_disk_sparse_backing);
+        assert_eq!(storage.user_disk_format, "pane-sparse-user-disk-v1");
+        assert_eq!(storage.user_disk_header_sha256.len(), 64);
         assert_eq!(
             layout
                 .framebuffer

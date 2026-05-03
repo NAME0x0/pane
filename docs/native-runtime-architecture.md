@@ -19,7 +19,7 @@ Pane currently owns:
 - a verified `boot-to-serial-loader.paneimg` candidate path for executing runtime-provided boot code under an explicit serial-output contract,
 - a verified kernel/initramfs boot-plan contract with a serial-console cmdline for the next WHP kernel-entry milestone,
 - a materialized kernel boot-layout contract for boot params, cmdline, kernel, and optional initramfs guest-memory placement,
-- a materialized storage attachment in the kernel layout when the verified Arch base image and Pane user disk are present,
+- a materialized storage attachment in the kernel layout when the verified Arch base image and Pane user disk are present, including sparse disk geometry and header verification data,
 - a first Pane-owned framebuffer contract mapped into guest memory for the future app-rendered display boundary,
 - a first keyboard/pointer input queue contract mapped into guest memory for the future app-owned input path,
 - native host preflight through `pane native-preflight`,
@@ -74,7 +74,7 @@ It must remain side-effect-free. It reports blockers; it does not enable Windows
 6. Kernel boot layout: materialize `kernel-boot-layout.json` with boot params built from the original bzImage setup header plus Pane-owned loader fields, cmdline, bzImage setup bytes, protected-mode payload placement, explicit Linux entry metadata, an initial E820 guest memory map, mapped framebuffer/input queue ranges, and optional initramfs guest-physical addresses with the loaded initramfs range reserved in E820.
 7. Boot-to-serial spike: implement WHP kernel entry, boot parameters, initramfs placement, and serial output capture far enough to prove Linux boot progress.
 8. CPU and MMIO exit handling: configure the Linux 32-bit boot-protocol register contract with a stack in mapped low RAM, map a Pane-owned boot GDT, classify unhandled memory-access exits as blockers with exact access type/GPA/GVA diagnostics, pass WHP default CPUID results back to the guest, maintain a minimal guest MSR state for RDMSR/WRMSR, emulate the basic COM1 UART register behavior needed for early serial setup, map reserved IOAPIC/local APIC MMIO stub pages for early probes, and keep expanding the Linux boot CPU/device contract only when the next real exit demands it.
-9. Runtime artifact boot: connect the kernel path to Pane's verified Arch base image and Pane sparse user disk. The layout now carries `/dev/pane0` as the read-only base OS device and `/dev/pane1` as writable user/package/customization storage when both artifacts are verified.
+9. Runtime artifact boot: connect the kernel path to Pane's verified Arch base image and Pane sparse user disk. The layout now carries `/dev/pane0` as the read-only base OS device and `/dev/pane1` as writable user/package/customization storage when both artifacts are verified, including sparse logical size, block size, backing mode, and header hash.
 10. Storage materialization: turn the descriptor into a durable block-device format with resize, snapshot, repair, export, and import semantics.
 11. Display milestone: add a Pane-owned framebuffer and input path inside the app window. The runtime now records the first fixed linear framebuffer and keyboard/pointer contracts, and the WHP kernel-layout runner maps those memory ranges. The remaining work is making them active guest-visible devices and rendering the framebuffer in Pane's app surface.
 12. Integration milestone: add clipboard, file exchange boundaries, audio, resize, recovery, logging, and diagnostics.

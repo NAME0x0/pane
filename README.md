@@ -41,7 +41,7 @@ Pane is a pre-release MVP. It is usable for the supported Arch + XFCE bridge pat
 | Display path | External Windows RDP client over XRDP, with Pane-managed connection assets and fallback handling. |
 | Shared files | PaneShared, durable by default and scratchable for disposable sessions. |
 | Supportability | Doctor checks, logs, repair/update/reset commands, and support bundles. |
-| Native runtime | WHP host preflight, serial boot fixture, boot-loader contract, kernel/initramfs plan, kernel layout, protected-mode entry probe, E820 map, COM1 probe model. |
+| Native runtime | WHP host preflight, serial boot fixture, boot-loader contract, kernel/initramfs plan, kernel layout, storage attachment, framebuffer/input contracts, protected-mode entry probe, E820 map, COM1 probe model. |
 | Not complete yet | Pane-owned Arch disk boot, native framebuffer/window, input, networking, audio, snapshots, and full GUI inside Pane's own renderer. |
 
 The project deliberately avoids claiming "zero latency", "full compatibility", or "contained VM" until the native boot, storage, and display milestones prove those properties.
@@ -210,6 +210,9 @@ What exists today:
 - verified boot-to-serial loader candidate slot,
 - verified kernel/initramfs boot-plan metadata,
 - materialized Linux kernel boot layout,
+- kernel-layout attachment for the verified Arch base image plus Pane user disk,
+- fixed linear framebuffer contract for the future Pane-rendered display path,
+- keyboard/pointer input contract for the future app-owned input path,
 - Linux bzImage setup header copying into boot params,
 - E820 memory map including boot params, GDT, initramfs, RAM, and APIC stubs,
 - protected-mode register handoff with boot params in `rsi`,

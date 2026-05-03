@@ -228,6 +228,8 @@ struct RuntimeDirectoryReport {
     runtime_config: String,
     native_manifest: String,
     kernel_boot_layout: String,
+    framebuffer_contract: String,
+    input_contract: String,
     manifest: String,
 }
 
@@ -285,6 +287,11 @@ struct RuntimeArtifactReport {
     kernel_boot_metadata_exists: bool,
     kernel_boot_layout_exists: bool,
     kernel_boot_layout_ready: bool,
+    framebuffer_contract_exists: bool,
+    framebuffer_contract_ready: bool,
+    framebuffer_resolution: Option<String>,
+    input_contract_exists: bool,
+    input_contract_ready: bool,
     user_disk_exists: bool,
     user_disk_capacity_gib: Option<u64>,
     user_disk_format: Option<String>,
@@ -399,6 +406,9 @@ struct KernelBootLayout {
     initramfs_sha256: Option<String>,
     cmdline: String,
     expected_serial_device: String,
+    storage: Option<KernelStorageAttachment>,
+    framebuffer: Option<FramebufferContract>,
+    input: Option<InputContract>,
     materialized_at_epoch_seconds: Option<u64>,
     notes: Vec<String>,
 }
@@ -409,6 +419,55 @@ struct KernelGuestMemoryRange {
     start_gpa: String,
     size_bytes: u64,
     region_type: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct KernelStorageAttachment {
+    schema_version: u32,
+    base_os_path: String,
+    base_os_sha256: String,
+    base_os_bytes: u64,
+    user_disk_path: String,
+    user_disk_capacity_gib: u64,
+    user_disk_format: String,
+    root_device: String,
+    user_device: String,
+    readonly_base: bool,
+    writable_user_disk: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct FramebufferContract {
+    schema_version: u32,
+    device: String,
+    width: u32,
+    height: u32,
+    stride_bytes: u32,
+    bytes_per_pixel: u32,
+    format: String,
+    guest_gpa: String,
+    size_bytes: u64,
+    resize_policy: String,
+}
+
+impl FramebufferContract {
+    fn resolution_label(&self) -> String {
+        format!(
+            "{}x{}x{}",
+            self.width,
+            self.height,
+            self.bytes_per_pixel * 8
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct InputContract {
+    schema_version: u32,
+    keyboard_device: String,
+    pointer_device: String,
+    transport: String,
+    coordinate_space: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1599,6 +1658,8 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
         prepare_runtime_paths(&paths)?;
         write_runtime_config(&paths, &session_name, &budget)?;
         write_native_runtime_manifest(&paths, &session_name)?;
+        write_framebuffer_contract(&paths)?;
+        write_input_contract(&paths)?;
     }
 
     if let Some(source_image) = args.register_base_image.as_deref() {
@@ -1717,6 +1778,8 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
         prepare_runtime_paths(&runtime_paths)?;
         write_runtime_config(&runtime_paths, &session_name, &runtime_budget)?;
         write_native_runtime_manifest(&runtime_paths, &session_name)?;
+        write_framebuffer_contract(&runtime_paths)?;
+        write_input_contract(&runtime_paths)?;
         create_serial_boot_image_artifact(&runtime_paths, false)?;
         let image = load_serial_boot_image_artifact(&runtime_paths)?;
         runtime = build_runtime_report(&session_name, DEFAULT_RUNTIME_CAPACITY_GIB, false)?;
@@ -1956,6 +2019,15 @@ fn native_kernel_plan(args: NativeKernelPlanArgs) -> AppResult<()> {
                 .to_string(),
         );
     }
+    if !runtime.artifacts.framebuffer_contract_ready {
+        blockers.push(
+            "No valid Pane framebuffer contract exists. Run `pane runtime --prepare`.".to_string(),
+        );
+    }
+    if !runtime.artifacts.input_contract_ready {
+        blockers
+            .push("No valid Pane input contract exists. Run `pane runtime --prepare`.".to_string());
+    }
 
     let layout = if blockers.is_empty() {
         Some(build_kernel_boot_layout(
@@ -1981,6 +2053,10 @@ fn native_kernel_plan(args: NativeKernelPlanArgs) -> AppResult<()> {
         blockers,
         next_steps: vec![
             "Implement WHP mapping for boot params, cmdline, kernel, and optional initramfs using this layout."
+                .to_string(),
+            "When storage artifacts are verified, expose the attached base OS image as the read-only root device and the Pane user disk as writable user/package storage."
+                .to_string(),
+            "Expose the framebuffer and input contracts as guest-visible devices before attempting a desktop session."
                 .to_string(),
             "Enter the Linux boot protocol only after serial console output can be captured deterministically."
                 .to_string(),
@@ -2724,6 +2800,8 @@ fn build_runtime_report(
             &runtime_storage_budget(capacity_gib),
         )?;
         write_native_runtime_manifest(&paths, &normalized_session)?;
+        write_framebuffer_contract(&paths)?;
+        write_input_contract(&paths)?;
     }
 
     let prepared = runtime_paths_prepared(&paths);
@@ -2763,6 +2841,8 @@ fn build_runtime_report(
             runtime_config: paths.runtime_config.display().to_string(),
             native_manifest: paths.native_manifest.display().to_string(),
             kernel_boot_layout: paths.kernel_boot_layout.display().to_string(),
+            framebuffer_contract: paths.framebuffer_contract.display().to_string(),
+            input_contract: paths.input_contract.display().to_string(),
             manifest: paths.manifest.display().to_string(),
         },
         storage_budget: budget,
@@ -2787,6 +2867,10 @@ fn build_runtime_report(
             "Register a verified kernel/initramfs boot plan with `pane runtime --register-kernel` and an explicit serial console cmdline."
                 .to_string(),
             "Materialize the WHP kernel boot layout with `pane native-kernel-plan --materialize`."
+                .to_string(),
+            "Use the kernel layout storage attachment to connect the verified Arch base image and Pane user disk to the native boot path."
+                .to_string(),
+            "Use the framebuffer/input contracts as the first Pane-owned display boundary before attempting a full desktop compositor."
                 .to_string(),
             "Replace the prepared kernel boot plan with actual WHP kernel entry, boot params, initramfs placement, and serial output capture."
                 .to_string(),
@@ -2850,7 +2934,46 @@ fn prepare_runtime_paths(paths: &RuntimePaths) -> AppResult<()> {
         fs::create_dir_all(path)?;
     }
 
+    write_framebuffer_contract(paths)?;
+    write_input_contract(paths)?;
+
     Ok(())
+}
+
+fn default_framebuffer_contract() -> FramebufferContract {
+    let width = 1024;
+    let height = 768;
+    let bytes_per_pixel = 4;
+    FramebufferContract {
+        schema_version: 1,
+        device: "pane-linear-framebuffer-v1".to_string(),
+        width,
+        height,
+        stride_bytes: width * bytes_per_pixel,
+        bytes_per_pixel,
+        format: "x8r8g8b8".to_string(),
+        guest_gpa: "0x0e000000".to_string(),
+        size_bytes: u64::from(width * height * bytes_per_pixel),
+        resize_policy: "fixed-until-display-device-milestone".to_string(),
+    }
+}
+
+fn default_input_contract() -> InputContract {
+    InputContract {
+        schema_version: 1,
+        keyboard_device: "pane-ps2-keyboard-v1".to_string(),
+        pointer_device: "pane-absolute-pointer-v1".to_string(),
+        transport: "pane-host-event-queue".to_string(),
+        coordinate_space: "framebuffer-pixels".to_string(),
+    }
+}
+
+fn write_framebuffer_contract(paths: &RuntimePaths) -> AppResult<()> {
+    write_json_file(&paths.framebuffer_contract, &default_framebuffer_contract())
+}
+
+fn write_input_contract(paths: &RuntimePaths) -> AppResult<()> {
+    write_json_file(&paths.input_contract, &default_input_contract())
 }
 
 fn runtime_paths_prepared(paths: &RuntimePaths) -> bool {
@@ -3787,6 +3910,12 @@ fn build_kernel_boot_layout(
     } else {
         Vec::new()
     };
+    let artifact_report = build_runtime_artifact_report(paths);
+    let storage = build_kernel_storage_attachment(paths, &artifact_report)?;
+    let framebuffer = read_json_file::<FramebufferContract>(&paths.framebuffer_contract)
+        .unwrap_or_else(|_| default_framebuffer_contract());
+    let input = read_json_file::<InputContract>(&paths.input_contract)
+        .unwrap_or_else(|_| default_input_contract());
 
     let layout = KernelBootLayout {
         schema_version: 1,
@@ -3816,9 +3945,16 @@ fn build_kernel_boot_layout(
         initramfs_sha256: metadata.initramfs_sha256,
         cmdline: metadata.cmdline,
         expected_serial_device: metadata.expected_serial_device,
+        storage,
+        framebuffer: Some(framebuffer),
+        input: Some(input),
         materialized_at_epoch_seconds: materialize.then(current_epoch_seconds),
         notes: vec![
             "This layout is Pane's deterministic handoff from artifact registration to the WHP Linux boot-protocol runner."
+                .to_string(),
+            "When base OS and user disk artifacts are verified, this layout carries their root/user storage attachment into the boot contract."
+                .to_string(),
+            "The framebuffer and input contracts are metadata only until the WHP runner exposes those devices to the guest."
                 .to_string(),
             "The next native milestone must map these guest physical addresses and prove serial boot output before GUI/display work."
                 .to_string(),
@@ -3830,6 +3966,37 @@ fn build_kernel_boot_layout(
     }
 
     Ok(layout)
+}
+
+fn build_kernel_storage_attachment(
+    paths: &RuntimePaths,
+    artifacts: &RuntimeArtifactReport,
+) -> AppResult<Option<KernelStorageAttachment>> {
+    if !artifacts.base_os_image_verified || !artifacts.user_disk_ready {
+        return Ok(None);
+    }
+
+    let user_disk_metadata = read_json_file::<UserDiskMetadata>(&paths.user_disk_metadata)?;
+    let base_sha256 = artifacts.base_os_image_sha256.clone().ok_or_else(|| {
+        AppError::message("Verified base OS image is missing its recorded SHA-256 digest.")
+    })?;
+    let base_bytes = artifacts.base_os_image_bytes.ok_or_else(|| {
+        AppError::message("Verified base OS image is missing its recorded byte length.")
+    })?;
+
+    Ok(Some(KernelStorageAttachment {
+        schema_version: 1,
+        base_os_path: paths.base_os_image.display().to_string(),
+        base_os_sha256: base_sha256,
+        base_os_bytes: base_bytes,
+        user_disk_path: user_disk_metadata.disk_path,
+        user_disk_capacity_gib: user_disk_metadata.capacity_gib,
+        user_disk_format: user_disk_metadata.format,
+        root_device: "/dev/pane0".to_string(),
+        user_device: "/dev/pane1".to_string(),
+        readonly_base: true,
+        writable_user_disk: true,
+    }))
 }
 
 fn default_linux_guest_memory_map(initramfs_bytes: u64) -> Vec<KernelGuestMemoryRange> {
@@ -4397,7 +4564,9 @@ fn write_native_runtime_manifest(paths: &RuntimePaths, session_name: &str) -> Ap
             "kernel_boot_metadata": paths.kernel_boot_metadata.display().to_string(),
             "kernel_boot_layout": paths.kernel_boot_layout.display().to_string(),
             "user_disk": paths.user_disk.display().to_string(),
-            "user_disk_metadata": paths.user_disk_metadata.display().to_string()
+            "user_disk_metadata": paths.user_disk_metadata.display().to_string(),
+            "framebuffer_contract": paths.framebuffer_contract.display().to_string(),
+            "input_contract": paths.input_contract.display().to_string()
         },
         "blockers": [
             "verified base OS image must exist before native boot",
@@ -4406,6 +4575,8 @@ fn write_native_runtime_manifest(paths: &RuntimePaths, session_name: &str) -> Ap
             "verified kernel boot plan must exist before WHP kernel-entry execution",
             "kernel boot layout must be materialized before WHP kernel-entry execution",
             "Pane user disk descriptor must exist before native boot",
+            "Pane framebuffer contract must exist before native display work",
+            "Pane input contract must exist before native display work",
             "Windows Hypervisor Platform host preflight must pass before the boot spike",
             "Pane-owned WHP boot engine is not implemented",
             "Pane-owned display transport is not implemented"
@@ -4561,6 +4732,46 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
                 && layout.cmdline == metadata.cmdline
                 && layout.cmdline.contains("console=ttyS0")
                 && layout.expected_serial_device == "ttyS0"
+                && layout.framebuffer.as_ref().is_some_and(|contract| {
+                    contract.schema_version == 1
+                        && contract.device == "pane-linear-framebuffer-v1"
+                        && contract.size_bytes
+                            == u64::from(contract.stride_bytes) * u64::from(contract.height)
+                })
+                && layout.input.as_ref().is_some_and(|contract| {
+                    contract.schema_version == 1
+                        && contract.keyboard_device == "pane-ps2-keyboard-v1"
+                        && contract.pointer_device == "pane-absolute-pointer-v1"
+                })
+        })
+        .unwrap_or(false);
+
+    let framebuffer_contract =
+        read_json_file::<FramebufferContract>(&paths.framebuffer_contract).ok();
+    let framebuffer_contract_ready = framebuffer_contract
+        .as_ref()
+        .map(|contract| {
+            contract.schema_version == 1
+                && contract.device == "pane-linear-framebuffer-v1"
+                && contract.width > 0
+                && contract.height > 0
+                && contract.bytes_per_pixel == 4
+                && contract.stride_bytes == contract.width * contract.bytes_per_pixel
+                && contract.size_bytes
+                    == u64::from(contract.stride_bytes) * u64::from(contract.height)
+                && parse_guest_physical_address(&contract.guest_gpa).is_ok()
+        })
+        .unwrap_or(false);
+
+    let input_contract = read_json_file::<InputContract>(&paths.input_contract).ok();
+    let input_contract_ready = input_contract
+        .as_ref()
+        .map(|contract| {
+            contract.schema_version == 1
+                && contract.keyboard_device == "pane-ps2-keyboard-v1"
+                && contract.pointer_device == "pane-absolute-pointer-v1"
+                && contract.transport == "pane-host-event-queue"
+                && contract.coordinate_space == "framebuffer-pixels"
         })
         .unwrap_or(false);
 
@@ -4634,6 +4845,13 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
         kernel_boot_metadata_exists: paths.kernel_boot_metadata.is_file(),
         kernel_boot_layout_exists: paths.kernel_boot_layout.is_file(),
         kernel_boot_layout_ready,
+        framebuffer_contract_exists: paths.framebuffer_contract.is_file(),
+        framebuffer_contract_ready,
+        framebuffer_resolution: framebuffer_contract
+            .as_ref()
+            .map(FramebufferContract::resolution_label),
+        input_contract_exists: paths.input_contract.is_file(),
+        input_contract_ready,
         user_disk_exists: paths.user_disk.is_file(),
         user_disk_capacity_gib: user_disk_metadata
             .as_ref()
@@ -4685,6 +4903,18 @@ fn build_native_runtime_report(
                     .to_string(),
             );
         }
+        if !artifacts.framebuffer_contract_ready {
+            blockers.push(
+                "No valid Pane framebuffer contract exists. Run `pane runtime --prepare` to write the first display boundary contract."
+                    .to_string(),
+            );
+        }
+        if !artifacts.input_contract_ready {
+            blockers.push(
+                "No valid Pane input contract exists. Run `pane runtime --prepare` to write the keyboard/pointer boundary contract."
+                    .to_string(),
+            );
+        }
 
         if !artifacts.base_os_image_exists {
             NativeRuntimeState::MissingBaseImage
@@ -4728,6 +4958,8 @@ fn build_native_runtime_report(
         && artifacts.serial_boot_image_ready
         && artifacts.runtime_config_exists
         && artifacts.native_manifest_exists
+        && artifacts.framebuffer_contract_ready
+        && artifacts.input_contract_ready
         && native_host.ready_for_boot_spike;
 
     NativeRuntimeReport {
@@ -7137,6 +7369,11 @@ fn print_runtime_report(report: &RuntimeReport) {
         report.directories.kernel_boot_metadata
     );
     println!("  Kernel Layout {}", report.directories.kernel_boot_layout);
+    println!(
+        "  Framebuffer    {}",
+        report.directories.framebuffer_contract
+    );
+    println!("  Input          {}", report.directories.input_contract);
     println!("  Disk Metadata  {}", report.directories.user_disk_metadata);
     println!("  Runtime Config {}", report.directories.runtime_config);
     println!("  Native Manifest {}", report.directories.native_manifest);
@@ -7237,6 +7474,17 @@ fn print_runtime_report(report: &RuntimeReport) {
     println!(
         "  Kernel Layout  {}",
         yes_no(report.artifacts.kernel_boot_layout_ready)
+    );
+    println!(
+        "  Framebuffer    {}",
+        yes_no(report.artifacts.framebuffer_contract_ready)
+    );
+    if let Some(resolution) = &report.artifacts.framebuffer_resolution {
+        println!("  FB Resolution  {}", resolution);
+    }
+    println!(
+        "  Input Contract {}",
+        yes_no(report.artifacts.input_contract_ready)
     );
     if let Some(cmdline) = &report.artifacts.kernel_cmdline {
         println!("  Kernel Cmdline {:?}", cmdline);
@@ -7466,6 +7714,24 @@ fn print_native_kernel_plan_report(report: &NativeKernelPlanReport) {
                     range.label, range.start_gpa, range.size_bytes, range.region_type
                 );
             }
+        }
+        if let Some(storage) = &layout.storage {
+            println!("Storage");
+            println!("  Root Device    {}", storage.root_device);
+            println!("  Base Image     {}", storage.base_os_path);
+            println!("  User Device    {}", storage.user_device);
+            println!("  User Disk      {}", storage.user_disk_path);
+        }
+        if let Some(framebuffer) = &layout.framebuffer {
+            println!("Display Contract");
+            println!("  Device         {}", framebuffer.device);
+            println!("  Resolution     {}", framebuffer.resolution_label());
+            println!("  Guest GPA      {}", framebuffer.guest_gpa);
+        }
+        if let Some(input) = &layout.input {
+            println!("Input Contract");
+            println!("  Keyboard       {}", input.keyboard_device);
+            println!("  Pointer        {}", input.pointer_device);
         }
         println!("  Serial Device  {}", layout.expected_serial_device);
         println!("  Cmdline        {:?}", layout.cmdline);
@@ -8131,19 +8397,19 @@ mod tests {
         build_kernel_boot_layout, build_linux_boot_params_page, build_native_runtime_report,
         build_runtime_artifact_report, build_steps, build_update_steps,
         create_serial_boot_image_artifact, create_user_disk_descriptor,
-        default_linux_guest_memory_map, determine_app_lifecycle, ensure_wsl_conf_setting,
-        format_doctor_blockers, initialize_managed_arch_environment, inspect_kernel_image_artifact,
-        inspect_workspace, inventory_contains_distro, kernel_layout_execution_image,
-        linux_guest_mapped_regions, load_kernel_layout_boot_image_artifact,
-        parse_guest_physical_address, preferred_transport, read_json_file, register_base_os_image,
-        register_boot_loader_image, register_kernel_boot_plan, resolve_bundle_output_path,
-        resolve_init_source, resolve_launch_target, resolve_managed_environment_for_reset,
-        resolve_saved_launch, resolve_session_context, resolve_status_distro,
-        runtime_storage_budget, sha256_file, status_port_for, validate_setup_password,
-        validate_setup_username, windows_transport_check, AppLifecyclePhase, AppNextAction,
-        CheckStatus, DistroHealth, DoctorCheck, DoctorReport, InitSource, KernelBootLayout,
-        KernelBootMetadata, NativeRuntimeState, StatusReport, WorkspaceHealth, WslInventory,
-        EMBEDDED_APP_ASSETS,
+        default_framebuffer_contract, default_input_contract, default_linux_guest_memory_map,
+        determine_app_lifecycle, ensure_wsl_conf_setting, format_doctor_blockers,
+        initialize_managed_arch_environment, inspect_kernel_image_artifact, inspect_workspace,
+        inventory_contains_distro, kernel_layout_execution_image, linux_guest_mapped_regions,
+        load_kernel_layout_boot_image_artifact, parse_guest_physical_address, preferred_transport,
+        read_json_file, register_base_os_image, register_boot_loader_image,
+        register_kernel_boot_plan, resolve_bundle_output_path, resolve_init_source,
+        resolve_launch_target, resolve_managed_environment_for_reset, resolve_saved_launch,
+        resolve_session_context, resolve_status_distro, runtime_storage_budget, sha256_file,
+        status_port_for, validate_setup_password, validate_setup_username, windows_transport_check,
+        AppLifecyclePhase, AppNextAction, CheckStatus, DistroHealth, DoctorCheck, DoctorReport,
+        FramebufferContract, InitSource, KernelBootLayout, KernelBootMetadata, NativeRuntimeState,
+        StatusReport, WorkspaceHealth, WslInventory, EMBEDDED_APP_ASSETS,
     };
 
     fn empty_workspace_health() -> WorkspaceHealth {
@@ -8189,6 +8455,8 @@ mod tests {
             user_disk_metadata: state.join("user-disk.json"),
             runtime_config: root.join("pane-runtime.config.json"),
             native_manifest: root.join("pane-native-runtime.json"),
+            framebuffer_contract: state.join("framebuffer-contract.json"),
+            input_contract: state.join("input-contract.json"),
             manifest: root.join("pane-runtime.json"),
             downloads,
             images,
@@ -8386,6 +8654,14 @@ mod tests {
         assert!(artifacts.serial_boot_image_exists);
         assert!(artifacts.serial_boot_metadata_exists);
         assert!(artifacts.serial_boot_image_ready);
+        assert!(artifacts.framebuffer_contract_exists);
+        assert!(artifacts.framebuffer_contract_ready);
+        assert_eq!(
+            artifacts.framebuffer_resolution.as_deref(),
+            Some("1024x768x32")
+        );
+        assert!(artifacts.input_contract_exists);
+        assert!(artifacts.input_contract_ready);
         assert_eq!(
             artifacts.serial_boot_banner.as_deref(),
             Some(crate::native::SERIAL_BOOT_BANNER_TEXT)
@@ -8667,6 +8943,9 @@ mod tests {
             initramfs_sha256: Some("1".repeat(64)),
             cmdline: "console=ttyS0 panic=-1".to_string(),
             expected_serial_device: "ttyS0".to_string(),
+            storage: None,
+            framebuffer: Some(default_framebuffer_contract()),
+            input: Some(default_input_contract()),
             materialized_at_epoch_seconds: Some(1),
             notes: Vec::new(),
         };
@@ -8758,6 +9037,9 @@ mod tests {
             initramfs_sha256: None,
             cmdline: "console=ttyS0 panic=-1".to_string(),
             expected_serial_device: "ttyS0".to_string(),
+            storage: None,
+            framebuffer: Some(default_framebuffer_contract()),
+            input: Some(default_input_contract()),
             materialized_at_epoch_seconds: Some(1),
             notes: Vec::new(),
         };
@@ -8811,6 +9093,9 @@ mod tests {
             initramfs_sha256: None,
             cmdline: "console=ttyS0 panic=-1".to_string(),
             expected_serial_device: "ttyS0".to_string(),
+            storage: None,
+            framebuffer: Some(default_framebuffer_contract()),
+            input: Some(default_input_contract()),
             materialized_at_epoch_seconds: Some(1),
             notes: Vec::new(),
         };
@@ -8890,6 +9175,8 @@ mod tests {
         assert!(artifacts.user_disk_exists);
         assert!(artifacts.user_disk_ready);
         assert_eq!(artifacts.user_disk_capacity_gib, Some(3));
+        assert!(artifacts.framebuffer_contract_ready);
+        assert!(artifacts.input_contract_ready);
         assert!(artifacts.serial_boot_image_exists);
         assert!(artifacts.serial_boot_image_ready);
         assert_eq!(
@@ -8905,6 +9192,60 @@ mod tests {
             .blockers
             .iter()
             .any(|blocker| blocker.contains("No valid Pane-owned user disk")));
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn kernel_boot_layout_attaches_verified_storage_and_display_contracts() {
+        let paths = temp_runtime_paths("kernel-layout-storage-display");
+        super::prepare_runtime_paths(&paths).unwrap();
+        let base = paths.downloads.join("arch-base.img");
+        let kernel = paths.downloads.join("vmlinuz-linux");
+        std::fs::write(&base, b"pane arch base image").unwrap();
+        std::fs::write(&kernel, fake_linux_bzimage()).unwrap();
+        let base_sha = sha256_file(&base).unwrap();
+        let kernel_sha = sha256_file(&kernel).unwrap();
+
+        register_base_os_image(&paths, &base, Some(&base_sha), false).unwrap();
+        create_user_disk_descriptor(&paths, &runtime_storage_budget(8), false).unwrap();
+        register_kernel_boot_plan(
+            &paths,
+            Some(&kernel),
+            Some(&kernel_sha),
+            None,
+            None,
+            Some("console=ttyS0 root=/dev/pane0 rw"),
+            false,
+        )
+        .unwrap();
+
+        let layout = build_kernel_boot_layout(&paths, "pane", true).unwrap();
+        let storage = layout.storage.as_ref().expect("storage attachment");
+        assert_eq!(storage.root_device, "/dev/pane0");
+        assert_eq!(storage.user_device, "/dev/pane1");
+        assert!(storage.readonly_base);
+        assert!(storage.writable_user_disk);
+        assert_eq!(storage.base_os_sha256, base_sha);
+        assert_eq!(storage.user_disk_capacity_gib, 3);
+        assert_eq!(
+            layout
+                .framebuffer
+                .as_ref()
+                .map(FramebufferContract::resolution_label)
+                .as_deref(),
+            Some("1024x768x32")
+        );
+        assert_eq!(
+            layout
+                .input
+                .as_ref()
+                .map(|contract| contract.pointer_device.as_str()),
+            Some("pane-absolute-pointer-v1")
+        );
+
+        let artifacts = build_runtime_artifact_report(&paths);
+        assert!(artifacts.kernel_boot_layout_ready);
 
         let _ = std::fs::remove_dir_all(&paths.root);
     }

@@ -49,6 +49,8 @@ pub struct RuntimePaths {
     pub runtime_config: PathBuf,
     pub native_manifest: PathBuf,
     pub kernel_boot_layout: PathBuf,
+    pub framebuffer_contract: PathBuf,
+    pub input_contract: PathBuf,
     pub manifest: PathBuf,
 }
 
@@ -158,6 +160,8 @@ pub fn runtime_for(session_name: &str) -> RuntimePaths {
         runtime_config: root.join("pane-runtime.config.json"),
         native_manifest: root.join("pane-native-runtime.json"),
         kernel_boot_layout: state.join("kernel-boot-layout.json"),
+        framebuffer_contract: state.join("framebuffer-contract.json"),
+        input_contract: state.join("input-contract.json"),
         manifest: root.join("pane-runtime.json"),
         downloads,
         images,
@@ -384,6 +388,19 @@ mod tests {
                 "state",
                 "kernel-boot-layout.json",
             ],
+        );
+        assert_path_ends_with(
+            &runtime.framebuffer_contract,
+            &[
+                "runtime",
+                "pane-session",
+                "state",
+                "framebuffer-contract.json",
+            ],
+        );
+        assert_path_ends_with(
+            &runtime.input_contract,
+            &["runtime", "pane-session", "state", "input-contract.json"],
         );
         assert_path_ends_with(&runtime.engines, &["runtime", "pane-session", "engines"]);
         assert_path_ends_with(&runtime.logs, &["runtime", "pane-session", "logs"]);

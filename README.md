@@ -206,6 +206,7 @@ What exists today:
 - runtime storage reservation under `%LOCALAPPDATA%\Pane\runtime\<session>`,
 - verified base-image metadata slot,
 - sparse Pane user disk artifact for future Linux packages, accounts, and customization data,
+- sparse user disk block I/O primitive with zero-fill semantics for the future WHP block-device handler,
 - runtime-backed serial boot image,
 - verified boot-to-serial loader candidate slot,
 - verified kernel/initramfs boot-plan metadata,

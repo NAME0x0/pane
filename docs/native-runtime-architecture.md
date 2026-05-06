@@ -15,6 +15,7 @@ Pane currently owns:
 - dedicated runtime storage under `%LOCALAPPDATA%\Pane\runtime\<session>`,
 - base OS image registration and SHA-256 verification metadata,
 - a sparse Pane user disk artifact for future Linux system, package, account, and customization data,
+- a sparse user disk block I/O primitive with zero-filled unallocated blocks for the future WHP block-device handler,
 - a runtime-backed `serial-boot.paneimg` test image plus SHA-256 metadata for the WHP boot-spike runner,
 - a verified `boot-to-serial-loader.paneimg` candidate path for executing runtime-provided boot code under an explicit serial-output contract,
 - a verified kernel/initramfs boot-plan contract with a serial-console cmdline for the next WHP kernel-entry milestone,

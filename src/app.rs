@@ -2,7 +2,7 @@
 
 use std::{
     fs::{self, OpenOptions},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -478,7 +478,7 @@ struct InputContract {
     event_record_bytes: u32,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct UserDiskMetadata {
     schema_version: u32,
     format: String,
@@ -3193,13 +3193,105 @@ fn user_disk_artifact_ready(paths: &RuntimePaths, metadata: &Option<UserDiskMeta
         return false;
     }
 
-    let Ok(header) = fs::read(&paths.user_disk) else {
+    let Ok(mut file) = OpenOptions::new().read(true).open(&paths.user_disk) else {
         return false;
     };
+    let Ok(header_len) = usize::try_from(metadata.allocated_header_bytes) else {
+        return false;
+    };
+    let mut header = vec![0_u8; header_len];
+    if file.read_exact(&mut header).is_err() {
+        return false;
+    }
 
-    header.len() as u64 == metadata.allocated_header_bytes
-        && header.starts_with(PANE_USER_DISK_MAGIC.as_bytes())
+    header.starts_with(PANE_USER_DISK_MAGIC.as_bytes())
         && sha256_bytes(&header) == metadata.header_sha256
+}
+
+#[allow(dead_code)] // Covered by tests; used by the upcoming WHP block-device handler.
+fn user_disk_data_offset(metadata: &UserDiskMetadata) -> u64 {
+    page_align_guest_range(metadata.allocated_header_bytes)
+}
+
+#[allow(dead_code)] // Covered by tests; used by the upcoming WHP block-device handler.
+fn user_disk_total_blocks(metadata: &UserDiskMetadata) -> u64 {
+    metadata.logical_size_bytes / metadata.block_size_bytes
+}
+
+#[allow(dead_code)] // Covered by tests; used by the upcoming WHP block-device handler.
+fn user_disk_block_offset(metadata: &UserDiskMetadata, block_index: u64) -> AppResult<u64> {
+    if block_index >= user_disk_total_blocks(metadata) {
+        return Err(AppError::message(format!(
+            "Pane user disk block {block_index} is outside the logical disk size."
+        )));
+    }
+
+    user_disk_data_offset(metadata)
+        .checked_add(block_index.saturating_mul(metadata.block_size_bytes))
+        .ok_or_else(|| AppError::message("Pane user disk block offset overflowed."))
+}
+
+#[allow(dead_code)] // Covered by tests; used by the upcoming WHP block-device handler.
+fn read_user_disk_block(
+    paths: &RuntimePaths,
+    metadata: &UserDiskMetadata,
+    block_index: u64,
+) -> AppResult<Vec<u8>> {
+    if !user_disk_artifact_ready(paths, &Some(metadata.clone())) {
+        return Err(AppError::message(
+            "Pane sparse user disk is not ready for block I/O.",
+        ));
+    }
+
+    let block_size: usize = metadata
+        .block_size_bytes
+        .try_into()
+        .map_err(|_| AppError::message("Pane user disk block size is too large for this host."))?;
+    let offset = user_disk_block_offset(metadata, block_index)?;
+    let mut block = vec![0_u8; block_size];
+    let mut file = OpenOptions::new().read(true).open(&paths.user_disk)?;
+    let file_len = file.metadata()?.len();
+    if offset >= file_len {
+        return Ok(block);
+    }
+
+    file.seek(SeekFrom::Start(offset))?;
+    let bytes_read = file.read(&mut block)?;
+    if bytes_read < block.len() {
+        block[bytes_read..].fill(0);
+    }
+    Ok(block)
+}
+
+#[allow(dead_code)] // Covered by tests; used by the upcoming WHP block-device handler.
+fn write_user_disk_block(
+    paths: &RuntimePaths,
+    metadata: &UserDiskMetadata,
+    block_index: u64,
+    block: &[u8],
+) -> AppResult<()> {
+    if !user_disk_artifact_ready(paths, &Some(metadata.clone())) {
+        return Err(AppError::message(
+            "Pane sparse user disk is not ready for block I/O.",
+        ));
+    }
+
+    let block_size: usize = metadata
+        .block_size_bytes
+        .try_into()
+        .map_err(|_| AppError::message("Pane user disk block size is too large for this host."))?;
+    if block.len() != block_size {
+        return Err(AppError::message(format!(
+            "Pane user disk writes must be exactly {block_size} bytes."
+        )));
+    }
+
+    let offset = user_disk_block_offset(metadata, block_index)?;
+    let mut file = OpenOptions::new().write(true).open(&paths.user_disk)?;
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(block)?;
+    file.flush()?;
+    Ok(())
 }
 
 fn create_serial_boot_image_artifact(paths: &RuntimePaths, force: bool) -> AppResult<()> {
@@ -8620,15 +8712,16 @@ mod tests {
         initialize_managed_arch_environment, inspect_kernel_image_artifact, inspect_workspace,
         inventory_contains_distro, kernel_layout_execution_image, linux_guest_mapped_regions,
         load_kernel_layout_boot_image_artifact, parse_guest_physical_address, preferred_transport,
-        read_json_file, register_base_os_image, register_boot_loader_image,
+        read_json_file, read_user_disk_block, register_base_os_image, register_boot_loader_image,
         register_kernel_boot_plan, resolve_bundle_output_path, resolve_init_source,
         resolve_launch_target, resolve_managed_environment_for_reset, resolve_saved_launch,
         resolve_session_context, resolve_status_distro, runtime_contract_guest_memory_ranges,
         runtime_storage_budget, sha256_file, status_port_for, user_disk_artifact_ready,
         validate_setup_password, validate_setup_username, windows_transport_check, write_json_file,
-        AppLifecyclePhase, AppNextAction, CheckStatus, DistroHealth, DoctorCheck, DoctorReport,
-        FramebufferContract, InitSource, KernelBootLayout, KernelBootMetadata, NativeRuntimeState,
-        StatusReport, UserDiskMetadata, WorkspaceHealth, WslInventory, EMBEDDED_APP_ASSETS,
+        write_user_disk_block, AppLifecyclePhase, AppNextAction, CheckStatus, DistroHealth,
+        DoctorCheck, DoctorReport, FramebufferContract, InitSource, KernelBootLayout,
+        KernelBootMetadata, NativeRuntimeState, StatusReport, UserDiskMetadata, WorkspaceHealth,
+        WslInventory, EMBEDDED_APP_ASSETS,
     };
 
     fn empty_workspace_health() -> WorkspaceHealth {
@@ -9487,6 +9580,30 @@ mod tests {
         assert_eq!(metadata.format, "pane-sparse-user-disk-v1");
         assert!(metadata.materialized_block_device);
         assert!(user_disk_bytes.starts_with(b"PANE_USER_DISK_V1\n"));
+        assert!(user_disk_artifact_ready(&paths, &Some(metadata)));
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn sparse_user_disk_block_io_zero_fills_and_persists_blocks() {
+        let paths = temp_runtime_paths("runtime-user-disk-block-io");
+        super::prepare_runtime_paths(&paths).unwrap();
+        create_user_disk_descriptor(&paths, &runtime_storage_budget(8), false).unwrap();
+        let metadata = read_json_file::<UserDiskMetadata>(&paths.user_disk_metadata).unwrap();
+
+        let zero_block = read_user_disk_block(&paths, &metadata, 2).unwrap();
+        assert_eq!(zero_block.len(), 4096);
+        assert!(zero_block.iter().all(|byte| *byte == 0));
+
+        let mut written = vec![0_u8; 4096];
+        written[..16].copy_from_slice(b"PANE_BLOCK_IO_V1");
+        write_user_disk_block(&paths, &metadata, 2, &written).unwrap();
+
+        let read_back = read_user_disk_block(&paths, &metadata, 2).unwrap();
+        assert_eq!(read_back, written);
+        let still_zero = read_user_disk_block(&paths, &metadata, 3).unwrap();
+        assert!(still_zero.iter().all(|byte| *byte == 0));
         assert!(user_disk_artifact_ready(&paths, &Some(metadata)));
 
         let _ = std::fs::remove_dir_all(&paths.root);

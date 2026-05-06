@@ -207,6 +207,7 @@ What exists today:
 - verified base-image metadata slot with raw disk/rootfs format inspection, Linux root partition hints, and kernel-layout root handoff decisions,
 - sparse Pane user disk artifact for future Linux packages, accounts, and customization data,
 - sparse user disk block I/O primitive with zero-fill semantics for the future WHP block-device handler,
+- verified Pane user disk snapshots under the runtime snapshot store,
 - runtime-backed serial boot image,
 - verified boot-to-serial loader candidate slot,
 - verified kernel/initramfs boot-plan metadata,
@@ -225,6 +226,12 @@ Prepare native-runtime state:
 
 ```powershell
 cargo run -- runtime --prepare --create-user-disk --create-serial-boot-image --capacity-gib 8
+```
+
+Create a recovery snapshot of the Pane user disk artifact:
+
+```powershell
+cargo run -- runtime --snapshot-user-disk
 ```
 
 Check WHP host and runtime readiness:

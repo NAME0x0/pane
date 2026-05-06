@@ -280,6 +280,9 @@ pub struct RuntimeArgs {
     /// Create the Pane-owned user disk descriptor for packages, accounts, and customizations.
     #[arg(long)]
     pub create_user_disk: bool,
+    /// Snapshot the Pane-owned user disk into the runtime snapshot store.
+    #[arg(long)]
+    pub snapshot_user_disk: bool,
     /// Create the Pane-owned serial boot test image used by the WHP boot-spike runner.
     #[arg(long)]
     pub create_serial_boot_image: bool,

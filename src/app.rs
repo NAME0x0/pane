@@ -298,6 +298,8 @@ struct RuntimeArtifactReport {
     user_disk_capacity_gib: Option<u64>,
     user_disk_format: Option<String>,
     user_disk_ready: bool,
+    user_disk_snapshot_count: usize,
+    latest_user_disk_snapshot: Option<String>,
     user_disk_metadata_exists: bool,
     runtime_manifest_exists: bool,
     runtime_config_exists: bool,
@@ -566,6 +568,23 @@ struct UserDiskMetadata {
     allocated_header_bytes: u64,
     header_sha256: String,
     materialized_block_device: bool,
+    created_at_epoch_seconds: u64,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct UserDiskSnapshotMetadata {
+    schema_version: u32,
+    snapshot_kind: String,
+    snapshot_id: String,
+    source_disk_path: String,
+    source_metadata_path: String,
+    snapshot_path: String,
+    source_disk_bytes: u64,
+    source_disk_sha256: String,
+    user_disk_capacity_gib: u64,
+    user_disk_logical_size_bytes: u64,
+    user_disk_block_size_bytes: u64,
     created_at_epoch_seconds: u64,
     notes: Vec<String>,
 }
@@ -1744,6 +1763,7 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
         || args.register_initramfs.is_some()
         || args.kernel_cmdline.is_some()
         || args.create_user_disk
+        || args.snapshot_user_disk
         || args.create_serial_boot_image
         || args.prepare;
 
@@ -1810,6 +1830,10 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
 
     if args.create_user_disk {
         create_user_disk_descriptor(&paths, &budget, args.force)?;
+    }
+
+    if args.snapshot_user_disk {
+        create_user_disk_snapshot(&paths)?;
     }
 
     if args.create_serial_boot_image {
@@ -3570,6 +3594,104 @@ fn write_user_disk_block(
     file.write_all(block)?;
     file.flush()?;
     Ok(())
+}
+
+fn create_user_disk_snapshot(paths: &RuntimePaths) -> AppResult<UserDiskSnapshotMetadata> {
+    let metadata = read_json_file::<UserDiskMetadata>(&paths.user_disk_metadata)?;
+    if !user_disk_artifact_ready(paths, &Some(metadata.clone())) {
+        return Err(AppError::message(
+            "Pane sparse user disk is not ready to snapshot. Run `pane runtime --create-user-disk` first.",
+        ));
+    }
+
+    fs::create_dir_all(&paths.snapshots)?;
+    let source_disk_bytes = fs::metadata(&paths.user_disk)?.len();
+    let source_disk_sha256 = sha256_file(&paths.user_disk)?;
+    let snapshot_id = next_user_disk_snapshot_id(paths)?;
+    let snapshot_path = paths.snapshots.join(format!("{snapshot_id}.panedisk"));
+    let snapshot_metadata_path = paths.snapshots.join(format!("{snapshot_id}.json"));
+
+    let copied_bytes = fs::copy(&paths.user_disk, &snapshot_path)?;
+    if copied_bytes != source_disk_bytes {
+        return Err(AppError::message(
+            "Pane user disk snapshot copied an unexpected number of bytes.",
+        ));
+    }
+    let copied_sha256 = sha256_file(&snapshot_path)?;
+    if copied_sha256 != source_disk_sha256 {
+        return Err(AppError::message(
+            "Pane user disk snapshot verification failed after copy.",
+        ));
+    }
+
+    let snapshot = UserDiskSnapshotMetadata {
+        schema_version: 1,
+        snapshot_kind: "pane-user-disk-snapshot-v1".to_string(),
+        snapshot_id,
+        source_disk_path: paths.user_disk.display().to_string(),
+        source_metadata_path: paths.user_disk_metadata.display().to_string(),
+        snapshot_path: snapshot_path.display().to_string(),
+        source_disk_bytes,
+        source_disk_sha256,
+        user_disk_capacity_gib: metadata.capacity_gib,
+        user_disk_logical_size_bytes: metadata.logical_size_bytes,
+        user_disk_block_size_bytes: metadata.block_size_bytes,
+        created_at_epoch_seconds: current_epoch_seconds(),
+        notes: vec![
+            "This snapshot captures the current Pane sparse user disk artifact for recovery experiments."
+                .to_string(),
+            "Restore, export, import, and resize semantics are separate milestones and must verify this metadata before mutation."
+                .to_string(),
+        ],
+    };
+    write_json_file(&snapshot_metadata_path, &snapshot)?;
+    Ok(snapshot)
+}
+
+fn next_user_disk_snapshot_id(paths: &RuntimePaths) -> AppResult<String> {
+    let base = format!("user-disk-{}", current_epoch_seconds());
+    for suffix in 0..1000 {
+        let candidate = if suffix == 0 {
+            base.clone()
+        } else {
+            format!("{base}-{suffix}")
+        };
+        if !paths
+            .snapshots
+            .join(format!("{candidate}.panedisk"))
+            .exists()
+            && !paths.snapshots.join(format!("{candidate}.json")).exists()
+        {
+            return Ok(candidate);
+        }
+    }
+    Err(AppError::message(
+        "Pane could not allocate a unique user disk snapshot name.",
+    ))
+}
+
+fn user_disk_snapshot_metadata_files(paths: &RuntimePaths) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(&paths.snapshots) else {
+        return Vec::new();
+    };
+    let mut metadata_files = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+        })
+        .filter(|path| {
+            read_json_file::<UserDiskSnapshotMetadata>(path)
+                .map(|metadata| metadata.snapshot_kind == "pane-user-disk-snapshot-v1")
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    metadata_files.sort();
+    metadata_files
 }
 
 fn create_serial_boot_image_artifact(paths: &RuntimePaths, force: bool) -> AppResult<()> {
@@ -5515,6 +5637,7 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
 
     let user_disk_metadata = read_json_file::<UserDiskMetadata>(&paths.user_disk_metadata).ok();
     let user_disk_ready = user_disk_artifact_ready(paths, &user_disk_metadata);
+    let user_disk_snapshots = user_disk_snapshot_metadata_files(paths);
 
     RuntimeArtifactReport {
         base_os_image_exists: paths.base_os_image.is_file(),
@@ -5596,6 +5719,10 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
             .as_ref()
             .map(|metadata| metadata.format.clone()),
         user_disk_ready,
+        user_disk_snapshot_count: user_disk_snapshots.len(),
+        latest_user_disk_snapshot: user_disk_snapshots
+            .last()
+            .map(|path| path.display().to_string()),
         user_disk_metadata_exists: paths.user_disk_metadata.is_file(),
         runtime_manifest_exists: paths.manifest.is_file(),
         runtime_config_exists: paths.runtime_config.is_file(),
@@ -8245,6 +8372,13 @@ fn print_runtime_report(report: &RuntimeReport) {
     if let Some(format) = &report.artifacts.user_disk_format {
         println!("  User Format    {}", format);
     }
+    println!(
+        "  Disk Snapshots {}",
+        report.artifacts.user_disk_snapshot_count
+    );
+    if let Some(snapshot) = &report.artifacts.latest_user_disk_snapshot {
+        println!("  Latest Snapshot {}", snapshot);
+    }
     println!("Ownership");
     println!(
         "  App Storage    {}",
@@ -9143,6 +9277,8 @@ fn yes_no(value: bool) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use crate::{
         cli::{InitArgs, ResetArgs},
         model::{DesktopEnvironment, DistroFamily, DistroRecord},
@@ -9158,7 +9294,7 @@ mod tests {
         build_bundle_doctor_request, build_distro_health, build_environment_catalog_report,
         build_kernel_boot_layout, build_linux_boot_params_page, build_native_runtime_report,
         build_runtime_artifact_report, build_steps, build_update_steps,
-        create_serial_boot_image_artifact, create_user_disk_descriptor,
+        create_serial_boot_image_artifact, create_user_disk_descriptor, create_user_disk_snapshot,
         default_framebuffer_contract, default_input_contract, default_linux_guest_memory_map,
         determine_app_lifecycle, ensure_wsl_conf_setting, format_doctor_blockers,
         initialize_managed_arch_environment, inspect_kernel_image_artifact, inspect_workspace,
@@ -9172,8 +9308,8 @@ mod tests {
         validate_setup_password, validate_setup_username, windows_transport_check, write_json_file,
         write_user_disk_block, AppLifecyclePhase, AppNextAction, BaseOsImageMetadata, CheckStatus,
         DistroHealth, DoctorCheck, DoctorReport, FramebufferContract, InitSource, KernelBootLayout,
-        KernelBootMetadata, NativeRuntimeState, StatusReport, UserDiskMetadata, WorkspaceHealth,
-        WslInventory, EMBEDDED_APP_ASSETS,
+        KernelBootMetadata, NativeRuntimeState, StatusReport, UserDiskMetadata,
+        UserDiskSnapshotMetadata, WorkspaceHealth, WslInventory, EMBEDDED_APP_ASSETS,
     };
 
     fn empty_workspace_health() -> WorkspaceHealth {
@@ -10151,6 +10287,44 @@ mod tests {
         let still_zero = read_user_disk_block(&paths, &metadata, 3).unwrap();
         assert!(still_zero.iter().all(|byte| *byte == 0));
         assert!(user_disk_artifact_ready(&paths, &Some(metadata)));
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn user_disk_snapshot_copies_and_verifies_sparse_artifact() {
+        let paths = temp_runtime_paths("runtime-user-disk-snapshot");
+        super::prepare_runtime_paths(&paths).unwrap();
+        create_user_disk_descriptor(&paths, &runtime_storage_budget(8), false).unwrap();
+        let metadata = read_json_file::<UserDiskMetadata>(&paths.user_disk_metadata).unwrap();
+        let mut written = vec![0_u8; 4096];
+        written[..16].copy_from_slice(b"PANE_SNAPSHOT_V1");
+        write_user_disk_block(&paths, &metadata, 2, &written).unwrap();
+        let source_sha = sha256_file(&paths.user_disk).unwrap();
+
+        let snapshot = create_user_disk_snapshot(&paths).unwrap();
+
+        let snapshot_path = PathBuf::from(&snapshot.snapshot_path);
+        assert!(snapshot_path.is_file());
+        assert_eq!(sha256_file(&snapshot_path).unwrap(), source_sha);
+        assert_eq!(snapshot.snapshot_kind, "pane-user-disk-snapshot-v1");
+        assert_eq!(snapshot.source_disk_sha256, source_sha);
+        assert_eq!(snapshot.user_disk_capacity_gib, 3);
+        assert_eq!(snapshot.user_disk_block_size_bytes, 4096);
+        let snapshot_metadata_path = paths
+            .snapshots
+            .join(format!("{}.json", snapshot.snapshot_id));
+        let persisted =
+            read_json_file::<UserDiskSnapshotMetadata>(&snapshot_metadata_path).unwrap();
+        assert_eq!(persisted.snapshot_id, snapshot.snapshot_id);
+
+        let artifacts = build_runtime_artifact_report(&paths);
+        assert_eq!(artifacts.user_disk_snapshot_count, 1);
+        let expected_snapshot_metadata = snapshot_metadata_path.display().to_string();
+        assert_eq!(
+            artifacts.latest_user_disk_snapshot.as_deref(),
+            Some(expected_snapshot_metadata.as_str())
+        );
 
         let _ = std::fs::remove_dir_all(&paths.root);
     }

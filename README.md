@@ -240,6 +240,13 @@ Restore the Pane user disk from a verified snapshot metadata file:
 cargo run -- runtime --restore-user-disk-snapshot C:\path\to\user-disk-<timestamp>.json
 ```
 
+Export or import a portable Pane user disk package:
+
+```powershell
+cargo run -- runtime --export-user-disk C:\path\to\pane-user-disk-export
+cargo run -- runtime --import-user-disk C:\path\to\pane-user-disk-export
+```
+
 Check WHP host and runtime readiness:
 
 ```powershell

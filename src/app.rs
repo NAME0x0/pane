@@ -589,9 +589,30 @@ struct UserDiskSnapshotMetadata {
     notes: Vec<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct UserDiskExportManifest {
+    schema_version: u32,
+    export_kind: String,
+    export_id: String,
+    exported_disk_filename: String,
+    exported_metadata_filename: String,
+    source_disk_path: String,
+    source_metadata_path: String,
+    source_disk_bytes: u64,
+    source_disk_sha256: String,
+    user_disk_capacity_gib: u64,
+    user_disk_logical_size_bytes: u64,
+    user_disk_block_size_bytes: u64,
+    exported_at_epoch_seconds: u64,
+    notes: Vec<String>,
+}
+
 const PANE_USER_DISK_FORMAT: &str = "pane-sparse-user-disk-v1";
 const PANE_USER_DISK_MAGIC: &str = "PANE_USER_DISK_V1\n";
 const PANE_USER_DISK_BLOCK_SIZE_BYTES: u64 = 4096;
+const PANE_USER_DISK_EXPORT_MANIFEST_FILENAME: &str = "pane-user-disk-export.json";
+const PANE_USER_DISK_EXPORT_DISK_FILENAME: &str = "user-data.panedisk";
+const PANE_USER_DISK_EXPORT_METADATA_FILENAME: &str = "user-disk.json";
 
 #[derive(Debug, Serialize)]
 struct NativeRuntimeReport {
@@ -883,7 +904,7 @@ pub fn run() -> AppResult<()> {
         Commands::Update(args) => update(args),
         Commands::Status(args) => status(args),
         Commands::AppStatus(args) => app_status(args),
-        Commands::Runtime(args) => runtime(args),
+        Commands::Runtime(args) => runtime(*args),
         Commands::NativePreflight(args) => native_preflight(args),
         Commands::NativeBootSpike(args) => native_boot_spike(args),
         Commands::NativeKernelPlan(args) => native_kernel_plan(args),
@@ -1765,6 +1786,7 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
         || args.create_user_disk
         || args.snapshot_user_disk
         || args.restore_user_disk_snapshot.is_some()
+        || args.import_user_disk.is_some()
         || args.create_serial_boot_image
         || args.prepare;
 
@@ -1841,8 +1863,16 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
         restore_user_disk_snapshot(&paths, snapshot_metadata)?;
     }
 
+    if let Some(import_package) = args.import_user_disk.as_deref() {
+        import_user_disk_package(&paths, import_package)?;
+    }
+
     if args.create_serial_boot_image {
         create_serial_boot_image_artifact(&paths, args.force)?;
+    }
+
+    if let Some(export_dir) = args.export_user_disk.as_deref() {
+        export_user_disk_package(&paths, export_dir, args.force)?;
     }
 
     let mut report = build_runtime_report(&session_name, args.capacity_gib, false)?;
@@ -3746,15 +3776,12 @@ fn restore_user_disk_snapshot(
         ));
     }
 
-    let expected_header = user_disk_header_bytes(logical_size_bytes);
-    let mut file = OpenOptions::new().read(true).open(&snapshot_path)?;
-    let mut actual_header = vec![0_u8; expected_header.len()];
-    file.read_exact(&mut actual_header)?;
-    if actual_header != expected_header {
-        return Err(AppError::message(
-            "Pane user disk snapshot header does not match its recorded geometry.",
-        ));
-    }
+    let expected_header = validate_user_disk_artifact_header(
+        &snapshot_path,
+        snapshot.user_disk_capacity_gib,
+        snapshot.user_disk_logical_size_bytes,
+        snapshot.user_disk_block_size_bytes,
+    )?;
 
     if let Some(parent) = paths.user_disk.parent() {
         fs::create_dir_all(parent)?;
@@ -3804,6 +3831,197 @@ fn restore_user_disk_snapshot(
     };
     write_json_file(&paths.user_disk_metadata, &metadata)?;
     Ok(snapshot)
+}
+
+fn export_user_disk_package(
+    paths: &RuntimePaths,
+    export_dir: &Path,
+    force: bool,
+) -> AppResult<UserDiskExportManifest> {
+    let metadata = read_json_file::<UserDiskMetadata>(&paths.user_disk_metadata)?;
+    if !user_disk_artifact_ready(paths, &Some(metadata.clone())) {
+        return Err(AppError::message(
+            "Pane sparse user disk is not ready to export. Run `pane runtime --create-user-disk` first.",
+        ));
+    }
+    if export_dir.is_file() {
+        return Err(AppError::message(
+            "Pane user disk export target must be a directory.",
+        ));
+    }
+
+    fs::create_dir_all(export_dir)?;
+    let manifest_path = export_dir.join(PANE_USER_DISK_EXPORT_MANIFEST_FILENAME);
+    let disk_path = export_dir.join(PANE_USER_DISK_EXPORT_DISK_FILENAME);
+    let metadata_path = export_dir.join(PANE_USER_DISK_EXPORT_METADATA_FILENAME);
+    if !force && (manifest_path.exists() || disk_path.exists() || metadata_path.exists()) {
+        return Err(AppError::message(format!(
+            "Pane user disk export package already exists at {}. Pass --force to replace the package files.",
+            export_dir.display()
+        )));
+    }
+
+    let source_disk_bytes = fs::metadata(&paths.user_disk)?.len();
+    let source_disk_sha256 = sha256_file(&paths.user_disk)?;
+    let copied_bytes = fs::copy(&paths.user_disk, &disk_path)?;
+    if copied_bytes != source_disk_bytes || sha256_file(&disk_path)? != source_disk_sha256 {
+        return Err(AppError::message(
+            "Pane user disk export verification failed after copy.",
+        ));
+    }
+    fs::copy(&paths.user_disk_metadata, &metadata_path)?;
+
+    let manifest = UserDiskExportManifest {
+        schema_version: 1,
+        export_kind: "pane-user-disk-export-v1".to_string(),
+        export_id: format!("pane-user-disk-export-{}", current_epoch_seconds()),
+        exported_disk_filename: PANE_USER_DISK_EXPORT_DISK_FILENAME.to_string(),
+        exported_metadata_filename: PANE_USER_DISK_EXPORT_METADATA_FILENAME.to_string(),
+        source_disk_path: paths.user_disk.display().to_string(),
+        source_metadata_path: paths.user_disk_metadata.display().to_string(),
+        source_disk_bytes,
+        source_disk_sha256,
+        user_disk_capacity_gib: metadata.capacity_gib,
+        user_disk_logical_size_bytes: metadata.logical_size_bytes,
+        user_disk_block_size_bytes: metadata.block_size_bytes,
+        exported_at_epoch_seconds: current_epoch_seconds(),
+        notes: vec![
+            "This package is a portable Pane user disk export for backup or migration."
+                .to_string(),
+            "Import verifies the manifest, byte count, SHA-256, and Pane disk header before replacing the active user disk."
+                .to_string(),
+        ],
+    };
+    write_json_file(&manifest_path, &manifest)?;
+    Ok(manifest)
+}
+
+fn import_user_disk_package(
+    paths: &RuntimePaths,
+    package_or_manifest: &Path,
+) -> AppResult<UserDiskExportManifest> {
+    let manifest_path = if package_or_manifest.is_dir() {
+        package_or_manifest.join(PANE_USER_DISK_EXPORT_MANIFEST_FILENAME)
+    } else {
+        package_or_manifest.to_path_buf()
+    };
+    let manifest = read_json_file::<UserDiskExportManifest>(&manifest_path)?;
+    if manifest.schema_version != 1 || manifest.export_kind != "pane-user-disk-export-v1" {
+        return Err(AppError::message(
+            "Pane user disk export manifest is not a supported export contract.",
+        ));
+    }
+    let package_dir = manifest_path.parent().ok_or_else(|| {
+        AppError::message("Pane user disk export manifest must live inside a package directory.")
+    })?;
+    let disk_path = package_dir.join(&manifest.exported_disk_filename);
+    let exported_metadata_path = package_dir.join(&manifest.exported_metadata_filename);
+    if !disk_path.is_file() || !exported_metadata_path.is_file() {
+        return Err(AppError::message(
+            "Pane user disk export package is missing its disk or metadata file.",
+        ));
+    }
+
+    let disk_bytes = fs::metadata(&disk_path)?.len();
+    if disk_bytes != manifest.source_disk_bytes {
+        return Err(AppError::message(
+            "Pane user disk export byte length does not match its manifest.",
+        ));
+    }
+    let disk_sha256 = sha256_file(&disk_path)?;
+    if disk_sha256 != manifest.source_disk_sha256 {
+        return Err(AppError::message(
+            "Pane user disk export SHA-256 does not match its manifest.",
+        ));
+    }
+    let expected_header = validate_user_disk_artifact_header(
+        &disk_path,
+        manifest.user_disk_capacity_gib,
+        manifest.user_disk_logical_size_bytes,
+        manifest.user_disk_block_size_bytes,
+    )?;
+    let exported_metadata = read_json_file::<UserDiskMetadata>(&exported_metadata_path)?;
+    if exported_metadata.format != PANE_USER_DISK_FORMAT
+        || exported_metadata.capacity_gib != manifest.user_disk_capacity_gib
+        || exported_metadata.logical_size_bytes != manifest.user_disk_logical_size_bytes
+        || exported_metadata.block_size_bytes != PANE_USER_DISK_BLOCK_SIZE_BYTES
+        || exported_metadata.header_sha256 != sha256_bytes(&expected_header)
+    {
+        return Err(AppError::message(
+            "Pane user disk export metadata does not match its manifest and disk header.",
+        ));
+    }
+
+    if let Some(parent) = paths.user_disk.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if let Some(parent) = paths.user_disk_metadata.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temp_import = paths.user_disk.with_extension("panedisk.import.tmp");
+    if temp_import.exists() {
+        fs::remove_file(&temp_import)?;
+    }
+    let copied_bytes = fs::copy(&disk_path, &temp_import)?;
+    if copied_bytes != manifest.source_disk_bytes || sha256_file(&temp_import)? != disk_sha256 {
+        let _ = fs::remove_file(&temp_import);
+        return Err(AppError::message(
+            "Pane user disk import verification failed after staging copy.",
+        ));
+    }
+
+    if paths.user_disk.exists() {
+        fs::remove_file(&paths.user_disk)?;
+    }
+    fs::rename(&temp_import, &paths.user_disk)?;
+
+    let metadata = UserDiskMetadata {
+        schema_version: 1,
+        format: PANE_USER_DISK_FORMAT.to_string(),
+        disk_path: paths.user_disk.display().to_string(),
+        capacity_gib: manifest.user_disk_capacity_gib,
+        logical_size_bytes: manifest.user_disk_logical_size_bytes,
+        block_size_bytes: PANE_USER_DISK_BLOCK_SIZE_BYTES,
+        sparse_backing: true,
+        allocated_header_bytes: expected_header.len() as u64,
+        header_sha256: sha256_bytes(&expected_header),
+        materialized_block_device: true,
+        created_at_epoch_seconds: current_epoch_seconds(),
+        notes: vec![
+            format!("Imported from Pane user disk export `{}`.", manifest.export_id),
+            "The imported artifact was verified by manifest, byte count, SHA-256, metadata, and Pane disk header before replacing the active user disk."
+                .to_string(),
+        ],
+    };
+    write_json_file(&paths.user_disk_metadata, &metadata)?;
+    Ok(manifest)
+}
+
+fn validate_user_disk_artifact_header(
+    disk_path: &Path,
+    capacity_gib: u64,
+    logical_size_bytes: u64,
+    block_size_bytes: u64,
+) -> AppResult<Vec<u8>> {
+    let expected_logical_size = user_disk_logical_size_bytes(capacity_gib)?;
+    if expected_logical_size != logical_size_bytes
+        || block_size_bytes != PANE_USER_DISK_BLOCK_SIZE_BYTES
+    {
+        return Err(AppError::message(
+            "Pane user disk artifact geometry is not compatible with this Pane version.",
+        ));
+    }
+
+    let expected_header = user_disk_header_bytes(logical_size_bytes);
+    let mut file = OpenOptions::new().read(true).open(disk_path)?;
+    let mut actual_header = vec![0_u8; expected_header.len()];
+    file.read_exact(&mut actual_header)?;
+    if actual_header != expected_header {
+        return Err(AppError::message(
+            "Pane user disk artifact header does not match its recorded geometry.",
+        ));
+    }
+    Ok(expected_header)
 }
 
 fn create_serial_boot_image_artifact(paths: &RuntimePaths, force: bool) -> AppResult<()> {
@@ -9408,9 +9626,10 @@ mod tests {
         build_runtime_artifact_report, build_steps, build_update_steps,
         create_serial_boot_image_artifact, create_user_disk_descriptor, create_user_disk_snapshot,
         default_framebuffer_contract, default_input_contract, default_linux_guest_memory_map,
-        determine_app_lifecycle, ensure_wsl_conf_setting, format_doctor_blockers,
-        initialize_managed_arch_environment, inspect_kernel_image_artifact, inspect_workspace,
-        inventory_contains_distro, kernel_layout_execution_image, linux_guest_mapped_regions,
+        determine_app_lifecycle, ensure_wsl_conf_setting, export_user_disk_package,
+        format_doctor_blockers, import_user_disk_package, initialize_managed_arch_environment,
+        inspect_kernel_image_artifact, inspect_workspace, inventory_contains_distro,
+        kernel_layout_execution_image, linux_guest_mapped_regions,
         load_kernel_layout_boot_image_artifact, parse_guest_physical_address, preferred_transport,
         read_json_file, read_user_disk_block, register_base_os_image, register_boot_loader_image,
         register_kernel_boot_plan, resolve_bundle_output_path, resolve_init_source,
@@ -9421,8 +9640,9 @@ mod tests {
         windows_transport_check, write_json_file, write_user_disk_block, AppLifecyclePhase,
         AppNextAction, BaseOsImageMetadata, CheckStatus, DistroHealth, DoctorCheck, DoctorReport,
         FramebufferContract, InitSource, KernelBootLayout, KernelBootMetadata, NativeRuntimeState,
-        StatusReport, UserDiskMetadata, UserDiskSnapshotMetadata, WorkspaceHealth, WslInventory,
-        EMBEDDED_APP_ASSETS,
+        StatusReport, UserDiskExportManifest, UserDiskMetadata, UserDiskSnapshotMetadata,
+        WorkspaceHealth, WslInventory, EMBEDDED_APP_ASSETS, PANE_USER_DISK_EXPORT_DISK_FILENAME,
+        PANE_USER_DISK_EXPORT_MANIFEST_FILENAME, PANE_USER_DISK_EXPORT_METADATA_FILENAME,
     };
 
     fn empty_workspace_health() -> WorkspaceHealth {
@@ -10482,6 +10702,62 @@ mod tests {
             .any(|note| note.contains("Restored from Pane user disk snapshot")));
 
         let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn user_disk_export_and_import_round_trip_verified_package() {
+        let paths = temp_runtime_paths("runtime-user-disk-export-source");
+        super::prepare_runtime_paths(&paths).unwrap();
+        create_user_disk_descriptor(&paths, &runtime_storage_budget(8), false).unwrap();
+        let metadata = read_json_file::<UserDiskMetadata>(&paths.user_disk_metadata).unwrap();
+        let mut original = vec![0_u8; 4096];
+        original[..16].copy_from_slice(b"PANE_EXPORT_V1__");
+        write_user_disk_block(&paths, &metadata, 2, &original).unwrap();
+        let source_sha = sha256_file(&paths.user_disk).unwrap();
+        let export_dir = paths.root.join("portable-export");
+
+        let manifest = export_user_disk_package(&paths, &export_dir, false).unwrap();
+
+        assert_eq!(manifest.export_kind, "pane-user-disk-export-v1");
+        assert_eq!(manifest.source_disk_sha256, source_sha);
+        assert!(export_dir
+            .join(PANE_USER_DISK_EXPORT_MANIFEST_FILENAME)
+            .is_file());
+        assert!(export_dir
+            .join(PANE_USER_DISK_EXPORT_DISK_FILENAME)
+            .is_file());
+        assert!(export_dir
+            .join(PANE_USER_DISK_EXPORT_METADATA_FILENAME)
+            .is_file());
+        let persisted = read_json_file::<UserDiskExportManifest>(
+            &export_dir.join(PANE_USER_DISK_EXPORT_MANIFEST_FILENAME),
+        )
+        .unwrap();
+        assert_eq!(persisted.export_id, manifest.export_id);
+
+        let target = temp_runtime_paths("runtime-user-disk-export-target");
+        super::prepare_runtime_paths(&target).unwrap();
+        let imported = import_user_disk_package(&target, &export_dir).unwrap();
+
+        assert_eq!(imported.export_id, manifest.export_id);
+        let imported_metadata =
+            read_json_file::<UserDiskMetadata>(&target.user_disk_metadata).unwrap();
+        assert!(user_disk_artifact_ready(
+            &target,
+            &Some(imported_metadata.clone())
+        ));
+        assert_eq!(sha256_file(&target.user_disk).unwrap(), source_sha);
+        assert_eq!(
+            read_user_disk_block(&target, &imported_metadata, 2).unwrap()[..16],
+            original[..16]
+        );
+        assert!(imported_metadata
+            .notes
+            .iter()
+            .any(|note| note.contains("Imported from Pane user disk export")));
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+        let _ = std::fs::remove_dir_all(&target.root);
     }
 
     #[test]

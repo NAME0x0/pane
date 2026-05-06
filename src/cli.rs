@@ -36,7 +36,7 @@ pub enum Commands {
     /// Show the app-facing lifecycle, next action, storage, and display transport state.
     AppStatus(AppStatusArgs),
     /// Inspect or prepare Pane-owned runtime storage for the future contained OS engine.
-    Runtime(RuntimeArgs),
+    Runtime(Box<RuntimeArgs>),
     /// Probe host readiness for Pane's future native OS runtime.
     NativePreflight(NativePreflightArgs),
     /// Exercise the first non-persistent WHP partition/vCPU boot-spike host step.
@@ -286,6 +286,15 @@ pub struct RuntimeArgs {
     /// Restore the Pane-owned user disk from a verified snapshot metadata JSON file.
     #[arg(long, conflicts_with_all = ["create_user_disk", "snapshot_user_disk"])]
     pub restore_user_disk_snapshot: Option<PathBuf>,
+    /// Export the Pane-owned user disk into a portable package directory.
+    #[arg(long)]
+    pub export_user_disk: Option<PathBuf>,
+    /// Import the Pane-owned user disk from a verified export package directory or manifest.
+    #[arg(
+        long,
+        conflicts_with_all = ["create_user_disk", "restore_user_disk_snapshot"]
+    )]
+    pub import_user_disk: Option<PathBuf>,
     /// Create the Pane-owned serial boot test image used by the WHP boot-spike runner.
     #[arg(long)]
     pub create_serial_boot_image: bool,

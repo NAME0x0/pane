@@ -256,6 +256,8 @@ struct RuntimeArtifactReport {
     base_os_image_exists: bool,
     base_os_image_bytes: Option<u64>,
     base_os_image_sha256: Option<String>,
+    base_os_image_format: Option<String>,
+    base_os_bootable_disk_hint: Option<bool>,
     base_os_image_verified: bool,
     base_os_metadata_exists: bool,
     serial_boot_image_exists: bool,
@@ -312,8 +314,25 @@ struct BaseOsImageMetadata {
     bytes: u64,
     sha256: String,
     expected_sha256: Option<String>,
+    #[serde(default = "unknown_base_os_image_format")]
+    image_format: String,
+    #[serde(default)]
+    bootable_disk_hint: bool,
     verified: bool,
     registered_at_epoch_seconds: u64,
+    #[serde(default)]
+    notes: Vec<String>,
+}
+
+fn unknown_base_os_image_format() -> String {
+    "unknown".to_string()
+}
+
+#[derive(Clone, Debug)]
+struct BaseOsImageInspection {
+    image_format: String,
+    bootable_disk_hint: bool,
+    notes: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3068,6 +3087,7 @@ fn register_base_os_image(
     }
 
     let bytes = fs::metadata(&paths.base_os_image)?.len();
+    let inspection = inspect_base_os_image_artifact(&paths.base_os_image)?;
     let metadata = BaseOsImageMetadata {
         schema_version: 1,
         distro_family: DistroFamily::Arch,
@@ -3081,10 +3101,68 @@ fn register_base_os_image(
         bytes,
         sha256: actual_sha256,
         expected_sha256,
+        image_format: inspection.image_format,
+        bootable_disk_hint: inspection.bootable_disk_hint,
         verified,
         registered_at_epoch_seconds: current_epoch_seconds(),
+        notes: inspection.notes,
     };
     write_json_file(&paths.base_os_metadata, &metadata)
+}
+
+fn inspect_base_os_image_artifact(path: &Path) -> AppResult<BaseOsImageInspection> {
+    let bytes = fs::metadata(path)?.len();
+    let read_len = usize::try_from(bytes.min(4096)).map_err(|_| {
+        AppError::message("Base OS image header length is too large for this host.")
+    })?;
+    let mut header = vec![0_u8; read_len];
+    let mut file = OpenOptions::new().read(true).open(path)?;
+    if read_len > 0 {
+        file.read_exact(&mut header)?;
+    }
+
+    let has_mbr_signature = header.get(510..512) == Some(&[0x55, 0xaa]);
+    let has_gpt_header = header.get(512..520) == Some(b"EFI PART");
+    let has_nonempty_mbr_partition = header
+        .get(446..510)
+        .map(|entries| entries.chunks_exact(16).any(|entry| entry[4] != 0))
+        .unwrap_or(false);
+    let has_tar_magic = header.get(257..263) == Some(b"ustar\0");
+    let has_zstd_magic = header.get(0..4) == Some(&[0x28, 0xb5, 0x2f, 0xfd]);
+    let has_gzip_magic = header.get(0..2) == Some(&[0x1f, 0x8b]);
+
+    let (image_format, bootable_disk_hint) = if has_gpt_header {
+        ("raw-gpt-disk", true)
+    } else if has_mbr_signature && has_nonempty_mbr_partition {
+        ("raw-mbr-disk", true)
+    } else if has_tar_magic {
+        ("tar-rootfs", false)
+    } else if has_zstd_magic {
+        ("zstd-compressed-image", false)
+    } else if has_gzip_magic {
+        ("gzip-compressed-image", false)
+    } else {
+        ("unknown", false)
+    };
+
+    let mut notes = Vec::new();
+    if bootable_disk_hint {
+        notes.push("Base OS image looks like a raw disk image with a partition table.".to_string());
+    } else {
+        notes.push(
+            "Base OS image does not look like a directly bootable raw disk yet; future native boot may require conversion or an initramfs root handoff."
+                .to_string(),
+        );
+    }
+    if bytes < 16 * 1024 * 1024 {
+        notes.push("Base OS image is smaller than 16 MiB; this is probably a test artifact, not a real Arch image.".to_string());
+    }
+
+    Ok(BaseOsImageInspection {
+        image_format: image_format.to_string(),
+        bootable_disk_hint,
+        notes,
+    })
 }
 
 fn create_user_disk_descriptor(
@@ -5161,6 +5239,12 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
         base_os_image_sha256: base_metadata
             .as_ref()
             .map(|metadata| metadata.sha256.clone()),
+        base_os_image_format: base_metadata
+            .as_ref()
+            .map(|metadata| metadata.image_format.clone()),
+        base_os_bootable_disk_hint: base_metadata
+            .as_ref()
+            .map(|metadata| metadata.bootable_disk_hint),
         base_os_image_verified,
         base_os_metadata_exists: paths.base_os_metadata.is_file(),
         serial_boot_image_exists: paths.serial_boot_image.is_file(),
@@ -7762,6 +7846,12 @@ fn print_runtime_report(report: &RuntimeReport) {
     if let Some(bytes) = report.artifacts.base_os_image_bytes {
         println!("  Base Bytes     {}", bytes);
     }
+    if let Some(format) = &report.artifacts.base_os_image_format {
+        println!("  Base Format    {}", format);
+    }
+    if let Some(bootable) = report.artifacts.base_os_bootable_disk_hint {
+        println!("  Base Boot Hint {}", yes_no(bootable));
+    }
     println!(
         "  Serial Boot    {}",
         yes_no(report.artifacts.serial_boot_image_exists)
@@ -8786,8 +8876,8 @@ mod tests {
         resolve_session_context, resolve_status_distro, runtime_contract_guest_memory_ranges,
         runtime_storage_budget, sha256_file, status_port_for, user_disk_artifact_ready,
         validate_setup_password, validate_setup_username, windows_transport_check, write_json_file,
-        write_user_disk_block, AppLifecyclePhase, AppNextAction, CheckStatus, DistroHealth,
-        DoctorCheck, DoctorReport, FramebufferContract, InitSource, KernelBootLayout,
+        write_user_disk_block, AppLifecyclePhase, AppNextAction, BaseOsImageMetadata, CheckStatus,
+        DistroHealth, DoctorCheck, DoctorReport, FramebufferContract, InitSource, KernelBootLayout,
         KernelBootMetadata, NativeRuntimeState, StatusReport, UserDiskMetadata, WorkspaceHealth,
         WslInventory, EMBEDDED_APP_ASSETS,
     };
@@ -9583,6 +9673,8 @@ mod tests {
             artifacts.base_os_image_sha256.as_deref(),
             Some(expected.as_str())
         );
+        assert_eq!(artifacts.base_os_image_format.as_deref(), Some("unknown"));
+        assert_eq!(artifacts.base_os_bootable_disk_hint, Some(false));
         assert!(artifacts.user_disk_exists);
         assert!(artifacts.user_disk_ready);
         assert_eq!(artifacts.user_disk_capacity_gib, Some(3));
@@ -9621,6 +9713,32 @@ mod tests {
             .blockers
             .iter()
             .any(|blocker| blocker.contains("No valid Pane-owned user disk")));
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn base_os_registration_records_raw_disk_boot_hint() {
+        let paths = temp_runtime_paths("runtime-base-image-gpt");
+        super::prepare_runtime_paths(&paths).unwrap();
+        let source = paths.downloads.join("arch-gpt.img");
+        let mut image = vec![0_u8; 4096];
+        image[510..512].copy_from_slice(&[0x55, 0xaa]);
+        image[512..520].copy_from_slice(b"EFI PART");
+        std::fs::write(&source, image).unwrap();
+        let expected = sha256_file(&source).unwrap();
+
+        register_base_os_image(&paths, &source, Some(&expected), false).unwrap();
+
+        let metadata = read_json_file::<BaseOsImageMetadata>(&paths.base_os_metadata).unwrap();
+        let artifacts = build_runtime_artifact_report(&paths);
+        assert_eq!(metadata.image_format, "raw-gpt-disk");
+        assert!(metadata.bootable_disk_hint);
+        assert_eq!(
+            artifacts.base_os_image_format.as_deref(),
+            Some("raw-gpt-disk")
+        );
+        assert_eq!(artifacts.base_os_bootable_disk_hint, Some(true));
 
         let _ = std::fs::remove_dir_all(&paths.root);
     }

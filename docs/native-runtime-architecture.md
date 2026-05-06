@@ -17,7 +17,7 @@ Pane currently owns:
 - a sparse Pane user disk artifact for future Linux system, package, account, and customization data,
 - a sparse user disk block I/O primitive with zero-filled unallocated blocks for the future WHP block-device handler,
 - a read-only base OS image block I/O primitive with EOF zero-fill behavior for the future WHP block-device handler,
-- a native block I/O command policy and WHP Pane block-port classification boundary for the future guest-visible storage device,
+- a native block I/O command policy, stateful Pane block-port register protocol, and WHP Pane block-port classification boundary for the future guest-visible storage device,
 - a host-side native block I/O adapter that routes allowed commands to verified base-image reads and sparse user-disk reads/writes,
 - verified Pane user disk snapshots, restore validation, portable export/import packages, conservative grow-only resize, and metadata repair under the runtime snapshot/storage boundary,
 - a runtime-backed `serial-boot.paneimg` test image plus SHA-256 metadata for the WHP boot-spike runner,

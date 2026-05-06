@@ -1787,6 +1787,7 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
         || args.snapshot_user_disk
         || args.restore_user_disk_snapshot.is_some()
         || args.import_user_disk.is_some()
+        || args.resize_user_disk_gib.is_some()
         || args.create_serial_boot_image
         || args.prepare;
 
@@ -1865,6 +1866,10 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
 
     if let Some(import_package) = args.import_user_disk.as_deref() {
         import_user_disk_package(&paths, import_package)?;
+    }
+
+    if let Some(new_capacity_gib) = args.resize_user_disk_gib {
+        resize_user_disk(&paths, new_capacity_gib)?;
     }
 
     if args.create_serial_boot_image {
@@ -3995,6 +4000,51 @@ fn import_user_disk_package(
     };
     write_json_file(&paths.user_disk_metadata, &metadata)?;
     Ok(manifest)
+}
+
+fn resize_user_disk(paths: &RuntimePaths, new_capacity_gib: u64) -> AppResult<UserDiskMetadata> {
+    let mut metadata = read_json_file::<UserDiskMetadata>(&paths.user_disk_metadata)?;
+    if !user_disk_artifact_ready(paths, &Some(metadata.clone())) {
+        return Err(AppError::message(
+            "Pane sparse user disk is not ready to resize. Run `pane runtime --create-user-disk` first.",
+        ));
+    }
+    if new_capacity_gib < metadata.capacity_gib {
+        return Err(AppError::message(format!(
+            "Pane user disk resize is grow-only. Current capacity is {} GiB; requested {} GiB.",
+            metadata.capacity_gib, new_capacity_gib
+        )));
+    }
+    if new_capacity_gib == metadata.capacity_gib {
+        return Ok(metadata);
+    }
+
+    let new_logical_size_bytes = user_disk_logical_size_bytes(new_capacity_gib)?;
+    if new_logical_size_bytes <= metadata.logical_size_bytes {
+        return Err(AppError::message(
+            "Pane user disk resize must increase logical size.",
+        ));
+    }
+    let new_header = user_disk_header_bytes(new_logical_size_bytes);
+    if new_header.len() as u64 != metadata.allocated_header_bytes {
+        return Err(AppError::message(
+            "Pane user disk resize would move existing block offsets because the disk header size changed. Export the disk and recreate/import with the larger size after the layout-migration milestone.",
+        ));
+    }
+
+    let mut file = OpenOptions::new().write(true).open(&paths.user_disk)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&new_header)?;
+    file.flush()?;
+
+    metadata.capacity_gib = new_capacity_gib;
+    metadata.logical_size_bytes = new_logical_size_bytes;
+    metadata.header_sha256 = sha256_bytes(&new_header);
+    metadata.notes.push(format!(
+        "Grew Pane sparse user disk logical capacity to {new_capacity_gib} GiB without moving existing block offsets."
+    ));
+    write_json_file(&paths.user_disk_metadata, &metadata)?;
+    Ok(metadata)
 }
 
 fn validate_user_disk_artifact_header(
@@ -9632,16 +9682,17 @@ mod tests {
         kernel_layout_execution_image, linux_guest_mapped_regions,
         load_kernel_layout_boot_image_artifact, parse_guest_physical_address, preferred_transport,
         read_json_file, read_user_disk_block, register_base_os_image, register_boot_loader_image,
-        register_kernel_boot_plan, resolve_bundle_output_path, resolve_init_source,
-        resolve_launch_target, resolve_managed_environment_for_reset, resolve_saved_launch,
-        resolve_session_context, resolve_status_distro, restore_user_disk_snapshot,
-        runtime_contract_guest_memory_ranges, runtime_storage_budget, sha256_file, status_port_for,
-        user_disk_artifact_ready, validate_setup_password, validate_setup_username,
-        windows_transport_check, write_json_file, write_user_disk_block, AppLifecyclePhase,
-        AppNextAction, BaseOsImageMetadata, CheckStatus, DistroHealth, DoctorCheck, DoctorReport,
-        FramebufferContract, InitSource, KernelBootLayout, KernelBootMetadata, NativeRuntimeState,
-        StatusReport, UserDiskExportManifest, UserDiskMetadata, UserDiskSnapshotMetadata,
-        WorkspaceHealth, WslInventory, EMBEDDED_APP_ASSETS, PANE_USER_DISK_EXPORT_DISK_FILENAME,
+        register_kernel_boot_plan, resize_user_disk, resolve_bundle_output_path,
+        resolve_init_source, resolve_launch_target, resolve_managed_environment_for_reset,
+        resolve_saved_launch, resolve_session_context, resolve_status_distro,
+        restore_user_disk_snapshot, runtime_contract_guest_memory_ranges, runtime_storage_budget,
+        sha256_file, status_port_for, user_disk_artifact_ready, validate_setup_password,
+        validate_setup_username, windows_transport_check, write_json_file, write_user_disk_block,
+        AppLifecyclePhase, AppNextAction, BaseOsImageMetadata, CheckStatus, DistroHealth,
+        DoctorCheck, DoctorReport, FramebufferContract, InitSource, KernelBootLayout,
+        KernelBootMetadata, NativeRuntimeState, StatusReport, UserDiskExportManifest,
+        UserDiskMetadata, UserDiskSnapshotMetadata, WorkspaceHealth, WslInventory,
+        EMBEDDED_APP_ASSETS, PANE_USER_DISK_EXPORT_DISK_FILENAME,
         PANE_USER_DISK_EXPORT_MANIFEST_FILENAME, PANE_USER_DISK_EXPORT_METADATA_FILENAME,
     };
 
@@ -10758,6 +10809,52 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&paths.root);
         let _ = std::fs::remove_dir_all(&target.root);
+    }
+
+    #[test]
+    fn user_disk_resize_grows_logical_capacity_without_moving_blocks() {
+        let paths = temp_runtime_paths("runtime-user-disk-resize");
+        super::prepare_runtime_paths(&paths).unwrap();
+        create_user_disk_descriptor(&paths, &runtime_storage_budget(8), false).unwrap();
+        let metadata = read_json_file::<UserDiskMetadata>(&paths.user_disk_metadata).unwrap();
+        let mut written = vec![0_u8; 4096];
+        written[..16].copy_from_slice(b"PANE_RESIZE_V1__");
+        write_user_disk_block(&paths, &metadata, 2, &written).unwrap();
+
+        let resized = resize_user_disk(&paths, 4).unwrap();
+
+        assert_eq!(resized.capacity_gib, 4);
+        assert_eq!(resized.logical_size_bytes, 4 * 1024 * 1024 * 1024);
+        assert_eq!(
+            resized.allocated_header_bytes,
+            metadata.allocated_header_bytes
+        );
+        assert!(resized
+            .notes
+            .iter()
+            .any(|note| note.contains("Grew Pane sparse user disk")));
+        assert!(user_disk_artifact_ready(&paths, &Some(resized.clone())));
+        assert_eq!(
+            read_user_disk_block(&paths, &resized, 2).unwrap()[..16],
+            written[..16]
+        );
+        let artifacts = build_runtime_artifact_report(&paths);
+        assert_eq!(artifacts.user_disk_capacity_gib, Some(4));
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn user_disk_resize_rejects_shrink() {
+        let paths = temp_runtime_paths("runtime-user-disk-resize-shrink");
+        super::prepare_runtime_paths(&paths).unwrap();
+        create_user_disk_descriptor(&paths, &runtime_storage_budget(8), false).unwrap();
+
+        let error = resize_user_disk(&paths, 2).unwrap_err().to_string();
+
+        assert!(error.contains("grow-only"));
+
+        let _ = std::fs::remove_dir_all(&paths.root);
     }
 
     #[test]

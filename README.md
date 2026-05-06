@@ -247,6 +247,12 @@ cargo run -- runtime --export-user-disk C:\path\to\pane-user-disk-export
 cargo run -- runtime --import-user-disk C:\path\to\pane-user-disk-export
 ```
 
+Grow the Pane user disk logical capacity:
+
+```powershell
+cargo run -- runtime --resize-user-disk-gib 4
+```
+
 Check WHP host and runtime readiness:
 
 ```powershell

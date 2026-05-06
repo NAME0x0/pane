@@ -204,7 +204,7 @@ Pane's long-term runtime target is not WSL, XRDP, `mstsc.exe`, QEMU, VirtualBox,
 What exists today:
 
 - runtime storage reservation under `%LOCALAPPDATA%\Pane\runtime\<session>`,
-- verified base-image metadata slot with raw disk/rootfs format inspection,
+- verified base-image metadata slot with raw disk/rootfs format and Linux root partition inspection,
 - sparse Pane user disk artifact for future Linux packages, accounts, and customization data,
 - sparse user disk block I/O primitive with zero-fill semantics for the future WHP block-device handler,
 - runtime-backed serial boot image,

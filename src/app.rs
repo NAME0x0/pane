@@ -318,6 +318,10 @@ struct BaseOsImageMetadata {
     image_format: String,
     #[serde(default)]
     bootable_disk_hint: bool,
+    #[serde(default)]
+    partitions: Vec<BaseOsPartition>,
+    #[serde(default)]
+    root_partition_hint: Option<BaseOsPartition>,
     verified: bool,
     registered_at_epoch_seconds: u64,
     #[serde(default)]
@@ -332,7 +336,22 @@ fn unknown_base_os_image_format() -> String {
 struct BaseOsImageInspection {
     image_format: String,
     bootable_disk_hint: bool,
+    partitions: Vec<BaseOsPartition>,
+    root_partition_hint: Option<BaseOsPartition>,
     notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct BaseOsPartition {
+    index: u32,
+    scheme: String,
+    partition_type: String,
+    bootable: bool,
+    start_lba: u64,
+    sector_count: u64,
+    byte_offset: u64,
+    byte_length: u64,
+    root_candidate: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -446,6 +465,10 @@ struct KernelStorageAttachment {
     base_os_path: String,
     base_os_sha256: String,
     base_os_bytes: u64,
+    base_os_image_format: String,
+    base_os_bootable_disk_hint: bool,
+    base_os_partitions: Vec<BaseOsPartition>,
+    base_os_root_partition_hint: Option<BaseOsPartition>,
     user_disk_path: String,
     user_disk_capacity_gib: u64,
     user_disk_logical_size_bytes: u64,
@@ -3103,6 +3126,8 @@ fn register_base_os_image(
         expected_sha256,
         image_format: inspection.image_format,
         bootable_disk_hint: inspection.bootable_disk_hint,
+        partitions: inspection.partitions,
+        root_partition_hint: inspection.root_partition_hint,
         verified,
         registered_at_epoch_seconds: current_epoch_seconds(),
         notes: inspection.notes,
@@ -3130,6 +3155,17 @@ fn inspect_base_os_image_artifact(path: &Path) -> AppResult<BaseOsImageInspectio
     let has_tar_magic = header.get(257..263) == Some(b"ustar\0");
     let has_zstd_magic = header.get(0..4) == Some(&[0x28, 0xb5, 0x2f, 0xfd]);
     let has_gzip_magic = header.get(0..2) == Some(&[0x1f, 0x8b]);
+    let partitions = if has_gpt_header {
+        inspect_gpt_partitions(&mut file, bytes)?
+    } else if has_mbr_signature {
+        inspect_mbr_partitions(&header)
+    } else {
+        Vec::new()
+    };
+    let root_partition_hint = partitions
+        .iter()
+        .find(|partition| partition.root_candidate)
+        .cloned();
 
     let (image_format, bootable_disk_hint) = if has_gpt_header {
         ("raw-gpt-disk", true)
@@ -3148,6 +3184,17 @@ fn inspect_base_os_image_artifact(path: &Path) -> AppResult<BaseOsImageInspectio
     let mut notes = Vec::new();
     if bootable_disk_hint {
         notes.push("Base OS image looks like a raw disk image with a partition table.".to_string());
+        if let Some(root) = &root_partition_hint {
+            notes.push(format!(
+                "Pane found a likely Linux root partition at index {} offset {} bytes.",
+                root.index, root.byte_offset
+            ));
+        } else {
+            notes.push(
+                "Pane did not find an obvious Linux root partition; native boot may need an explicit root handoff."
+                    .to_string(),
+            );
+        }
     } else {
         notes.push(
             "Base OS image does not look like a directly bootable raw disk yet; future native boot may require conversion or an initramfs root handoff."
@@ -3161,8 +3208,127 @@ fn inspect_base_os_image_artifact(path: &Path) -> AppResult<BaseOsImageInspectio
     Ok(BaseOsImageInspection {
         image_format: image_format.to_string(),
         bootable_disk_hint,
+        partitions,
+        root_partition_hint,
         notes,
     })
+}
+
+fn inspect_mbr_partitions(header: &[u8]) -> Vec<BaseOsPartition> {
+    header
+        .get(446..510)
+        .into_iter()
+        .flat_map(|entries| entries.chunks_exact(16).enumerate())
+        .filter_map(|(index, entry)| {
+            let partition_type = entry[4];
+            let start_lba = read_u32_le_slice(&entry[8..12])? as u64;
+            let sector_count = read_u32_le_slice(&entry[12..16])? as u64;
+            if partition_type == 0 || sector_count == 0 {
+                return None;
+            }
+            let root_candidate = matches!(partition_type, 0x83 | 0x8e);
+            Some(BaseOsPartition {
+                index: (index + 1) as u32,
+                scheme: "mbr".to_string(),
+                partition_type: format!("0x{partition_type:02x}"),
+                bootable: entry[0] == 0x80,
+                start_lba,
+                sector_count,
+                byte_offset: start_lba.saturating_mul(512),
+                byte_length: sector_count.saturating_mul(512),
+                root_candidate,
+            })
+        })
+        .collect()
+}
+
+fn inspect_gpt_partitions(
+    file: &mut fs::File,
+    image_bytes: u64,
+) -> AppResult<Vec<BaseOsPartition>> {
+    if image_bytes < 1024 {
+        return Ok(Vec::new());
+    }
+
+    let mut gpt_header = [0_u8; 92];
+    file.seek(SeekFrom::Start(512))?;
+    file.read_exact(&mut gpt_header)?;
+    let entries_lba = read_u64_le_at(&gpt_header, 72).unwrap_or(2);
+    let entry_count = read_u32_le_at(&gpt_header, 80).unwrap_or(0).min(128);
+    let entry_size = read_u32_le_at(&gpt_header, 84)
+        .unwrap_or(128)
+        .clamp(128, 4096);
+    if entry_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let entries_offset = entries_lba.saturating_mul(512);
+    let entries_bytes = u64::from(entry_count).saturating_mul(u64::from(entry_size));
+    if entries_offset.saturating_add(entries_bytes) > image_bytes {
+        return Ok(Vec::new());
+    }
+
+    let mut partitions = Vec::new();
+    file.seek(SeekFrom::Start(entries_offset))?;
+    for index in 0..entry_count {
+        let mut entry = vec![0_u8; entry_size as usize];
+        file.read_exact(&mut entry)?;
+        if entry
+            .get(0..16)
+            .map(|guid| guid.iter().all(|byte| *byte == 0))
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let first_lba = read_u64_le_at(&entry, 32).unwrap_or(0);
+        let last_lba = read_u64_le_at(&entry, 40).unwrap_or(0);
+        if first_lba == 0 || last_lba < first_lba {
+            continue;
+        }
+        let partition_type = gpt_partition_type_label(&entry[0..16]);
+        let root_candidate = partition_type.contains("linux");
+        let sector_count = last_lba - first_lba + 1;
+        partitions.push(BaseOsPartition {
+            index: index + 1,
+            scheme: "gpt".to_string(),
+            partition_type,
+            bootable: false,
+            start_lba: first_lba,
+            sector_count,
+            byte_offset: first_lba.saturating_mul(512),
+            byte_length: sector_count.saturating_mul(512),
+            root_candidate,
+        });
+    }
+
+    Ok(partitions)
+}
+
+fn gpt_partition_type_label(guid: &[u8]) -> String {
+    const LINUX_FILESYSTEM_GUID_LE: [u8; 16] = [
+        0xaf, 0x3d, 0xc6, 0x0f, 0x83, 0x84, 0x72, 0x47, 0x8e, 0x79, 0x3d, 0x69, 0xd8, 0x47, 0x7d,
+        0xe4,
+    ];
+    const LINUX_ROOT_X86_64_GUID_LE: [u8; 16] = [
+        0xe3, 0xbc, 0x68, 0x4f, 0xcd, 0xe8, 0xb1, 0x4d, 0x96, 0xe7, 0xfb, 0xca, 0xf9, 0x84, 0xb7,
+        0x09,
+    ];
+    if guid == LINUX_FILESYSTEM_GUID_LE {
+        "linux-filesystem".to_string()
+    } else if guid == LINUX_ROOT_X86_64_GUID_LE {
+        "linux-root-x86_64".to_string()
+    } else {
+        format!("gpt-guid-{}", hex_lower(guid))
+    }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn read_u32_le_slice(bytes: &[u8]) -> Option<u32> {
+    let slice = bytes.get(0..4)?;
+    Some(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
 }
 
 fn create_user_disk_descriptor(
@@ -4018,6 +4184,11 @@ fn read_u16_le_at(bytes: &[u8], offset: usize) -> Option<u16> {
     Some(u16::from_le_bytes([slice[0], slice[1]]))
 }
 
+fn read_u32_le_at(bytes: &[u8], offset: usize) -> Option<u32> {
+    let slice = bytes.get(offset..offset + 4)?;
+    Some(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
 fn read_u64_le_at(bytes: &[u8], offset: usize) -> Option<u64> {
     let slice = bytes.get(offset..offset + 8)?;
     Some(u64::from_le_bytes([
@@ -4341,12 +4512,17 @@ fn build_kernel_storage_attachment(
     let base_bytes = artifacts.base_os_image_bytes.ok_or_else(|| {
         AppError::message("Verified base OS image is missing its recorded byte length.")
     })?;
+    let base_metadata = read_json_file::<BaseOsImageMetadata>(&paths.base_os_metadata)?;
 
     Ok(Some(KernelStorageAttachment {
         schema_version: 1,
         base_os_path: paths.base_os_image.display().to_string(),
         base_os_sha256: base_sha256,
         base_os_bytes: base_bytes,
+        base_os_image_format: base_metadata.image_format,
+        base_os_bootable_disk_hint: base_metadata.bootable_disk_hint,
+        base_os_partitions: base_metadata.partitions,
+        base_os_root_partition_hint: base_metadata.root_partition_hint,
         user_disk_path: user_disk_metadata.disk_path,
         user_disk_capacity_gib: user_disk_metadata.capacity_gib,
         user_disk_logical_size_bytes: user_disk_metadata.logical_size_bytes,
@@ -8178,6 +8354,15 @@ fn print_native_kernel_plan_report(report: &NativeKernelPlanReport) {
             println!("Storage");
             println!("  Root Device    {}", storage.root_device);
             println!("  Base Image     {}", storage.base_os_path);
+            println!("  Base Format    {}", storage.base_os_image_format);
+            println!(
+                "  Base Boot Hint {}",
+                yes_no(storage.base_os_bootable_disk_hint)
+            );
+            if let Some(root) = &storage.base_os_root_partition_hint {
+                println!("  Base Root Part {}", root.index);
+                println!("  Root Offset    {}", root.byte_offset);
+            }
             println!("  User Device    {}", storage.user_device);
             println!("  User Disk      {}", storage.user_disk_path);
             println!("  Contract GPA   {}", storage.contract_gpa);
@@ -9739,6 +9924,72 @@ mod tests {
             Some("raw-gpt-disk")
         );
         assert_eq!(artifacts.base_os_bootable_disk_hint, Some(true));
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn base_os_registration_records_linux_root_partition_hint() {
+        let paths = temp_runtime_paths("runtime-base-image-mbr-root");
+        super::prepare_runtime_paths(&paths).unwrap();
+        let source = paths.downloads.join("arch-mbr.img");
+        let mut image = vec![0_u8; 4096];
+        image[446] = 0x80;
+        image[450] = 0x83;
+        image[454..458].copy_from_slice(&2048_u32.to_le_bytes());
+        image[458..462].copy_from_slice(&4096_u32.to_le_bytes());
+        image[510..512].copy_from_slice(&[0x55, 0xaa]);
+        std::fs::write(&source, image).unwrap();
+        let expected = sha256_file(&source).unwrap();
+
+        register_base_os_image(&paths, &source, Some(&expected), false).unwrap();
+
+        let metadata = read_json_file::<BaseOsImageMetadata>(&paths.base_os_metadata).unwrap();
+        assert_eq!(metadata.image_format, "raw-mbr-disk");
+        assert_eq!(metadata.partitions.len(), 1);
+        let root = metadata.root_partition_hint.expect("root partition hint");
+        assert_eq!(root.index, 1);
+        assert_eq!(root.partition_type, "0x83");
+        assert!(root.bootable);
+        assert_eq!(root.byte_offset, 2048 * 512);
+        assert_eq!(root.byte_length, 4096 * 512);
+        assert!(root.root_candidate);
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn base_os_registration_records_gpt_linux_root_partition_hint() {
+        let paths = temp_runtime_paths("runtime-base-image-gpt-root");
+        super::prepare_runtime_paths(&paths).unwrap();
+        let source = paths.downloads.join("arch-gpt.img");
+        let mut image = vec![0_u8; 4096 * 512];
+        image[510..512].copy_from_slice(&[0x55, 0xaa]);
+        image[512..520].copy_from_slice(b"EFI PART");
+        image[512 + 72..512 + 80].copy_from_slice(&2_u64.to_le_bytes());
+        image[512 + 80..512 + 84].copy_from_slice(&1_u32.to_le_bytes());
+        image[512 + 84..512 + 88].copy_from_slice(&128_u32.to_le_bytes());
+        let entry = 1024;
+        image[entry..entry + 16].copy_from_slice(&[
+            0xe3, 0xbc, 0x68, 0x4f, 0xcd, 0xe8, 0xb1, 0x4d, 0x96, 0xe7, 0xfb, 0xca, 0xf9, 0x84,
+            0xb7, 0x09,
+        ]);
+        image[entry + 32..entry + 40].copy_from_slice(&2048_u64.to_le_bytes());
+        image[entry + 40..entry + 48].copy_from_slice(&4095_u64.to_le_bytes());
+        std::fs::write(&source, image).unwrap();
+        let expected = sha256_file(&source).unwrap();
+
+        register_base_os_image(&paths, &source, Some(&expected), false).unwrap();
+
+        let metadata = read_json_file::<BaseOsImageMetadata>(&paths.base_os_metadata).unwrap();
+        assert_eq!(metadata.image_format, "raw-gpt-disk");
+        assert_eq!(metadata.partitions.len(), 1);
+        let root = metadata.root_partition_hint.expect("root partition hint");
+        assert_eq!(root.index, 1);
+        assert_eq!(root.partition_type, "linux-root-x86_64");
+        assert_eq!(root.byte_offset, 2048 * 512);
+        assert_eq!(root.byte_length, 2048 * 512);
+        assert!(root.root_candidate);
 
         let _ = std::fs::remove_dir_all(&paths.root);
     }

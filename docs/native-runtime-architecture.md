@@ -13,7 +13,7 @@ Pane currently owns:
 - managed Arch onboarding and repair flows,
 - PaneShared user file exchange,
 - dedicated runtime storage under `%LOCALAPPDATA%\Pane\runtime\<session>`,
-- base OS image registration, SHA-256 verification metadata, and raw disk/rootfs format inspection,
+- base OS image registration, SHA-256 verification metadata, raw disk/rootfs format inspection, and Linux root partition hints,
 - a sparse Pane user disk artifact for future Linux system, package, account, and customization data,
 - a sparse user disk block I/O primitive with zero-filled unallocated blocks for the future WHP block-device handler,
 - a runtime-backed `serial-boot.paneimg` test image plus SHA-256 metadata for the WHP boot-spike runner,

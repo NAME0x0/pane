@@ -3687,6 +3687,67 @@ fn write_user_disk_block(
     Ok(())
 }
 
+#[allow(dead_code)] // Covered by tests; this is the adapter the WHP block-exit handler will call.
+#[derive(Debug, PartialEq, Eq)]
+struct NativeBlockIoExecution {
+    decision: crate::native::NativeBlockIoDecision,
+    bytes: Vec<u8>,
+}
+
+#[allow(dead_code)] // Covered by tests; wired into live WHP exits in the next storage milestone.
+fn execute_native_block_io_command(
+    paths: &RuntimePaths,
+    command: &crate::native::NativeBlockIoCommand,
+    write_payload: Option<&[u8]>,
+) -> AppResult<NativeBlockIoExecution> {
+    let decision = crate::native::evaluate_native_block_io(command);
+    if !decision.allowed {
+        return Ok(NativeBlockIoExecution {
+            decision,
+            bytes: Vec::new(),
+        });
+    }
+
+    let block_size: usize = command.block_size_bytes.try_into().map_err(|_| {
+        AppError::message("Pane native block I/O block size is too large for this host.")
+    })?;
+
+    let bytes = match (command.device, command.operation) {
+        (crate::native::NativeBlockDeviceId::BaseOs, crate::native::NativeBlockOperation::Read) => {
+            read_base_os_block(paths, command.block_index)?
+        }
+        (
+            crate::native::NativeBlockDeviceId::UserDisk,
+            crate::native::NativeBlockOperation::Read,
+        ) => {
+            let metadata = read_json_file::<UserDiskMetadata>(&paths.user_disk_metadata)?;
+            read_user_disk_block(paths, &metadata, command.block_index)?
+        }
+        (
+            crate::native::NativeBlockDeviceId::UserDisk,
+            crate::native::NativeBlockOperation::Write,
+        ) => {
+            let payload = write_payload.ok_or_else(|| {
+                AppError::message("Pane native user-disk write command is missing a payload.")
+            })?;
+            if payload.len() != block_size {
+                return Err(AppError::message(format!(
+                    "Pane native user-disk write payload must be exactly {block_size} bytes."
+                )));
+            }
+            let metadata = read_json_file::<UserDiskMetadata>(&paths.user_disk_metadata)?;
+            write_user_disk_block(paths, &metadata, command.block_index, payload)?;
+            Vec::new()
+        }
+        (
+            crate::native::NativeBlockDeviceId::BaseOs,
+            crate::native::NativeBlockOperation::Write,
+        ) => Vec::new(),
+    };
+
+    Ok(NativeBlockIoExecution { decision, bytes })
+}
+
 fn create_user_disk_snapshot(paths: &RuntimePaths) -> AppResult<UserDiskSnapshotMetadata> {
     let metadata = read_json_file::<UserDiskMetadata>(&paths.user_disk_metadata)?;
     if !user_disk_artifact_ready(paths, &Some(metadata.clone())) {
@@ -9836,10 +9897,10 @@ mod tests {
         build_runtime_artifact_report, build_steps, build_update_steps,
         create_serial_boot_image_artifact, create_user_disk_descriptor, create_user_disk_snapshot,
         default_framebuffer_contract, default_input_contract, default_linux_guest_memory_map,
-        determine_app_lifecycle, ensure_wsl_conf_setting, export_user_disk_package,
-        format_doctor_blockers, import_user_disk_package, initialize_managed_arch_environment,
-        inspect_kernel_image_artifact, inspect_workspace, inventory_contains_distro,
-        kernel_layout_execution_image, linux_guest_mapped_regions,
+        determine_app_lifecycle, ensure_wsl_conf_setting, execute_native_block_io_command,
+        export_user_disk_package, format_doctor_blockers, import_user_disk_package,
+        initialize_managed_arch_environment, inspect_kernel_image_artifact, inspect_workspace,
+        inventory_contains_distro, kernel_layout_execution_image, linux_guest_mapped_regions,
         load_kernel_layout_boot_image_artifact, parse_guest_physical_address, preferred_transport,
         read_base_os_block, read_json_file, read_user_disk_block, register_base_os_image,
         register_boot_loader_image, register_kernel_boot_plan, repair_user_disk_metadata,
@@ -10857,6 +10918,77 @@ mod tests {
         let still_zero = read_user_disk_block(&paths, &metadata, 3).unwrap();
         assert!(still_zero.iter().all(|byte| *byte == 0));
         assert!(user_disk_artifact_ready(&paths, &Some(metadata)));
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn native_block_io_adapter_routes_base_reads_and_user_writes() {
+        let paths = temp_runtime_paths("runtime-native-block-io-adapter");
+        super::prepare_runtime_paths(&paths).unwrap();
+        let base = paths.downloads.join("arch-base.img");
+        let mut image = vec![0_u8; 5000];
+        image[..16].copy_from_slice(b"PANE_BASE_ADAPT_");
+        std::fs::write(&base, image).unwrap();
+        let base_sha = sha256_file(&base).unwrap();
+        register_base_os_image(&paths, &base, Some(&base_sha), false).unwrap();
+        create_user_disk_descriptor(&paths, &runtime_storage_budget(8), false).unwrap();
+
+        let base_read = execute_native_block_io_command(
+            &paths,
+            &crate::native::NativeBlockIoCommand {
+                device: crate::native::NativeBlockDeviceId::BaseOs,
+                operation: crate::native::NativeBlockOperation::Read,
+                block_index: 0,
+                block_size_bytes: crate::native::PANE_BLOCK_IO_BLOCK_SIZE_BYTES,
+            },
+            None,
+        )
+        .unwrap();
+        assert!(base_read.decision.allowed);
+        assert_eq!(&base_read.bytes[..16], b"PANE_BASE_ADAPT_");
+
+        let denied_base_write = execute_native_block_io_command(
+            &paths,
+            &crate::native::NativeBlockIoCommand {
+                device: crate::native::NativeBlockDeviceId::BaseOs,
+                operation: crate::native::NativeBlockOperation::Write,
+                block_index: 0,
+                block_size_bytes: crate::native::PANE_BLOCK_IO_BLOCK_SIZE_BYTES,
+            },
+            Some(&vec![1_u8; 4096]),
+        )
+        .unwrap();
+        assert!(!denied_base_write.decision.allowed);
+        assert_eq!(denied_base_write.decision.status, "readonly-device");
+
+        let payload = vec![0x5a_u8; 4096];
+        let user_write = execute_native_block_io_command(
+            &paths,
+            &crate::native::NativeBlockIoCommand {
+                device: crate::native::NativeBlockDeviceId::UserDisk,
+                operation: crate::native::NativeBlockOperation::Write,
+                block_index: 3,
+                block_size_bytes: crate::native::PANE_BLOCK_IO_BLOCK_SIZE_BYTES,
+            },
+            Some(&payload),
+        )
+        .unwrap();
+        assert!(user_write.decision.allowed);
+        assert!(user_write.bytes.is_empty());
+
+        let user_read = execute_native_block_io_command(
+            &paths,
+            &crate::native::NativeBlockIoCommand {
+                device: crate::native::NativeBlockDeviceId::UserDisk,
+                operation: crate::native::NativeBlockOperation::Read,
+                block_index: 3,
+                block_size_bytes: crate::native::PANE_BLOCK_IO_BLOCK_SIZE_BYTES,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(user_read.bytes, payload);
 
         let _ = std::fs::remove_dir_all(&paths.root);
     }

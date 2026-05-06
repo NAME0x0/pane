@@ -215,6 +215,7 @@ What exists today:
 - fixed linear framebuffer contract mapped into guest memory for the future Pane-rendered display path,
 - keyboard/pointer input queue contract mapped into guest memory for the future app-owned input path,
 - Linux bzImage setup header copying into boot params,
+- Pane runtime contract discovery arguments on the Linux kernel command line,
 - E820 memory map including boot params, GDT, initramfs, RAM, APIC stubs, framebuffer memory, and input queue memory,
 - protected-mode register handoff with boot params in `rsi`,
 - minimal COM1 UART behavior for early serial setup,

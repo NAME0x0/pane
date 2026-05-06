@@ -3723,6 +3723,56 @@ fn storage_contract_page_bytes(storage: &KernelStorageAttachment) -> AppResult<V
     Ok(page)
 }
 
+fn augment_kernel_cmdline_for_runtime_contracts(
+    base_cmdline: &str,
+    storage: Option<&KernelStorageAttachment>,
+    framebuffer: &FramebufferContract,
+    input: &InputContract,
+) -> AppResult<String> {
+    let mut cmdline = base_cmdline.trim().to_string();
+    if let Some(storage) = storage {
+        append_kernel_arg(
+            &mut cmdline,
+            format!("pane.storage_contract={}", storage.contract_gpa),
+        );
+        append_kernel_arg(&mut cmdline, format!("pane.root={}", storage.root_device));
+        append_kernel_arg(&mut cmdline, format!("pane.user={}", storage.user_device));
+    }
+    append_kernel_arg(
+        &mut cmdline,
+        format!(
+            "pane.framebuffer={},{},{},{},{}",
+            framebuffer.guest_gpa,
+            framebuffer.width,
+            framebuffer.height,
+            framebuffer.bytes_per_pixel * 8,
+            framebuffer.format
+        ),
+    );
+    append_kernel_arg(
+        &mut cmdline,
+        format!("pane.input_queue={}", input.guest_queue_gpa),
+    );
+    validate_kernel_cmdline(&cmdline)?;
+    Ok(cmdline)
+}
+
+fn append_kernel_arg(cmdline: &mut String, arg: String) {
+    let key = arg.split_once('=').map(|(key, _)| key).unwrap_or(&arg);
+    if cmdline.split_whitespace().any(|existing| {
+        existing == key
+            || existing
+                .strip_prefix(key)
+                .is_some_and(|suffix| suffix.starts_with('='))
+    }) {
+        return;
+    }
+    if !cmdline.is_empty() {
+        cmdline.push(' ');
+    }
+    cmdline.push_str(&arg);
+}
+
 fn build_linux_boot_params_page(
     layout: &KernelBootLayout,
     kernel_bytes: Option<&[u8]>,
@@ -4133,6 +4183,12 @@ fn build_kernel_boot_layout(
         .unwrap_or_else(|_| default_framebuffer_contract());
     let input = read_json_file::<InputContract>(&paths.input_contract)
         .unwrap_or_else(|_| default_input_contract());
+    let cmdline = augment_kernel_cmdline_for_runtime_contracts(
+        &metadata.cmdline,
+        storage.as_ref(),
+        &framebuffer,
+        &input,
+    )?;
     if is_linux_bzimage {
         if let Some(storage) = &storage {
             guest_memory_map.push(storage_contract_guest_memory_range(storage)?);
@@ -4167,7 +4223,7 @@ fn build_kernel_boot_layout(
         initramfs_path: metadata.initramfs_stored_path,
         initramfs_bytes: metadata.initramfs_bytes,
         initramfs_sha256: metadata.initramfs_sha256,
-        cmdline: metadata.cmdline,
+        cmdline,
         expected_serial_device: metadata.expected_serial_device,
         storage,
         framebuffer: Some(framebuffer),
@@ -5034,6 +5090,18 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
             } else {
                 Vec::new()
             };
+            let expected_cmdline = framebuffer_contract
+                .as_ref()
+                .zip(input_contract.as_ref())
+                .and_then(|(framebuffer, input)| {
+                    augment_kernel_cmdline_for_runtime_contracts(
+                        &metadata.cmdline,
+                        layout.storage.as_ref(),
+                        framebuffer,
+                        input,
+                    )
+                    .ok()
+                });
 
             kernel_boot_plan_ready
                 && layout.schema_version == 1
@@ -5065,7 +5133,7 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
                 && layout.initramfs_path == metadata.initramfs_stored_path
                 && layout.initramfs_bytes == metadata.initramfs_bytes
                 && layout.initramfs_sha256 == metadata.initramfs_sha256
-                && layout.cmdline == metadata.cmdline
+                && Some(&layout.cmdline) == expected_cmdline.as_ref()
                 && layout.cmdline.contains("console=ttyS0")
                 && layout.expected_serial_device == "ttyS0"
                 && layout.framebuffer.as_ref().is_some_and(|contract| {
@@ -9638,6 +9706,13 @@ mod tests {
         assert_eq!(storage.root_device, "/dev/pane0");
         assert_eq!(storage.user_device, "/dev/pane1");
         assert_eq!(storage.contract_gpa, "0x0dfe0000");
+        assert!(layout.cmdline.contains("pane.storage_contract=0x0dfe0000"));
+        assert!(layout.cmdline.contains("pane.root=/dev/pane0"));
+        assert!(layout.cmdline.contains("pane.user=/dev/pane1"));
+        assert!(layout
+            .cmdline
+            .contains("pane.framebuffer=0x0e000000,1024,768,32,x8r8g8b8"));
+        assert!(layout.cmdline.contains("pane.input_queue=0x0dff0000"));
         assert!(storage.readonly_base);
         assert!(storage.writable_user_disk);
         assert_eq!(storage.base_os_sha256, base_sha);

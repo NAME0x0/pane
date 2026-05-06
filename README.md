@@ -208,6 +208,7 @@ What exists today:
 - sparse Pane user disk artifact for future Linux packages, accounts, and customization data,
 - sparse user disk block I/O primitive with zero-fill semantics for the future WHP block-device handler,
 - read-only base OS image block I/O primitive with EOF zero-fill semantics for the future WHP block-device handler,
+- native block I/O policy plus WHP Pane block-port classification for the future guest-visible storage device,
 - verified Pane user disk snapshots under the runtime snapshot store,
 - runtime-backed serial boot image,
 - verified boot-to-serial loader candidate slot,

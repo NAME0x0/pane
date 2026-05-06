@@ -19,6 +19,11 @@ pub(crate) const LINUX_BOOT_GDT_GPA: u64 = 0x0000_8000;
 pub(crate) const LINUX_BOOT_STACK_GPA: u64 = 0x0008_0000;
 pub(crate) const LINUX_BOOT_CODE_SELECTOR: u16 = 0x10;
 pub(crate) const LINUX_BOOT_DATA_SELECTOR: u16 = 0x18;
+pub(crate) const PANE_BLOCK_IO_BASE_PORT: u16 = 0x0d00;
+pub(crate) const PANE_BLOCK_IO_PORT_COUNT: u16 = 0x0010;
+pub(crate) const PANE_BLOCK_IO_LAST_PORT: u16 =
+    PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_PORT_COUNT - 1;
+pub(crate) const PANE_BLOCK_IO_BLOCK_SIZE_BYTES: u32 = 4096;
 
 #[derive(Clone, Debug)]
 pub(crate) struct NativeSerialBootImage {
@@ -54,6 +59,106 @@ pub(crate) struct NativeGuestMemoryRegion {
     pub(crate) bytes: Vec<u8>,
     pub(crate) writable: bool,
     pub(crate) executable: bool,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum NativeBlockDeviceId {
+    BaseOs,
+    UserDisk,
+}
+
+impl NativeBlockDeviceId {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::BaseOs => "pane-base-os",
+            Self::UserDisk => "pane-user-disk",
+        }
+    }
+
+    fn writable(self) -> bool {
+        matches!(self, Self::UserDisk)
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum NativeBlockOperation {
+    Read,
+    Write,
+}
+
+impl NativeBlockOperation {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NativeBlockIoCommand {
+    pub(crate) device: NativeBlockDeviceId,
+    pub(crate) operation: NativeBlockOperation,
+    pub(crate) block_index: u64,
+    pub(crate) block_size_bytes: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NativeBlockIoDecision {
+    pub(crate) allowed: bool,
+    pub(crate) status: &'static str,
+    pub(crate) detail: String,
+}
+
+pub(crate) fn evaluate_native_block_io(command: &NativeBlockIoCommand) -> NativeBlockIoDecision {
+    if command.block_size_bytes != PANE_BLOCK_IO_BLOCK_SIZE_BYTES {
+        return NativeBlockIoDecision {
+            allowed: false,
+            status: "unsupported-block-size",
+            detail: format!(
+                "Pane block I/O requires {} byte blocks; guest requested {} bytes.",
+                PANE_BLOCK_IO_BLOCK_SIZE_BYTES, command.block_size_bytes
+            ),
+        };
+    }
+
+    if command.operation == NativeBlockOperation::Write && !command.device.writable() {
+        return NativeBlockIoDecision {
+            allowed: false,
+            status: "readonly-device",
+            detail: format!(
+                "Pane rejected write to read-only {} block {}.",
+                command.device.label(),
+                command.block_index
+            ),
+        };
+    }
+
+    NativeBlockIoDecision {
+        allowed: true,
+        status: "allowed",
+        detail: format!(
+            "Pane accepted {} for {} block {}.",
+            command.operation.label(),
+            command.device.label(),
+            command.block_index
+        ),
+    }
+}
+
+pub(crate) fn pane_block_io_port_offset(port: u16) -> Option<u16> {
+    if (PANE_BLOCK_IO_BASE_PORT..=PANE_BLOCK_IO_LAST_PORT).contains(&port) {
+        Some(port - PANE_BLOCK_IO_BASE_PORT)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn pane_block_io_device_for_port(port: u16) -> Option<NativeBlockDeviceId> {
+    match pane_block_io_port_offset(port)? {
+        0..=7 => Some(NativeBlockDeviceId::BaseOs),
+        _ => Some(NativeBlockDeviceId::UserDisk),
+    }
 }
 
 pub(crate) fn serial_boot_test_image_bytes() -> Vec<u8> {
@@ -629,6 +734,10 @@ mod windows_whp {
         NativeSerialBootImage, NativeWhpCallReport, WhpPreflightReport, LINUX_BOOT_CODE_SELECTOR,
         LINUX_BOOT_DATA_SELECTOR, LINUX_BOOT_GDT_GPA, LINUX_BOOT_STACK_GPA, REQUIRED_WHP_EXPORTS,
         SERIAL_BOOT_BANNER_TEXT, SERIAL_BOOT_TEST_IMAGE_SIZE,
+    };
+    use crate::native::{
+        evaluate_native_block_io, pane_block_io_device_for_port, NativeBlockIoCommand,
+        NativeBlockOperation, PANE_BLOCK_IO_BLOCK_SIZE_BYTES,
     };
 
     const WHV_CAPABILITY_CODE_HYPERVISOR_PRESENT: u32 = 0;
@@ -1785,6 +1894,30 @@ mod windows_whp {
                     serial_byte,
                     rax,
                 } => {
+                    if let Some(device) = pane_block_io_device_for_port(port) {
+                        let command = NativeBlockIoCommand {
+                            device,
+                            operation: if is_write {
+                                NativeBlockOperation::Write
+                            } else {
+                                NativeBlockOperation::Read
+                            },
+                            block_index: 0,
+                            block_size_bytes: PANE_BLOCK_IO_BLOCK_SIZE_BYTES,
+                        };
+                        let decision = evaluate_native_block_io(&command);
+                        report.calls.push(NativeWhpCallReport {
+                            name: "PaneBlockIoExitPending",
+                            hresult: None,
+                            ok: decision.allowed,
+                            detail: format!(
+                                "Linux reached Pane block I/O port 0x{port:04x}; policy={} detail={}. The next milestone must service this exit with the base/user disk block backends.",
+                                decision.status, decision.detail
+                            ),
+                        });
+                        break;
+                    }
+
                     if access_size != 1
                         || !(SERIAL_COM1_PORT..=SERIAL_COM1_LAST_PORT).contains(&port)
                     {
@@ -2575,9 +2708,12 @@ mod windows_whp {
             WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS,
         };
         use crate::native::{
-            linux_boot_gdt_page_bytes, serial_boot_test_image_bytes, NativePartitionSmokeReport,
+            evaluate_native_block_io, linux_boot_gdt_page_bytes, pane_block_io_device_for_port,
+            pane_block_io_port_offset, serial_boot_test_image_bytes, NativeBlockDeviceId,
+            NativeBlockIoCommand, NativeBlockOperation, NativePartitionSmokeReport,
             NativePartitionSmokeStatus, LINUX_BOOT_CODE_SELECTOR, LINUX_BOOT_DATA_SELECTOR,
-            LINUX_BOOT_GDT_GPA, LINUX_BOOT_STACK_GPA, SERIAL_BOOT_BANNER_TEXT,
+            LINUX_BOOT_GDT_GPA, LINUX_BOOT_STACK_GPA, PANE_BLOCK_IO_BASE_PORT,
+            PANE_BLOCK_IO_BLOCK_SIZE_BYTES, PANE_BLOCK_IO_LAST_PORT, SERIAL_BOOT_BANNER_TEXT,
         };
 
         #[test]
@@ -2666,6 +2802,67 @@ mod windows_whp {
             assert!(!serial.write(SERIAL_COM1_PORT + 1, 0x00));
             assert_eq!(serial.read(SERIAL_COM1_PORT), 0x01);
             assert_eq!(serial.read(SERIAL_COM1_PORT + 1), 0x00);
+        }
+
+        #[test]
+        fn pane_block_io_ports_are_classified_for_storage_exits() {
+            assert_eq!(pane_block_io_port_offset(PANE_BLOCK_IO_BASE_PORT), Some(0));
+            assert_eq!(
+                pane_block_io_port_offset(PANE_BLOCK_IO_BASE_PORT + 7),
+                Some(7)
+            );
+            assert_eq!(
+                pane_block_io_port_offset(PANE_BLOCK_IO_LAST_PORT),
+                Some(PANE_BLOCK_IO_LAST_PORT - PANE_BLOCK_IO_BASE_PORT)
+            );
+            assert_eq!(pane_block_io_port_offset(PANE_BLOCK_IO_BASE_PORT - 1), None);
+            assert_eq!(pane_block_io_port_offset(PANE_BLOCK_IO_LAST_PORT + 1), None);
+            assert_eq!(
+                pane_block_io_device_for_port(PANE_BLOCK_IO_BASE_PORT),
+                Some(NativeBlockDeviceId::BaseOs)
+            );
+            assert_eq!(
+                pane_block_io_device_for_port(PANE_BLOCK_IO_BASE_PORT + 8),
+                Some(NativeBlockDeviceId::UserDisk)
+            );
+        }
+
+        #[test]
+        fn native_block_io_contract_enforces_base_read_only_policy() {
+            let base_read = evaluate_native_block_io(&NativeBlockIoCommand {
+                device: NativeBlockDeviceId::BaseOs,
+                operation: NativeBlockOperation::Read,
+                block_index: 9,
+                block_size_bytes: PANE_BLOCK_IO_BLOCK_SIZE_BYTES,
+            });
+            assert!(base_read.allowed);
+            assert_eq!(base_read.status, "allowed");
+
+            let base_write = evaluate_native_block_io(&NativeBlockIoCommand {
+                device: NativeBlockDeviceId::BaseOs,
+                operation: NativeBlockOperation::Write,
+                block_index: 9,
+                block_size_bytes: PANE_BLOCK_IO_BLOCK_SIZE_BYTES,
+            });
+            assert!(!base_write.allowed);
+            assert_eq!(base_write.status, "readonly-device");
+
+            let user_write = evaluate_native_block_io(&NativeBlockIoCommand {
+                device: NativeBlockDeviceId::UserDisk,
+                operation: NativeBlockOperation::Write,
+                block_index: 9,
+                block_size_bytes: PANE_BLOCK_IO_BLOCK_SIZE_BYTES,
+            });
+            assert!(user_write.allowed);
+
+            let bad_block_size = evaluate_native_block_io(&NativeBlockIoCommand {
+                device: NativeBlockDeviceId::UserDisk,
+                operation: NativeBlockOperation::Read,
+                block_index: 9,
+                block_size_bytes: 512,
+            });
+            assert!(!bad_block_size.allowed);
+            assert_eq!(bad_block_size.status, "unsupported-block-size");
         }
 
         #[test]

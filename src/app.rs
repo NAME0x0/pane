@@ -467,6 +467,8 @@ struct KernelStorageAttachment {
     base_os_path: String,
     base_os_sha256: String,
     base_os_bytes: u64,
+    #[serde(default = "default_base_os_block_size_bytes")]
+    base_os_block_size_bytes: u64,
     base_os_image_format: String,
     base_os_bootable_disk_hint: bool,
     base_os_partitions: Vec<BaseOsPartition>,
@@ -610,9 +612,14 @@ struct UserDiskExportManifest {
 const PANE_USER_DISK_FORMAT: &str = "pane-sparse-user-disk-v1";
 const PANE_USER_DISK_MAGIC: &str = "PANE_USER_DISK_V1\n";
 const PANE_USER_DISK_BLOCK_SIZE_BYTES: u64 = 4096;
+const PANE_BASE_OS_BLOCK_SIZE_BYTES: u64 = 4096;
 const PANE_USER_DISK_EXPORT_MANIFEST_FILENAME: &str = "pane-user-disk-export.json";
 const PANE_USER_DISK_EXPORT_DISK_FILENAME: &str = "user-data.panedisk";
 const PANE_USER_DISK_EXPORT_METADATA_FILENAME: &str = "user-disk.json";
+
+fn default_base_os_block_size_bytes() -> u64 {
+    PANE_BASE_OS_BLOCK_SIZE_BYTES
+}
 
 #[derive(Debug, Serialize)]
 struct NativeRuntimeReport {
@@ -3434,6 +3441,45 @@ fn read_u32_le_slice(bytes: &[u8]) -> Option<u32> {
     Some(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
 }
 
+#[allow(dead_code)] // Covered by tests; used by the upcoming WHP read-only base block-device handler.
+fn read_base_os_block(paths: &RuntimePaths, block_index: u64) -> AppResult<Vec<u8>> {
+    let metadata = read_json_file::<BaseOsImageMetadata>(&paths.base_os_metadata)?;
+    if !metadata.verified {
+        return Err(AppError::message(
+            "Pane base OS image is not verified for block I/O.",
+        ));
+    }
+    if metadata.stored_path != paths.base_os_image.display().to_string() {
+        return Err(AppError::message(
+            "Pane base OS image metadata points at a different artifact path.",
+        ));
+    }
+    let actual_bytes = fs::metadata(&paths.base_os_image)?.len();
+    if actual_bytes != metadata.bytes || sha256_file(&paths.base_os_image)? != metadata.sha256 {
+        return Err(AppError::message(
+            "Pane base OS image changed after registration; re-register it before block I/O.",
+        ));
+    }
+
+    let block_size: usize = PANE_BASE_OS_BLOCK_SIZE_BYTES
+        .try_into()
+        .map_err(|_| AppError::message("Pane base OS block size is too large for this host."))?;
+    let offset = block_index
+        .checked_mul(PANE_BASE_OS_BLOCK_SIZE_BYTES)
+        .ok_or_else(|| AppError::message("Pane base OS block offset overflowed."))?;
+    let mut block = vec![0_u8; block_size];
+    if offset >= metadata.bytes {
+        return Ok(block);
+    }
+
+    let mut file = OpenOptions::new().read(true).open(&paths.base_os_image)?;
+    file.seek(SeekFrom::Start(offset))?;
+    let remaining = metadata.bytes - offset;
+    let to_read = remaining.min(PANE_BASE_OS_BLOCK_SIZE_BYTES) as usize;
+    file.read_exact(&mut block[..to_read])?;
+    Ok(block)
+}
+
 fn create_user_disk_descriptor(
     paths: &RuntimePaths,
     budget: &RuntimeStorageBudget,
@@ -5185,6 +5231,7 @@ fn build_kernel_storage_attachment(
         base_os_path: paths.base_os_image.display().to_string(),
         base_os_sha256: base_sha256,
         base_os_bytes: base_bytes,
+        base_os_block_size_bytes: PANE_BASE_OS_BLOCK_SIZE_BYTES,
         base_os_image_format: base_metadata.image_format,
         base_os_bootable_disk_hint: base_metadata.bootable_disk_hint,
         base_os_partitions: base_metadata.partitions,
@@ -9088,6 +9135,7 @@ fn print_native_kernel_plan_report(report: &NativeKernelPlanReport) {
             println!("  Root Device    {}", storage.root_device);
             println!("  Base Image     {}", storage.base_os_path);
             println!("  Base Format    {}", storage.base_os_image_format);
+            println!("  Base Block     {}", storage.base_os_block_size_bytes);
             println!(
                 "  Base Boot Hint {}",
                 yes_no(storage.base_os_bootable_disk_hint)
@@ -9793,9 +9841,9 @@ mod tests {
         inspect_kernel_image_artifact, inspect_workspace, inventory_contains_distro,
         kernel_layout_execution_image, linux_guest_mapped_regions,
         load_kernel_layout_boot_image_artifact, parse_guest_physical_address, preferred_transport,
-        read_json_file, read_user_disk_block, register_base_os_image, register_boot_loader_image,
-        register_kernel_boot_plan, repair_user_disk_metadata, resize_user_disk,
-        resolve_bundle_output_path, resolve_init_source, resolve_launch_target,
+        read_base_os_block, read_json_file, read_user_disk_block, register_base_os_image,
+        register_boot_loader_image, register_kernel_boot_plan, repair_user_disk_metadata,
+        resize_user_disk, resolve_bundle_output_path, resolve_init_source, resolve_launch_target,
         resolve_managed_environment_for_reset, resolve_saved_launch, resolve_session_context,
         resolve_status_distro, restore_user_disk_snapshot, runtime_contract_guest_memory_ranges,
         runtime_storage_budget, sha256_file, status_port_for, user_disk_artifact_ready,
@@ -10736,6 +10784,32 @@ mod tests {
     }
 
     #[test]
+    fn read_base_os_block_zero_fills_tail_and_beyond_eof() {
+        let paths = temp_runtime_paths("runtime-base-image-block-read");
+        super::prepare_runtime_paths(&paths).unwrap();
+        let source = paths.downloads.join("arch-base.img");
+        let mut image = vec![0_u8; 5000];
+        image[..16].copy_from_slice(b"PANE_BASE_BLOCK_");
+        image[4096..4112].copy_from_slice(b"PANE_TAIL_BLOCK_");
+        std::fs::write(&source, image).unwrap();
+        let expected = sha256_file(&source).unwrap();
+        register_base_os_image(&paths, &source, Some(&expected), false).unwrap();
+
+        let first = read_base_os_block(&paths, 0).unwrap();
+        let second = read_base_os_block(&paths, 1).unwrap();
+        let beyond = read_base_os_block(&paths, 2).unwrap();
+
+        assert_eq!(first.len(), 4096);
+        assert_eq!(&first[..16], b"PANE_BASE_BLOCK_");
+        assert_eq!(second.len(), 4096);
+        assert_eq!(&second[..16], b"PANE_TAIL_BLOCK_");
+        assert!(second[904..].iter().all(|byte| *byte == 0));
+        assert!(beyond.iter().all(|byte| *byte == 0));
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
     fn create_user_disk_upgrades_legacy_descriptor_to_sparse_artifact() {
         let paths = temp_runtime_paths("runtime-user-disk-upgrade");
         super::prepare_runtime_paths(&paths).unwrap();
@@ -11032,6 +11106,7 @@ mod tests {
         assert_eq!(storage.root_device, "/dev/pane0");
         assert_eq!(storage.user_device, "/dev/pane1");
         assert_eq!(storage.contract_gpa, "0x0dfe0000");
+        assert_eq!(storage.base_os_block_size_bytes, 4096);
         assert!(layout.cmdline.contains("pane.storage_contract=0x0dfe0000"));
         assert!(layout.cmdline.contains("pane.root=/dev/pane0"));
         assert!(layout.cmdline.contains("pane.root_mode=base-device"));

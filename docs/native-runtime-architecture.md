@@ -16,6 +16,7 @@ Pane currently owns:
 - base OS image registration, SHA-256 verification metadata, raw disk/rootfs format inspection, Linux root partition hints, and kernel-layout root handoff decisions,
 - a sparse Pane user disk artifact for future Linux system, package, account, and customization data,
 - a sparse user disk block I/O primitive with zero-filled unallocated blocks for the future WHP block-device handler,
+- a read-only base OS image block I/O primitive with EOF zero-fill behavior for the future WHP block-device handler,
 - verified Pane user disk snapshots, restore validation, portable export/import packages, conservative grow-only resize, and metadata repair under the runtime snapshot/storage boundary,
 - a runtime-backed `serial-boot.paneimg` test image plus SHA-256 metadata for the WHP boot-spike runner,
 - a verified `boot-to-serial-loader.paneimg` candidate path for executing runtime-provided boot code under an explicit serial-output contract,

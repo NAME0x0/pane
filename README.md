@@ -207,6 +207,7 @@ What exists today:
 - verified base-image metadata slot with raw disk/rootfs format inspection, Linux root partition hints, and kernel-layout root handoff decisions,
 - sparse Pane user disk artifact for future Linux packages, accounts, and customization data,
 - sparse user disk block I/O primitive with zero-fill semantics for the future WHP block-device handler,
+- read-only base OS image block I/O primitive with EOF zero-fill semantics for the future WHP block-device handler,
 - verified Pane user disk snapshots under the runtime snapshot store,
 - runtime-backed serial boot image,
 - verified boot-to-serial loader candidate slot,

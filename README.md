@@ -41,7 +41,7 @@ Pane is a pre-release MVP. It is usable for the supported Arch + XFCE bridge pat
 | Display path | External Windows RDP client over XRDP, with Pane-managed connection assets and fallback handling. |
 | Shared files | PaneShared, durable by default and scratchable for disposable sessions. |
 | Supportability | Doctor checks, logs, repair/update/reset commands, and support bundles. |
-| Native runtime | WHP host preflight, serial boot fixture, boot-loader contract, kernel/initramfs plan, kernel layout, storage attachment, mapped framebuffer/input queue contracts, protected-mode entry probe, E820 map, COM1 probe model. |
+| Native runtime | WHP host preflight, serial boot fixture, boot-loader contract, kernel/initramfs plan, kernel layout, storage attachment, root handoff contract, mapped framebuffer/input queue contracts, protected-mode entry probe, E820 map, COM1 probe model. |
 | Not complete yet | Pane-owned Arch disk boot, native framebuffer/window, input, networking, audio, snapshots, and full GUI inside Pane's own renderer. |
 
 The project deliberately avoids claiming "zero latency", "full compatibility", or "contained VM" until the native boot, storage, and display milestones prove those properties.
@@ -204,7 +204,7 @@ Pane's long-term runtime target is not WSL, XRDP, `mstsc.exe`, QEMU, VirtualBox,
 What exists today:
 
 - runtime storage reservation under `%LOCALAPPDATA%\Pane\runtime\<session>`,
-- verified base-image metadata slot with raw disk/rootfs format and Linux root partition inspection,
+- verified base-image metadata slot with raw disk/rootfs format inspection, Linux root partition hints, and kernel-layout root handoff decisions,
 - sparse Pane user disk artifact for future Linux packages, accounts, and customization data,
 - sparse user disk block I/O primitive with zero-fill semantics for the future WHP block-device handler,
 - runtime-backed serial boot image,

@@ -469,6 +469,8 @@ struct KernelStorageAttachment {
     base_os_bootable_disk_hint: bool,
     base_os_partitions: Vec<BaseOsPartition>,
     base_os_root_partition_hint: Option<BaseOsPartition>,
+    #[serde(default = "default_kernel_root_handoff")]
+    root_handoff: KernelRootHandoff,
     user_disk_path: String,
     user_disk_capacity_gib: u64,
     user_disk_logical_size_bytes: u64,
@@ -481,6 +483,38 @@ struct KernelStorageAttachment {
     contract_gpa: String,
     readonly_base: bool,
     writable_user_disk: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct KernelRootHandoff {
+    schema_version: u32,
+    mode: String,
+    root_device: String,
+    base_device: String,
+    partition_index: Option<u32>,
+    partition_byte_offset: Option<u64>,
+    partition_byte_length: Option<u64>,
+    filesystem_hint: Option<String>,
+    requires_initramfs_driver: bool,
+    notes: Vec<String>,
+}
+
+fn default_kernel_root_handoff() -> KernelRootHandoff {
+    KernelRootHandoff {
+        schema_version: 1,
+        mode: "base-device".to_string(),
+        root_device: "/dev/pane0".to_string(),
+        base_device: "/dev/pane0".to_string(),
+        partition_index: None,
+        partition_byte_offset: None,
+        partition_byte_length: None,
+        filesystem_hint: None,
+        requires_initramfs_driver: true,
+        notes: vec![
+            "Legacy layout without explicit root handoff; Pane will treat the whole base device as root."
+                .to_string(),
+        ],
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -3979,7 +4013,23 @@ fn augment_kernel_cmdline_for_runtime_contracts(
             &mut cmdline,
             format!("pane.storage_contract={}", storage.contract_gpa),
         );
-        append_kernel_arg(&mut cmdline, format!("pane.root={}", storage.root_device));
+        append_kernel_arg(
+            &mut cmdline,
+            format!("pane.root={}", storage.root_handoff.root_device),
+        );
+        append_kernel_arg(
+            &mut cmdline,
+            format!("pane.root_mode={}", storage.root_handoff.mode),
+        );
+        if let Some(index) = storage.root_handoff.partition_index {
+            append_kernel_arg(&mut cmdline, format!("pane.root_partition={index}"));
+        }
+        if let Some(offset) = storage.root_handoff.partition_byte_offset {
+            append_kernel_arg(&mut cmdline, format!("pane.root_offset={offset}"));
+        }
+        if let Some(length) = storage.root_handoff.partition_byte_length {
+            append_kernel_arg(&mut cmdline, format!("pane.root_length={length}"));
+        }
         append_kernel_arg(&mut cmdline, format!("pane.user={}", storage.user_device));
     }
     append_kernel_arg(
@@ -4513,6 +4563,8 @@ fn build_kernel_storage_attachment(
         AppError::message("Verified base OS image is missing its recorded byte length.")
     })?;
     let base_metadata = read_json_file::<BaseOsImageMetadata>(&paths.base_os_metadata)?;
+    let root_handoff = build_kernel_root_handoff(&base_metadata);
+    let root_device = root_handoff.root_device.clone();
 
     Ok(Some(KernelStorageAttachment {
         schema_version: 1,
@@ -4523,6 +4575,7 @@ fn build_kernel_storage_attachment(
         base_os_bootable_disk_hint: base_metadata.bootable_disk_hint,
         base_os_partitions: base_metadata.partitions,
         base_os_root_partition_hint: base_metadata.root_partition_hint,
+        root_handoff,
         user_disk_path: user_disk_metadata.disk_path,
         user_disk_capacity_gib: user_disk_metadata.capacity_gib,
         user_disk_logical_size_bytes: user_disk_metadata.logical_size_bytes,
@@ -4530,12 +4583,66 @@ fn build_kernel_storage_attachment(
         user_disk_sparse_backing: user_disk_metadata.sparse_backing,
         user_disk_header_sha256: user_disk_metadata.header_sha256,
         user_disk_format: user_disk_metadata.format,
-        root_device: "/dev/pane0".to_string(),
+        root_device,
         user_device: "/dev/pane1".to_string(),
         contract_gpa: "0x0dfe0000".to_string(),
         readonly_base: true,
         writable_user_disk: true,
     }))
+}
+
+fn build_kernel_root_handoff(base_metadata: &BaseOsImageMetadata) -> KernelRootHandoff {
+    const BASE_DEVICE: &str = "/dev/pane0";
+
+    if let Some(root) = &base_metadata.root_partition_hint {
+        return KernelRootHandoff {
+            schema_version: 1,
+            mode: "base-partition".to_string(),
+            root_device: format!("{BASE_DEVICE}p{}", root.index),
+            base_device: BASE_DEVICE.to_string(),
+            partition_index: Some(root.index),
+            partition_byte_offset: Some(root.byte_offset),
+            partition_byte_length: Some(root.byte_length),
+            filesystem_hint: Some(root.partition_type.clone()),
+            requires_initramfs_driver: true,
+            notes: vec![
+                "Pane found a likely Linux root partition and will hand it to the guest as the root target."
+                    .to_string(),
+                "A Pane-aware initramfs or block driver is still required before Linux can mount this device natively."
+                    .to_string(),
+            ],
+        };
+    }
+
+    let (mode, note) = if base_metadata.bootable_disk_hint {
+        (
+            "base-disk",
+            "Pane found a bootable raw disk but no obvious Linux root partition; the whole base disk is the root candidate.",
+        )
+    } else if base_metadata.image_format == "tar-rootfs" {
+        (
+            "rootfs-archive",
+            "Pane found a rootfs archive; native boot needs an initramfs extraction or conversion path before mounting root.",
+        )
+    } else {
+        (
+            "base-device",
+            "Pane did not find a stronger root hint; the whole base device remains the conservative root candidate.",
+        )
+    };
+
+    KernelRootHandoff {
+        schema_version: 1,
+        mode: mode.to_string(),
+        root_device: BASE_DEVICE.to_string(),
+        base_device: BASE_DEVICE.to_string(),
+        partition_index: None,
+        partition_byte_offset: None,
+        partition_byte_length: None,
+        filesystem_hint: Some(base_metadata.image_format.clone()),
+        requires_initramfs_driver: true,
+        notes: vec![note.to_string()],
+    }
 }
 
 fn storage_contract_guest_memory_range(
@@ -8363,6 +8470,8 @@ fn print_native_kernel_plan_report(report: &NativeKernelPlanReport) {
                 println!("  Base Root Part {}", root.index);
                 println!("  Root Offset    {}", root.byte_offset);
             }
+            println!("  Root Mode      {}", storage.root_handoff.mode);
+            println!("  Root Handoff   {}", storage.root_handoff.root_device);
             println!("  User Device    {}", storage.user_device);
             println!("  User Disk      {}", storage.user_disk_path);
             println!("  Contract GPA   {}", storage.contract_gpa);
@@ -10077,6 +10186,7 @@ mod tests {
         assert_eq!(storage.contract_gpa, "0x0dfe0000");
         assert!(layout.cmdline.contains("pane.storage_contract=0x0dfe0000"));
         assert!(layout.cmdline.contains("pane.root=/dev/pane0"));
+        assert!(layout.cmdline.contains("pane.root_mode=base-device"));
         assert!(layout.cmdline.contains("pane.user=/dev/pane1"));
         assert!(layout
             .cmdline
@@ -10084,6 +10194,13 @@ mod tests {
         assert!(layout.cmdline.contains("pane.input_queue=0x0dff0000"));
         assert!(storage.readonly_base);
         assert!(storage.writable_user_disk);
+        assert_eq!(storage.root_handoff.mode, "base-device");
+        assert_eq!(storage.root_handoff.root_device, "/dev/pane0");
+        assert_eq!(
+            storage.root_handoff.filesystem_hint.as_deref(),
+            Some("unknown")
+        );
+        assert!(storage.root_handoff.requires_initramfs_driver);
         assert_eq!(storage.base_os_sha256, base_sha);
         assert_eq!(storage.user_disk_capacity_gib, 3);
         assert_eq!(storage.user_disk_logical_size_bytes, 3 * 1024 * 1024 * 1024);
@@ -10125,6 +10242,69 @@ mod tests {
 
         let artifacts = build_runtime_artifact_report(&paths);
         assert!(artifacts.kernel_boot_layout_ready);
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn kernel_boot_layout_uses_partition_root_handoff_when_available() {
+        let paths = temp_runtime_paths("kernel-layout-root-handoff");
+        super::prepare_runtime_paths(&paths).unwrap();
+        let base = paths.downloads.join("arch-root-partition.img");
+        let kernel = paths.downloads.join("vmlinuz-linux");
+        let mut image = vec![0_u8; 4096];
+        image[446] = 0x80;
+        image[450] = 0x83;
+        image[454..458].copy_from_slice(&2048_u32.to_le_bytes());
+        image[458..462].copy_from_slice(&4096_u32.to_le_bytes());
+        image[510..512].copy_from_slice(&[0x55, 0xaa]);
+        std::fs::write(&base, image).unwrap();
+        std::fs::write(&kernel, fake_linux_bzimage()).unwrap();
+        let base_sha = sha256_file(&base).unwrap();
+        let kernel_sha = sha256_file(&kernel).unwrap();
+
+        register_base_os_image(&paths, &base, Some(&base_sha), false).unwrap();
+        create_user_disk_descriptor(&paths, &runtime_storage_budget(8), false).unwrap();
+        register_kernel_boot_plan(
+            &paths,
+            Some(&kernel),
+            Some(&kernel_sha),
+            None,
+            None,
+            Some("console=ttyS0 rw"),
+            false,
+        )
+        .unwrap();
+
+        let layout = build_kernel_boot_layout(&paths, "pane", true).unwrap();
+        let storage = layout.storage.as_ref().expect("storage attachment");
+
+        assert_eq!(storage.root_device, "/dev/pane0p1");
+        assert_eq!(storage.root_handoff.mode, "base-partition");
+        assert_eq!(storage.root_handoff.root_device, "/dev/pane0p1");
+        assert_eq!(storage.root_handoff.partition_index, Some(1));
+        assert_eq!(storage.root_handoff.partition_byte_offset, Some(2048 * 512));
+        assert_eq!(storage.root_handoff.partition_byte_length, Some(4096 * 512));
+        assert_eq!(
+            storage.root_handoff.filesystem_hint.as_deref(),
+            Some("0x83")
+        );
+        assert!(storage.root_handoff.requires_initramfs_driver);
+        assert!(layout.cmdline.contains("pane.root=/dev/pane0p1"));
+        assert!(layout.cmdline.contains("pane.root_mode=base-partition"));
+        assert!(layout.cmdline.contains("pane.root_partition=1"));
+        assert!(layout.cmdline.contains("pane.root_offset=1048576"));
+        assert!(layout.cmdline.contains("pane.root_length=2097152"));
+
+        let mapped_regions = linux_guest_mapped_regions(&layout).unwrap();
+        let storage_contract = mapped_regions
+            .iter()
+            .find(|region| region.label == "pane-storage-contract")
+            .expect("storage contract region");
+        assert!(storage_contract
+            .bytes
+            .windows("base-partition".len())
+            .any(|window| window == b"base-partition"));
 
         let _ = std::fs::remove_dir_all(&paths.root);
     }

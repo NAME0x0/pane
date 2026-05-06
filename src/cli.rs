@@ -283,6 +283,9 @@ pub struct RuntimeArgs {
     /// Snapshot the Pane-owned user disk into the runtime snapshot store.
     #[arg(long)]
     pub snapshot_user_disk: bool,
+    /// Restore the Pane-owned user disk from a verified snapshot metadata JSON file.
+    #[arg(long, conflicts_with_all = ["create_user_disk", "snapshot_user_disk"])]
+    pub restore_user_disk_snapshot: Option<PathBuf>,
     /// Create the Pane-owned serial boot test image used by the WHP boot-spike runner.
     #[arg(long)]
     pub create_serial_boot_image: bool,

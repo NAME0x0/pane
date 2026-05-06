@@ -1764,6 +1764,7 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
         || args.kernel_cmdline.is_some()
         || args.create_user_disk
         || args.snapshot_user_disk
+        || args.restore_user_disk_snapshot.is_some()
         || args.create_serial_boot_image
         || args.prepare;
 
@@ -1834,6 +1835,10 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
 
     if args.snapshot_user_disk {
         create_user_disk_snapshot(&paths)?;
+    }
+
+    if let Some(snapshot_metadata) = args.restore_user_disk_snapshot.as_deref() {
+        restore_user_disk_snapshot(&paths, snapshot_metadata)?;
     }
 
     if args.create_serial_boot_image {
@@ -3692,6 +3697,113 @@ fn user_disk_snapshot_metadata_files(paths: &RuntimePaths) -> Vec<PathBuf> {
         .collect::<Vec<_>>();
     metadata_files.sort();
     metadata_files
+}
+
+fn restore_user_disk_snapshot(
+    paths: &RuntimePaths,
+    snapshot_metadata_path: &Path,
+) -> AppResult<UserDiskSnapshotMetadata> {
+    let snapshot = read_json_file::<UserDiskSnapshotMetadata>(snapshot_metadata_path)?;
+    if snapshot.schema_version != 1 || snapshot.snapshot_kind != "pane-user-disk-snapshot-v1" {
+        return Err(AppError::message(
+            "Pane user disk snapshot metadata is not a supported snapshot contract.",
+        ));
+    }
+
+    let mut snapshot_path = PathBuf::from(&snapshot.snapshot_path);
+    if !snapshot_path.is_file() {
+        let sibling = snapshot_metadata_path.with_extension("panedisk");
+        if sibling.is_file() {
+            snapshot_path = sibling;
+        }
+    }
+    if !snapshot_path.is_file() {
+        return Err(AppError::message(format!(
+            "Pane user disk snapshot artifact is missing for metadata {}.",
+            snapshot_metadata_path.display()
+        )));
+    }
+
+    let snapshot_bytes = fs::metadata(&snapshot_path)?.len();
+    if snapshot_bytes != snapshot.source_disk_bytes {
+        return Err(AppError::message(
+            "Pane user disk snapshot byte length does not match its metadata.",
+        ));
+    }
+    let snapshot_sha256 = sha256_file(&snapshot_path)?;
+    if snapshot_sha256 != snapshot.source_disk_sha256 {
+        return Err(AppError::message(
+            "Pane user disk snapshot SHA-256 does not match its metadata.",
+        ));
+    }
+
+    let logical_size_bytes = user_disk_logical_size_bytes(snapshot.user_disk_capacity_gib)?;
+    if logical_size_bytes != snapshot.user_disk_logical_size_bytes
+        || snapshot.user_disk_block_size_bytes != PANE_USER_DISK_BLOCK_SIZE_BYTES
+    {
+        return Err(AppError::message(
+            "Pane user disk snapshot geometry is not compatible with this Pane version.",
+        ));
+    }
+
+    let expected_header = user_disk_header_bytes(logical_size_bytes);
+    let mut file = OpenOptions::new().read(true).open(&snapshot_path)?;
+    let mut actual_header = vec![0_u8; expected_header.len()];
+    file.read_exact(&mut actual_header)?;
+    if actual_header != expected_header {
+        return Err(AppError::message(
+            "Pane user disk snapshot header does not match its recorded geometry.",
+        ));
+    }
+
+    if let Some(parent) = paths.user_disk.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if let Some(parent) = paths.user_disk_metadata.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let temp_restore = paths.user_disk.with_extension("panedisk.restore.tmp");
+    if temp_restore.exists() {
+        fs::remove_file(&temp_restore)?;
+    }
+    let copied_bytes = fs::copy(&snapshot_path, &temp_restore)?;
+    if copied_bytes != snapshot.source_disk_bytes || sha256_file(&temp_restore)? != snapshot_sha256
+    {
+        let _ = fs::remove_file(&temp_restore);
+        return Err(AppError::message(
+            "Pane user disk restore verification failed after staging copy.",
+        ));
+    }
+
+    if paths.user_disk.exists() {
+        fs::remove_file(&paths.user_disk)?;
+    }
+    fs::rename(&temp_restore, &paths.user_disk)?;
+
+    let metadata = UserDiskMetadata {
+        schema_version: 1,
+        format: PANE_USER_DISK_FORMAT.to_string(),
+        disk_path: paths.user_disk.display().to_string(),
+        capacity_gib: snapshot.user_disk_capacity_gib,
+        logical_size_bytes,
+        block_size_bytes: PANE_USER_DISK_BLOCK_SIZE_BYTES,
+        sparse_backing: true,
+        allocated_header_bytes: expected_header.len() as u64,
+        header_sha256: sha256_bytes(&expected_header),
+        materialized_block_device: true,
+        created_at_epoch_seconds: current_epoch_seconds(),
+        notes: vec![
+            format!(
+                "Restored from Pane user disk snapshot `{}`.",
+                snapshot.snapshot_id
+            ),
+            "The restored artifact was verified by byte count, SHA-256, and Pane disk header before replacing the active user disk."
+                .to_string(),
+        ],
+    };
+    write_json_file(&paths.user_disk_metadata, &metadata)?;
+    Ok(snapshot)
 }
 
 fn create_serial_boot_image_artifact(paths: &RuntimePaths, force: bool) -> AppResult<()> {
@@ -9303,13 +9415,14 @@ mod tests {
         read_json_file, read_user_disk_block, register_base_os_image, register_boot_loader_image,
         register_kernel_boot_plan, resolve_bundle_output_path, resolve_init_source,
         resolve_launch_target, resolve_managed_environment_for_reset, resolve_saved_launch,
-        resolve_session_context, resolve_status_distro, runtime_contract_guest_memory_ranges,
-        runtime_storage_budget, sha256_file, status_port_for, user_disk_artifact_ready,
-        validate_setup_password, validate_setup_username, windows_transport_check, write_json_file,
-        write_user_disk_block, AppLifecyclePhase, AppNextAction, BaseOsImageMetadata, CheckStatus,
-        DistroHealth, DoctorCheck, DoctorReport, FramebufferContract, InitSource, KernelBootLayout,
-        KernelBootMetadata, NativeRuntimeState, StatusReport, UserDiskMetadata,
-        UserDiskSnapshotMetadata, WorkspaceHealth, WslInventory, EMBEDDED_APP_ASSETS,
+        resolve_session_context, resolve_status_distro, restore_user_disk_snapshot,
+        runtime_contract_guest_memory_ranges, runtime_storage_budget, sha256_file, status_port_for,
+        user_disk_artifact_ready, validate_setup_password, validate_setup_username,
+        windows_transport_check, write_json_file, write_user_disk_block, AppLifecyclePhase,
+        AppNextAction, BaseOsImageMetadata, CheckStatus, DistroHealth, DoctorCheck, DoctorReport,
+        FramebufferContract, InitSource, KernelBootLayout, KernelBootMetadata, NativeRuntimeState,
+        StatusReport, UserDiskMetadata, UserDiskSnapshotMetadata, WorkspaceHealth, WslInventory,
+        EMBEDDED_APP_ASSETS,
     };
 
     fn empty_workspace_health() -> WorkspaceHealth {
@@ -10325,6 +10438,48 @@ mod tests {
             artifacts.latest_user_disk_snapshot.as_deref(),
             Some(expected_snapshot_metadata.as_str())
         );
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn user_disk_restore_replaces_active_disk_from_verified_snapshot() {
+        let paths = temp_runtime_paths("runtime-user-disk-restore");
+        super::prepare_runtime_paths(&paths).unwrap();
+        create_user_disk_descriptor(&paths, &runtime_storage_budget(8), false).unwrap();
+        let metadata = read_json_file::<UserDiskMetadata>(&paths.user_disk_metadata).unwrap();
+        let mut original = vec![0_u8; 4096];
+        original[..16].copy_from_slice(b"PANE_RESTORE_OLD");
+        write_user_disk_block(&paths, &metadata, 2, &original).unwrap();
+        let snapshot = create_user_disk_snapshot(&paths).unwrap();
+        let snapshot_metadata_path = paths
+            .snapshots
+            .join(format!("{}.json", snapshot.snapshot_id));
+        let mut mutated = vec![0_u8; 4096];
+        mutated[..16].copy_from_slice(b"PANE_RESTORE_NEW");
+        write_user_disk_block(&paths, &metadata, 2, &mutated).unwrap();
+        assert_eq!(
+            read_user_disk_block(&paths, &metadata, 2).unwrap()[..16],
+            mutated[..16]
+        );
+
+        let restored = restore_user_disk_snapshot(&paths, &snapshot_metadata_path).unwrap();
+
+        assert_eq!(restored.snapshot_id, snapshot.snapshot_id);
+        let restored_metadata =
+            read_json_file::<UserDiskMetadata>(&paths.user_disk_metadata).unwrap();
+        assert!(user_disk_artifact_ready(
+            &paths,
+            &Some(restored_metadata.clone())
+        ));
+        assert_eq!(
+            read_user_disk_block(&paths, &restored_metadata, 2).unwrap()[..16],
+            original[..16]
+        );
+        assert!(restored_metadata
+            .notes
+            .iter()
+            .any(|note| note.contains("Restored from Pane user disk snapshot")));
 
         let _ = std::fs::remove_dir_all(&paths.root);
     }

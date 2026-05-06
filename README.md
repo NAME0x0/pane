@@ -234,6 +234,12 @@ Create a recovery snapshot of the Pane user disk artifact:
 cargo run -- runtime --snapshot-user-disk
 ```
 
+Restore the Pane user disk from a verified snapshot metadata file:
+
+```powershell
+cargo run -- runtime --restore-user-disk-snapshot C:\path\to\user-disk-<timestamp>.json
+```
+
 Check WHP host and runtime readiness:
 
 ```powershell

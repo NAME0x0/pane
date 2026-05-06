@@ -1788,6 +1788,7 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
         || args.restore_user_disk_snapshot.is_some()
         || args.import_user_disk.is_some()
         || args.resize_user_disk_gib.is_some()
+        || args.repair_user_disk
         || args.create_serial_boot_image
         || args.prepare;
 
@@ -1870,6 +1871,10 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
 
     if let Some(new_capacity_gib) = args.resize_user_disk_gib {
         resize_user_disk(&paths, new_capacity_gib)?;
+    }
+
+    if args.repair_user_disk {
+        repair_user_disk_metadata(&paths)?;
     }
 
     if args.create_serial_boot_image {
@@ -4045,6 +4050,113 @@ fn resize_user_disk(paths: &RuntimePaths, new_capacity_gib: u64) -> AppResult<Us
     ));
     write_json_file(&paths.user_disk_metadata, &metadata)?;
     Ok(metadata)
+}
+
+#[derive(Debug)]
+struct UserDiskHeaderInspection {
+    capacity_gib: u64,
+    logical_size_bytes: u64,
+    block_size_bytes: u64,
+    allocated_header_bytes: u64,
+    header_sha256: String,
+}
+
+fn repair_user_disk_metadata(paths: &RuntimePaths) -> AppResult<UserDiskMetadata> {
+    if !paths.user_disk.is_file() {
+        return Err(AppError::message(
+            "Pane user disk is missing; nothing can be repaired.",
+        ));
+    }
+    let header = inspect_user_disk_header(&paths.user_disk)?;
+    let metadata = UserDiskMetadata {
+        schema_version: 1,
+        format: PANE_USER_DISK_FORMAT.to_string(),
+        disk_path: paths.user_disk.display().to_string(),
+        capacity_gib: header.capacity_gib,
+        logical_size_bytes: header.logical_size_bytes,
+        block_size_bytes: header.block_size_bytes,
+        sparse_backing: true,
+        allocated_header_bytes: header.allocated_header_bytes,
+        header_sha256: header.header_sha256,
+        materialized_block_device: true,
+        created_at_epoch_seconds: current_epoch_seconds(),
+        notes: vec![
+            "Repaired Pane user disk metadata from a valid disk header.".to_string(),
+            "Only metadata was rebuilt; Pane did not infer or modify guest filesystem contents."
+                .to_string(),
+        ],
+    };
+    write_json_file(&paths.user_disk_metadata, &metadata)?;
+    if !user_disk_artifact_ready(paths, &Some(metadata.clone())) {
+        return Err(AppError::message(
+            "Pane user disk metadata repair did not produce a ready artifact.",
+        ));
+    }
+    Ok(metadata)
+}
+
+fn inspect_user_disk_header(disk_path: &Path) -> AppResult<UserDiskHeaderInspection> {
+    let mut file = OpenOptions::new().read(true).open(disk_path)?;
+    let mut buffer = vec![0_u8; 512];
+    let bytes_read = file.read(&mut buffer)?;
+    buffer.truncate(bytes_read);
+    let header_end = buffer
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|index| index + 2)
+        .ok_or_else(|| AppError::message("Pane user disk header terminator is missing."))?;
+    let header = &buffer[..header_end];
+    let header_text = std::str::from_utf8(header)
+        .map_err(|_| AppError::message("Pane user disk header is not valid UTF-8."))?;
+    if !header_text.starts_with(PANE_USER_DISK_MAGIC) {
+        return Err(AppError::message(
+            "Pane user disk header magic is missing or invalid.",
+        ));
+    }
+    let format = user_disk_header_field(header_text, "format")?;
+    if format != PANE_USER_DISK_FORMAT {
+        return Err(AppError::message(
+            "Pane user disk header format is not supported.",
+        ));
+    }
+    let logical_size_bytes = user_disk_header_field(header_text, "logical_size_bytes")?
+        .parse::<u64>()
+        .map_err(|_| AppError::message("Pane user disk logical size is invalid."))?;
+    let block_size_bytes = user_disk_header_field(header_text, "block_size_bytes")?
+        .parse::<u64>()
+        .map_err(|_| AppError::message("Pane user disk block size is invalid."))?;
+    if block_size_bytes != PANE_USER_DISK_BLOCK_SIZE_BYTES {
+        return Err(AppError::message(
+            "Pane user disk block size is not compatible with this Pane version.",
+        ));
+    }
+    let gib = 1024_u64 * 1024 * 1024;
+    if logical_size_bytes == 0 || logical_size_bytes % gib != 0 {
+        return Err(AppError::message(
+            "Pane user disk logical size is not an exact GiB value.",
+        ));
+    }
+    let capacity_gib = logical_size_bytes / gib;
+    let expected_header = user_disk_header_bytes(logical_size_bytes);
+    if expected_header != header {
+        return Err(AppError::message(
+            "Pane user disk header fields are not in the canonical Pane format.",
+        ));
+    }
+    Ok(UserDiskHeaderInspection {
+        capacity_gib,
+        logical_size_bytes,
+        block_size_bytes,
+        allocated_header_bytes: header.len() as u64,
+        header_sha256: sha256_bytes(header),
+    })
+}
+
+fn user_disk_header_field<'a>(header: &'a str, key: &str) -> AppResult<&'a str> {
+    header
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{key}=")))
+        .ok_or_else(|| AppError::message(format!("Pane user disk header is missing `{key}`.")))
 }
 
 fn validate_user_disk_artifact_header(
@@ -9682,14 +9794,14 @@ mod tests {
         kernel_layout_execution_image, linux_guest_mapped_regions,
         load_kernel_layout_boot_image_artifact, parse_guest_physical_address, preferred_transport,
         read_json_file, read_user_disk_block, register_base_os_image, register_boot_loader_image,
-        register_kernel_boot_plan, resize_user_disk, resolve_bundle_output_path,
-        resolve_init_source, resolve_launch_target, resolve_managed_environment_for_reset,
-        resolve_saved_launch, resolve_session_context, resolve_status_distro,
-        restore_user_disk_snapshot, runtime_contract_guest_memory_ranges, runtime_storage_budget,
-        sha256_file, status_port_for, user_disk_artifact_ready, validate_setup_password,
-        validate_setup_username, windows_transport_check, write_json_file, write_user_disk_block,
-        AppLifecyclePhase, AppNextAction, BaseOsImageMetadata, CheckStatus, DistroHealth,
-        DoctorCheck, DoctorReport, FramebufferContract, InitSource, KernelBootLayout,
+        register_kernel_boot_plan, repair_user_disk_metadata, resize_user_disk,
+        resolve_bundle_output_path, resolve_init_source, resolve_launch_target,
+        resolve_managed_environment_for_reset, resolve_saved_launch, resolve_session_context,
+        resolve_status_distro, restore_user_disk_snapshot, runtime_contract_guest_memory_ranges,
+        runtime_storage_budget, sha256_file, status_port_for, user_disk_artifact_ready,
+        validate_setup_password, validate_setup_username, windows_transport_check, write_json_file,
+        write_user_disk_block, AppLifecyclePhase, AppNextAction, BaseOsImageMetadata, CheckStatus,
+        DistroHealth, DoctorCheck, DoctorReport, FramebufferContract, InitSource, KernelBootLayout,
         KernelBootMetadata, NativeRuntimeState, StatusReport, UserDiskExportManifest,
         UserDiskMetadata, UserDiskSnapshotMetadata, WorkspaceHealth, WslInventory,
         EMBEDDED_APP_ASSETS, PANE_USER_DISK_EXPORT_DISK_FILENAME,
@@ -10853,6 +10965,40 @@ mod tests {
         let error = resize_user_disk(&paths, 2).unwrap_err().to_string();
 
         assert!(error.contains("grow-only"));
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn user_disk_repair_rebuilds_metadata_from_valid_header() {
+        let paths = temp_runtime_paths("runtime-user-disk-repair");
+        super::prepare_runtime_paths(&paths).unwrap();
+        create_user_disk_descriptor(&paths, &runtime_storage_budget(8), false).unwrap();
+        std::fs::remove_file(&paths.user_disk_metadata).unwrap();
+
+        let repaired = repair_user_disk_metadata(&paths).unwrap();
+
+        assert_eq!(repaired.capacity_gib, 3);
+        assert_eq!(repaired.logical_size_bytes, 3 * 1024 * 1024 * 1024);
+        assert_eq!(repaired.block_size_bytes, 4096);
+        assert!(user_disk_artifact_ready(&paths, &Some(repaired.clone())));
+        assert!(repaired
+            .notes
+            .iter()
+            .any(|note| note.contains("Repaired Pane user disk metadata")));
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn user_disk_repair_rejects_corrupt_header() {
+        let paths = temp_runtime_paths("runtime-user-disk-repair-corrupt");
+        super::prepare_runtime_paths(&paths).unwrap();
+        std::fs::write(&paths.user_disk, b"not a pane disk\n\n").unwrap();
+
+        let error = repair_user_disk_metadata(&paths).unwrap_err().to_string();
+
+        assert!(error.contains("header magic"));
 
         let _ = std::fs::remove_dir_all(&paths.root);
     }

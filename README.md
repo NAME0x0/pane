@@ -253,6 +253,12 @@ Grow the Pane user disk logical capacity:
 cargo run -- runtime --resize-user-disk-gib 4
 ```
 
+Repair user disk metadata when the disk header is still valid:
+
+```powershell
+cargo run -- runtime --repair-user-disk
+```
+
 Check WHP host and runtime readiness:
 
 ```powershell

@@ -298,6 +298,9 @@ pub struct RuntimeArgs {
     /// Grow the Pane-owned user disk logical capacity in GiB. Shrinking is rejected.
     #[arg(long, conflicts_with = "create_user_disk")]
     pub resize_user_disk_gib: Option<u64>,
+    /// Repair Pane user disk metadata when the disk header is still valid.
+    #[arg(long, conflicts_with = "create_user_disk")]
+    pub repair_user_disk: bool,
     /// Create the Pane-owned serial boot test image used by the WHP boot-spike runner.
     #[arg(long)]
     pub create_serial_boot_image: bool,

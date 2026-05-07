@@ -469,6 +469,18 @@ struct KernelStorageAttachment {
     base_os_bytes: u64,
     #[serde(default = "default_base_os_block_size_bytes")]
     base_os_block_size_bytes: u64,
+    #[serde(default = "default_pane_block_io_protocol")]
+    block_io_protocol: String,
+    #[serde(default = "default_pane_block_io_port_base")]
+    block_io_port_base: String,
+    #[serde(default = "default_pane_block_io_port_count")]
+    block_io_port_count: u16,
+    #[serde(default = "default_pane_block_io_status_port_offset")]
+    block_io_status_port_offset: u16,
+    #[serde(default = "default_pane_block_io_data_port_offset")]
+    block_io_data_port_offset: u16,
+    #[serde(default = "default_pane_block_io_block_size_bytes")]
+    block_io_block_size_bytes: u64,
     base_os_image_format: String,
     base_os_bootable_disk_hint: bool,
     base_os_partitions: Vec<BaseOsPartition>,
@@ -619,6 +631,30 @@ const PANE_USER_DISK_EXPORT_METADATA_FILENAME: &str = "user-disk.json";
 
 fn default_base_os_block_size_bytes() -> u64 {
     PANE_BASE_OS_BLOCK_SIZE_BYTES
+}
+
+fn default_pane_block_io_protocol() -> String {
+    "pane-port-block-v1".to_string()
+}
+
+fn default_pane_block_io_port_base() -> String {
+    format!("{:#06x}", crate::native::PANE_BLOCK_IO_BASE_PORT)
+}
+
+fn default_pane_block_io_port_count() -> u16 {
+    crate::native::PANE_BLOCK_IO_PORT_COUNT
+}
+
+fn default_pane_block_io_status_port_offset() -> u16 {
+    2
+}
+
+fn default_pane_block_io_data_port_offset() -> u16 {
+    12
+}
+
+fn default_pane_block_io_block_size_bytes() -> u64 {
+    u64::from(crate::native::PANE_BLOCK_IO_BLOCK_SIZE_BYTES)
 }
 
 #[derive(Debug, Serialize)]
@@ -4756,6 +4792,15 @@ fn augment_kernel_cmdline_for_runtime_contracts(
             append_kernel_arg(&mut cmdline, format!("pane.root_length={length}"));
         }
         append_kernel_arg(&mut cmdline, format!("pane.user={}", storage.user_device));
+        append_kernel_arg(
+            &mut cmdline,
+            format!(
+                "pane.block_io={},{},{}",
+                storage.block_io_port_base,
+                storage.block_io_port_count,
+                storage.block_io_block_size_bytes
+            ),
+        );
     }
     append_kernel_arg(
         &mut cmdline,
@@ -5297,6 +5342,12 @@ fn build_kernel_storage_attachment(
         base_os_sha256: base_sha256,
         base_os_bytes: base_bytes,
         base_os_block_size_bytes: PANE_BASE_OS_BLOCK_SIZE_BYTES,
+        block_io_protocol: default_pane_block_io_protocol(),
+        block_io_port_base: default_pane_block_io_port_base(),
+        block_io_port_count: default_pane_block_io_port_count(),
+        block_io_status_port_offset: default_pane_block_io_status_port_offset(),
+        block_io_data_port_offset: default_pane_block_io_data_port_offset(),
+        block_io_block_size_bytes: default_pane_block_io_block_size_bytes(),
         base_os_image_format: base_metadata.image_format,
         base_os_bootable_disk_hint: base_metadata.bootable_disk_hint,
         base_os_partitions: base_metadata.partitions,
@@ -11243,10 +11294,17 @@ mod tests {
         assert_eq!(storage.user_device, "/dev/pane1");
         assert_eq!(storage.contract_gpa, "0x0dfe0000");
         assert_eq!(storage.base_os_block_size_bytes, 4096);
+        assert_eq!(storage.block_io_protocol, "pane-port-block-v1");
+        assert_eq!(storage.block_io_port_base, "0x0d00");
+        assert_eq!(storage.block_io_port_count, 16);
+        assert_eq!(storage.block_io_status_port_offset, 2);
+        assert_eq!(storage.block_io_data_port_offset, 12);
+        assert_eq!(storage.block_io_block_size_bytes, 4096);
         assert!(layout.cmdline.contains("pane.storage_contract=0x0dfe0000"));
         assert!(layout.cmdline.contains("pane.root=/dev/pane0"));
         assert!(layout.cmdline.contains("pane.root_mode=base-device"));
         assert!(layout.cmdline.contains("pane.user=/dev/pane1"));
+        assert!(layout.cmdline.contains("pane.block_io=0x0d00,16,4096"));
         assert!(layout
             .cmdline
             .contains("pane.framebuffer=0x0e000000,1024,768,32,x8r8g8b8"));
@@ -11279,6 +11337,10 @@ mod tests {
             .expect("storage contract region");
         assert_eq!(storage_contract.guest_gpa, 0x0dfe_0000);
         assert!(storage_contract.bytes.starts_with(b"{\"schema_version\":1"));
+        assert!(storage_contract
+            .bytes
+            .windows("pane-port-block-v1".len())
+            .any(|window| window == b"pane-port-block-v1"));
         assert!(storage_contract
             .bytes
             .windows("/dev/pane1".len())

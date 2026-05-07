@@ -2278,6 +2278,15 @@ fn native_kernel_plan(args: NativeKernelPlanArgs) -> AppResult<()> {
         blockers
             .push("No valid Pane input contract exists. Run `pane runtime --prepare`.".to_string());
     }
+    if runtime.artifacts.base_os_image_verified
+        && runtime.artifacts.user_disk_ready
+        && !runtime.artifacts.initramfs_driver_bundle_ready
+    {
+        blockers.push(
+            "No valid Pane initramfs driver source bundle exists. Run `pane runtime --write-initramfs-driver` before materializing a storage-backed kernel layout."
+                .to_string(),
+        );
+    }
 
     let layout = if blockers.is_empty() {
         Some(build_kernel_boot_layout(
@@ -6405,6 +6414,39 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
                 && metadata.kernel_load_gpa == "0x00100000"
         })
         .unwrap_or(false);
+    let initramfs_driver_metadata =
+        read_json_file::<PaneInitramfsDriverMetadata>(&paths.initramfs_driver_metadata).ok();
+    let initramfs_driver_bundle_exists = paths.initramfs_driver_dir.is_dir();
+    let initramfs_driver_bundle_ready = initramfs_driver_metadata
+        .as_ref()
+        .map(|metadata| {
+            metadata.schema_version == 1
+                && metadata.bundle_kind == "pane-initramfs-driver-source-v1"
+                && metadata.driver_dir == paths.initramfs_driver_dir.display().to_string()
+                && metadata.block_io_protocol == default_pane_block_io_protocol()
+                && metadata.block_io_port_base == default_pane_block_io_port_base()
+                && metadata.block_io_port_count == default_pane_block_io_port_count()
+                && metadata.block_io_status_port_offset
+                    == default_pane_block_io_status_port_offset()
+                && metadata.block_io_data_port_offset == default_pane_block_io_data_port_offset()
+                && metadata.block_io_block_size_bytes == default_pane_block_io_block_size_bytes()
+                && sha256_file(Path::new(&metadata.hook_path)).ok().as_deref()
+                    == Some(metadata.hook_sha256.as_str())
+                && sha256_file(Path::new(&metadata.header_path))
+                    .ok()
+                    .as_deref()
+                    == Some(metadata.header_sha256.as_str())
+                && sha256_file(Path::new(&metadata.probe_source_path))
+                    .ok()
+                    .as_deref()
+                    == Some(metadata.probe_source_sha256.as_str())
+                && sha256_file(Path::new(&metadata.readme_path))
+                    .ok()
+                    .as_deref()
+                    == Some(metadata.readme_sha256.as_str())
+        })
+        .unwrap_or(false);
+
     let kernel_boot_layout = read_json_file::<KernelBootLayout>(&paths.kernel_boot_layout).ok();
     let framebuffer_contract =
         read_json_file::<FramebufferContract>(&paths.framebuffer_contract).ok();
@@ -6505,6 +6547,7 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
                 && layout.initramfs_sha256 == metadata.initramfs_sha256
                 && Some(&layout.cmdline) == expected_cmdline.as_ref()
                 && layout.cmdline.contains("console=ttyS0")
+                && (layout.storage.is_none() || initramfs_driver_bundle_ready)
                 && layout.expected_serial_device == "ttyS0"
                 && layout.framebuffer.as_ref().is_some_and(|contract| {
                     contract.schema_version == 1
@@ -6519,39 +6562,6 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
                         && contract.guest_queue_gpa == "0x0dff0000"
                         && contract.queue_size_bytes == 0x00001000
                 })
-        })
-        .unwrap_or(false);
-
-    let initramfs_driver_metadata =
-        read_json_file::<PaneInitramfsDriverMetadata>(&paths.initramfs_driver_metadata).ok();
-    let initramfs_driver_bundle_exists = paths.initramfs_driver_dir.is_dir();
-    let initramfs_driver_bundle_ready = initramfs_driver_metadata
-        .as_ref()
-        .map(|metadata| {
-            metadata.schema_version == 1
-                && metadata.bundle_kind == "pane-initramfs-driver-source-v1"
-                && metadata.driver_dir == paths.initramfs_driver_dir.display().to_string()
-                && metadata.block_io_protocol == default_pane_block_io_protocol()
-                && metadata.block_io_port_base == default_pane_block_io_port_base()
-                && metadata.block_io_port_count == default_pane_block_io_port_count()
-                && metadata.block_io_status_port_offset
-                    == default_pane_block_io_status_port_offset()
-                && metadata.block_io_data_port_offset == default_pane_block_io_data_port_offset()
-                && metadata.block_io_block_size_bytes == default_pane_block_io_block_size_bytes()
-                && sha256_file(Path::new(&metadata.hook_path)).ok().as_deref()
-                    == Some(metadata.hook_sha256.as_str())
-                && sha256_file(Path::new(&metadata.header_path))
-                    .ok()
-                    .as_deref()
-                    == Some(metadata.header_sha256.as_str())
-                && sha256_file(Path::new(&metadata.probe_source_path))
-                    .ok()
-                    .as_deref()
-                    == Some(metadata.probe_source_sha256.as_str())
-                && sha256_file(Path::new(&metadata.readme_path))
-                    .ok()
-                    .as_deref()
-                    == Some(metadata.readme_sha256.as_str())
         })
         .unwrap_or(false);
 
@@ -6698,6 +6708,15 @@ fn build_native_runtime_report(
         if !artifacts.input_contract_ready {
             blockers.push(
                 "No valid Pane input contract exists. Run `pane runtime --prepare` to write the keyboard/pointer boundary contract."
+                    .to_string(),
+            );
+        }
+        if artifacts.base_os_image_verified
+            && artifacts.user_disk_ready
+            && !artifacts.initramfs_driver_bundle_ready
+        {
+            blockers.push(
+                "No valid Pane initramfs driver source bundle exists for native root storage discovery. Run `pane runtime --write-initramfs-driver`."
                     .to_string(),
             );
         }
@@ -11601,6 +11620,7 @@ mod tests {
 
         register_base_os_image(&paths, &base, Some(&base_sha), false).unwrap();
         create_user_disk_descriptor(&paths, &runtime_storage_budget(8), false).unwrap();
+        write_pane_initramfs_driver_bundle(&paths).unwrap();
         register_kernel_boot_plan(
             &paths,
             Some(&kernel),
@@ -11692,6 +11712,46 @@ mod tests {
     }
 
     #[test]
+    fn storage_backed_kernel_layout_requires_initramfs_driver_bundle() {
+        let paths = temp_runtime_paths("kernel-layout-requires-driver");
+        super::prepare_runtime_paths(&paths).unwrap();
+        let base = paths.downloads.join("arch-base.img");
+        let kernel = paths.downloads.join("vmlinuz-linux");
+        std::fs::write(&base, b"pane arch base image").unwrap();
+        std::fs::write(&kernel, fake_linux_bzimage()).unwrap();
+        let base_sha = sha256_file(&base).unwrap();
+        let kernel_sha = sha256_file(&kernel).unwrap();
+
+        register_base_os_image(&paths, &base, Some(&base_sha), false).unwrap();
+        create_user_disk_descriptor(&paths, &runtime_storage_budget(8), false).unwrap();
+        register_kernel_boot_plan(
+            &paths,
+            Some(&kernel),
+            Some(&kernel_sha),
+            None,
+            None,
+            Some("console=ttyS0 root=/dev/pane0 rw"),
+            false,
+        )
+        .unwrap();
+        let layout = build_kernel_boot_layout(&paths, "pane", true).unwrap();
+        assert!(layout.storage.is_some());
+
+        let artifacts = build_runtime_artifact_report(&paths);
+        assert!(artifacts.kernel_boot_layout_exists);
+        assert!(!artifacts.initramfs_driver_bundle_ready);
+        assert!(!artifacts.kernel_boot_layout_ready);
+        let native_runtime =
+            build_native_runtime_report(true, &artifacts, &test_native_host_report(true));
+        assert!(native_runtime
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("--write-initramfs-driver")));
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
     fn kernel_boot_layout_uses_partition_root_handoff_when_available() {
         let paths = temp_runtime_paths("kernel-layout-root-handoff");
         super::prepare_runtime_paths(&paths).unwrap();
@@ -11710,6 +11770,7 @@ mod tests {
 
         register_base_os_image(&paths, &base, Some(&base_sha), false).unwrap();
         create_user_disk_descriptor(&paths, &runtime_storage_budget(8), false).unwrap();
+        write_pane_initramfs_driver_bundle(&paths).unwrap();
         register_kernel_boot_plan(
             &paths,
             Some(&kernel),

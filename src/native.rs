@@ -291,6 +291,10 @@ pub(crate) fn service_native_block_io_command(
     }
 }
 
+pub(crate) fn native_block_io_exit_can_resume(status_code: u8) -> bool {
+    status_code == PANE_BLOCK_IO_STATUS_SERVICED
+}
+
 pub(crate) fn pane_block_io_port_offset(port: u16) -> Option<u16> {
     if (PANE_BLOCK_IO_BASE_PORT..=PANE_BLOCK_IO_LAST_PORT).contains(&port) {
         Some(port - PANE_BLOCK_IO_BASE_PORT)
@@ -1002,7 +1006,8 @@ mod windows_whp {
         SERIAL_BOOT_TEST_IMAGE_SIZE,
     };
     use crate::native::{
-        pane_block_io_port_offset, service_native_block_io_command, NativeBlockIoPortState,
+        native_block_io_exit_can_resume, pane_block_io_port_offset,
+        service_native_block_io_command, NativeBlockIoPortState,
     };
 
     const WHV_CAPABILITY_CODE_HYPERVISOR_PRESENT: u32 = 0;
@@ -2190,7 +2195,20 @@ mod windows_whp {
                                     outcome.status_code,
                                     outcome.response_bytes,
                                 );
+                                let can_resume =
+                                    native_block_io_exit_can_resume(outcome.status_code);
                                 report.calls.push(outcome.report);
+                                if can_resume {
+                                    if !set_guest_rip(
+                                        partition,
+                                        set_virtual_processor_registers,
+                                        next_rip,
+                                        report,
+                                    ) {
+                                        break;
+                                    }
+                                    continue;
+                                }
                                 break;
                             }
 
@@ -3008,14 +3026,15 @@ mod windows_whp {
             WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS,
         };
         use crate::native::{
-            evaluate_native_block_io, linux_boot_gdt_page_bytes, pane_block_io_port_offset,
-            serial_boot_test_image_bytes, service_native_block_io_command, NativeBlockDeviceId,
-            NativeBlockIoCommand, NativeBlockIoPortState, NativeBlockIoServiceResult,
-            NativeBlockOperation, NativePartitionSmokeReport, NativePartitionSmokeStatus,
-            LINUX_BOOT_CODE_SELECTOR, LINUX_BOOT_DATA_SELECTOR, LINUX_BOOT_GDT_GPA,
-            LINUX_BOOT_STACK_GPA, PANE_BLOCK_IO_BASE_PORT, PANE_BLOCK_IO_BLOCK_SIZE_BYTES,
-            PANE_BLOCK_IO_LAST_PORT, PANE_BLOCK_IO_STATUS_DENIED, PANE_BLOCK_IO_STATUS_SERVICED,
-            PANE_BLOCK_IO_STATUS_SUBMITTED, SERIAL_BOOT_BANNER_TEXT,
+            evaluate_native_block_io, linux_boot_gdt_page_bytes, native_block_io_exit_can_resume,
+            pane_block_io_port_offset, serial_boot_test_image_bytes,
+            service_native_block_io_command, NativeBlockDeviceId, NativeBlockIoCommand,
+            NativeBlockIoPortState, NativeBlockIoServiceResult, NativeBlockOperation,
+            NativePartitionSmokeReport, NativePartitionSmokeStatus, LINUX_BOOT_CODE_SELECTOR,
+            LINUX_BOOT_DATA_SELECTOR, LINUX_BOOT_GDT_GPA, LINUX_BOOT_STACK_GPA,
+            PANE_BLOCK_IO_BASE_PORT, PANE_BLOCK_IO_BLOCK_SIZE_BYTES, PANE_BLOCK_IO_LAST_PORT,
+            PANE_BLOCK_IO_STATUS_DENIED, PANE_BLOCK_IO_STATUS_FAILED,
+            PANE_BLOCK_IO_STATUS_SERVICED, PANE_BLOCK_IO_STATUS_SUBMITTED, SERIAL_BOOT_BANNER_TEXT,
         };
 
         #[test]
@@ -3275,6 +3294,22 @@ mod windows_whp {
 
             assert!(state.write(PANE_BLOCK_IO_BASE_PORT + 4, 1).is_none());
             assert_eq!(state.read(PANE_BLOCK_IO_BASE_PORT + 13), 0);
+        }
+
+        #[test]
+        fn native_block_io_runner_only_resumes_after_serviced_exits() {
+            assert!(native_block_io_exit_can_resume(
+                PANE_BLOCK_IO_STATUS_SERVICED
+            ));
+            assert!(!native_block_io_exit_can_resume(
+                PANE_BLOCK_IO_STATUS_SUBMITTED
+            ));
+            assert!(!native_block_io_exit_can_resume(
+                PANE_BLOCK_IO_STATUS_DENIED
+            ));
+            assert!(!native_block_io_exit_can_resume(
+                PANE_BLOCK_IO_STATUS_FAILED
+            ));
         }
 
         #[test]

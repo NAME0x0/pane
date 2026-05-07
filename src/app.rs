@@ -289,6 +289,10 @@ struct RuntimeArtifactReport {
     initramfs_driver_bundle_exists: bool,
     initramfs_driver_metadata_exists: bool,
     initramfs_driver_bundle_ready: bool,
+    pane_block_module_exists: bool,
+    pane_block_module_bytes: Option<u64>,
+    pane_block_module_sha256: Option<String>,
+    pane_block_module_verified: bool,
     kernel_cmdline: Option<String>,
     kernel_boot_plan_ready: bool,
     kernel_boot_metadata_exists: bool,
@@ -450,6 +454,20 @@ struct PaneInitramfsDriverMetadata {
     block_io_data_port_offset: u16,
     block_io_block_size_bytes: u64,
     generated_at_epoch_seconds: u64,
+    notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct PaneBlockModuleMetadata {
+    schema_version: u32,
+    module_kind: String,
+    source_path: String,
+    stored_path: String,
+    bytes: u64,
+    sha256: String,
+    expected_sha256: Option<String>,
+    verified: bool,
+    registered_at_epoch_seconds: u64,
     notes: Vec<String>,
 }
 
@@ -1939,6 +1957,19 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
 
     if args.write_initramfs_driver {
         write_pane_initramfs_driver_bundle(&paths)?;
+    }
+
+    if let Some(module) = args.register_pane_block_module.as_deref() {
+        register_pane_block_module(
+            &paths,
+            module,
+            args.pane_block_module_expected_sha256.as_deref(),
+            args.force,
+        )?;
+    } else if args.pane_block_module_expected_sha256.is_some() {
+        return Err(AppError::message(
+            "--pane-block-module-expected-sha256 requires --register-pane-block-module.",
+        ));
     }
 
     if args.build_discovery_initramfs {
@@ -4008,6 +4039,91 @@ fn load_verified_pane_initramfs_driver_metadata(
     Ok(metadata)
 }
 
+fn pane_block_module_path(paths: &RuntimePaths) -> PathBuf {
+    paths.initramfs_driver_dir.join("pane-block.ko")
+}
+
+fn pane_block_module_metadata_path(paths: &RuntimePaths) -> PathBuf {
+    paths.state.join("pane-block-module.json")
+}
+
+fn register_pane_block_module(
+    paths: &RuntimePaths,
+    source_module: &Path,
+    expected_sha256: Option<&str>,
+    force: bool,
+) -> AppResult<()> {
+    load_verified_pane_initramfs_driver_metadata(paths)?;
+    if expected_sha256.is_none() {
+        return Err(AppError::message(
+            "Pane block module registration requires --pane-block-module-expected-sha256 so Pane can verify the module before including it in the initramfs.",
+        ));
+    }
+    let destination = pane_block_module_path(paths);
+    let registration = copy_verified_runtime_artifact(
+        source_module,
+        &destination,
+        expected_sha256,
+        "Pane block module",
+        force,
+    )?;
+    if !registration.verified {
+        return Err(AppError::message(
+            "Pane block module must be registered with --pane-block-module-expected-sha256 before it can be included in a native boot initramfs.",
+        ));
+    }
+    let metadata = PaneBlockModuleMetadata {
+        schema_version: 1,
+        module_kind: "pane-linux-block-module-v1".to_string(),
+        source_path: registration.source_path,
+        stored_path: registration.stored_path,
+        bytes: registration.bytes,
+        sha256: registration.sha256,
+        expected_sha256: registration.expected_sha256,
+        verified: registration.verified,
+        registered_at_epoch_seconds: current_epoch_seconds(),
+        notes: vec![
+            "This kernel module is expected to be built from the generated pane-block.c source against the target Arch kernel.".to_string(),
+            "Pane copies this module into the discovery initramfs as /lib/modules/pane-block.ko so /init can load it before waiting for /dev/pane0.".to_string(),
+        ],
+    };
+    write_json_file(&pane_block_module_metadata_path(paths), &metadata)
+}
+
+fn load_verified_pane_block_module_metadata(
+    paths: &RuntimePaths,
+) -> AppResult<PaneBlockModuleMetadata> {
+    let module_path = pane_block_module_path(paths);
+    let metadata_path = pane_block_module_metadata_path(paths);
+    let metadata = read_json_file::<PaneBlockModuleMetadata>(&metadata_path).map_err(|error| {
+        AppError::message(format!(
+            "Pane block module metadata is missing or invalid. Register the module with `pane runtime --register-pane-block-module ... --pane-block-module-expected-sha256 ...`: {error}"
+        ))
+    })?;
+    if metadata.schema_version != 1
+        || metadata.module_kind != "pane-linux-block-module-v1"
+        || metadata.stored_path != module_path.display().to_string()
+        || !metadata.verified
+    {
+        return Err(AppError::message(
+            "Pane block module metadata is not verified for this runtime. Re-register it with the expected SHA-256.",
+        ));
+    }
+    let actual_sha256 = sha256_file(&module_path).map_err(|error| {
+        AppError::message(format!(
+            "Registered Pane block module is missing or unreadable at {}: {error}",
+            module_path.display()
+        ))
+    })?;
+    let actual_bytes = fs::metadata(&module_path)?.len();
+    if metadata.sha256 != actual_sha256 || metadata.bytes != actual_bytes {
+        return Err(AppError::message(
+            "Registered Pane block module no longer matches its verified metadata. Re-register it before building the initramfs.",
+        ));
+    }
+    Ok(metadata)
+}
+
 fn pane_initramfs_hook_source() -> String {
     format!(
         r#"#!/bin/sh
@@ -4829,6 +4945,9 @@ fn build_and_register_pane_discovery_initramfs(paths: &RuntimePaths, force: bool
             "Pane discovery initramfs build script is missing: {}. Regenerate it with `pane runtime --write-initramfs-driver`.",
             build_script.display()
         )));
+    }
+    if pane_block_module_path(paths).exists() {
+        load_verified_pane_block_module_metadata(paths)?;
     }
     let status = Command::new("sh")
         .arg("./build-pane-initramfs.sh")
@@ -7321,6 +7440,27 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
                     == Some(metadata.readme_sha256.as_str())
         })
         .unwrap_or(false);
+    let pane_block_module_path = pane_block_module_path(paths);
+    let pane_block_module_metadata_path = pane_block_module_metadata_path(paths);
+    let pane_block_module_metadata =
+        read_json_file::<PaneBlockModuleMetadata>(&pane_block_module_metadata_path).ok();
+    let pane_block_module_bytes = fs::metadata(&pane_block_module_path)
+        .ok()
+        .map(|metadata| metadata.len());
+    let pane_block_module_actual_sha256 = sha256_file(&pane_block_module_path).ok();
+    let pane_block_module_verified = pane_block_module_metadata
+        .as_ref()
+        .zip(pane_block_module_bytes)
+        .zip(pane_block_module_actual_sha256.as_ref())
+        .map(|((metadata, bytes), actual_sha256)| {
+            metadata.schema_version == 1
+                && metadata.module_kind == "pane-linux-block-module-v1"
+                && metadata.stored_path == pane_block_module_path.display().to_string()
+                && metadata.bytes == bytes
+                && metadata.sha256 == *actual_sha256
+                && metadata.verified
+        })
+        .unwrap_or(false);
 
     let kernel_boot_layout = read_json_file::<KernelBootLayout>(&paths.kernel_boot_layout).ok();
     let framebuffer_contract =
@@ -7517,6 +7657,12 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
         initramfs_driver_bundle_exists,
         initramfs_driver_metadata_exists: paths.initramfs_driver_metadata.is_file(),
         initramfs_driver_bundle_ready,
+        pane_block_module_exists: pane_block_module_path.is_file(),
+        pane_block_module_bytes,
+        pane_block_module_sha256: pane_block_module_metadata
+            .as_ref()
+            .map(|metadata| metadata.sha256.clone()),
+        pane_block_module_verified,
         kernel_cmdline: kernel_boot_metadata
             .as_ref()
             .map(|metadata| metadata.cmdline.clone()),
@@ -10188,6 +10334,16 @@ fn print_runtime_report(report: &RuntimeReport) {
         yes_no(report.artifacts.initramfs_driver_bundle_ready)
     );
     println!(
+        "  Pane Block Module {}",
+        yes_no(report.artifacts.pane_block_module_verified)
+    );
+    if let Some(sha256) = &report.artifacts.pane_block_module_sha256 {
+        println!("  Pane Block Module SHA-256 {}", sha256);
+    }
+    if let Some(bytes) = report.artifacts.pane_block_module_bytes {
+        println!("  Pane Block Module Bytes {}", bytes);
+    }
+    println!(
         "  Kernel Plan    {}",
         yes_no(report.artifacts.kernel_boot_plan_ready)
     );
@@ -11171,13 +11327,13 @@ mod tests {
         load_kernel_layout_boot_image_artifact, pane_initramfs_expected_serial_milestones,
         parse_guest_physical_address, preferred_transport, read_base_os_block, read_json_file,
         read_user_disk_block, register_base_os_image, register_boot_loader_image,
-        register_kernel_boot_plan, register_pane_discovery_initramfs_artifact,
-        repair_user_disk_metadata, resize_user_disk, resolve_bundle_output_path,
-        resolve_init_source, resolve_launch_target, resolve_managed_environment_for_reset,
-        resolve_saved_launch, resolve_session_context, resolve_status_distro,
-        restore_user_disk_snapshot, runtime_contract_guest_memory_ranges, runtime_storage_budget,
-        sha256_file, status_port_for, user_disk_artifact_ready, validate_setup_password,
-        validate_setup_username, windows_transport_check, write_json_file,
+        register_kernel_boot_plan, register_pane_block_module,
+        register_pane_discovery_initramfs_artifact, repair_user_disk_metadata, resize_user_disk,
+        resolve_bundle_output_path, resolve_init_source, resolve_launch_target,
+        resolve_managed_environment_for_reset, resolve_saved_launch, resolve_session_context,
+        resolve_status_distro, restore_user_disk_snapshot, runtime_contract_guest_memory_ranges,
+        runtime_storage_budget, sha256_file, status_port_for, user_disk_artifact_ready,
+        validate_setup_password, validate_setup_username, windows_transport_check, write_json_file,
         write_pane_initramfs_driver_bundle, write_user_disk_block, AppLifecyclePhase,
         AppNextAction, BaseOsImageMetadata, CheckStatus, DistroHealth, DoctorCheck, DoctorReport,
         FramebufferContract, InitSource, KernelBootLayout, KernelBootMetadata, NativeRuntimeState,
@@ -12373,6 +12529,31 @@ mod tests {
         assert!(artifacts.initramfs_driver_bundle_exists);
         assert!(artifacts.initramfs_driver_metadata_exists);
         assert!(artifacts.initramfs_driver_bundle_ready);
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn registers_verified_pane_block_module_for_initramfs_packaging() {
+        let paths = temp_runtime_paths("runtime-pane-block-module");
+        super::prepare_runtime_paths(&paths).unwrap();
+        write_pane_initramfs_driver_bundle(&paths).unwrap();
+
+        let source = paths.downloads.join("pane-block.ko");
+        std::fs::write(&source, b"fake pane block kernel module").unwrap();
+        let sha256 = sha256_file(&source).unwrap();
+
+        register_pane_block_module(&paths, &source, Some(&sha256), false).unwrap();
+        let artifacts = build_runtime_artifact_report(&paths);
+
+        assert!(paths.initramfs_driver_dir.join("pane-block.ko").is_file());
+        assert!(paths.state.join("pane-block-module.json").is_file());
+        assert!(artifacts.pane_block_module_exists);
+        assert!(artifacts.pane_block_module_verified);
+        assert_eq!(
+            artifacts.pane_block_module_sha256.as_deref(),
+            Some(sha256.as_str())
+        );
 
         let _ = std::fs::remove_dir_all(&paths.root);
     }

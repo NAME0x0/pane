@@ -283,6 +283,12 @@ pub struct RuntimeArgs {
     /// Build the generated discovery initramfs cpio and register it into the verified kernel boot plan.
     #[arg(long)]
     pub build_discovery_initramfs: bool,
+    /// Copy a compiled pane-block.ko into the generated initramfs driver bundle.
+    #[arg(long)]
+    pub register_pane_block_module: Option<PathBuf>,
+    /// Expected SHA-256 digest for --register-pane-block-module. Without this, the module is recorded but not trusted.
+    #[arg(long)]
+    pub pane_block_module_expected_sha256: Option<String>,
     /// Create the Pane-owned user disk descriptor for packages, accounts, and customizations.
     #[arg(long)]
     pub create_user_disk: bool,

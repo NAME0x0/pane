@@ -95,7 +95,7 @@ Pane cannot claim the native runtime is real until:
 - `pane native-boot-spike --execute --run-fixture` can load the runtime-backed serial boot image, map guest memory, set registers, run guest code, decode the deterministic `PANE_BOOT_OK` serial banner, observe HLT, unmap memory, and release all WHP resources,
 - `pane native-boot-spike --execute --run-boot-loader` can load a verified runtime-provided boot-loader candidate, validate its expected serial output, observe HLT, and release all WHP resources,
 - `pane runtime --register-kernel` can prepare a verified kernel/initramfs boot plan with serial console output required before any WHP kernel-entry work starts,
-- `pane runtime --write-initramfs-driver` can generate a reproducible Pane initramfs driver source bundle that discovers `pane.storage_contract` and `pane.block_io`,
+- `pane runtime --write-initramfs-driver` can generate a reproducible Pane initramfs driver source/build-script bundle that discovers `pane.storage_contract` and `pane.block_io`,
 - `pane native-kernel-plan --materialize` can write and re-validate the deterministic kernel boot layout before the WHP runner maps those guest addresses,
 - materialized kernel layouts attach the verified base OS image and Pane user disk when both exist, instead of treating the kernel entry path as detached from future Arch storage,
 - runtime preparation writes explicit framebuffer and input contracts so display work has a stable guest/device boundary instead of an undefined "draw pixels somehow" milestone,

@@ -430,10 +430,12 @@ struct PaneInitramfsDriverMetadata {
     hook_path: String,
     header_path: String,
     probe_source_path: String,
+    build_script_path: String,
     readme_path: String,
     hook_sha256: String,
     header_sha256: String,
     probe_source_sha256: String,
+    build_script_sha256: String,
     readme_sha256: String,
     block_io_protocol: String,
     block_io_port_base: String,
@@ -3840,11 +3842,13 @@ fn write_pane_initramfs_driver_bundle(
     let hook_path = paths.initramfs_driver_dir.join("pane-initramfs-hook.sh");
     let header_path = paths.initramfs_driver_dir.join("pane-port-block.h");
     let probe_source_path = paths.initramfs_driver_dir.join("pane-port-probe.c");
+    let build_script_path = paths.initramfs_driver_dir.join("build-pane-initramfs.sh");
     let readme_path = paths.initramfs_driver_dir.join("README.md");
 
     fs::write(&hook_path, pane_initramfs_hook_source())?;
     fs::write(&header_path, pane_port_block_header_source())?;
     fs::write(&probe_source_path, pane_port_probe_source())?;
+    fs::write(&build_script_path, pane_initramfs_build_script())?;
     fs::write(&readme_path, pane_initramfs_driver_readme())?;
 
     let metadata = PaneInitramfsDriverMetadata {
@@ -3854,10 +3858,12 @@ fn write_pane_initramfs_driver_bundle(
         hook_path: hook_path.display().to_string(),
         header_path: header_path.display().to_string(),
         probe_source_path: probe_source_path.display().to_string(),
+        build_script_path: build_script_path.display().to_string(),
         readme_path: readme_path.display().to_string(),
         hook_sha256: sha256_file(&hook_path)?,
         header_sha256: sha256_file(&header_path)?,
         probe_source_sha256: sha256_file(&probe_source_path)?,
+        build_script_sha256: sha256_file(&build_script_path)?,
         readme_sha256: sha256_file(&readme_path)?,
         block_io_protocol: default_pane_block_io_protocol(),
         block_io_port_base: default_pane_block_io_port_base(),
@@ -4004,6 +4010,40 @@ int main(void) {
     .to_string()
 }
 
+fn pane_initramfs_build_script() -> String {
+    r#"#!/bin/sh
+set -eu
+
+# Build a minimal Pane native-storage discovery initramfs.
+# Run from this directory on Linux with gcc and cpio available:
+#   sh build-pane-initramfs.sh ./pane-storage-discovery.cpio
+
+output="${1:-pane-storage-discovery.cpio}"
+workdir="$(mktemp -d)"
+trap 'rm -rf "$workdir"' EXIT
+
+mkdir -p "$workdir/bin" "$workdir/proc" "$workdir/run/pane"
+cc -Os -static -o "$workdir/bin/pane-port-probe" pane-port-probe.c
+cp pane-initramfs-hook.sh "$workdir/bin/pane-initramfs-hook"
+chmod +x "$workdir/bin/pane-initramfs-hook" "$workdir/bin/pane-port-probe"
+
+cat > "$workdir/init" <<'EOF'
+#!/bin/sh
+set -eu
+mount -t proc proc /proc 2>/dev/null || true
+/bin/pane-initramfs-hook
+/bin/pane-port-probe || echo "pane-initramfs: port probe failed" >&2
+echo "pane-initramfs: discovery complete; root mount driver is the next milestone" >&2
+exec sh
+EOF
+chmod +x "$workdir/init"
+
+(cd "$workdir" && find . -print | cpio -o -H newc > "$OLDPWD/$output")
+printf 'wrote %s\n' "$output"
+"#
+    .to_string()
+}
+
 fn pane_initramfs_driver_readme() -> String {
     r#"# Pane Initramfs Driver Source
 
@@ -4021,6 +4061,15 @@ Expected kernel arguments:
 - `pane.block_io=<base-port>,<port-count>,<block-size-bytes>`
 - `pane.root=<root-device>`
 - `pane.user=<user-device>`
+
+To build the discovery initramfs on Linux:
+
+```sh
+sh build-pane-initramfs.sh ./pane-storage-discovery.cpio
+```
+
+The generated cpio is a discovery/probe initramfs, not the final Arch
+root-mount initramfs.
 "#
     .to_string()
 }
@@ -6440,6 +6489,10 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
                     .ok()
                     .as_deref()
                     == Some(metadata.probe_source_sha256.as_str())
+                && sha256_file(Path::new(&metadata.build_script_path))
+                    .ok()
+                    .as_deref()
+                    == Some(metadata.build_script_sha256.as_str())
                 && sha256_file(Path::new(&metadata.readme_path))
                     .ok()
                     .as_deref()
@@ -11374,6 +11427,10 @@ mod tests {
             .initramfs_driver_dir
             .join("pane-port-probe.c")
             .is_file());
+        assert!(paths
+            .initramfs_driver_dir
+            .join("build-pane-initramfs.sh")
+            .is_file());
         assert!(paths.initramfs_driver_metadata.is_file());
         let hook =
             std::fs::read_to_string(paths.initramfs_driver_dir.join("pane-initramfs-hook.sh"))
@@ -11384,6 +11441,11 @@ mod tests {
             std::fs::read_to_string(paths.initramfs_driver_dir.join("pane-port-block.h")).unwrap();
         assert!(header.contains("#define PANE_BLOCK_IO_BASE_PORT 3328"));
         assert!(header.contains("#define PANE_BLOCK_IO_DATA_OFFSET 12"));
+        let build_script =
+            std::fs::read_to_string(paths.initramfs_driver_dir.join("build-pane-initramfs.sh"))
+                .unwrap();
+        assert!(build_script.contains("cpio -o -H newc"));
+        assert!(build_script.contains("pane-port-probe"));
         assert!(artifacts.initramfs_driver_bundle_exists);
         assert!(artifacts.initramfs_driver_metadata_exists);
         assert!(artifacts.initramfs_driver_bundle_ready);

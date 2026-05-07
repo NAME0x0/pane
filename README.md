@@ -216,7 +216,7 @@ What exists today:
 - verified kernel/initramfs boot-plan metadata,
 - materialized Linux kernel boot layout,
 - kernel-layout attachment for the verified Arch base image plus guest-mapped Pane sparse user disk and block-port ABI contract,
-- generated Pane initramfs driver source and build-script bundle with a self-contained discovery `/init` plus kernel-layout serial milestone gates for guest-side native storage discovery,
+- generated Pane initramfs driver source/build-script bundle with a self-contained discovery `/init`, a build/register path for the discovery cpio, and kernel-layout serial milestone gates for guest-side native storage discovery,
 - fixed linear framebuffer contract mapped into guest memory for the future Pane-rendered display path,
 - keyboard/pointer input queue contract mapped into guest memory for the future app-owned input path,
 - Linux bzImage setup header copying into boot params,
@@ -294,9 +294,12 @@ Register a verified Linux kernel and optional initramfs:
 cargo run -- runtime --register-kernel C:\path\to\vmlinuz-linux --kernel-expected-sha256 <64-char-sha256> --kernel-cmdline "console=ttyS0 panic=-1"
 cargo run -- runtime --register-initramfs C:\path\to\initramfs-linux.img --initramfs-expected-sha256 <64-char-sha256> --kernel-cmdline "console=ttyS0 panic=-1"
 cargo run -- runtime --write-initramfs-driver
+cargo run -- runtime --build-discovery-initramfs
 cargo run -- native-kernel-plan --materialize
 cargo run -- native-boot-spike --execute --run-kernel-layout
 ```
+
+`--build-discovery-initramfs` runs the generated `build-pane-initramfs.sh` with `sh`, `cc`, and `cpio`, then registers the produced cpio as a verified initramfs artifact in the existing kernel boot plan. If those tools are unavailable, build the cpio externally from the generated bundle and register it with `--register-initramfs`.
 
 That path is still a kernel-entry probe. It is not a completed Arch boot until Pane proves deterministic early Linux serial output, root filesystem mounting, userspace start, and eventually display.
 Storage-backed kernel layouts require the generated Pane initramfs driver bundle so root discovery is not treated as ready without guest-side support. The generated discovery initramfs now boots a C `/init` directly and the kernel-layout runner carries deterministic serial milestones such as `PANE_INITRAMFS_DISCOVERY_START`, `PANE_BLOCK_IO_PROBE_OK`, and `PANE_INITRAMFS_DISCOVERY_DONE` as the proof target.

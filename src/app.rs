@@ -1862,6 +1862,7 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
         || args.register_initramfs.is_some()
         || args.kernel_cmdline.is_some()
         || args.write_initramfs_driver
+        || args.build_discovery_initramfs
         || args.create_user_disk
         || args.snapshot_user_disk
         || args.restore_user_disk_snapshot.is_some()
@@ -1934,6 +1935,10 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
 
     if args.write_initramfs_driver {
         write_pane_initramfs_driver_bundle(&paths)?;
+    }
+
+    if args.build_discovery_initramfs {
+        build_and_register_pane_discovery_initramfs(&paths, args.force)?;
     }
 
     if args.create_user_disk {
@@ -2307,6 +2312,16 @@ fn native_kernel_plan(args: NativeKernelPlanArgs) -> AppResult<()> {
     {
         blockers.push(
             "No valid Pane initramfs driver source bundle exists. Run `pane runtime --write-initramfs-driver` before materializing a storage-backed kernel layout."
+                .to_string(),
+        );
+    }
+    if runtime.artifacts.base_os_image_verified
+        && runtime.artifacts.user_disk_ready
+        && runtime.artifacts.initramfs_driver_bundle_ready
+        && !runtime.artifacts.initramfs_image_verified
+    {
+        blockers.push(
+            "No verified Pane discovery initramfs artifact exists. Run `pane runtime --build-discovery-initramfs`, or register an externally built initramfs with `pane runtime --register-initramfs <path> --initramfs-expected-sha256 <sha256>`."
                 .to_string(),
         );
     }
@@ -4327,6 +4342,58 @@ fn pane_initramfs_expected_serial_milestones() -> Vec<String> {
     ]
 }
 
+fn build_and_register_pane_discovery_initramfs(paths: &RuntimePaths, force: bool) -> AppResult<()> {
+    let metadata = load_verified_pane_initramfs_driver_metadata(paths)?;
+    if !paths.kernel_boot_metadata.is_file() {
+        return Err(AppError::message(
+            "`pane runtime --build-discovery-initramfs` requires an existing verified kernel boot plan. Register a kernel first with `pane runtime --register-kernel ... --kernel-expected-sha256 ...`.",
+        ));
+    }
+
+    let output = paths
+        .initramfs_driver_dir
+        .join("pane-storage-discovery.cpio");
+    let build_script = Path::new(&metadata.build_script_path);
+    if !build_script.is_file() {
+        return Err(AppError::message(format!(
+            "Pane discovery initramfs build script is missing: {}. Regenerate it with `pane runtime --write-initramfs-driver`.",
+            build_script.display()
+        )));
+    }
+    let status = Command::new("sh")
+        .arg("./build-pane-initramfs.sh")
+        .arg("pane-storage-discovery.cpio")
+        .current_dir(&paths.initramfs_driver_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| {
+            AppError::message(format!(
+                "Failed to run Pane discovery initramfs build script with `sh`: {error}. Install a POSIX shell plus `cc` and `cpio`, or build the cpio externally and register it with `pane runtime --register-initramfs`."
+            ))
+        })?;
+
+    if !status.status.success() {
+        return Err(AppError::message(format!(
+            "Pane discovery initramfs build failed with status {}.\nstdout:\n{}\nstderr:\n{}",
+            status.status,
+            String::from_utf8_lossy(&status.stdout),
+            String::from_utf8_lossy(&status.stderr)
+        )));
+    }
+
+    register_pane_discovery_initramfs_artifact(paths, &output, force)
+}
+
+fn register_pane_discovery_initramfs_artifact(
+    paths: &RuntimePaths,
+    source: &Path,
+    force: bool,
+) -> AppResult<()> {
+    let sha256 = sha256_file(source)?;
+    register_kernel_boot_plan(paths, None, None, Some(source), Some(&sha256), None, force)
+}
+
 fn create_user_disk_snapshot(paths: &RuntimePaths) -> AppResult<UserDiskSnapshotMetadata> {
     let metadata = read_json_file::<UserDiskMetadata>(&paths.user_disk_metadata)?;
     if !user_disk_artifact_ready(paths, &Some(metadata.clone())) {
@@ -5790,6 +5857,11 @@ fn build_kernel_boot_layout(
     };
     let artifact_report = build_runtime_artifact_report(paths);
     let storage = build_kernel_storage_attachment(paths, &artifact_report)?;
+    if storage.is_some() && !metadata.initramfs_verified {
+        return Err(AppError::message(
+            "Storage-backed kernel layouts require a verified initramfs artifact containing Pane discovery support. Run `pane runtime --write-initramfs-driver --build-discovery-initramfs`, or register an externally built initramfs with `pane runtime --register-initramfs <path> --initramfs-expected-sha256 <sha256>`.",
+        ));
+    }
     let initramfs_driver = if storage.is_some() {
         Some(load_verified_pane_initramfs_driver_metadata(paths)?)
     } else {
@@ -6877,6 +6949,7 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
                 && layout.initramfs_sha256 == metadata.initramfs_sha256
                 && Some(&layout.cmdline) == expected_cmdline.as_ref()
                 && layout.cmdline.contains("console=ttyS0")
+                && (layout.storage.is_none() || initramfs_image_verified)
                 && (layout.storage.is_none() || initramfs_driver_bundle_ready)
                 && layout.initramfs_driver
                     == layout
@@ -7053,6 +7126,16 @@ fn build_native_runtime_report(
         {
             blockers.push(
                 "No valid Pane initramfs driver source bundle exists for native root storage discovery. Run `pane runtime --write-initramfs-driver`."
+                    .to_string(),
+            );
+        }
+        if artifacts.base_os_image_verified
+            && artifacts.user_disk_ready
+            && artifacts.initramfs_driver_bundle_ready
+            && !artifacts.initramfs_image_verified
+        {
+            blockers.push(
+                "No verified Pane discovery initramfs artifact exists for native root storage discovery. Run `pane runtime --build-discovery-initramfs`, or register an externally built initramfs with `pane runtime --register-initramfs <path> --initramfs-expected-sha256 <sha256>`."
                     .to_string(),
             );
         }
@@ -10610,12 +10693,13 @@ mod tests {
         load_kernel_layout_boot_image_artifact, pane_initramfs_expected_serial_milestones,
         parse_guest_physical_address, preferred_transport, read_base_os_block, read_json_file,
         read_user_disk_block, register_base_os_image, register_boot_loader_image,
-        register_kernel_boot_plan, repair_user_disk_metadata, resize_user_disk,
-        resolve_bundle_output_path, resolve_init_source, resolve_launch_target,
-        resolve_managed_environment_for_reset, resolve_saved_launch, resolve_session_context,
-        resolve_status_distro, restore_user_disk_snapshot, runtime_contract_guest_memory_ranges,
-        runtime_storage_budget, sha256_file, status_port_for, user_disk_artifact_ready,
-        validate_setup_password, validate_setup_username, windows_transport_check, write_json_file,
+        register_kernel_boot_plan, register_pane_discovery_initramfs_artifact,
+        repair_user_disk_metadata, resize_user_disk, resolve_bundle_output_path,
+        resolve_init_source, resolve_launch_target, resolve_managed_environment_for_reset,
+        resolve_saved_launch, resolve_session_context, resolve_status_distro,
+        restore_user_disk_snapshot, runtime_contract_guest_memory_ranges, runtime_storage_budget,
+        sha256_file, status_port_for, user_disk_artifact_ready, validate_setup_password,
+        validate_setup_username, windows_transport_check, write_json_file,
         write_pane_initramfs_driver_bundle, write_user_disk_block, AppLifecyclePhase,
         AppNextAction, BaseOsImageMetadata, CheckStatus, DistroHealth, DoctorCheck, DoctorReport,
         FramebufferContract, InitSource, KernelBootLayout, KernelBootMetadata, NativeRuntimeState,
@@ -10696,6 +10780,19 @@ mod tests {
         bytes[0x258..0x260].copy_from_slice(&0x0100_0000_u64.to_le_bytes());
         bytes[2560..].fill(0xcc);
         bytes
+    }
+
+    fn register_fake_discovery_initramfs(paths: &RuntimePaths) {
+        let discovery_initramfs = paths
+            .initramfs_driver_dir
+            .join("pane-storage-discovery.cpio");
+        std::fs::create_dir_all(&paths.initramfs_driver_dir).unwrap();
+        std::fs::write(
+            &discovery_initramfs,
+            b"PANE_INITRAMFS_DISCOVERY_START\nPANE_BLOCK_IO_PROBE_OK\nPANE_INITRAMFS_DISCOVERY_DONE\n",
+        )
+        .unwrap();
+        register_pane_discovery_initramfs_artifact(paths, &discovery_initramfs, false).unwrap();
     }
 
     fn empty_doctor_report() -> DoctorReport {
@@ -11767,6 +11864,59 @@ mod tests {
     }
 
     #[test]
+    fn registers_generated_discovery_initramfs_into_kernel_plan() {
+        let paths = temp_runtime_paths("runtime-pane-discovery-initramfs");
+        super::prepare_runtime_paths(&paths).unwrap();
+        let kernel = paths.downloads.join("vmlinuz-linux");
+        let discovery_initramfs = paths
+            .initramfs_driver_dir
+            .join("pane-storage-discovery.cpio");
+        std::fs::create_dir_all(&paths.initramfs_driver_dir).unwrap();
+        std::fs::write(&kernel, fake_linux_bzimage()).unwrap();
+        std::fs::write(
+            &discovery_initramfs,
+            b"PANE_INITRAMFS_DISCOVERY_START\nPANE_BLOCK_IO_PROBE_OK\nPANE_INITRAMFS_DISCOVERY_DONE\n",
+        )
+        .unwrap();
+        let kernel_sha = sha256_file(&kernel).unwrap();
+        let discovery_sha = sha256_file(&discovery_initramfs).unwrap();
+
+        register_kernel_boot_plan(
+            &paths,
+            Some(&kernel),
+            Some(&kernel_sha),
+            None,
+            None,
+            Some("console=ttyS0 panic=-1"),
+            false,
+        )
+        .unwrap();
+
+        register_pane_discovery_initramfs_artifact(&paths, &discovery_initramfs, false).unwrap();
+        let metadata = read_json_file::<KernelBootMetadata>(&paths.kernel_boot_metadata).unwrap();
+        let artifacts = build_runtime_artifact_report(&paths);
+        let stored_initramfs_path = paths.initramfs_image.display().to_string();
+
+        assert_eq!(
+            metadata.initramfs_stored_path.as_deref(),
+            Some(stored_initramfs_path.as_str())
+        );
+        assert_eq!(
+            metadata.initramfs_sha256.as_deref(),
+            Some(discovery_sha.as_str())
+        );
+        assert_eq!(
+            metadata.initramfs_expected_sha256.as_deref(),
+            Some(discovery_sha.as_str())
+        );
+        assert!(metadata.initramfs_verified);
+        assert!(artifacts.initramfs_image_exists);
+        assert!(artifacts.initramfs_image_verified);
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
     fn user_disk_snapshot_copies_and_verifies_sparse_artifact() {
         let paths = temp_runtime_paths("runtime-user-disk-snapshot");
         super::prepare_runtime_paths(&paths).unwrap();
@@ -12006,6 +12156,7 @@ mod tests {
             false,
         )
         .unwrap();
+        register_fake_discovery_initramfs(&paths);
 
         let layout = build_kernel_boot_layout(&paths, "pane", true).unwrap();
         let storage = layout.storage.as_ref().expect("storage attachment");
@@ -12135,6 +12286,12 @@ mod tests {
             .iter()
             .any(|blocker| blocker.contains("--write-initramfs-driver")));
 
+        write_pane_initramfs_driver_bundle(&paths).unwrap();
+        let error = build_kernel_boot_layout(&paths, "pane", true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--build-discovery-initramfs"));
+
         let _ = std::fs::remove_dir_all(&paths.root);
     }
 
@@ -12168,6 +12325,7 @@ mod tests {
             false,
         )
         .unwrap();
+        register_fake_discovery_initramfs(&paths);
 
         let layout = build_kernel_boot_layout(&paths, "pane", true).unwrap();
         let storage = layout.storage.as_ref().expect("storage attachment");

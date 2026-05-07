@@ -280,6 +280,9 @@ pub struct RuntimeArgs {
     /// Write Pane's guest-side initramfs driver source bundle for the native storage ABI.
     #[arg(long)]
     pub write_initramfs_driver: bool,
+    /// Build the generated discovery initramfs cpio and register it into the verified kernel boot plan.
+    #[arg(long)]
+    pub build_discovery_initramfs: bool,
     /// Create the Pane-owned user disk descriptor for packages, accounts, and customizations.
     #[arg(long)]
     pub create_user_disk: bool,

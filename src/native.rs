@@ -24,6 +24,11 @@ pub(crate) const PANE_BLOCK_IO_PORT_COUNT: u16 = 0x0010;
 pub(crate) const PANE_BLOCK_IO_LAST_PORT: u16 =
     PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_PORT_COUNT - 1;
 pub(crate) const PANE_BLOCK_IO_BLOCK_SIZE_BYTES: u32 = 4096;
+pub(crate) const PANE_BLOCK_IO_STATUS_SUBMITTED: u8 = 0x01;
+pub(crate) const PANE_BLOCK_IO_STATUS_SERVICED: u8 = 0x02;
+pub(crate) const PANE_BLOCK_IO_STATUS_DENIED: u8 = 0xfc;
+pub(crate) const PANE_BLOCK_IO_STATUS_FAILED: u8 = 0xfd;
+pub(crate) const PANE_BLOCK_IO_STATUS_INVALID: u8 = 0xfe;
 
 #[derive(Clone, Debug)]
 pub(crate) struct NativeSerialBootImage {
@@ -110,6 +115,21 @@ pub(crate) struct NativeBlockIoDecision {
     pub(crate) detail: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NativeBlockIoServiceResult {
+    pub(crate) decision: NativeBlockIoDecision,
+    pub(crate) bytes: Vec<u8>,
+}
+
+pub(crate) type NativeBlockIoHandler<'a> =
+    dyn Fn(&NativeBlockIoCommand, Option<&[u8]>) -> Result<NativeBlockIoServiceResult, String> + 'a;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NativeBlockIoServiceOutcome {
+    pub(crate) report: NativeWhpCallReport,
+    pub(crate) status_code: u8,
+}
+
 pub(crate) fn evaluate_native_block_io(command: &NativeBlockIoCommand) -> NativeBlockIoDecision {
     if command.block_size_bytes != PANE_BLOCK_IO_BLOCK_SIZE_BYTES {
         return NativeBlockIoDecision {
@@ -143,6 +163,124 @@ pub(crate) fn evaluate_native_block_io(command: &NativeBlockIoCommand) -> Native
             command.device.label(),
             command.block_index
         ),
+    }
+}
+
+pub(crate) fn service_native_block_io_command(
+    command: &NativeBlockIoCommand,
+    handler: Option<&NativeBlockIoHandler<'_>>,
+) -> NativeBlockIoServiceOutcome {
+    let decision = evaluate_native_block_io(command);
+    if !decision.allowed {
+        return NativeBlockIoServiceOutcome {
+            report: NativeWhpCallReport {
+                name: "PaneBlockIoPolicyDenied",
+                hresult: None,
+                ok: false,
+                detail: format!(
+                    "Pane denied {} for {} block {}; policy={} detail={}.",
+                    command.operation.label(),
+                    command.device.label(),
+                    command.block_index,
+                    decision.status,
+                    decision.detail
+                ),
+            },
+            status_code: PANE_BLOCK_IO_STATUS_DENIED,
+        };
+    }
+
+    let Some(handler) = handler else {
+        return NativeBlockIoServiceOutcome {
+            report: NativeWhpCallReport {
+                name: "PaneBlockIoExitPending",
+                hresult: None,
+                ok: true,
+                detail: format!(
+                    "Linux submitted Pane block I/O command for {} {} block {}; policy={} detail={}. The next milestone must attach the runtime disk service to this exit.",
+                    command.operation.label(),
+                    command.device.label(),
+                    command.block_index,
+                    decision.status,
+                    decision.detail
+                ),
+            },
+            status_code: PANE_BLOCK_IO_STATUS_SUBMITTED,
+        };
+    };
+
+    match handler(command, None) {
+        Ok(result) if !result.decision.allowed => NativeBlockIoServiceOutcome {
+            report: NativeWhpCallReport {
+                name: "PaneBlockIoPolicyDenied",
+                hresult: None,
+                ok: false,
+                detail: format!(
+                    "Pane runtime storage denied {} for {} block {}; policy={} detail={}.",
+                    command.operation.label(),
+                    command.device.label(),
+                    command.block_index,
+                    result.decision.status,
+                    result.decision.detail
+                ),
+            },
+            status_code: PANE_BLOCK_IO_STATUS_DENIED,
+        },
+        Ok(result) => {
+            let expected_len = match command.operation {
+                NativeBlockOperation::Read => command.block_size_bytes as usize,
+                NativeBlockOperation::Write => 0,
+            };
+            let ok = result.bytes.len() == expected_len;
+            NativeBlockIoServiceOutcome {
+                report: NativeWhpCallReport {
+                    name: if ok {
+                        "PaneBlockIoServiced"
+                    } else {
+                        "PaneBlockIoServiceFailed"
+                    },
+                    hresult: None,
+                    ok,
+                    detail: if ok {
+                        format!(
+                            "Pane runtime storage serviced {} for {} block {} with {} response bytes.",
+                            command.operation.label(),
+                            command.device.label(),
+                            command.block_index,
+                            result.bytes.len()
+                        )
+                    } else {
+                        format!(
+                            "Pane runtime storage returned {} response bytes for {} {} block {}; expected {}.",
+                            result.bytes.len(),
+                            command.operation.label(),
+                            command.device.label(),
+                            command.block_index,
+                            expected_len
+                        )
+                    },
+                },
+                status_code: if ok {
+                    PANE_BLOCK_IO_STATUS_SERVICED
+                } else {
+                    PANE_BLOCK_IO_STATUS_FAILED
+                },
+            }
+        }
+        Err(error) => NativeBlockIoServiceOutcome {
+            report: NativeWhpCallReport {
+                name: "PaneBlockIoServiceFailed",
+                hresult: None,
+                ok: false,
+                detail: format!(
+                    "Pane runtime storage failed {} for {} block {}: {error}",
+                    command.operation.label(),
+                    command.device.label(),
+                    command.block_index
+                ),
+            },
+            status_code: PANE_BLOCK_IO_STATUS_FAILED,
+        },
     }
 }
 
@@ -181,7 +319,7 @@ impl NativeBlockIoPortState {
                     0 => NativeBlockDeviceId::BaseOs,
                     1 => NativeBlockDeviceId::UserDisk,
                     _ => {
-                        self.status = 0xfe;
+                        self.status = PANE_BLOCK_IO_STATUS_INVALID;
                         return None;
                     }
                 };
@@ -193,7 +331,7 @@ impl NativeBlockIoPortState {
                     0 => NativeBlockOperation::Read,
                     1 => NativeBlockOperation::Write,
                     _ => {
-                        self.status = 0xfe;
+                        self.status = PANE_BLOCK_IO_STATUS_INVALID;
                         return None;
                     }
                 };
@@ -202,10 +340,10 @@ impl NativeBlockIoPortState {
             }
             2 => {
                 if value != 1 {
-                    self.status = 0xfe;
+                    self.status = PANE_BLOCK_IO_STATUS_INVALID;
                     return None;
                 }
-                self.status = 1;
+                self.status = PANE_BLOCK_IO_STATUS_SUBMITTED;
                 Some(NativeBlockIoCommand {
                     device: self.device,
                     operation: self.operation,
@@ -220,6 +358,10 @@ impl NativeBlockIoPortState {
             }
             _ => None,
         }
+    }
+
+    pub(crate) fn set_status(&mut self, status: u8) {
+        self.status = status;
     }
 
     pub(crate) fn read(&self, port: u16) -> u8 {
@@ -391,7 +533,7 @@ impl NativePartitionSmokeStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub(crate) struct NativeWhpCallReport {
     pub(crate) name: &'static str,
     pub(crate) hresult: Option<String>,
@@ -414,6 +556,7 @@ pub(crate) fn run_partition_smoke(
     run_fixture: bool,
     boot_image: Option<&NativeSerialBootImage>,
     host: &NativeHostPreflightReport,
+    block_io_handler: Option<&NativeBlockIoHandler<'_>>,
 ) -> NativePartitionSmokeReport {
     if !execute {
         return planned_partition_smoke_report(run_fixture);
@@ -437,7 +580,7 @@ pub(crate) fn run_partition_smoke(
         );
     }
 
-    run_whp_partition_smoke(run_fixture, boot_image)
+    run_whp_partition_smoke(run_fixture, boot_image, block_io_handler)
 }
 
 fn supported_host_arch(arch: &str) -> bool {
@@ -763,6 +906,7 @@ fn probe_whp() -> WhpPreflightReport {
 fn run_whp_partition_smoke(
     run_fixture: bool,
     boot_image: Option<&NativeSerialBootImage>,
+    _block_io_handler: Option<&NativeBlockIoHandler<'_>>,
 ) -> NativePartitionSmokeReport {
     skipped_partition_smoke_report(
         true,
@@ -781,8 +925,9 @@ fn probe_whp() -> WhpPreflightReport {
 fn run_whp_partition_smoke(
     run_fixture: bool,
     boot_image: Option<&NativeSerialBootImage>,
+    block_io_handler: Option<&NativeBlockIoHandler<'_>>,
 ) -> NativePartitionSmokeReport {
-    windows_whp::run_partition_smoke(run_fixture, boot_image)
+    windows_whp::run_partition_smoke(run_fixture, boot_image, block_io_handler)
 }
 
 #[cfg(test)]
@@ -808,14 +953,15 @@ mod windows_whp {
     };
 
     use super::{
-        base_export_checks, NativeExportCheck, NativeGuestEntryMode, NativeGuestMemoryRegion,
-        NativeGuestRegionReport, NativePartitionSmokeReport, NativePartitionSmokeStatus,
-        NativeSerialBootImage, NativeWhpCallReport, WhpPreflightReport, LINUX_BOOT_CODE_SELECTOR,
-        LINUX_BOOT_DATA_SELECTOR, LINUX_BOOT_GDT_GPA, LINUX_BOOT_STACK_GPA, REQUIRED_WHP_EXPORTS,
-        SERIAL_BOOT_BANNER_TEXT, SERIAL_BOOT_TEST_IMAGE_SIZE,
+        base_export_checks, NativeBlockIoHandler, NativeExportCheck, NativeGuestEntryMode,
+        NativeGuestMemoryRegion, NativeGuestRegionReport, NativePartitionSmokeReport,
+        NativePartitionSmokeStatus, NativeSerialBootImage, NativeWhpCallReport, WhpPreflightReport,
+        LINUX_BOOT_CODE_SELECTOR, LINUX_BOOT_DATA_SELECTOR, LINUX_BOOT_GDT_GPA,
+        LINUX_BOOT_STACK_GPA, REQUIRED_WHP_EXPORTS, SERIAL_BOOT_BANNER_TEXT,
+        SERIAL_BOOT_TEST_IMAGE_SIZE,
     };
     use crate::native::{
-        evaluate_native_block_io, pane_block_io_port_offset, NativeBlockIoPortState,
+        pane_block_io_port_offset, service_native_block_io_command, NativeBlockIoPortState,
     };
 
     const WHV_CAPABILITY_CODE_HYPERVISOR_PRESENT: u32 = 0;
@@ -988,6 +1134,7 @@ mod windows_whp {
     pub(super) fn run_partition_smoke(
         run_fixture: bool,
         boot_image: Option<&NativeSerialBootImage>,
+        block_io_handler: Option<&NativeBlockIoHandler<'_>>,
     ) -> NativePartitionSmokeReport {
         let mut report = NativePartitionSmokeReport {
             product_shape:
@@ -1287,6 +1434,7 @@ mod windows_whp {
                             run_virtual_processor,
                             set_virtual_processor_registers,
                             boot_image,
+                            block_io_handler,
                             &mut report,
                         );
                     }
@@ -1771,6 +1919,7 @@ mod windows_whp {
         run_virtual_processor: WhvRunVirtualProcessor,
         set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
         boot_image: &NativeSerialBootImage,
+        block_io_handler: Option<&NativeBlockIoHandler<'_>>,
         report: &mut NativePartitionSmokeReport,
     ) {
         match boot_image.entry_mode {
@@ -1785,6 +1934,7 @@ mod windows_whp {
                 partition,
                 run_virtual_processor,
                 set_virtual_processor_registers,
+                block_io_handler,
                 report,
             ),
         }
@@ -1929,6 +2079,7 @@ mod windows_whp {
         partition: *mut c_void,
         run_virtual_processor: WhvRunVirtualProcessor,
         set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
+        block_io_handler: Option<&NativeBlockIoHandler<'_>>,
         report: &mut NativePartitionSmokeReport,
     ) {
         report.serial_expected_text = None;
@@ -1992,16 +2143,10 @@ mod windows_whp {
                         let next_rip = rip + u64::from(instruction_length);
                         if is_write {
                             if let Some(command) = block_state.write(port, serial_byte) {
-                                let decision = evaluate_native_block_io(&command);
-                                report.calls.push(NativeWhpCallReport {
-                                    name: "PaneBlockIoExitPending",
-                                    hresult: None,
-                                    ok: decision.allowed,
-                                    detail: format!(
-                                        "Linux submitted Pane block I/O command on port 0x{port:04x}; policy={} detail={}. The next milestone must service this exit with the base/user disk block backends.",
-                                        decision.status, decision.detail
-                                    ),
-                                });
+                                let outcome =
+                                    service_native_block_io_command(&command, block_io_handler);
+                                block_state.set_status(outcome.status_code);
+                                report.calls.push(outcome.report);
                                 break;
                             }
 
@@ -2820,11 +2965,13 @@ mod windows_whp {
         };
         use crate::native::{
             evaluate_native_block_io, linux_boot_gdt_page_bytes, pane_block_io_port_offset,
-            serial_boot_test_image_bytes, NativeBlockDeviceId, NativeBlockIoCommand,
-            NativeBlockIoPortState, NativeBlockOperation, NativePartitionSmokeReport,
-            NativePartitionSmokeStatus, LINUX_BOOT_CODE_SELECTOR, LINUX_BOOT_DATA_SELECTOR,
-            LINUX_BOOT_GDT_GPA, LINUX_BOOT_STACK_GPA, PANE_BLOCK_IO_BASE_PORT,
-            PANE_BLOCK_IO_BLOCK_SIZE_BYTES, PANE_BLOCK_IO_LAST_PORT, SERIAL_BOOT_BANNER_TEXT,
+            serial_boot_test_image_bytes, service_native_block_io_command, NativeBlockDeviceId,
+            NativeBlockIoCommand, NativeBlockIoPortState, NativeBlockIoServiceResult,
+            NativeBlockOperation, NativePartitionSmokeReport, NativePartitionSmokeStatus,
+            LINUX_BOOT_CODE_SELECTOR, LINUX_BOOT_DATA_SELECTOR, LINUX_BOOT_GDT_GPA,
+            LINUX_BOOT_STACK_GPA, PANE_BLOCK_IO_BASE_PORT, PANE_BLOCK_IO_BLOCK_SIZE_BYTES,
+            PANE_BLOCK_IO_LAST_PORT, PANE_BLOCK_IO_STATUS_DENIED, PANE_BLOCK_IO_STATUS_SERVICED,
+            PANE_BLOCK_IO_STATUS_SUBMITTED, SERIAL_BOOT_BANNER_TEXT,
         };
 
         #[test]
@@ -2995,7 +3142,69 @@ mod windows_whp {
             assert_eq!(command.operation, NativeBlockOperation::Write);
             assert_eq!(command.block_index, 0x0102_0304_0506_0708);
             assert_eq!(command.block_size_bytes, PANE_BLOCK_IO_BLOCK_SIZE_BYTES);
-            assert_eq!(state.read(PANE_BLOCK_IO_BASE_PORT + 2), 1);
+            assert_eq!(
+                state.read(PANE_BLOCK_IO_BASE_PORT + 2),
+                PANE_BLOCK_IO_STATUS_SUBMITTED
+            );
+        }
+
+        #[test]
+        fn native_block_io_service_reports_pending_without_handler() {
+            let command = NativeBlockIoCommand {
+                device: NativeBlockDeviceId::BaseOs,
+                operation: NativeBlockOperation::Read,
+                block_index: 4,
+                block_size_bytes: PANE_BLOCK_IO_BLOCK_SIZE_BYTES,
+            };
+
+            let outcome = service_native_block_io_command(&command, None);
+
+            assert_eq!(outcome.report.name, "PaneBlockIoExitPending");
+            assert!(outcome.report.ok);
+            assert_eq!(outcome.status_code, PANE_BLOCK_IO_STATUS_SUBMITTED);
+        }
+
+        #[test]
+        fn native_block_io_service_invokes_runtime_handler_for_reads() {
+            let command = NativeBlockIoCommand {
+                device: NativeBlockDeviceId::BaseOs,
+                operation: NativeBlockOperation::Read,
+                block_index: 4,
+                block_size_bytes: PANE_BLOCK_IO_BLOCK_SIZE_BYTES,
+            };
+            let handler = |command: &NativeBlockIoCommand, payload: Option<&[u8]>| {
+                assert_eq!(command.block_index, 4);
+                assert!(payload.is_none());
+                Ok(NativeBlockIoServiceResult {
+                    decision: evaluate_native_block_io(command),
+                    bytes: vec![0x7b_u8; PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize],
+                })
+            };
+
+            let outcome = service_native_block_io_command(&command, Some(&handler));
+
+            assert_eq!(outcome.report.name, "PaneBlockIoServiced");
+            assert!(outcome.report.ok);
+            assert_eq!(outcome.status_code, PANE_BLOCK_IO_STATUS_SERVICED);
+        }
+
+        #[test]
+        fn native_block_io_service_denies_readonly_writes_before_handler() {
+            let command = NativeBlockIoCommand {
+                device: NativeBlockDeviceId::BaseOs,
+                operation: NativeBlockOperation::Write,
+                block_index: 4,
+                block_size_bytes: PANE_BLOCK_IO_BLOCK_SIZE_BYTES,
+            };
+            let handler = |_command: &NativeBlockIoCommand, _payload: Option<&[u8]>| {
+                panic!("denied commands must not reach storage handler")
+            };
+
+            let outcome = service_native_block_io_command(&command, Some(&handler));
+
+            assert_eq!(outcome.report.name, "PaneBlockIoPolicyDenied");
+            assert!(!outcome.report.ok);
+            assert_eq!(outcome.status_code, PANE_BLOCK_IO_STATUS_DENIED);
         }
 
         #[test]
@@ -3394,7 +3603,7 @@ mod tests {
             whp_report(true, true, Some(true)),
         );
 
-        let report = run_partition_smoke(false, false, None, &host);
+        let report = run_partition_smoke(false, false, None, &host, None);
 
         assert_eq!(report.status, NativePartitionSmokeStatus::Planned);
         assert!(!report.attempted);
@@ -3411,7 +3620,7 @@ mod tests {
             whp_report(true, true, Some(true)),
         );
 
-        let report = run_partition_smoke(false, true, None, &host);
+        let report = run_partition_smoke(false, true, None, &host, None);
 
         assert_eq!(report.status, NativePartitionSmokeStatus::Planned);
         assert!(report.fixture_requested);
@@ -3428,7 +3637,7 @@ mod tests {
             whp_report(false, false, None),
         );
 
-        let report = run_partition_smoke(true, false, None, &host);
+        let report = run_partition_smoke(true, false, None, &host, None);
 
         assert_eq!(report.status, NativePartitionSmokeStatus::Skipped);
         assert!(!report.attempted);
@@ -3445,7 +3654,7 @@ mod tests {
             whp_report(false, false, None),
         );
 
-        let report = run_partition_smoke(true, true, None, &host);
+        let report = run_partition_smoke(true, true, None, &host, None);
 
         assert_eq!(report.status, NativePartitionSmokeStatus::Skipped);
         assert!(report.fixture_requested);
@@ -3484,7 +3693,7 @@ mod tests {
             extra_regions: Vec::new(),
         };
 
-        let report = run_partition_smoke(true, true, Some(&image), &host);
+        let report = run_partition_smoke(true, true, Some(&image), &host, None);
 
         assert_eq!(report.status, NativePartitionSmokeStatus::Skipped);
         assert_eq!(

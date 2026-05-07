@@ -1961,11 +1961,23 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
         None
     };
     let host = runtime.native_host.clone();
+    let runtime_block_io_handler =
+        |command: &crate::native::NativeBlockIoCommand, write_payload: Option<&[u8]>| {
+            execute_native_block_io_command(&runtime_paths, command, write_payload)
+                .map_err(|error| error.to_string())
+        };
+    let block_io_handler: Option<&crate::native::NativeBlockIoHandler<'_>> =
+        if args.execute && args.run_kernel_layout {
+            Some(&runtime_block_io_handler)
+        } else {
+            None
+        };
     let partition_smoke = crate::native::run_partition_smoke(
         args.execute,
         run_guest_image,
         boot_image.as_ref(),
         &host,
+        block_io_handler,
     );
     let protected_linux_entry_requested =
         partition_smoke.entry_mode.as_deref() == Some("linux-protected-mode-32");
@@ -3687,22 +3699,14 @@ fn write_user_disk_block(
     Ok(())
 }
 
-#[allow(dead_code)] // Covered by tests; this is the adapter the WHP block-exit handler will call.
-#[derive(Debug, PartialEq, Eq)]
-struct NativeBlockIoExecution {
-    decision: crate::native::NativeBlockIoDecision,
-    bytes: Vec<u8>,
-}
-
-#[allow(dead_code)] // Covered by tests; wired into live WHP exits in the next storage milestone.
 fn execute_native_block_io_command(
     paths: &RuntimePaths,
     command: &crate::native::NativeBlockIoCommand,
     write_payload: Option<&[u8]>,
-) -> AppResult<NativeBlockIoExecution> {
+) -> AppResult<crate::native::NativeBlockIoServiceResult> {
     let decision = crate::native::evaluate_native_block_io(command);
     if !decision.allowed {
-        return Ok(NativeBlockIoExecution {
+        return Ok(crate::native::NativeBlockIoServiceResult {
             decision,
             bytes: Vec::new(),
         });
@@ -3745,7 +3749,7 @@ fn execute_native_block_io_command(
         ) => Vec::new(),
     };
 
-    Ok(NativeBlockIoExecution { decision, bytes })
+    Ok(crate::native::NativeBlockIoServiceResult { decision, bytes })
 }
 
 fn create_user_disk_snapshot(paths: &RuntimePaths) -> AppResult<UserDiskSnapshotMetadata> {

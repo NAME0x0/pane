@@ -6446,16 +6446,19 @@ fn build_kernel_boot_layout(
     };
     let artifact_report = build_runtime_artifact_report(paths);
     let storage = build_kernel_storage_attachment(paths, &artifact_report)?;
-    if storage.is_some() && !metadata.initramfs_verified {
-        return Err(AppError::message(
-            "Storage-backed kernel layouts require a verified initramfs artifact containing Pane discovery support. Run `pane runtime --write-initramfs-driver --build-discovery-initramfs`, or register an externally built initramfs with `pane runtime --register-initramfs <path> --initramfs-expected-sha256 <sha256>`.",
-        ));
-    }
     let initramfs_driver = if storage.is_some() {
         Some(load_verified_pane_initramfs_driver_metadata(paths)?)
     } else {
         None
     };
+    if storage.is_some() {
+        load_verified_pane_block_module_metadata(paths)?;
+    }
+    if storage.is_some() && !metadata.initramfs_verified {
+        return Err(AppError::message(
+            "Storage-backed kernel layouts require a verified initramfs artifact containing Pane discovery support. Run `pane runtime --write-initramfs-driver --build-discovery-initramfs`, or register an externally built initramfs with `pane runtime --register-initramfs <path> --initramfs-expected-sha256 <sha256>`.",
+        ));
+    }
     let expected_serial_milestones = if initramfs_driver.is_some() {
         pane_initramfs_expected_serial_milestones()
     } else {
@@ -7569,6 +7572,7 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
                 && layout.cmdline.contains("console=ttyS0")
                 && (layout.storage.is_none() || initramfs_image_verified)
                 && (layout.storage.is_none() || initramfs_driver_bundle_ready)
+                && (layout.storage.is_none() || pane_block_module_verified)
                 && layout.initramfs_driver
                     == layout
                         .storage
@@ -7756,6 +7760,17 @@ fn build_native_runtime_report(
         if artifacts.base_os_image_verified
             && artifacts.user_disk_ready
             && artifacts.initramfs_driver_bundle_ready
+            && !artifacts.pane_block_module_verified
+        {
+            blockers.push(
+                "No verified Pane block module exists for native root storage. Build pane-block.ko from the generated bundle against the target Arch kernel, then run `pane runtime --register-pane-block-module <path> --pane-block-module-expected-sha256 <sha256>`."
+                    .to_string(),
+            );
+        }
+        if artifacts.base_os_image_verified
+            && artifacts.user_disk_ready
+            && artifacts.initramfs_driver_bundle_ready
+            && artifacts.pane_block_module_verified
             && !artifacts.initramfs_image_verified
         {
             blockers.push(
@@ -11429,6 +11444,13 @@ mod tests {
         register_pane_discovery_initramfs_artifact(paths, &discovery_initramfs, false).unwrap();
     }
 
+    fn register_fake_pane_block_module(paths: &RuntimePaths) {
+        let module = paths.downloads.join("pane-block.ko");
+        std::fs::write(&module, b"fake pane block kernel module").unwrap();
+        let module_sha = sha256_file(&module).unwrap();
+        register_pane_block_module(paths, &module, Some(&module_sha), false).unwrap();
+    }
+
     fn empty_doctor_report() -> DoctorReport {
         DoctorReport {
             target_distro: None,
@@ -12841,6 +12863,7 @@ mod tests {
         register_base_os_image(&paths, &base, Some(&base_sha), false).unwrap();
         create_user_disk_descriptor(&paths, &runtime_storage_budget(8), false).unwrap();
         write_pane_initramfs_driver_bundle(&paths).unwrap();
+        register_fake_pane_block_module(&paths);
         register_kernel_boot_plan(
             &paths,
             Some(&kernel),
@@ -12985,6 +13008,19 @@ mod tests {
         let error = build_kernel_boot_layout(&paths, "pane", true)
             .unwrap_err()
             .to_string();
+        assert!(error.contains("--register-pane-block-module"));
+        let artifacts = build_runtime_artifact_report(&paths);
+        let native_runtime =
+            build_native_runtime_report(true, &artifacts, &test_native_host_report(true));
+        assert!(native_runtime
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("--register-pane-block-module")));
+
+        register_fake_pane_block_module(&paths);
+        let error = build_kernel_boot_layout(&paths, "pane", true)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("--build-discovery-initramfs"));
 
         let _ = std::fs::remove_dir_all(&paths.root);
@@ -13010,6 +13046,7 @@ mod tests {
         register_base_os_image(&paths, &base, Some(&base_sha), false).unwrap();
         create_user_disk_descriptor(&paths, &runtime_storage_budget(8), false).unwrap();
         write_pane_initramfs_driver_bundle(&paths).unwrap();
+        register_fake_pane_block_module(&paths);
         register_kernel_boot_plan(
             &paths,
             Some(&kernel),

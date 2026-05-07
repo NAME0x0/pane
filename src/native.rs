@@ -109,6 +109,12 @@ pub(crate) struct NativeBlockIoCommand {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NativeBlockIoSubmission {
+    pub(crate) command: NativeBlockIoCommand,
+    pub(crate) write_payload: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NativeBlockIoDecision {
     pub(crate) allowed: bool,
     pub(crate) status: &'static str,
@@ -170,6 +176,7 @@ pub(crate) fn evaluate_native_block_io(command: &NativeBlockIoCommand) -> Native
 pub(crate) fn service_native_block_io_command(
     command: &NativeBlockIoCommand,
     handler: Option<&NativeBlockIoHandler<'_>>,
+    write_payload: Option<&[u8]>,
 ) -> NativeBlockIoServiceOutcome {
     let decision = evaluate_native_block_io(command);
     if !decision.allowed {
@@ -212,7 +219,7 @@ pub(crate) fn service_native_block_io_command(
         };
     };
 
-    match handler(command, None) {
+    match handler(command, write_payload) {
         Ok(result) if !result.decision.allowed => NativeBlockIoServiceOutcome {
             report: NativeWhpCallReport {
                 name: "PaneBlockIoPolicyDenied",
@@ -311,6 +318,7 @@ pub(crate) struct NativeBlockIoPortState {
     status: u8,
     response_bytes: Vec<u8>,
     response_cursor: usize,
+    write_payload: Vec<u8>,
 }
 
 impl Default for NativeBlockIoPortState {
@@ -322,6 +330,7 @@ impl Default for NativeBlockIoPortState {
             status: 0,
             response_bytes: Vec::new(),
             response_cursor: 0,
+            write_payload: Vec::new(),
         }
     }
 }
@@ -332,10 +341,15 @@ impl NativeBlockIoPortState {
         self.response_cursor = 0;
     }
 
-    pub(crate) fn write(&mut self, port: u16, value: u8) -> Option<NativeBlockIoCommand> {
+    fn clear_transfer_buffers(&mut self) {
+        self.clear_response();
+        self.write_payload.clear();
+    }
+
+    pub(crate) fn write(&mut self, port: u16, value: u8) -> Option<NativeBlockIoSubmission> {
         match pane_block_io_port_offset(port)? {
             0 => {
-                self.clear_response();
+                self.clear_transfer_buffers();
                 self.device = match value {
                     0 => NativeBlockDeviceId::BaseOs,
                     1 => NativeBlockDeviceId::UserDisk,
@@ -348,7 +362,7 @@ impl NativeBlockIoPortState {
                 None
             }
             1 => {
-                self.clear_response();
+                self.clear_transfer_buffers();
                 self.operation = match value {
                     0 => NativeBlockOperation::Read,
                     1 => NativeBlockOperation::Write,
@@ -367,16 +381,36 @@ impl NativeBlockIoPortState {
                     return None;
                 }
                 self.status = PANE_BLOCK_IO_STATUS_SUBMITTED;
-                Some(NativeBlockIoCommand {
+                let command = NativeBlockIoCommand {
                     device: self.device,
                     operation: self.operation,
                     block_index: u64::from_le_bytes(self.block_index_bytes),
                     block_size_bytes: PANE_BLOCK_IO_BLOCK_SIZE_BYTES,
+                };
+                let write_payload = (self.operation == NativeBlockOperation::Write)
+                    .then(|| self.write_payload.clone());
+                Some(NativeBlockIoSubmission {
+                    command,
+                    write_payload,
                 })
             }
             4..=11 => {
-                self.clear_response();
+                self.clear_transfer_buffers();
                 self.block_index_bytes[usize::from(pane_block_io_port_offset(port)? - 4)] = value;
+                self.status = 0;
+                None
+            }
+            12 => {
+                self.clear_response();
+                if self.operation != NativeBlockOperation::Write {
+                    self.status = PANE_BLOCK_IO_STATUS_INVALID;
+                    return None;
+                }
+                if self.write_payload.len() >= PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize {
+                    self.status = PANE_BLOCK_IO_STATUS_INVALID;
+                    return None;
+                }
+                self.write_payload.push(value);
                 self.status = 0;
                 None
             }
@@ -2188,9 +2222,12 @@ mod windows_whp {
 
                         let next_rip = rip + u64::from(instruction_length);
                         if is_write {
-                            if let Some(command) = block_state.write(port, serial_byte) {
-                                let outcome =
-                                    service_native_block_io_command(&command, block_io_handler);
+                            if let Some(submission) = block_state.write(port, serial_byte) {
+                                let outcome = service_native_block_io_command(
+                                    &submission.command,
+                                    block_io_handler,
+                                    submission.write_payload.as_deref(),
+                                );
                                 block_state.set_service_result(
                                     outcome.status_code,
                                     outcome.response_bytes,
@@ -3197,18 +3234,39 @@ mod windows_whp {
                     .is_none());
             }
 
-            let command = state
+            let submission = state
                 .write(PANE_BLOCK_IO_BASE_PORT + 2, 1)
                 .expect("submit creates command");
 
+            let command = submission.command;
             assert_eq!(command.device, NativeBlockDeviceId::UserDisk);
             assert_eq!(command.operation, NativeBlockOperation::Write);
             assert_eq!(command.block_index, 0x0102_0304_0506_0708);
             assert_eq!(command.block_size_bytes, PANE_BLOCK_IO_BLOCK_SIZE_BYTES);
+            assert_eq!(submission.write_payload, Some(Vec::new()));
             assert_eq!(
                 state.read(PANE_BLOCK_IO_BASE_PORT + 2),
                 PANE_BLOCK_IO_STATUS_SUBMITTED
             );
+        }
+
+        #[test]
+        fn native_block_io_port_state_collects_write_payload_bytes() {
+            let mut state = NativeBlockIoPortState::default();
+
+            assert!(state.write(PANE_BLOCK_IO_BASE_PORT, 1).is_none());
+            assert!(state.write(PANE_BLOCK_IO_BASE_PORT + 1, 1).is_none());
+            assert!(state.write(PANE_BLOCK_IO_BASE_PORT + 12, 0xde).is_none());
+            assert!(state.write(PANE_BLOCK_IO_BASE_PORT + 12, 0xad).is_none());
+            assert!(state.write(PANE_BLOCK_IO_BASE_PORT + 12, 0xbe).is_none());
+
+            let submission = state
+                .write(PANE_BLOCK_IO_BASE_PORT + 2, 1)
+                .expect("submit creates command");
+
+            assert_eq!(submission.command.device, NativeBlockDeviceId::UserDisk);
+            assert_eq!(submission.command.operation, NativeBlockOperation::Write);
+            assert_eq!(submission.write_payload, Some(vec![0xde, 0xad, 0xbe]));
         }
 
         #[test]
@@ -3220,7 +3278,7 @@ mod windows_whp {
                 block_size_bytes: PANE_BLOCK_IO_BLOCK_SIZE_BYTES,
             };
 
-            let outcome = service_native_block_io_command(&command, None);
+            let outcome = service_native_block_io_command(&command, None, None);
 
             assert_eq!(outcome.report.name, "PaneBlockIoExitPending");
             assert!(outcome.report.ok);
@@ -3244,7 +3302,7 @@ mod windows_whp {
                 })
             };
 
-            let outcome = service_native_block_io_command(&command, Some(&handler));
+            let outcome = service_native_block_io_command(&command, Some(&handler), None);
 
             assert_eq!(outcome.report.name, "PaneBlockIoServiced");
             assert!(outcome.report.ok);
@@ -3267,11 +3325,38 @@ mod windows_whp {
                 panic!("denied commands must not reach storage handler")
             };
 
-            let outcome = service_native_block_io_command(&command, Some(&handler));
+            let outcome = service_native_block_io_command(&command, Some(&handler), None);
 
             assert_eq!(outcome.report.name, "PaneBlockIoPolicyDenied");
             assert!(!outcome.report.ok);
             assert_eq!(outcome.status_code, PANE_BLOCK_IO_STATUS_DENIED);
+        }
+
+        #[test]
+        fn native_block_io_service_passes_user_write_payload_to_handler() {
+            let command = NativeBlockIoCommand {
+                device: NativeBlockDeviceId::UserDisk,
+                operation: NativeBlockOperation::Write,
+                block_index: 4,
+                block_size_bytes: PANE_BLOCK_IO_BLOCK_SIZE_BYTES,
+            };
+            let payload = vec![0x33_u8; PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize];
+            let handler = |command: &NativeBlockIoCommand, payload: Option<&[u8]>| {
+                assert_eq!(command.operation, NativeBlockOperation::Write);
+                let payload = payload.expect("write payload is present");
+                assert_eq!(payload.len(), PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize);
+                assert!(payload.iter().all(|byte| *byte == 0x33));
+                Ok(NativeBlockIoServiceResult {
+                    decision: evaluate_native_block_io(command),
+                    bytes: Vec::new(),
+                })
+            };
+
+            let outcome = service_native_block_io_command(&command, Some(&handler), Some(&payload));
+
+            assert_eq!(outcome.report.name, "PaneBlockIoServiced");
+            assert!(outcome.report.ok);
+            assert_eq!(outcome.status_code, PANE_BLOCK_IO_STATUS_SERVICED);
         }
 
         #[test]

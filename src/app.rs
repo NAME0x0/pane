@@ -422,7 +422,7 @@ struct KernelBootMetadata {
     notes: Vec<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct PaneInitramfsDriverMetadata {
     schema_version: u32,
     bundle_kind: String,
@@ -477,6 +477,7 @@ struct KernelBootLayout {
     cmdline: String,
     expected_serial_device: String,
     storage: Option<KernelStorageAttachment>,
+    initramfs_driver: Option<PaneInitramfsDriverMetadata>,
     framebuffer: Option<FramebufferContract>,
     input: Option<InputContract>,
     materialized_at_epoch_seconds: Option<u64>,
@@ -3882,6 +3883,60 @@ fn write_pane_initramfs_driver_bundle(
     Ok(metadata)
 }
 
+fn load_verified_pane_initramfs_driver_metadata(
+    paths: &RuntimePaths,
+) -> AppResult<PaneInitramfsDriverMetadata> {
+    let metadata = read_json_file::<PaneInitramfsDriverMetadata>(&paths.initramfs_driver_metadata)
+        .map_err(|error| {
+            AppError::message(format!(
+                "Pane initramfs driver metadata is missing or invalid. Run `pane runtime --write-initramfs-driver`: {error}"
+            ))
+        })?;
+    if metadata.schema_version != 1
+        || metadata.bundle_kind != "pane-initramfs-driver-source-v1"
+        || metadata.driver_dir != paths.initramfs_driver_dir.display().to_string()
+        || metadata.block_io_protocol != default_pane_block_io_protocol()
+        || metadata.block_io_port_base != default_pane_block_io_port_base()
+        || metadata.block_io_port_count != default_pane_block_io_port_count()
+        || metadata.block_io_status_port_offset != default_pane_block_io_status_port_offset()
+        || metadata.block_io_data_port_offset != default_pane_block_io_data_port_offset()
+        || metadata.block_io_block_size_bytes != default_pane_block_io_block_size_bytes()
+    {
+        return Err(AppError::message(
+            "Pane initramfs driver metadata does not match the native block I/O ABI. Regenerate it with `pane runtime --write-initramfs-driver`.",
+        ));
+    }
+
+    for (label, path, expected_sha256) in [
+        ("hook", &metadata.hook_path, &metadata.hook_sha256),
+        ("header", &metadata.header_path, &metadata.header_sha256),
+        (
+            "probe source",
+            &metadata.probe_source_path,
+            &metadata.probe_source_sha256,
+        ),
+        (
+            "build script",
+            &metadata.build_script_path,
+            &metadata.build_script_sha256,
+        ),
+        ("readme", &metadata.readme_path, &metadata.readme_sha256),
+    ] {
+        let actual = sha256_file(Path::new(path)).map_err(|error| {
+            AppError::message(format!(
+                "Pane initramfs driver {label} artifact at {path} is missing or unreadable: {error}"
+            ))
+        })?;
+        if actual != *expected_sha256 {
+            return Err(AppError::message(format!(
+                "Pane initramfs driver {label} artifact at {path} no longer matches metadata. Regenerate it with `pane runtime --write-initramfs-driver`."
+            )));
+        }
+    }
+
+    Ok(metadata)
+}
+
 fn pane_initramfs_hook_source() -> String {
     format!(
         r#"#!/bin/sh
@@ -5534,6 +5589,11 @@ fn build_kernel_boot_layout(
     };
     let artifact_report = build_runtime_artifact_report(paths);
     let storage = build_kernel_storage_attachment(paths, &artifact_report)?;
+    let initramfs_driver = if storage.is_some() {
+        Some(load_verified_pane_initramfs_driver_metadata(paths)?)
+    } else {
+        None
+    };
     let framebuffer = read_json_file::<FramebufferContract>(&paths.framebuffer_contract)
         .unwrap_or_else(|_| default_framebuffer_contract());
     let input = read_json_file::<InputContract>(&paths.input_contract)
@@ -5581,6 +5641,7 @@ fn build_kernel_boot_layout(
         cmdline,
         expected_serial_device: metadata.expected_serial_device,
         storage,
+        initramfs_driver,
         framebuffer: Some(framebuffer),
         input: Some(input),
         materialized_at_epoch_seconds: materialize.then(current_epoch_seconds),
@@ -6601,6 +6662,11 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
                 && Some(&layout.cmdline) == expected_cmdline.as_ref()
                 && layout.cmdline.contains("console=ttyS0")
                 && (layout.storage.is_none() || initramfs_driver_bundle_ready)
+                && layout.initramfs_driver
+                    == layout
+                        .storage
+                        .as_ref()
+                        .and_then(|_| initramfs_driver_metadata.clone())
                 && layout.expected_serial_device == "ttyS0"
                 && layout.framebuffer.as_ref().is_some_and(|contract| {
                     contract.schema_version == 1
@@ -10870,6 +10936,7 @@ mod tests {
             cmdline: "console=ttyS0 panic=-1".to_string(),
             expected_serial_device: "ttyS0".to_string(),
             storage: None,
+            initramfs_driver: None,
             framebuffer: Some(default_framebuffer_contract()),
             input: Some(default_input_contract()),
             materialized_at_epoch_seconds: Some(1),
@@ -10964,6 +11031,7 @@ mod tests {
             cmdline: "console=ttyS0 panic=-1".to_string(),
             expected_serial_device: "ttyS0".to_string(),
             storage: None,
+            initramfs_driver: None,
             framebuffer: Some(default_framebuffer_contract()),
             input: Some(default_input_contract()),
             materialized_at_epoch_seconds: Some(1),
@@ -11025,6 +11093,7 @@ mod tests {
             cmdline: "console=ttyS0 panic=-1".to_string(),
             expected_serial_device: "ttyS0".to_string(),
             storage: None,
+            initramfs_driver: None,
             framebuffer: Some(default_framebuffer_contract()),
             input: Some(default_input_contract()),
             materialized_at_epoch_seconds: Some(1),
@@ -11696,6 +11765,12 @@ mod tests {
 
         let layout = build_kernel_boot_layout(&paths, "pane", true).unwrap();
         let storage = layout.storage.as_ref().expect("storage attachment");
+        let driver = layout
+            .initramfs_driver
+            .as_ref()
+            .expect("initramfs driver attachment");
+        assert_eq!(driver.bundle_kind, "pane-initramfs-driver-source-v1");
+        assert_eq!(driver.block_io_protocol, "pane-port-block-v1");
         assert_eq!(storage.root_device, "/dev/pane0");
         assert_eq!(storage.user_device, "/dev/pane1");
         assert_eq!(storage.contract_gpa, "0x0dfe0000");
@@ -11796,11 +11871,13 @@ mod tests {
             false,
         )
         .unwrap();
-        let layout = build_kernel_boot_layout(&paths, "pane", true).unwrap();
-        assert!(layout.storage.is_some());
+        let error = build_kernel_boot_layout(&paths, "pane", true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--write-initramfs-driver"));
 
         let artifacts = build_runtime_artifact_report(&paths);
-        assert!(artifacts.kernel_boot_layout_exists);
+        assert!(!artifacts.kernel_boot_layout_exists);
         assert!(!artifacts.initramfs_driver_bundle_ready);
         assert!(!artifacts.kernel_boot_layout_ready);
         let native_runtime =

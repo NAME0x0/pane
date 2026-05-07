@@ -299,6 +299,7 @@ cargo run -- native-boot-spike --execute --run-kernel-layout
 ```
 
 That path is still a kernel-entry probe. It is not a completed Arch boot until Pane proves deterministic early Linux serial output, root filesystem mounting, userspace start, and eventually display.
+Storage-backed kernel layouts require the generated Pane initramfs driver bundle so root discovery is not treated as ready without guest-side support.
 
 ## Command Reference
 

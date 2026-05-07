@@ -40,11 +40,13 @@ pub struct RuntimePaths {
     pub boot_loader_image: PathBuf,
     pub kernel_image: PathBuf,
     pub initramfs_image: PathBuf,
+    pub initramfs_driver_dir: PathBuf,
     pub user_disk: PathBuf,
     pub base_os_metadata: PathBuf,
     pub serial_boot_metadata: PathBuf,
     pub boot_loader_metadata: PathBuf,
     pub kernel_boot_metadata: PathBuf,
+    pub initramfs_driver_metadata: PathBuf,
     pub user_disk_metadata: PathBuf,
     pub runtime_config: PathBuf,
     pub native_manifest: PathBuf,
@@ -151,11 +153,13 @@ pub fn runtime_for(session_name: &str) -> RuntimePaths {
         boot_loader_image: engines.join("boot-to-serial-loader.paneimg"),
         kernel_image: engines.join("linux-kernel.paneimg"),
         initramfs_image: engines.join("initramfs.paneinitrd"),
+        initramfs_driver_dir: engines.join("pane-initramfs-driver"),
         user_disk: disks.join("user-data.panedisk"),
         base_os_metadata: state.join("base-os-image.json"),
         serial_boot_metadata: state.join("serial-boot-image.json"),
         boot_loader_metadata: state.join("boot-to-serial-loader.json"),
         kernel_boot_metadata: state.join("kernel-boot.json"),
+        initramfs_driver_metadata: state.join("pane-initramfs-driver.json"),
         user_disk_metadata: state.join("user-disk.json"),
         runtime_config: root.join("pane-runtime.config.json"),
         native_manifest: root.join("pane-native-runtime.json"),
@@ -346,6 +350,10 @@ mod tests {
             &runtime.initramfs_image,
             &["engines", "initramfs.paneinitrd"],
         );
+        assert_path_ends_with(
+            &runtime.initramfs_driver_dir,
+            &["engines", "pane-initramfs-driver"],
+        );
         assert_path_ends_with(&runtime.user_disk, &["disks", "user-data.panedisk"]);
         assert_path_ends_with(
             &runtime.runtime_config,
@@ -371,6 +379,15 @@ mod tests {
         assert_path_ends_with(
             &runtime.kernel_boot_metadata,
             &["runtime", "pane-session", "state", "kernel-boot.json"],
+        );
+        assert_path_ends_with(
+            &runtime.initramfs_driver_metadata,
+            &[
+                "runtime",
+                "pane-session",
+                "state",
+                "pane-initramfs-driver.json",
+            ],
         );
         assert_path_ends_with(
             &runtime.user_disk_metadata,

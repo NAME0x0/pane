@@ -219,11 +219,13 @@ struct RuntimeDirectoryReport {
     boot_loader_image: String,
     kernel_image: String,
     initramfs_image: String,
+    initramfs_driver_dir: String,
     user_disk: String,
     base_os_metadata: String,
     serial_boot_metadata: String,
     boot_loader_metadata: String,
     kernel_boot_metadata: String,
+    initramfs_driver_metadata: String,
     user_disk_metadata: String,
     runtime_config: String,
     native_manifest: String,
@@ -284,6 +286,9 @@ struct RuntimeArtifactReport {
     initramfs_image_bytes: Option<u64>,
     initramfs_image_sha256: Option<String>,
     initramfs_image_verified: bool,
+    initramfs_driver_bundle_exists: bool,
+    initramfs_driver_metadata_exists: bool,
+    initramfs_driver_bundle_ready: bool,
     kernel_cmdline: Option<String>,
     kernel_boot_plan_ready: bool,
     kernel_boot_metadata_exists: bool,
@@ -414,6 +419,29 @@ struct KernelBootMetadata {
     kernel_load_gpa: String,
     initramfs_load_gpa: Option<String>,
     registered_at_epoch_seconds: u64,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PaneInitramfsDriverMetadata {
+    schema_version: u32,
+    bundle_kind: String,
+    driver_dir: String,
+    hook_path: String,
+    header_path: String,
+    probe_source_path: String,
+    readme_path: String,
+    hook_sha256: String,
+    header_sha256: String,
+    probe_source_sha256: String,
+    readme_sha256: String,
+    block_io_protocol: String,
+    block_io_port_base: String,
+    block_io_port_count: u16,
+    block_io_status_port_offset: u16,
+    block_io_data_port_offset: u16,
+    block_io_block_size_bytes: u64,
+    generated_at_epoch_seconds: u64,
     notes: Vec<String>,
 }
 
@@ -1826,6 +1854,7 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
         || args.register_kernel.is_some()
         || args.register_initramfs.is_some()
         || args.kernel_cmdline.is_some()
+        || args.write_initramfs_driver
         || args.create_user_disk
         || args.snapshot_user_disk
         || args.restore_user_disk_snapshot.is_some()
@@ -1894,6 +1923,10 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
         return Err(AppError::message(
             "--kernel-expected-sha256 requires --register-kernel, and --initramfs-expected-sha256 requires --register-initramfs.",
         ));
+    }
+
+    if args.write_initramfs_driver {
+        write_pane_initramfs_driver_bundle(&paths)?;
     }
 
     if args.create_user_disk {
@@ -3049,11 +3082,13 @@ fn build_runtime_report(
             boot_loader_image: paths.boot_loader_image.display().to_string(),
             kernel_image: paths.kernel_image.display().to_string(),
             initramfs_image: paths.initramfs_image.display().to_string(),
+            initramfs_driver_dir: paths.initramfs_driver_dir.display().to_string(),
             user_disk: paths.user_disk.display().to_string(),
             base_os_metadata: paths.base_os_metadata.display().to_string(),
             serial_boot_metadata: paths.serial_boot_metadata.display().to_string(),
             boot_loader_metadata: paths.boot_loader_metadata.display().to_string(),
             kernel_boot_metadata: paths.kernel_boot_metadata.display().to_string(),
+            initramfs_driver_metadata: paths.initramfs_driver_metadata.display().to_string(),
             user_disk_metadata: paths.user_disk_metadata.display().to_string(),
             runtime_config: paths.runtime_config.display().to_string(),
             native_manifest: paths.native_manifest.display().to_string(),
@@ -3786,6 +3821,199 @@ fn execute_native_block_io_command(
     };
 
     Ok(crate::native::NativeBlockIoServiceResult { decision, bytes })
+}
+
+fn write_pane_initramfs_driver_bundle(
+    paths: &RuntimePaths,
+) -> AppResult<PaneInitramfsDriverMetadata> {
+    fs::create_dir_all(&paths.initramfs_driver_dir)?;
+
+    let hook_path = paths.initramfs_driver_dir.join("pane-initramfs-hook.sh");
+    let header_path = paths.initramfs_driver_dir.join("pane-port-block.h");
+    let probe_source_path = paths.initramfs_driver_dir.join("pane-port-probe.c");
+    let readme_path = paths.initramfs_driver_dir.join("README.md");
+
+    fs::write(&hook_path, pane_initramfs_hook_source())?;
+    fs::write(&header_path, pane_port_block_header_source())?;
+    fs::write(&probe_source_path, pane_port_probe_source())?;
+    fs::write(&readme_path, pane_initramfs_driver_readme())?;
+
+    let metadata = PaneInitramfsDriverMetadata {
+        schema_version: 1,
+        bundle_kind: "pane-initramfs-driver-source-v1".to_string(),
+        driver_dir: paths.initramfs_driver_dir.display().to_string(),
+        hook_path: hook_path.display().to_string(),
+        header_path: header_path.display().to_string(),
+        probe_source_path: probe_source_path.display().to_string(),
+        readme_path: readme_path.display().to_string(),
+        hook_sha256: sha256_file(&hook_path)?,
+        header_sha256: sha256_file(&header_path)?,
+        probe_source_sha256: sha256_file(&probe_source_path)?,
+        readme_sha256: sha256_file(&readme_path)?,
+        block_io_protocol: default_pane_block_io_protocol(),
+        block_io_port_base: default_pane_block_io_port_base(),
+        block_io_port_count: default_pane_block_io_port_count(),
+        block_io_status_port_offset: default_pane_block_io_status_port_offset(),
+        block_io_data_port_offset: default_pane_block_io_data_port_offset(),
+        block_io_block_size_bytes: default_pane_block_io_block_size_bytes(),
+        generated_at_epoch_seconds: current_epoch_seconds(),
+        notes: vec![
+            "This bundle is the reproducible guest-side source contract for Pane's native storage ABI.".to_string(),
+            "It is not yet a complete Linux block driver or root-mount implementation.".to_string(),
+            "The next native boot milestone must compile/package this into a verified initramfs and prove root discovery from /proc/cmdline.".to_string(),
+        ],
+    };
+    write_json_file(&paths.initramfs_driver_metadata, &metadata)?;
+    Ok(metadata)
+}
+
+fn pane_initramfs_hook_source() -> String {
+    format!(
+        r#"#!/bin/sh
+set -eu
+
+# Pane initramfs discovery hook.
+# This runs before root mount and records the native storage contract that a
+# Pane-aware block driver must consume.
+
+pane_cmdline_value() {{
+    key="$1"
+    for token in $(cat /proc/cmdline); do
+        case "$token" in
+            "$key="*) printf '%s\n' "${{token#*=}}"; return 0 ;;
+        esac
+    done
+    return 1
+}}
+
+pane_storage_contract="$(pane_cmdline_value pane.storage_contract || true)"
+pane_block_io="$(pane_cmdline_value pane.block_io || true)"
+pane_root="$(pane_cmdline_value pane.root || true)"
+pane_user="$(pane_cmdline_value pane.user || true)"
+
+mkdir -p /run/pane
+cat > /run/pane/native-storage.env <<EOF
+PANE_STORAGE_CONTRACT=$pane_storage_contract
+PANE_BLOCK_IO=$pane_block_io
+PANE_ROOT=$pane_root
+PANE_USER=$pane_user
+PANE_BLOCK_IO_PROTOCOL={}
+PANE_BLOCK_IO_STATUS_OFFSET={}
+PANE_BLOCK_IO_DATA_OFFSET={}
+EOF
+
+if [ -z "$pane_storage_contract" ] || [ -z "$pane_block_io" ]; then
+    echo "pane-initramfs: missing pane.storage_contract or pane.block_io kernel argument" >&2
+    exit 1
+fi
+
+echo "pane-initramfs: discovered storage contract at $pane_storage_contract with block ABI $pane_block_io"
+"#,
+        default_pane_block_io_protocol(),
+        default_pane_block_io_status_port_offset(),
+        default_pane_block_io_data_port_offset()
+    )
+}
+
+fn pane_port_block_header_source() -> String {
+    format!(
+        r#"#ifndef PANE_PORT_BLOCK_H
+#define PANE_PORT_BLOCK_H
+
+#include <stdint.h>
+
+#define PANE_BLOCK_IO_PROTOCOL "{}"
+#define PANE_BLOCK_IO_BASE_PORT {}
+#define PANE_BLOCK_IO_PORT_COUNT {}
+#define PANE_BLOCK_IO_DEVICE_OFFSET 0
+#define PANE_BLOCK_IO_OPERATION_OFFSET 1
+#define PANE_BLOCK_IO_STATUS_OFFSET {}
+#define PANE_BLOCK_IO_BLOCK_SIZE_UNITS_OFFSET 3
+#define PANE_BLOCK_IO_BLOCK_INDEX_OFFSET 4
+#define PANE_BLOCK_IO_DATA_OFFSET {}
+#define PANE_BLOCK_IO_RESPONSE_SIZE_LOW_OFFSET 13
+#define PANE_BLOCK_IO_RESPONSE_SIZE_MID_OFFSET 14
+#define PANE_BLOCK_IO_RESPONSE_SIZE_HIGH_OFFSET 15
+#define PANE_BLOCK_IO_BLOCK_SIZE_BYTES {}
+
+#define PANE_BLOCK_DEVICE_BASE_OS 0
+#define PANE_BLOCK_DEVICE_USER_DISK 1
+#define PANE_BLOCK_OPERATION_READ 0
+#define PANE_BLOCK_OPERATION_WRITE 1
+
+#define PANE_BLOCK_STATUS_SUBMITTED 0x01
+#define PANE_BLOCK_STATUS_SERVICED 0x02
+#define PANE_BLOCK_STATUS_DENIED 0xfc
+#define PANE_BLOCK_STATUS_FAILED 0xfd
+#define PANE_BLOCK_STATUS_INVALID 0xfe
+
+#endif
+"#,
+        default_pane_block_io_protocol(),
+        crate::native::PANE_BLOCK_IO_BASE_PORT,
+        crate::native::PANE_BLOCK_IO_PORT_COUNT,
+        default_pane_block_io_status_port_offset(),
+        default_pane_block_io_data_port_offset(),
+        crate::native::PANE_BLOCK_IO_BLOCK_SIZE_BYTES
+    )
+}
+
+fn pane_port_probe_source() -> String {
+    r#"#include "pane-port-block.h"
+
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/io.h>
+
+/*
+ * Pane native-storage probe.
+ *
+ * This is intentionally a small initramfs-side probe source, not the final
+ * kernel block driver. It verifies that the packaged initramfs can reach the
+ * Pane port ABI before the later milestone promotes the protocol into a real
+ * root-mountable block device.
+ */
+
+int main(void) {
+    if (ioperm(PANE_BLOCK_IO_BASE_PORT, PANE_BLOCK_IO_PORT_COUNT, 1) != 0) {
+        fprintf(stderr, "pane-port-probe: ioperm failed: %d\n", errno);
+        return 2;
+    }
+
+    unsigned int units = inb(PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_BLOCK_SIZE_UNITS_OFFSET);
+    unsigned int bytes = units * 512U;
+    printf("pane-port-probe: protocol=%s base=0x%x ports=%u block_size=%u\n",
+           PANE_BLOCK_IO_PROTOCOL,
+           PANE_BLOCK_IO_BASE_PORT,
+           PANE_BLOCK_IO_PORT_COUNT,
+           bytes);
+
+    return bytes == PANE_BLOCK_IO_BLOCK_SIZE_BYTES ? 0 : 3;
+}
+"#
+    .to_string()
+}
+
+fn pane_initramfs_driver_readme() -> String {
+    r#"# Pane Initramfs Driver Source
+
+This bundle is generated by `pane runtime --write-initramfs-driver`.
+
+It defines the guest-side discovery hook and C probe source for Pane's native
+block-port ABI. It is intentionally not the final root-mountable Linux block
+driver yet. The next milestone is to compile/package this bundle into a
+verified initramfs, then promote the probe into a real early block-device path
+that can expose `/dev/pane0` and `/dev/pane1`.
+
+Expected kernel arguments:
+
+- `pane.storage_contract=<guest-physical-address>`
+- `pane.block_io=<base-port>,<port-count>,<block-size-bytes>`
+- `pane.root=<root-device>`
+- `pane.user=<user-device>`
+"#
+    .to_string()
 }
 
 fn create_user_disk_snapshot(paths: &RuntimePaths) -> AppResult<UserDiskSnapshotMetadata> {
@@ -6005,6 +6233,7 @@ fn write_runtime_config(
         "boot_loader_image": paths.boot_loader_image.display().to_string(),
         "kernel_image": paths.kernel_image.display().to_string(),
         "initramfs_image": paths.initramfs_image.display().to_string(),
+        "initramfs_driver_dir": paths.initramfs_driver_dir.display().to_string(),
         "kernel_boot_layout": paths.kernel_boot_layout.display().to_string(),
         "user_disk": paths.user_disk.display().to_string(),
         "policy": {
@@ -6045,7 +6274,9 @@ fn write_native_runtime_manifest(paths: &RuntimePaths, session_name: &str) -> Ap
             "boot_loader_metadata": paths.boot_loader_metadata.display().to_string(),
             "kernel_image": paths.kernel_image.display().to_string(),
             "initramfs_image": paths.initramfs_image.display().to_string(),
+            "initramfs_driver_dir": paths.initramfs_driver_dir.display().to_string(),
             "kernel_boot_metadata": paths.kernel_boot_metadata.display().to_string(),
+            "initramfs_driver_metadata": paths.initramfs_driver_metadata.display().to_string(),
             "kernel_boot_layout": paths.kernel_boot_layout.display().to_string(),
             "user_disk": paths.user_disk.display().to_string(),
             "user_disk_metadata": paths.user_disk_metadata.display().to_string(),
@@ -6057,6 +6288,7 @@ fn write_native_runtime_manifest(paths: &RuntimePaths, session_name: &str) -> Ap
             "runtime-backed serial boot image must exist before the WHP boot-to-serial spike",
             "verified boot-to-serial loader must exist before runtime-provided boot-candidate execution",
             "verified kernel boot plan must exist before WHP kernel-entry execution",
+            "Pane initramfs driver bundle must exist before root storage can be mounted natively",
             "kernel boot layout must be materialized before WHP kernel-entry execution",
             "Pane sparse user disk must exist before native boot",
             "Pane framebuffer contract must exist before native display work",
@@ -6290,6 +6522,39 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
         })
         .unwrap_or(false);
 
+    let initramfs_driver_metadata =
+        read_json_file::<PaneInitramfsDriverMetadata>(&paths.initramfs_driver_metadata).ok();
+    let initramfs_driver_bundle_exists = paths.initramfs_driver_dir.is_dir();
+    let initramfs_driver_bundle_ready = initramfs_driver_metadata
+        .as_ref()
+        .map(|metadata| {
+            metadata.schema_version == 1
+                && metadata.bundle_kind == "pane-initramfs-driver-source-v1"
+                && metadata.driver_dir == paths.initramfs_driver_dir.display().to_string()
+                && metadata.block_io_protocol == default_pane_block_io_protocol()
+                && metadata.block_io_port_base == default_pane_block_io_port_base()
+                && metadata.block_io_port_count == default_pane_block_io_port_count()
+                && metadata.block_io_status_port_offset
+                    == default_pane_block_io_status_port_offset()
+                && metadata.block_io_data_port_offset == default_pane_block_io_data_port_offset()
+                && metadata.block_io_block_size_bytes == default_pane_block_io_block_size_bytes()
+                && sha256_file(Path::new(&metadata.hook_path)).ok().as_deref()
+                    == Some(metadata.hook_sha256.as_str())
+                && sha256_file(Path::new(&metadata.header_path))
+                    .ok()
+                    .as_deref()
+                    == Some(metadata.header_sha256.as_str())
+                && sha256_file(Path::new(&metadata.probe_source_path))
+                    .ok()
+                    .as_deref()
+                    == Some(metadata.probe_source_sha256.as_str())
+                && sha256_file(Path::new(&metadata.readme_path))
+                    .ok()
+                    .as_deref()
+                    == Some(metadata.readme_sha256.as_str())
+        })
+        .unwrap_or(false);
+
     let user_disk_metadata = read_json_file::<UserDiskMetadata>(&paths.user_disk_metadata).ok();
     let user_disk_ready = user_disk_artifact_ready(paths, &user_disk_metadata);
     let user_disk_snapshots = user_disk_snapshot_metadata_files(paths);
@@ -6352,6 +6617,9 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
             .as_ref()
             .and_then(|metadata| metadata.initramfs_sha256.clone()),
         initramfs_image_verified,
+        initramfs_driver_bundle_exists,
+        initramfs_driver_metadata_exists: paths.initramfs_driver_metadata.is_file(),
+        initramfs_driver_bundle_ready,
         kernel_cmdline: kernel_boot_metadata
             .as_ref()
             .map(|metadata| metadata.cmdline.clone()),
@@ -8872,6 +9140,10 @@ fn print_runtime_report(report: &RuntimeReport) {
     println!("  Boot Loader    {}", report.directories.boot_loader_image);
     println!("  Kernel Image   {}", report.directories.kernel_image);
     println!("  Initramfs      {}", report.directories.initramfs_image);
+    println!(
+        "  Initramfs Driver {}",
+        report.directories.initramfs_driver_dir
+    );
     println!("  User Disk      {}", report.directories.user_disk);
     println!("  Base Metadata  {}", report.directories.base_os_metadata);
     println!(
@@ -8885,6 +9157,10 @@ fn print_runtime_report(report: &RuntimeReport) {
     println!(
         "  Kernel Metadata {}",
         report.directories.kernel_boot_metadata
+    );
+    println!(
+        "  Driver Metadata {}",
+        report.directories.initramfs_driver_metadata
     );
     println!("  Kernel Layout {}", report.directories.kernel_boot_layout);
     println!(
@@ -8991,6 +9267,10 @@ fn print_runtime_report(report: &RuntimeReport) {
     if let Some(bytes) = report.artifacts.initramfs_image_bytes {
         println!("  Initramfs Bytes {}", bytes);
     }
+    println!(
+        "  Initramfs Driver {}",
+        yes_no(report.artifacts.initramfs_driver_bundle_ready)
+    );
     println!(
         "  Kernel Plan    {}",
         yes_no(report.artifacts.kernel_boot_plan_ready)
@@ -9964,11 +10244,11 @@ mod tests {
         resolve_status_distro, restore_user_disk_snapshot, runtime_contract_guest_memory_ranges,
         runtime_storage_budget, sha256_file, status_port_for, user_disk_artifact_ready,
         validate_setup_password, validate_setup_username, windows_transport_check, write_json_file,
-        write_user_disk_block, AppLifecyclePhase, AppNextAction, BaseOsImageMetadata, CheckStatus,
-        DistroHealth, DoctorCheck, DoctorReport, FramebufferContract, InitSource, KernelBootLayout,
-        KernelBootMetadata, NativeRuntimeState, StatusReport, UserDiskExportManifest,
-        UserDiskMetadata, UserDiskSnapshotMetadata, WorkspaceHealth, WslInventory,
-        EMBEDDED_APP_ASSETS, PANE_USER_DISK_EXPORT_DISK_FILENAME,
+        write_pane_initramfs_driver_bundle, write_user_disk_block, AppLifecyclePhase,
+        AppNextAction, BaseOsImageMetadata, CheckStatus, DistroHealth, DoctorCheck, DoctorReport,
+        FramebufferContract, InitSource, KernelBootLayout, KernelBootMetadata, NativeRuntimeState,
+        StatusReport, UserDiskExportManifest, UserDiskMetadata, UserDiskSnapshotMetadata,
+        WorkspaceHealth, WslInventory, EMBEDDED_APP_ASSETS, PANE_USER_DISK_EXPORT_DISK_FILENAME,
         PANE_USER_DISK_EXPORT_MANIFEST_FILENAME, PANE_USER_DISK_EXPORT_METADATA_FILENAME,
     };
 
@@ -10006,11 +10286,13 @@ mod tests {
             boot_loader_image: engines.join("boot-to-serial-loader.paneimg"),
             kernel_image: engines.join("linux-kernel.paneimg"),
             initramfs_image: engines.join("initramfs.paneinitrd"),
+            initramfs_driver_dir: engines.join("pane-initramfs-driver"),
             user_disk: disks.join("user-data.panedisk"),
             base_os_metadata: state.join("base-os-image.json"),
             serial_boot_metadata: state.join("serial-boot-image.json"),
             boot_loader_metadata: state.join("boot-to-serial-loader.json"),
             kernel_boot_metadata: state.join("kernel-boot.json"),
+            initramfs_driver_metadata: state.join("pane-initramfs-driver.json"),
             kernel_boot_layout: state.join("kernel-boot-layout.json"),
             user_disk_metadata: state.join("user-disk.json"),
             runtime_config: root.join("pane-runtime.config.json"),
@@ -11044,6 +11326,48 @@ mod tests {
         )
         .unwrap();
         assert_eq!(user_read.bytes, payload);
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn writes_pane_initramfs_driver_source_bundle() {
+        let paths = temp_runtime_paths("runtime-pane-initramfs-driver");
+        super::prepare_runtime_paths(&paths).unwrap();
+
+        let metadata = write_pane_initramfs_driver_bundle(&paths).unwrap();
+        let artifacts = build_runtime_artifact_report(&paths);
+
+        assert_eq!(metadata.bundle_kind, "pane-initramfs-driver-source-v1");
+        assert_eq!(metadata.block_io_protocol, "pane-port-block-v1");
+        assert_eq!(metadata.block_io_port_base, "0x0d00");
+        assert_eq!(metadata.block_io_port_count, 16);
+        assert_eq!(metadata.block_io_block_size_bytes, 4096);
+        assert!(paths
+            .initramfs_driver_dir
+            .join("pane-initramfs-hook.sh")
+            .is_file());
+        assert!(paths
+            .initramfs_driver_dir
+            .join("pane-port-block.h")
+            .is_file());
+        assert!(paths
+            .initramfs_driver_dir
+            .join("pane-port-probe.c")
+            .is_file());
+        assert!(paths.initramfs_driver_metadata.is_file());
+        let hook =
+            std::fs::read_to_string(paths.initramfs_driver_dir.join("pane-initramfs-hook.sh"))
+                .unwrap();
+        assert!(hook.contains("pane.storage_contract"));
+        assert!(hook.contains("pane.block_io"));
+        let header =
+            std::fs::read_to_string(paths.initramfs_driver_dir.join("pane-port-block.h")).unwrap();
+        assert!(header.contains("#define PANE_BLOCK_IO_BASE_PORT 3328"));
+        assert!(header.contains("#define PANE_BLOCK_IO_DATA_OFFSET 12"));
+        assert!(artifacts.initramfs_driver_bundle_exists);
+        assert!(artifacts.initramfs_driver_metadata_exists);
+        assert!(artifacts.initramfs_driver_bundle_ready);
 
         let _ = std::fs::remove_dir_all(&paths.root);
     }

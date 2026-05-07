@@ -277,6 +277,9 @@ pub struct RuntimeArgs {
     /// Kernel command line to persist in the native runtime boot plan.
     #[arg(long)]
     pub kernel_cmdline: Option<String>,
+    /// Write Pane's guest-side initramfs driver source bundle for the native storage ABI.
+    #[arg(long)]
+    pub write_initramfs_driver: bool,
     /// Create the Pane-owned user disk descriptor for packages, accounts, and customizations.
     #[arg(long)]
     pub create_user_disk: bool,

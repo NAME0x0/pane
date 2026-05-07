@@ -431,12 +431,16 @@ struct PaneInitramfsDriverMetadata {
     header_path: String,
     init_source_path: String,
     probe_source_path: String,
+    block_driver_source_path: String,
+    block_driver_build_script_path: String,
     build_script_path: String,
     readme_path: String,
     hook_sha256: String,
     header_sha256: String,
     init_source_sha256: String,
     probe_source_sha256: String,
+    block_driver_source_sha256: String,
+    block_driver_build_script_sha256: String,
     build_script_sha256: String,
     readme_sha256: String,
     block_io_protocol: String,
@@ -3879,6 +3883,10 @@ fn write_pane_initramfs_driver_bundle(
     let header_path = paths.initramfs_driver_dir.join("pane-port-block.h");
     let init_source_path = paths.initramfs_driver_dir.join("pane-init.c");
     let probe_source_path = paths.initramfs_driver_dir.join("pane-port-probe.c");
+    let block_driver_source_path = paths.initramfs_driver_dir.join("pane-block.c");
+    let block_driver_build_script_path = paths
+        .initramfs_driver_dir
+        .join("build-pane-block-module.sh");
     let build_script_path = paths.initramfs_driver_dir.join("build-pane-initramfs.sh");
     let readme_path = paths.initramfs_driver_dir.join("README.md");
 
@@ -3886,6 +3894,11 @@ fn write_pane_initramfs_driver_bundle(
     fs::write(&header_path, pane_port_block_header_source())?;
     fs::write(&init_source_path, pane_init_source())?;
     fs::write(&probe_source_path, pane_port_probe_source())?;
+    fs::write(&block_driver_source_path, pane_block_driver_source())?;
+    fs::write(
+        &block_driver_build_script_path,
+        pane_block_driver_build_script(),
+    )?;
     fs::write(&build_script_path, pane_initramfs_build_script())?;
     fs::write(&readme_path, pane_initramfs_driver_readme())?;
 
@@ -3897,12 +3910,16 @@ fn write_pane_initramfs_driver_bundle(
         header_path: header_path.display().to_string(),
         init_source_path: init_source_path.display().to_string(),
         probe_source_path: probe_source_path.display().to_string(),
+        block_driver_source_path: block_driver_source_path.display().to_string(),
+        block_driver_build_script_path: block_driver_build_script_path.display().to_string(),
         build_script_path: build_script_path.display().to_string(),
         readme_path: readme_path.display().to_string(),
         hook_sha256: sha256_file(&hook_path)?,
         header_sha256: sha256_file(&header_path)?,
         init_source_sha256: sha256_file(&init_source_path)?,
         probe_source_sha256: sha256_file(&probe_source_path)?,
+        block_driver_source_sha256: sha256_file(&block_driver_source_path)?,
+        block_driver_build_script_sha256: sha256_file(&block_driver_build_script_path)?,
         build_script_sha256: sha256_file(&build_script_path)?,
         readme_sha256: sha256_file(&readme_path)?,
         block_io_protocol: default_pane_block_io_protocol(),
@@ -3914,8 +3931,8 @@ fn write_pane_initramfs_driver_bundle(
         generated_at_epoch_seconds: current_epoch_seconds(),
         notes: vec![
             "This bundle is the reproducible guest-side source contract for Pane's native storage ABI.".to_string(),
-            "It is not yet a complete Linux block driver or root-mount implementation.".to_string(),
-            "The next native boot milestone must compile/package this into a verified initramfs and prove root discovery from /proc/cmdline.".to_string(),
+            "It includes a Linux block-driver source/build contract for /dev/pane0 and /dev/pane1, but Pane does not yet compile or load the module automatically.".to_string(),
+            "The next native boot milestone must compile/package this into a verified initramfs and prove the root handoff against a target Arch kernel.".to_string(),
         ],
     };
     write_json_file(&paths.initramfs_driver_metadata, &metadata)?;
@@ -3958,6 +3975,16 @@ fn load_verified_pane_initramfs_driver_metadata(
             "probe source",
             &metadata.probe_source_path,
             &metadata.probe_source_sha256,
+        ),
+        (
+            "block driver source",
+            &metadata.block_driver_source_path,
+            &metadata.block_driver_source_sha256,
+        ),
+        (
+            "block driver build script",
+            &metadata.block_driver_build_script_path,
+            &metadata.block_driver_build_script_sha256,
         ),
         (
             "build script",
@@ -4379,6 +4406,286 @@ int main(void) {
     .to_string()
 }
 
+fn pane_block_driver_source() -> String {
+    r#"#include "pane-port-block.h"
+
+#include <linux/blk-mq.h>
+#include <linux/blkdev.h>
+#include <linux/errno.h>
+#include <linux/err.h>
+#include <linux/hdreg.h>
+#include <linux/io.h>
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/string.h>
+#include <linux/types.h>
+#include <linux/vmalloc.h>
+
+#define PANE_BLOCK_DRIVER_NAME "pane_block"
+#define PANE_BLOCK_DEVICE_COUNT 2
+#define PANE_BLOCK_DEFAULT_BLOCKS 2097152UL
+#define PANE_BLOCK_SECTOR_SIZE 512U
+#define PANE_BLOCK_TIMEOUT_POLLS 1000000U
+
+static unsigned long device_blocks[PANE_BLOCK_DEVICE_COUNT] = {
+    PANE_BLOCK_DEFAULT_BLOCKS,
+    PANE_BLOCK_DEFAULT_BLOCKS,
+};
+module_param_array(device_blocks, ulong, NULL, 0444);
+MODULE_PARM_DESC(device_blocks, "Logical 4096-byte Pane blocks for /dev/pane0 and /dev/pane1");
+
+struct pane_block_disk {
+    int pane_device_id;
+    int major;
+    char name[DISK_NAME_LEN];
+    struct gendisk *disk;
+    struct blk_mq_tag_set tag_set;
+};
+
+static struct pane_block_disk pane_disks[PANE_BLOCK_DEVICE_COUNT];
+
+static const struct block_device_operations pane_block_fops = {
+    .owner = THIS_MODULE,
+};
+
+static void pane_block_write_index(u64 block_index)
+{
+    int index;
+
+    for (index = 0; index < 8; index++)
+        outb((block_index >> (index * 8)) & 0xff,
+             PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_BLOCK_INDEX_OFFSET + index);
+}
+
+static int pane_block_wait_serviced(void)
+{
+    unsigned int poll;
+
+    for (poll = 0; poll < PANE_BLOCK_TIMEOUT_POLLS; poll++) {
+        u8 status = inb(PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_STATUS_OFFSET);
+
+        if (status == PANE_BLOCK_STATUS_SERVICED)
+            return 0;
+        if (status == PANE_BLOCK_STATUS_DENIED ||
+            status == PANE_BLOCK_STATUS_FAILED ||
+            status == PANE_BLOCK_STATUS_INVALID)
+            return -EIO;
+        cpu_relax();
+    }
+
+    return -ETIMEDOUT;
+}
+
+static int pane_block_transfer(int device_id, int operation, u64 block_index, void *buffer)
+{
+    unsigned int byte_index;
+    unsigned char *bytes = buffer;
+
+    outb(device_id, PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_DEVICE_OFFSET);
+    outb(operation, PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_OPERATION_OFFSET);
+    pane_block_write_index(block_index);
+
+    if (operation == PANE_BLOCK_OPERATION_WRITE) {
+        for (byte_index = 0; byte_index < PANE_BLOCK_IO_BLOCK_SIZE_BYTES; byte_index++)
+            outb(bytes[byte_index], PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_DATA_OFFSET);
+    }
+
+    outb(1, PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_STATUS_OFFSET);
+    if (pane_block_wait_serviced() != 0)
+        return -EIO;
+
+    if (operation == PANE_BLOCK_OPERATION_READ) {
+        for (byte_index = 0; byte_index < PANE_BLOCK_IO_BLOCK_SIZE_BYTES; byte_index++)
+            bytes[byte_index] = inb(PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_DATA_OFFSET);
+    }
+
+    return 0;
+}
+
+static blk_status_t pane_block_queue_rq(struct blk_mq_hw_ctx *hctx,
+                                        const struct blk_mq_queue_data *bd)
+{
+    struct request *rq = bd->rq;
+    struct pane_block_disk *pane_disk = rq->q->queuedata;
+    struct bio_vec bvec;
+    struct req_iterator iter;
+    blk_status_t status = BLK_STS_OK;
+    int operation;
+
+    if (rq_data_dir(rq) == READ)
+        operation = PANE_BLOCK_OPERATION_READ;
+    else if (rq_data_dir(rq) == WRITE)
+        operation = PANE_BLOCK_OPERATION_WRITE;
+    else {
+        blk_mq_start_request(rq);
+        blk_mq_end_request(rq, BLK_STS_IOERR);
+        return BLK_STS_IOERR;
+    }
+
+    blk_mq_start_request(rq);
+
+    rq_for_each_segment(bvec, rq, iter) {
+        unsigned int offset;
+        sector_t sector = iter.iter.bi_sector;
+        u64 block_index;
+        unsigned char *mapped = kmap_local_page(bvec.bv_page);
+        unsigned char *segment = mapped + bvec.bv_offset;
+
+        if ((bvec.bv_len % PANE_BLOCK_IO_BLOCK_SIZE_BYTES) != 0) {
+            kunmap_local(mapped);
+            status = BLK_STS_IOERR;
+            break;
+        }
+
+        for (offset = 0; offset < bvec.bv_len; offset += PANE_BLOCK_IO_BLOCK_SIZE_BYTES) {
+            block_index = sector / (PANE_BLOCK_IO_BLOCK_SIZE_BYTES / PANE_BLOCK_SECTOR_SIZE);
+            if (pane_block_transfer(pane_disk->pane_device_id,
+                                    operation,
+                                    block_index,
+                                    segment + offset) != 0) {
+                status = BLK_STS_IOERR;
+                break;
+            }
+            sector += PANE_BLOCK_IO_BLOCK_SIZE_BYTES / PANE_BLOCK_SECTOR_SIZE;
+        }
+
+        kunmap_local(mapped);
+        if (status != BLK_STS_OK)
+            break;
+    }
+
+    blk_mq_end_request(rq, status);
+    return status;
+}
+
+static const struct blk_mq_ops pane_block_mq_ops = {
+    .queue_rq = pane_block_queue_rq,
+};
+
+static int pane_block_create_disk(int index, int pane_device_id, const char *name)
+{
+    struct pane_block_disk *pane_disk = &pane_disks[index];
+    sector_t capacity_sectors = device_blocks[index] *
+                                (PANE_BLOCK_IO_BLOCK_SIZE_BYTES / PANE_BLOCK_SECTOR_SIZE);
+    int ret;
+
+    pane_disk->pane_device_id = pane_device_id;
+    strscpy(pane_disk->name, name, sizeof(pane_disk->name));
+    pane_disk->tag_set.ops = &pane_block_mq_ops;
+    pane_disk->tag_set.nr_hw_queues = 1;
+    pane_disk->tag_set.queue_depth = 64;
+    pane_disk->tag_set.numa_node = NUMA_NO_NODE;
+    pane_disk->tag_set.cmd_size = 0;
+    pane_disk->tag_set.flags = BLK_MQ_F_SHOULD_MERGE;
+    pane_disk->tag_set.driver_data = pane_disk;
+
+    ret = blk_mq_alloc_tag_set(&pane_disk->tag_set);
+    if (ret)
+        return ret;
+
+    pane_disk->major = register_blkdev(0, name);
+    if (pane_disk->major <= 0) {
+        ret = -EBUSY;
+        blk_mq_free_tag_set(&pane_disk->tag_set);
+        return ret;
+    }
+
+    pane_disk->disk = blk_mq_alloc_disk(&pane_disk->tag_set, pane_disk);
+    if (IS_ERR(pane_disk->disk)) {
+        ret = PTR_ERR(pane_disk->disk);
+        pane_disk->disk = NULL;
+        unregister_blkdev(pane_disk->major, name);
+        blk_mq_free_tag_set(&pane_disk->tag_set);
+        return ret;
+    }
+
+    pane_disk->disk->major = pane_disk->major;
+    pane_disk->disk->first_minor = 0;
+    pane_disk->disk->fops = &pane_block_fops;
+    pane_disk->disk->private_data = pane_disk;
+    pane_disk->disk->queue->queuedata = pane_disk;
+    blk_queue_logical_block_size(pane_disk->disk->queue, PANE_BLOCK_IO_BLOCK_SIZE_BYTES);
+    snprintf(pane_disk->disk->disk_name, DISK_NAME_LEN, "%s", name);
+    set_capacity(pane_disk->disk, capacity_sectors);
+    add_disk(pane_disk->disk);
+    return 0;
+}
+
+static void pane_block_destroy_disk(int index)
+{
+    struct pane_block_disk *pane_disk = &pane_disks[index];
+
+    if (pane_disk->disk) {
+        del_gendisk(pane_disk->disk);
+        put_disk(pane_disk->disk);
+    }
+    if (pane_disk->major > 0)
+        unregister_blkdev(pane_disk->major, pane_disk->name);
+    blk_mq_free_tag_set(&pane_disk->tag_set);
+}
+
+static int __init pane_block_init(void)
+{
+    int ret;
+
+    ret = pane_block_create_disk(0, PANE_BLOCK_DEVICE_BASE_OS, "pane0");
+    if (ret)
+        return ret;
+
+    ret = pane_block_create_disk(1, PANE_BLOCK_DEVICE_USER_DISK, "pane1");
+    if (ret) {
+        pane_block_destroy_disk(0);
+        return ret;
+    }
+
+    pr_info(PANE_BLOCK_DRIVER_NAME ": registered /dev/pane0 and /dev/pane1 for %s\n",
+            PANE_BLOCK_IO_PROTOCOL);
+    return 0;
+}
+
+static void __exit pane_block_exit(void)
+{
+    pane_block_destroy_disk(1);
+    pane_block_destroy_disk(0);
+}
+
+module_init(pane_block_init);
+module_exit(pane_block_exit);
+
+MODULE_AUTHOR("Pane");
+MODULE_DESCRIPTION("Pane native port-backed block device contract for /dev/pane0 and /dev/pane1");
+MODULE_LICENSE("GPL");
+"#
+    .to_string()
+}
+
+fn pane_block_driver_build_script() -> String {
+    r#"#!/bin/sh
+set -eu
+
+# Build the Pane Linux block module against a target kernel build tree.
+# Example:
+#   KERNEL_BUILD_DIR=/lib/modules/$(uname -r)/build sh build-pane-block-module.sh ./pane-block.ko
+
+: "${KERNEL_BUILD_DIR:?set KERNEL_BUILD_DIR to the Linux kernel build directory}"
+
+output="${1:-pane-block.ko}"
+workdir="$(mktemp -d)"
+trap 'rm -rf "$workdir"' EXIT
+
+cp pane-block.c "$workdir/pane-block.c"
+cp pane-port-block.h "$workdir/pane-port-block.h"
+cat > "$workdir/Makefile" <<'EOF'
+obj-m += pane-block.o
+EOF
+
+make -C "$KERNEL_BUILD_DIR" M="$workdir" modules
+cp "$workdir/pane-block.ko" "$output"
+printf 'wrote %s\n' "$output"
+"#
+    .to_string()
+}
+
 fn pane_initramfs_build_script() -> String {
     r#"#!/bin/sh
 set -eu
@@ -4391,10 +4698,13 @@ output="${1:-pane-storage-discovery.cpio}"
 workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
 
-mkdir -p "$workdir/bin" "$workdir/dev" "$workdir/newroot" "$workdir/proc" "$workdir/run/pane" "$workdir/sys"
+mkdir -p "$workdir/bin" "$workdir/dev" "$workdir/lib/modules" "$workdir/newroot" "$workdir/proc" "$workdir/run/pane" "$workdir/sys"
 cc -Os -static -o "$workdir/init" pane-init.c
 cc -Os -static -o "$workdir/bin/pane-port-probe" pane-port-probe.c
 cp pane-initramfs-hook.sh "$workdir/bin/pane-initramfs-hook"
+if [ -f pane-block.ko ]; then
+    cp pane-block.ko "$workdir/lib/modules/pane-block.ko"
+fi
 chmod +x "$workdir/init" "$workdir/bin/pane-initramfs-hook" "$workdir/bin/pane-port-probe"
 
 (cd "$workdir" && find . -print | cpio -o -H newc > "$OLDPWD/$output")
@@ -4408,12 +4718,14 @@ fn pane_initramfs_driver_readme() -> String {
 
 This bundle is generated by `pane runtime --write-initramfs-driver`.
 
-It defines the guest-side discovery hook, C probe source, and self-contained C
-`/init` source for Pane's native block-port ABI. The generated `/init` discovers
-the Pane storage contract, writes `/run/pane/native-storage.env`, waits for the
-declared root device, attempts to mount it at `/newroot`, moves proc/sys/dev into
-the new root, and executes the real Linux init. The remaining prerequisite is a
-guest-visible Pane block device that exposes `/dev/pane0` and `/dev/pane1`.
+It defines the guest-side discovery hook, C probe source, self-contained C
+`/init` source, and Linux block-driver source contract for Pane's native
+block-port ABI. The generated `/init` discovers the Pane storage contract,
+writes `/run/pane/native-storage.env`, waits for the declared root device,
+attempts to mount it at `/newroot`, moves proc/sys/dev into the new root, and
+executes the real Linux init once `/dev/pane0` exists. The generated
+`pane-block.c` is the early guest device contract that maps Pane's read-only
+base OS to `/dev/pane0` and the writable user disk to `/dev/pane1`.
 
 Expected kernel arguments:
 
@@ -4428,9 +4740,16 @@ To build the discovery initramfs on Linux:
 sh build-pane-initramfs.sh ./pane-storage-discovery.cpio
 ```
 
+To build the optional Pane block module against a target kernel tree:
+
+```sh
+KERNEL_BUILD_DIR=/lib/modules/$(uname -r)/build sh build-pane-block-module.sh ./pane-block.ko
+sh build-pane-initramfs.sh ./pane-storage-discovery.cpio
+```
+
 The generated cpio is a discovery/probe initramfs, not the final Arch
-root-mount initramfs until a Pane block driver or equivalent early device path
-creates the declared root device.
+root-mount initramfs until the Pane block module is compiled for the target Arch
+kernel and loaded early enough to create the declared root device.
 
 Expected serial-observable milestones:
 
@@ -6943,6 +7262,14 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
                     .ok()
                     .as_deref()
                     == Some(metadata.probe_source_sha256.as_str())
+                && sha256_file(Path::new(&metadata.block_driver_source_path))
+                    .ok()
+                    .as_deref()
+                    == Some(metadata.block_driver_source_sha256.as_str())
+                && sha256_file(Path::new(&metadata.block_driver_build_script_path))
+                    .ok()
+                    .as_deref()
+                    == Some(metadata.block_driver_build_script_sha256.as_str())
                 && sha256_file(Path::new(&metadata.build_script_path))
                     .ok()
                     .as_deref()
@@ -11941,6 +12268,11 @@ mod tests {
             .initramfs_driver_dir
             .join("pane-port-probe.c")
             .is_file());
+        assert!(paths.initramfs_driver_dir.join("pane-block.c").is_file());
+        assert!(paths
+            .initramfs_driver_dir
+            .join("build-pane-block-module.sh")
+            .is_file());
         assert!(paths
             .initramfs_driver_dir
             .join("build-pane-initramfs.sh")
@@ -11968,8 +12300,32 @@ mod tests {
                 .unwrap();
         assert!(build_script.contains("cpio -o -H newc"));
         assert!(build_script.contains("$workdir/newroot"));
+        assert!(build_script.contains("$workdir/lib/modules"));
         assert!(build_script.contains("-o \"$workdir/init\" pane-init.c"));
         assert!(build_script.contains("pane-port-probe"));
+        assert!(build_script.contains("pane-block.ko"));
+        let block_driver =
+            std::fs::read_to_string(paths.initramfs_driver_dir.join("pane-block.c")).unwrap();
+        assert!(block_driver.contains("PANE_BLOCK_DRIVER_NAME \"pane_block\""));
+        assert!(block_driver.contains("PANE_BLOCK_DEVICE_BASE_OS"));
+        assert!(block_driver.contains("PANE_BLOCK_DEVICE_USER_DISK"));
+        assert!(block_driver.contains("PANE_BLOCK_OPERATION_READ"));
+        assert!(block_driver.contains("PANE_BLOCK_OPERATION_WRITE"));
+        assert!(block_driver.contains("PANE_BLOCK_IO_BASE_PORT"));
+        assert!(block_driver.contains("PANE_BLOCK_STATUS_SERVICED"));
+        assert!(block_driver.contains("blk_mq"));
+        assert!(block_driver.contains("add_disk"));
+        assert!(block_driver.contains("/dev/pane0"));
+        assert!(block_driver.contains("/dev/pane1"));
+        let block_build_script = std::fs::read_to_string(
+            paths
+                .initramfs_driver_dir
+                .join("build-pane-block-module.sh"),
+        )
+        .unwrap();
+        assert!(block_build_script.contains("KERNEL_BUILD_DIR"));
+        assert!(block_build_script.contains("pane-block.ko"));
+        assert!(block_build_script.contains("make -C"));
         assert!(artifacts.initramfs_driver_bundle_exists);
         assert!(artifacts.initramfs_driver_metadata_exists);
         assert!(artifacts.initramfs_driver_bundle_ready);

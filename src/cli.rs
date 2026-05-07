@@ -283,6 +283,12 @@ pub struct RuntimeArgs {
     /// Build the generated discovery initramfs cpio and register it into the verified kernel boot plan.
     #[arg(long)]
     pub build_discovery_initramfs: bool,
+    /// Build pane-block.ko from the generated source, then register it into the initramfs driver bundle.
+    #[arg(long)]
+    pub build_pane_block_module: bool,
+    /// Linux kernel build directory used by --build-pane-block-module.
+    #[arg(long)]
+    pub kernel_build_dir: Option<PathBuf>,
     /// Copy a compiled pane-block.ko into the generated initramfs driver bundle.
     #[arg(long)]
     pub register_pane_block_module: Option<PathBuf>,

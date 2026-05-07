@@ -1895,6 +1895,8 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
         || args.kernel_cmdline.is_some()
         || args.write_initramfs_driver
         || args.build_discovery_initramfs
+        || args.build_pane_block_module
+        || args.register_pane_block_module.is_some()
         || args.create_user_disk
         || args.snapshot_user_disk
         || args.restore_user_disk_snapshot.is_some()
@@ -1969,7 +1971,20 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
         write_pane_initramfs_driver_bundle(&paths)?;
     }
 
-    if let Some(module) = args.register_pane_block_module.as_deref() {
+    if args.build_pane_block_module && args.register_pane_block_module.is_some() {
+        return Err(AppError::message(
+            "--build-pane-block-module and --register-pane-block-module are mutually exclusive.",
+        ));
+    }
+    if !args.build_pane_block_module && args.kernel_build_dir.is_some() {
+        return Err(AppError::message(
+            "--kernel-build-dir requires --build-pane-block-module.",
+        ));
+    }
+
+    if args.build_pane_block_module {
+        build_and_register_pane_block_module(&paths, args.kernel_build_dir.as_deref(), args.force)?;
+    } else if let Some(module) = args.register_pane_block_module.as_deref() {
         register_pane_block_module(
             &paths,
             module,
@@ -4175,6 +4190,66 @@ fn load_verified_pane_block_module_metadata(
         ));
     }
     Ok(metadata)
+}
+
+fn build_and_register_pane_block_module(
+    paths: &RuntimePaths,
+    kernel_build_dir: Option<&Path>,
+    force: bool,
+) -> AppResult<()> {
+    let kernel_build_dir = kernel_build_dir.ok_or_else(|| {
+        AppError::message(
+            "--build-pane-block-module requires --kernel-build-dir pointing at the target Arch kernel build directory.",
+        )
+    })?;
+    if !kernel_build_dir.is_dir() {
+        return Err(AppError::message(format!(
+            "Pane block module kernel build directory does not exist or is not a directory: {}",
+            kernel_build_dir.display()
+        )));
+    }
+    load_verified_pane_initramfs_driver_metadata(paths)?;
+    let build_script = paths
+        .initramfs_driver_dir
+        .join("build-pane-block-module.sh");
+    if !build_script.is_file() {
+        return Err(AppError::message(format!(
+            "Pane block module build script is missing: {}. Regenerate it with `pane runtime --write-initramfs-driver`.",
+            build_script.display()
+        )));
+    }
+    let output = pane_block_module_path(paths);
+    if output.exists() && !force {
+        return Err(AppError::message(format!(
+            "A Pane block module already exists at {}. Pass --force to rebuild and replace it.",
+            output.display()
+        )));
+    }
+    let status = Command::new("sh")
+        .arg("./build-pane-block-module.sh")
+        .arg("pane-block.ko")
+        .env("KERNEL_BUILD_DIR", kernel_build_dir)
+        .current_dir(&paths.initramfs_driver_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| {
+            AppError::message(format!(
+                "Failed to run Pane block module build script with `sh`: {error}. Build pane-block.ko externally from the generated bundle, then register it with `pane runtime --register-pane-block-module <path> --pane-block-module-expected-sha256 <sha256>`."
+            ))
+        })?;
+
+    if !status.status.success() {
+        return Err(AppError::message(format!(
+            "Pane block module build failed with status {}.\nstdout:\n{}\nstderr:\n{}",
+            status.status,
+            String::from_utf8_lossy(&status.stdout),
+            String::from_utf8_lossy(&status.stderr)
+        )));
+    }
+
+    let sha256 = sha256_file(&output)?;
+    register_pane_block_module(paths, &output, Some(&sha256), true)
 }
 
 fn pane_initramfs_hook_source() -> String {
@@ -11401,15 +11476,16 @@ mod tests {
     };
 
     use super::{
-        build_bundle_doctor_request, build_distro_health, build_environment_catalog_report,
-        build_kernel_boot_layout, build_linux_boot_params_page, build_native_runtime_report,
-        build_runtime_artifact_report, build_steps, build_update_steps,
-        create_serial_boot_image_artifact, create_user_disk_descriptor, create_user_disk_snapshot,
-        default_framebuffer_contract, default_input_contract, default_linux_guest_memory_map,
-        determine_app_lifecycle, ensure_wsl_conf_setting, execute_native_block_io_command,
-        export_user_disk_package, format_doctor_blockers, import_user_disk_package,
-        initialize_managed_arch_environment, inspect_kernel_image_artifact, inspect_workspace,
-        inventory_contains_distro, kernel_layout_execution_image, linux_guest_mapped_regions,
+        build_and_register_pane_block_module, build_bundle_doctor_request, build_distro_health,
+        build_environment_catalog_report, build_kernel_boot_layout, build_linux_boot_params_page,
+        build_native_runtime_report, build_runtime_artifact_report, build_steps,
+        build_update_steps, create_serial_boot_image_artifact, create_user_disk_descriptor,
+        create_user_disk_snapshot, default_framebuffer_contract, default_input_contract,
+        default_linux_guest_memory_map, determine_app_lifecycle, ensure_wsl_conf_setting,
+        execute_native_block_io_command, export_user_disk_package, format_doctor_blockers,
+        import_user_disk_package, initialize_managed_arch_environment,
+        inspect_kernel_image_artifact, inspect_workspace, inventory_contains_distro,
+        kernel_layout_execution_image, linux_guest_mapped_regions,
         load_kernel_layout_boot_image_artifact, load_verified_pane_block_module_metadata,
         pane_initramfs_expected_serial_milestones, parse_guest_physical_address,
         preferred_transport, read_base_os_block, read_json_file, read_user_disk_block,
@@ -12646,6 +12722,10 @@ mod tests {
             false,
         )
         .unwrap();
+        let error = build_and_register_pane_block_module(&paths, None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--kernel-build-dir"));
 
         let source = paths.downloads.join("pane-block.ko");
         std::fs::write(&source, b"fake pane block kernel module").unwrap();

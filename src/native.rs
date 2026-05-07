@@ -128,6 +128,7 @@ pub(crate) type NativeBlockIoHandler<'a> =
 pub(crate) struct NativeBlockIoServiceOutcome {
     pub(crate) report: NativeWhpCallReport,
     pub(crate) status_code: u8,
+    pub(crate) response_bytes: Vec<u8>,
 }
 
 pub(crate) fn evaluate_native_block_io(command: &NativeBlockIoCommand) -> NativeBlockIoDecision {
@@ -187,6 +188,7 @@ pub(crate) fn service_native_block_io_command(
                 ),
             },
             status_code: PANE_BLOCK_IO_STATUS_DENIED,
+            response_bytes: Vec::new(),
         };
     }
 
@@ -206,6 +208,7 @@ pub(crate) fn service_native_block_io_command(
                 ),
             },
             status_code: PANE_BLOCK_IO_STATUS_SUBMITTED,
+            response_bytes: Vec::new(),
         };
     };
 
@@ -225,6 +228,7 @@ pub(crate) fn service_native_block_io_command(
                 ),
             },
             status_code: PANE_BLOCK_IO_STATUS_DENIED,
+            response_bytes: Vec::new(),
         },
         Ok(result) => {
             let expected_len = match command.operation {
@@ -232,6 +236,7 @@ pub(crate) fn service_native_block_io_command(
                 NativeBlockOperation::Write => 0,
             };
             let ok = result.bytes.len() == expected_len;
+            let response_len = result.bytes.len();
             NativeBlockIoServiceOutcome {
                 report: NativeWhpCallReport {
                     name: if ok {
@@ -247,12 +252,12 @@ pub(crate) fn service_native_block_io_command(
                             command.operation.label(),
                             command.device.label(),
                             command.block_index,
-                            result.bytes.len()
+                            response_len
                         )
                     } else {
                         format!(
                             "Pane runtime storage returned {} response bytes for {} {} block {}; expected {}.",
-                            result.bytes.len(),
+                            response_len,
                             command.operation.label(),
                             command.device.label(),
                             command.block_index,
@@ -265,6 +270,7 @@ pub(crate) fn service_native_block_io_command(
                 } else {
                     PANE_BLOCK_IO_STATUS_FAILED
                 },
+                response_bytes: if ok { result.bytes } else { Vec::new() },
             }
         }
         Err(error) => NativeBlockIoServiceOutcome {
@@ -280,6 +286,7 @@ pub(crate) fn service_native_block_io_command(
                 ),
             },
             status_code: PANE_BLOCK_IO_STATUS_FAILED,
+            response_bytes: Vec::new(),
         },
     }
 }
@@ -298,6 +305,8 @@ pub(crate) struct NativeBlockIoPortState {
     operation: NativeBlockOperation,
     block_index_bytes: [u8; 8],
     status: u8,
+    response_bytes: Vec<u8>,
+    response_cursor: usize,
 }
 
 impl Default for NativeBlockIoPortState {
@@ -307,14 +316,22 @@ impl Default for NativeBlockIoPortState {
             operation: NativeBlockOperation::Read,
             block_index_bytes: [0; 8],
             status: 0,
+            response_bytes: Vec::new(),
+            response_cursor: 0,
         }
     }
 }
 
 impl NativeBlockIoPortState {
+    fn clear_response(&mut self) {
+        self.response_bytes.clear();
+        self.response_cursor = 0;
+    }
+
     pub(crate) fn write(&mut self, port: u16, value: u8) -> Option<NativeBlockIoCommand> {
         match pane_block_io_port_offset(port)? {
             0 => {
+                self.clear_response();
                 self.device = match value {
                     0 => NativeBlockDeviceId::BaseOs,
                     1 => NativeBlockDeviceId::UserDisk,
@@ -327,6 +344,7 @@ impl NativeBlockIoPortState {
                 None
             }
             1 => {
+                self.clear_response();
                 self.operation = match value {
                     0 => NativeBlockOperation::Read,
                     1 => NativeBlockOperation::Write,
@@ -339,6 +357,7 @@ impl NativeBlockIoPortState {
                 None
             }
             2 => {
+                self.clear_response();
                 if value != 1 {
                     self.status = PANE_BLOCK_IO_STATUS_INVALID;
                     return None;
@@ -352,6 +371,7 @@ impl NativeBlockIoPortState {
                 })
             }
             4..=11 => {
+                self.clear_response();
                 self.block_index_bytes[usize::from(pane_block_io_port_offset(port)? - 4)] = value;
                 self.status = 0;
                 None
@@ -360,11 +380,17 @@ impl NativeBlockIoPortState {
         }
     }
 
-    pub(crate) fn set_status(&mut self, status: u8) {
+    pub(crate) fn set_service_result(&mut self, status: u8, response_bytes: Vec<u8>) {
         self.status = status;
+        self.response_cursor = 0;
+        self.response_bytes = if status == PANE_BLOCK_IO_STATUS_SERVICED {
+            response_bytes
+        } else {
+            Vec::new()
+        };
     }
 
-    pub(crate) fn read(&self, port: u16) -> u8 {
+    pub(crate) fn read(&mut self, port: u16) -> u8 {
         match pane_block_io_port_offset(port) {
             Some(0) => match self.device {
                 NativeBlockDeviceId::BaseOs => 0,
@@ -377,6 +403,21 @@ impl NativeBlockIoPortState {
             Some(2) => self.status,
             Some(3) => (PANE_BLOCK_IO_BLOCK_SIZE_BYTES / 512) as u8,
             Some(offset @ 4..=11) => self.block_index_bytes[usize::from(offset - 4)],
+            Some(12) => {
+                let value = self
+                    .response_bytes
+                    .get(self.response_cursor)
+                    .copied()
+                    .unwrap_or(0);
+                self.response_cursor = self
+                    .response_cursor
+                    .saturating_add(1)
+                    .min(self.response_bytes.len());
+                value
+            }
+            Some(13) => (self.response_bytes.len() & 0xff) as u8,
+            Some(14) => ((self.response_bytes.len() >> 8) & 0xff) as u8,
+            Some(15) => ((self.response_bytes.len() >> 16) & 0xff) as u8,
             _ => 0,
         }
     }
@@ -2145,7 +2186,10 @@ mod windows_whp {
                             if let Some(command) = block_state.write(port, serial_byte) {
                                 let outcome =
                                     service_native_block_io_command(&command, block_io_handler);
-                                block_state.set_status(outcome.status_code);
+                                block_state.set_service_result(
+                                    outcome.status_code,
+                                    outcome.response_bytes,
+                                );
                                 report.calls.push(outcome.report);
                                 break;
                             }
@@ -3186,6 +3230,10 @@ mod windows_whp {
             assert_eq!(outcome.report.name, "PaneBlockIoServiced");
             assert!(outcome.report.ok);
             assert_eq!(outcome.status_code, PANE_BLOCK_IO_STATUS_SERVICED);
+            assert_eq!(
+                outcome.response_bytes,
+                vec![0x7b_u8; PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize]
+            );
         }
 
         #[test]
@@ -3205,6 +3253,28 @@ mod windows_whp {
             assert_eq!(outcome.report.name, "PaneBlockIoPolicyDenied");
             assert!(!outcome.report.ok);
             assert_eq!(outcome.status_code, PANE_BLOCK_IO_STATUS_DENIED);
+        }
+
+        #[test]
+        fn native_block_io_port_state_streams_serviced_read_bytes() {
+            let mut state = NativeBlockIoPortState::default();
+
+            state.set_service_result(PANE_BLOCK_IO_STATUS_SERVICED, vec![0xaa, 0xbb, 0xcc]);
+
+            assert_eq!(
+                state.read(PANE_BLOCK_IO_BASE_PORT + 2),
+                PANE_BLOCK_IO_STATUS_SERVICED
+            );
+            assert_eq!(state.read(PANE_BLOCK_IO_BASE_PORT + 13), 3);
+            assert_eq!(state.read(PANE_BLOCK_IO_BASE_PORT + 14), 0);
+            assert_eq!(state.read(PANE_BLOCK_IO_BASE_PORT + 15), 0);
+            assert_eq!(state.read(PANE_BLOCK_IO_BASE_PORT + 12), 0xaa);
+            assert_eq!(state.read(PANE_BLOCK_IO_BASE_PORT + 12), 0xbb);
+            assert_eq!(state.read(PANE_BLOCK_IO_BASE_PORT + 12), 0xcc);
+            assert_eq!(state.read(PANE_BLOCK_IO_BASE_PORT + 12), 0);
+
+            assert!(state.write(PANE_BLOCK_IO_BASE_PORT + 4, 1).is_none());
+            assert_eq!(state.read(PANE_BLOCK_IO_BASE_PORT + 13), 0);
         }
 
         #[test]

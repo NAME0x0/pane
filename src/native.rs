@@ -36,6 +36,7 @@ pub(crate) struct NativeSerialBootImage {
     pub(crate) path: Option<String>,
     pub(crate) bytes: Vec<u8>,
     pub(crate) expected_serial_text: String,
+    pub(crate) expected_serial_markers: Vec<String>,
     pub(crate) guest_entry_gpa: u64,
     pub(crate) entry_mode: NativeGuestEntryMode,
     pub(crate) boot_params_gpa: Option<u64>,
@@ -575,6 +576,8 @@ pub(crate) struct NativePartitionSmokeReport {
     pub(crate) serial_bytes: Vec<u8>,
     pub(crate) serial_text: Option<String>,
     pub(crate) serial_expected_text: Option<String>,
+    pub(crate) serial_expected_markers: Vec<String>,
+    pub(crate) serial_markers_observed: bool,
     pub(crate) serial_io_exit_count: u32,
     pub(crate) halt_observed: bool,
     pub(crate) calls: Vec<NativeWhpCallReport>,
@@ -903,6 +906,8 @@ fn planned_partition_smoke_report(run_fixture: bool) -> NativePartitionSmokeRepo
         serial_bytes: Vec::new(),
         serial_text: None,
         serial_expected_text: run_fixture.then(|| SERIAL_BOOT_BANNER_TEXT.to_string()),
+        serial_expected_markers: Vec::new(),
+        serial_markers_observed: false,
         serial_io_exit_count: 0,
         halt_observed: false,
         calls: Vec::new(),
@@ -957,6 +962,10 @@ fn skipped_partition_smoke_report(
             (image.entry_mode == NativeGuestEntryMode::RealModeSerial)
                 .then(|| image.expected_serial_text.clone())
         }),
+        serial_expected_markers: boot_image
+            .map(|image| image.expected_serial_markers.clone())
+            .unwrap_or_default(),
+        serial_markers_observed: false,
         serial_io_exit_count: 0,
         halt_observed: false,
         calls: Vec::new(),
@@ -1254,6 +1263,10 @@ mod windows_whp {
                         .then(|| image.expected_serial_text.clone())
                 })
                 .or_else(|| run_fixture.then(|| SERIAL_BOOT_BANNER_TEXT.to_string())),
+            serial_expected_markers: boot_image
+                .map(|image| image.expected_serial_markers.clone())
+                .unwrap_or_default(),
+            serial_markers_observed: false,
             serial_io_exit_count: 0,
             halt_observed: false,
             calls: Vec::new(),
@@ -2441,6 +2454,25 @@ mod windows_whp {
         }
 
         report.serial_io_exit_count = report.serial_bytes.len() as u32;
+        report.serial_markers_observed = serial_markers_observed(report);
+        if !report.serial_expected_markers.is_empty() {
+            report.calls.push(NativeWhpCallReport {
+                name: "LinuxSerialMilestones",
+                hresult: None,
+                ok: report.serial_markers_observed,
+                detail: if report.serial_markers_observed {
+                    format!(
+                        "Observed expected Linux serial milestones: {}.",
+                        report.serial_expected_markers.join(", ")
+                    )
+                } else {
+                    format!(
+                        "Expected Linux serial milestones were not all observed yet: {}.",
+                        report.serial_expected_markers.join(", ")
+                    )
+                },
+            });
+        }
         report.calls.push(NativeWhpCallReport {
             name: "LinuxEntryProbeBoundary",
             hresult: None,
@@ -2748,9 +2780,24 @@ mod windows_whp {
             && report.serial_text == report.serial_expected_text
     }
 
+    fn serial_markers_observed(report: &NativePartitionSmokeReport) -> bool {
+        let Some(text) = report.serial_text.as_deref() else {
+            return report.serial_expected_markers.is_empty();
+        };
+        let mut cursor = 0;
+        for marker in &report.serial_expected_markers {
+            let Some(offset) = text[cursor..].find(marker) else {
+                return false;
+            };
+            cursor += offset + marker.len();
+        }
+        true
+    }
+
     fn linux_entry_probe_passed(report: &NativePartitionSmokeReport) -> bool {
         report.virtual_processor_ran
             && report.exit_reason.is_some()
+            && (report.serial_expected_markers.is_empty() || report.serial_markers_observed)
             && !report.calls.iter().any(|call| {
                 matches!(call.name, "LinuxEntryProbeExitBudget" | "AdvanceGuestRip") && !call.ok
             })
@@ -2779,7 +2826,12 @@ mod windows_whp {
         if linux_entry_probe_passed(report) {
             let exit = report.exit_reason_label.as_deref().unwrap_or("unknown");
             let serial = report.serial_text.as_deref().unwrap_or("");
-            if serial.is_empty() {
+            if !report.serial_expected_markers.is_empty() {
+                format!(
+                    "Linux protected-mode entry observed expected serial milestones before WHP exit `{exit}`: {}.",
+                    report.serial_expected_markers.join(", ")
+                )
+            } else if serial.is_empty() {
                 format!(
                     "Linux protected-mode entry was accepted and reached WHP exit `{exit}`; early Linux serial output is not proven yet."
                 )
@@ -2791,6 +2843,11 @@ mod windows_whp {
         } else if !report.virtual_processor_ran {
             "Linux protected-mode entry did not run far enough to produce a WHP exit context."
                 .to_string()
+        } else if !report.serial_expected_markers.is_empty() && !report.serial_markers_observed {
+            format!(
+                "Linux protected-mode entry has not yet emitted the required serial milestones: {}.",
+                report.serial_expected_markers.join(", ")
+            )
         } else {
             let exit = report.exit_reason_label.as_deref().unwrap_or("unknown");
             let next = match report.exit_reason {
@@ -3048,19 +3105,19 @@ mod windows_whp {
         use super::{
             decode_exit_context, guest_contract_passed, linux_entry_probe_detail,
             linux_entry_probe_passed, linux_protected_mode_registers, serial_contract_passed,
-            Com1SerialState, DecodedExit, CPUID_DEFAULT_RAX_OFFSET, CPUID_DEFAULT_RBX_OFFSET,
-            CPUID_DEFAULT_RCX_OFFSET, CPUID_DEFAULT_RDX_OFFSET, CPUID_RAX_OFFSET, CPUID_RCX_OFFSET,
-            IO_ACCESS_INFO_OFFSET, IO_PORT_OFFSET, IO_RAX_OFFSET, MEMORY_ACCESS_INFO_OFFSET,
-            MEMORY_GPA_OFFSET, MEMORY_GVA_OFFSET, MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET,
-            MSR_RAX_OFFSET, MSR_RDX_OFFSET, SERIAL_COM1_PORT, VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET,
-            VP_CONTEXT_RIP_OFFSET, WHV_REGISTER_CR0, WHV_REGISTER_CR3, WHV_REGISTER_CR4,
-            WHV_REGISTER_CS, WHV_REGISTER_DS, WHV_REGISTER_ES, WHV_REGISTER_GDTR,
-            WHV_REGISTER_IDTR, WHV_REGISTER_RBP, WHV_REGISTER_RBX, WHV_REGISTER_RDI,
-            WHV_REGISTER_RFLAGS, WHV_REGISTER_RIP, WHV_REGISTER_RSI, WHV_REGISTER_RSP,
-            WHV_REGISTER_SS, WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE,
-            WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS, WHV_RUN_VP_EXIT_REASON_X64_CPUID,
-            WHV_RUN_VP_EXIT_REASON_X64_HALT, WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS,
-            WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS,
+            serial_markers_observed, Com1SerialState, DecodedExit, CPUID_DEFAULT_RAX_OFFSET,
+            CPUID_DEFAULT_RBX_OFFSET, CPUID_DEFAULT_RCX_OFFSET, CPUID_DEFAULT_RDX_OFFSET,
+            CPUID_RAX_OFFSET, CPUID_RCX_OFFSET, IO_ACCESS_INFO_OFFSET, IO_PORT_OFFSET,
+            IO_RAX_OFFSET, MEMORY_ACCESS_INFO_OFFSET, MEMORY_GPA_OFFSET, MEMORY_GVA_OFFSET,
+            MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET, MSR_RAX_OFFSET, MSR_RDX_OFFSET,
+            SERIAL_COM1_PORT, VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET, VP_CONTEXT_RIP_OFFSET,
+            WHV_REGISTER_CR0, WHV_REGISTER_CR3, WHV_REGISTER_CR4, WHV_REGISTER_CS, WHV_REGISTER_DS,
+            WHV_REGISTER_ES, WHV_REGISTER_GDTR, WHV_REGISTER_IDTR, WHV_REGISTER_RBP,
+            WHV_REGISTER_RBX, WHV_REGISTER_RDI, WHV_REGISTER_RFLAGS, WHV_REGISTER_RIP,
+            WHV_REGISTER_RSI, WHV_REGISTER_RSP, WHV_REGISTER_SS,
+            WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE, WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS,
+            WHV_RUN_VP_EXIT_REASON_X64_CPUID, WHV_RUN_VP_EXIT_REASON_X64_HALT,
+            WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS, WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS,
         };
         use crate::native::{
             evaluate_native_block_io, linux_boot_gdt_page_bytes, native_block_io_exit_can_resume,
@@ -3465,6 +3522,8 @@ mod windows_whp {
                 serial_bytes: Vec::new(),
                 serial_text: None,
                 serial_expected_text: None,
+                serial_expected_markers: Vec::new(),
+                serial_markers_observed: false,
                 serial_io_exit_count: 0,
                 halt_observed: false,
                 calls: Vec::new(),
@@ -3506,6 +3565,33 @@ mod windows_whp {
                 crate::native::NativeGuestEntryMode::LinuxProtectedMode32
             ));
             assert!(report.serial_expected_text.is_none());
+        }
+
+        #[test]
+        fn linux_entry_probe_requires_declared_serial_milestones() {
+            let mut report = base_report();
+            report.exit_reason = Some(WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS);
+            report.exit_reason_label = Some("x64-io-port-access".to_string());
+            report.serial_expected_markers = vec![
+                "PANE_INITRAMFS_DISCOVERY_START".to_string(),
+                "PANE_BLOCK_IO_PROBE_OK".to_string(),
+                "PANE_INITRAMFS_DISCOVERY_DONE".to_string(),
+            ];
+            report.serial_text =
+                Some("PANE_INITRAMFS_DISCOVERY_START\nPANE_BLOCK_IO_PROBE_OK\n".to_string());
+            report.serial_markers_observed = serial_markers_observed(&report);
+
+            assert!(!report.serial_markers_observed);
+            assert!(!linux_entry_probe_passed(&report));
+
+            report.serial_text = Some(
+                "PANE_INITRAMFS_DISCOVERY_START\nPANE_BLOCK_IO_PROBE_OK\nPANE_INITRAMFS_DISCOVERY_DONE\n"
+                    .to_string(),
+            );
+            report.serial_markers_observed = serial_markers_observed(&report);
+
+            assert!(report.serial_markers_observed);
+            assert!(linux_entry_probe_passed(&report));
         }
 
         #[test]
@@ -3877,6 +3963,7 @@ mod tests {
             path: Some("vmlinuz-linux".to_string()),
             bytes: vec![0_u8; 128],
             expected_serial_text: SERIAL_BOOT_BANNER_TEXT.to_string(),
+            expected_serial_markers: vec!["PANE_INITRAMFS_DISCOVERY_START".to_string()],
             guest_entry_gpa: 0x0010_0000,
             entry_mode: NativeGuestEntryMode::LinuxProtectedMode32,
             boot_params_gpa: Some(0x7000),
@@ -3895,5 +3982,9 @@ mod tests {
             Some("linux-protected-mode-32")
         );
         assert_eq!(report.boot_params_gpa.as_deref(), Some("0x00007000"));
+        assert_eq!(
+            report.serial_expected_markers,
+            vec!["PANE_INITRAMFS_DISCOVERY_START".to_string()]
+        );
     }
 }

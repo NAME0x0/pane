@@ -478,6 +478,8 @@ struct KernelBootLayout {
     initramfs_sha256: Option<String>,
     cmdline: String,
     expected_serial_device: String,
+    #[serde(default)]
+    expected_serial_milestones: Vec<String>,
     storage: Option<KernelStorageAttachment>,
     initramfs_driver: Option<PaneInitramfsDriverMetadata>,
     framebuffer: Option<FramebufferContract>,
@@ -2065,7 +2067,12 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
         && (!args.run_fixture || runtime.artifacts.serial_boot_image_ready)
         && (!args.run_boot_loader || runtime.artifacts.boot_loader_image_verified)
         && (!args.run_kernel_layout || runtime.artifacts.kernel_boot_layout_ready)
-        && (!protected_linux_entry_requested || partition_smoke.serial_text.is_some());
+        && (!protected_linux_entry_requested
+            || if partition_smoke.serial_expected_markers.is_empty() {
+                partition_smoke.serial_text.is_some()
+            } else {
+                partition_smoke.serial_markers_observed
+            });
 
     let mut blockers = Vec::new();
     if !args.execute {
@@ -2139,6 +2146,17 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
     }
     if let Some(blocker) = &partition_smoke.blocker {
         blockers.push(blocker.clone());
+    }
+    if args.execute
+        && args.run_kernel_layout
+        && protected_linux_entry_requested
+        && !partition_smoke.serial_expected_markers.is_empty()
+        && !partition_smoke.serial_markers_observed
+    {
+        blockers.push(format!(
+            "Kernel layout has not yet produced the required initramfs serial milestones: {}.",
+            partition_smoke.serial_expected_markers.join(", ")
+        ));
     }
     if args.execute
         && partition_smoke.status != crate::native::NativePartitionSmokeStatus::Pass
@@ -4301,6 +4319,14 @@ Expected serial-observable milestones:
     .to_string()
 }
 
+fn pane_initramfs_expected_serial_milestones() -> Vec<String> {
+    vec![
+        "PANE_INITRAMFS_DISCOVERY_START".to_string(),
+        "PANE_BLOCK_IO_PROBE_OK".to_string(),
+        "PANE_INITRAMFS_DISCOVERY_DONE".to_string(),
+    ]
+}
+
 fn create_user_disk_snapshot(paths: &RuntimePaths) -> AppResult<UserDiskSnapshotMetadata> {
     let metadata = read_json_file::<UserDiskMetadata>(&paths.user_disk_metadata)?;
     if !user_disk_artifact_ready(paths, &Some(metadata.clone())) {
@@ -4926,6 +4952,7 @@ fn load_serial_boot_image_artifact(
         path: Some(paths.serial_boot_image.display().to_string()),
         bytes,
         expected_serial_text: crate::native::SERIAL_BOOT_BANNER_TEXT.to_string(),
+        expected_serial_markers: Vec::new(),
         guest_entry_gpa: 0x1000,
         entry_mode: crate::native::NativeGuestEntryMode::RealModeSerial,
         boot_params_gpa: None,
@@ -5060,6 +5087,7 @@ fn load_boot_loader_image_artifact(
         path: Some(paths.boot_loader_image.display().to_string()),
         bytes,
         expected_serial_text: metadata.expected_serial_text,
+        expected_serial_markers: Vec::new(),
         guest_entry_gpa: 0x1000,
         entry_mode: crate::native::NativeGuestEntryMode::RealModeSerial,
         boot_params_gpa: None,
@@ -5152,6 +5180,7 @@ fn load_kernel_layout_boot_image_artifact(
         } else {
             crate::native::SERIAL_BOOT_BANNER_TEXT.to_string()
         },
+        expected_serial_markers: layout.expected_serial_milestones,
         guest_entry_gpa: kernel_entry_gpa,
         entry_mode: if layout.kernel_format == "linux-bzimage" {
             crate::native::NativeGuestEntryMode::LinuxProtectedMode32
@@ -5766,6 +5795,11 @@ fn build_kernel_boot_layout(
     } else {
         None
     };
+    let expected_serial_milestones = if initramfs_driver.is_some() {
+        pane_initramfs_expected_serial_milestones()
+    } else {
+        Vec::new()
+    };
     let framebuffer = read_json_file::<FramebufferContract>(&paths.framebuffer_contract)
         .unwrap_or_else(|_| default_framebuffer_contract());
     let input = read_json_file::<InputContract>(&paths.input_contract)
@@ -5812,6 +5846,7 @@ fn build_kernel_boot_layout(
         initramfs_sha256: metadata.initramfs_sha256,
         cmdline,
         expected_serial_device: metadata.expected_serial_device,
+        expected_serial_milestones,
         storage,
         initramfs_driver,
         framebuffer: Some(framebuffer),
@@ -6804,6 +6839,11 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
                     )
                     .ok()
                 });
+            let expected_serial_milestones = if layout.storage.is_some() {
+                pane_initramfs_expected_serial_milestones()
+            } else {
+                Vec::new()
+            };
 
             kernel_boot_plan_ready
                 && layout.schema_version == 1
@@ -6844,6 +6884,7 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
                         .as_ref()
                         .and_then(|_| initramfs_driver_metadata.clone())
                 && layout.expected_serial_device == "ttyS0"
+                && layout.expected_serial_milestones == expected_serial_milestones
                 && layout.framebuffer.as_ref().is_some_and(|contract| {
                     contract.schema_version == 1
                         && contract.device == "pane-linear-framebuffer-v1"
@@ -9831,6 +9872,12 @@ fn print_native_kernel_plan_report(report: &NativeKernelPlanReport) {
         if let Some(mode) = &layout.linux_expected_entry_mode {
             println!("  Entry Mode     {}", mode);
         }
+        if !layout.expected_serial_milestones.is_empty() {
+            println!(
+                "  Serial Milestones {}",
+                layout.expected_serial_milestones.join(", ")
+            );
+        }
         if !layout.guest_memory_map.is_empty() {
             println!("Guest Memory Map");
             for range in &layout.guest_memory_map {
@@ -10004,6 +10051,16 @@ fn print_native_boot_spike_report(report: &NativeBootSpikeReport) {
     }
     if let Some(expected) = &report.partition_smoke.serial_expected_text {
         println!("  Serial Expect  {:?}", expected);
+    }
+    if !report.partition_smoke.serial_expected_markers.is_empty() {
+        println!(
+            "  Serial Markers {}",
+            report.partition_smoke.serial_expected_markers.join(", ")
+        );
+        println!(
+            "  Markers Seen   {}",
+            yes_no(report.partition_smoke.serial_markers_observed)
+        );
     }
     if let Some(text) = &report.partition_smoke.serial_text {
         println!("  Serial Text    {:?}", text);
@@ -10550,10 +10607,11 @@ mod tests {
         export_user_disk_package, format_doctor_blockers, import_user_disk_package,
         initialize_managed_arch_environment, inspect_kernel_image_artifact, inspect_workspace,
         inventory_contains_distro, kernel_layout_execution_image, linux_guest_mapped_regions,
-        load_kernel_layout_boot_image_artifact, parse_guest_physical_address, preferred_transport,
-        read_base_os_block, read_json_file, read_user_disk_block, register_base_os_image,
-        register_boot_loader_image, register_kernel_boot_plan, repair_user_disk_metadata,
-        resize_user_disk, resolve_bundle_output_path, resolve_init_source, resolve_launch_target,
+        load_kernel_layout_boot_image_artifact, pane_initramfs_expected_serial_milestones,
+        parse_guest_physical_address, preferred_transport, read_base_os_block, read_json_file,
+        read_user_disk_block, register_base_os_image, register_boot_loader_image,
+        register_kernel_boot_plan, repair_user_disk_metadata, resize_user_disk,
+        resolve_bundle_output_path, resolve_init_source, resolve_launch_target,
         resolve_managed_environment_for_reset, resolve_saved_launch, resolve_session_context,
         resolve_status_distro, restore_user_disk_snapshot, runtime_contract_guest_memory_ranges,
         runtime_storage_budget, sha256_file, status_port_for, user_disk_artifact_ready,
@@ -11111,6 +11169,7 @@ mod tests {
             initramfs_sha256: Some("1".repeat(64)),
             cmdline: "console=ttyS0 panic=-1".to_string(),
             expected_serial_device: "ttyS0".to_string(),
+            expected_serial_milestones: Vec::new(),
             storage: None,
             initramfs_driver: None,
             framebuffer: Some(default_framebuffer_contract()),
@@ -11206,6 +11265,7 @@ mod tests {
             initramfs_sha256: None,
             cmdline: "console=ttyS0 panic=-1".to_string(),
             expected_serial_device: "ttyS0".to_string(),
+            expected_serial_milestones: Vec::new(),
             storage: None,
             initramfs_driver: None,
             framebuffer: Some(default_framebuffer_contract()),
@@ -11268,6 +11328,7 @@ mod tests {
             initramfs_sha256: None,
             cmdline: "console=ttyS0 panic=-1".to_string(),
             expected_serial_device: "ttyS0".to_string(),
+            expected_serial_milestones: Vec::new(),
             storage: None,
             initramfs_driver: None,
             framebuffer: Some(default_framebuffer_contract()),
@@ -11954,6 +12015,10 @@ mod tests {
             .expect("initramfs driver attachment");
         assert_eq!(driver.bundle_kind, "pane-initramfs-driver-source-v1");
         assert_eq!(driver.block_io_protocol, "pane-port-block-v1");
+        assert_eq!(
+            layout.expected_serial_milestones,
+            pane_initramfs_expected_serial_milestones()
+        );
         assert_eq!(storage.root_device, "/dev/pane0");
         assert_eq!(storage.user_device, "/dev/pane1");
         assert_eq!(storage.contract_gpa, "0x0dfe0000");
@@ -12118,6 +12183,10 @@ mod tests {
             Some("0x83")
         );
         assert!(storage.root_handoff.requires_initramfs_driver);
+        assert_eq!(
+            layout.expected_serial_milestones,
+            pane_initramfs_expected_serial_milestones()
+        );
         assert!(layout.cmdline.contains("pane.root=/dev/pane0p1"));
         assert!(layout.cmdline.contains("pane.root_mode=base-partition"));
         assert!(layout.cmdline.contains("pane.root_partition=1"));

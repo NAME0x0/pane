@@ -240,6 +240,14 @@ try {
     if (-not $runtimeKernelReport.artifacts.kernel_boot_plan_ready) {
         throw "pane runtime --register-kernel did not create a verified kernel boot plan."
     }
+    $runtimeInitramfsDriver = Invoke-Capture -OutputPath (Join-Path $artifactRoot "runtime-initramfs-driver.json") -Body {
+        & $paneExe runtime --json --write-initramfs-driver --session-name $SessionName --capacity-gib 8
+    }
+    Assert-Success -Result $runtimeInitramfsDriver -Label "pane runtime --write-initramfs-driver"
+    $runtimeInitramfsDriverReport = $runtimeInitramfsDriver.Output | ConvertFrom-Json
+    if (-not $runtimeInitramfsDriverReport.artifacts.initramfs_driver_bundle_ready) {
+        throw "pane runtime --write-initramfs-driver did not create a verified initramfs driver source bundle."
+    }
     $nativeKernelPlan = Invoke-Capture -OutputPath (Join-Path $artifactRoot "native-kernel-plan.json") -Body {
         & $paneExe native-kernel-plan --json --materialize --session-name $SessionName
     }
@@ -249,6 +257,7 @@ try {
         throw "pane native-kernel-plan did not materialize a verified kernel boot layout."
     }
     $checks.native_kernel_plan = "pass"
+    $checks.runtime_initramfs_driver = "pass"
     $checks.runtime_prepare = "pass"
 
     $nativePreflight = Invoke-Capture -OutputPath (Join-Path $artifactRoot "native-preflight.json") -Body {

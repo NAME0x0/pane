@@ -4083,6 +4083,7 @@ fn pane_init_source() -> String {
 #include <sys/io.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 
 #define COM1_PORT 0x3f8
@@ -4138,6 +4139,38 @@ static void log_key_value(const char *key, const char *value) {
     log_line(line);
 }
 
+static void mkdir_if_missing(const char *path, mode_t mode) {
+    if (mkdir(path, mode) != 0 && errno != EEXIST) {
+        char line[256];
+        snprintf(line, sizeof(line), "PANE_INITRAMFS_MKDIR_FAILED path=%s errno=%d", path, errno);
+        log_line(line);
+    }
+}
+
+static void write_native_storage_env(
+    const char *storage_contract,
+    const char *block_io,
+    const char *root_device,
+    const char *user_device
+) {
+    mkdir_if_missing("/run", 0755);
+    mkdir_if_missing("/run/pane", 0755);
+    int fd = open("/run/pane/native-storage.env", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        log_line("PANE_INITRAMFS_ENV_WRITE_FAILED");
+        return;
+    }
+    dprintf(fd, "PANE_STORAGE_CONTRACT=%s\n", storage_contract);
+    dprintf(fd, "PANE_BLOCK_IO=%s\n", block_io);
+    dprintf(fd, "PANE_ROOT=%s\n", root_device);
+    dprintf(fd, "PANE_USER=%s\n", user_device);
+    dprintf(fd, "PANE_BLOCK_IO_PROTOCOL=%s\n", PANE_BLOCK_IO_PROTOCOL);
+    dprintf(fd, "PANE_BLOCK_IO_BASE_PORT=0x%x\n", PANE_BLOCK_IO_BASE_PORT);
+    dprintf(fd, "PANE_BLOCK_IO_BLOCK_SIZE_BYTES=%u\n", PANE_BLOCK_IO_BLOCK_SIZE_BYTES);
+    close(fd);
+    log_line("PANE_INITRAMFS_ENV_READY");
+}
+
 static int read_cmdline(char *buffer, size_t size) {
     int fd = open("/proc/cmdline", O_RDONLY);
     if (fd < 0) {
@@ -4182,6 +4215,67 @@ static void wait_forever(void) {
     }
 }
 
+static void prepare_minimal_mounts(void) {
+    mkdir_if_missing("/proc", 0555);
+    mkdir_if_missing("/sys", 0555);
+    mkdir_if_missing("/dev", 0755);
+    mkdir_if_missing("/newroot", 0755);
+    mount("proc", "/proc", "proc", 0, "");
+    mount("sysfs", "/sys", "sysfs", 0, "");
+    if (mount("devtmpfs", "/dev", "devtmpfs", 0, "mode=0755") != 0) {
+        mknod("/dev/console", S_IFCHR | 0600, makedev(5, 1));
+        mknod("/dev/null", S_IFCHR | 0666, makedev(1, 3));
+    }
+}
+
+static int wait_for_device(const char *path) {
+    for (unsigned int attempt = 0; attempt < 100; attempt++) {
+        if (access(path, F_OK) == 0) {
+            return 0;
+        }
+        usleep(100000);
+    }
+    return -1;
+}
+
+static int try_mount_root(const char *root_device) {
+    const char *filesystems[] = {"ext4", "btrfs", "xfs", "f2fs", NULL};
+    for (unsigned int index = 0; filesystems[index] != NULL; index++) {
+        if (mount(root_device, "/newroot", filesystems[index], MS_RELATIME, "") == 0) {
+            char line[128];
+            snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_OK fs=%s", filesystems[index]);
+            log_line(line);
+            return 0;
+        }
+    }
+    if (mount(root_device, "/newroot", "ext4", MS_RDONLY | MS_RELATIME, "") == 0) {
+        log_line("PANE_ROOT_MOUNT_OK fs=ext4 readonly=true");
+        return 0;
+    }
+    return -1;
+}
+
+static void move_mount_if_present(const char *source, const char *target) {
+    mkdir_if_missing(target, 0755);
+    mount(source, target, NULL, MS_MOVE, NULL);
+}
+
+static void exec_real_init(void) {
+    move_mount_if_present("/proc", "/newroot/proc");
+    move_mount_if_present("/sys", "/newroot/sys");
+    move_mount_if_present("/dev", "/newroot/dev");
+    if (chdir("/newroot") != 0 || chroot(".") != 0 || chdir("/") != 0) {
+        log_line("PANE_ROOT_SWITCH_FAILED");
+        wait_forever();
+    }
+    log_line("PANE_INIT_EXEC");
+    execl("/sbin/init", "init", NULL);
+    execl("/usr/lib/systemd/systemd", "systemd", NULL);
+    execl("/bin/init", "init", NULL);
+    log_line("PANE_INIT_EXEC_FAILED");
+    wait_forever();
+}
+
 int main(void) {
     char cmdline[4096];
     char storage_contract[128] = {0};
@@ -4191,8 +4285,7 @@ int main(void) {
 
     com1_init();
     log_line("PANE_INITRAMFS_DISCOVERY_START");
-    mkdir("/proc", 0555);
-    mount("proc", "/proc", "proc", 0, "");
+    prepare_minimal_mounts();
 
     if (read_cmdline(cmdline, sizeof(cmdline)) != 0) {
         log_line("PANE_INITRAMFS_CMDLINE_FAILED");
@@ -4231,6 +4324,18 @@ int main(void) {
 
     log_line("PANE_BLOCK_IO_PROBE_OK");
     log_line("PANE_INITRAMFS_DISCOVERY_DONE");
+    write_native_storage_env(storage_contract, block_io, root_device, user_device);
+
+    log_line("PANE_ROOT_MOUNT_ATTEMPT");
+    if (wait_for_device(root_device) != 0) {
+        log_line("PANE_ROOT_DEVICE_WAIT_TIMEOUT");
+        wait_forever();
+    }
+    if (try_mount_root(root_device) != 0) {
+        log_line("PANE_ROOT_MOUNT_FAILED");
+        wait_forever();
+    }
+    exec_real_init();
     wait_forever();
 }
 "#
@@ -4286,7 +4391,7 @@ output="${1:-pane-storage-discovery.cpio}"
 workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
 
-mkdir -p "$workdir/bin" "$workdir/proc" "$workdir/run/pane"
+mkdir -p "$workdir/bin" "$workdir/dev" "$workdir/newroot" "$workdir/proc" "$workdir/run/pane" "$workdir/sys"
 cc -Os -static -o "$workdir/init" pane-init.c
 cc -Os -static -o "$workdir/bin/pane-port-probe" pane-port-probe.c
 cp pane-initramfs-hook.sh "$workdir/bin/pane-initramfs-hook"
@@ -4304,10 +4409,11 @@ fn pane_initramfs_driver_readme() -> String {
 This bundle is generated by `pane runtime --write-initramfs-driver`.
 
 It defines the guest-side discovery hook, C probe source, and self-contained C
-`/init` source for Pane's native block-port ABI. It is intentionally not the
-final root-mountable Linux block driver yet. The next milestone is to promote
-the probe into a real early block-device path that can expose `/dev/pane0` and
-`/dev/pane1`.
+`/init` source for Pane's native block-port ABI. The generated `/init` discovers
+the Pane storage contract, writes `/run/pane/native-storage.env`, waits for the
+declared root device, attempts to mount it at `/newroot`, moves proc/sys/dev into
+the new root, and executes the real Linux init. The remaining prerequisite is a
+guest-visible Pane block device that exposes `/dev/pane0` and `/dev/pane1`.
 
 Expected kernel arguments:
 
@@ -4323,13 +4429,17 @@ sh build-pane-initramfs.sh ./pane-storage-discovery.cpio
 ```
 
 The generated cpio is a discovery/probe initramfs, not the final Arch
-root-mount initramfs.
+root-mount initramfs until a Pane block driver or equivalent early device path
+creates the declared root device.
 
 Expected serial-observable milestones:
 
 - `PANE_INITRAMFS_DISCOVERY_START`
 - `PANE_BLOCK_IO_PROBE_OK`
 - `PANE_INITRAMFS_DISCOVERY_DONE`
+- `PANE_ROOT_MOUNT_ATTEMPT`
+- `PANE_ROOT_MOUNT_OK`
+- `PANE_INIT_EXEC`
 "#
     .to_string()
 }
@@ -11849,11 +11959,15 @@ mod tests {
             std::fs::read_to_string(paths.initramfs_driver_dir.join("pane-init.c")).unwrap();
         assert!(init_source.contains("PANE_INITRAMFS_DISCOVERY_START"));
         assert!(init_source.contains("PANE_BLOCK_IO_PROBE_OK"));
+        assert!(init_source.contains("PANE_ROOT_MOUNT_ATTEMPT"));
+        assert!(init_source.contains("PANE_ROOT_MOUNT_OK"));
+        assert!(init_source.contains("execl(\"/sbin/init\""));
         assert!(init_source.contains("#define COM1_PORT 0x3f8"));
         let build_script =
             std::fs::read_to_string(paths.initramfs_driver_dir.join("build-pane-initramfs.sh"))
                 .unwrap();
         assert!(build_script.contains("cpio -o -H newc"));
+        assert!(build_script.contains("$workdir/newroot"));
         assert!(build_script.contains("-o \"$workdir/init\" pane-init.c"));
         assert!(build_script.contains("pane-port-probe"));
         assert!(artifacts.initramfs_driver_bundle_exists);

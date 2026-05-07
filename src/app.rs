@@ -429,11 +429,13 @@ struct PaneInitramfsDriverMetadata {
     driver_dir: String,
     hook_path: String,
     header_path: String,
+    init_source_path: String,
     probe_source_path: String,
     build_script_path: String,
     readme_path: String,
     hook_sha256: String,
     header_sha256: String,
+    init_source_sha256: String,
     probe_source_sha256: String,
     build_script_sha256: String,
     readme_sha256: String,
@@ -3842,12 +3844,14 @@ fn write_pane_initramfs_driver_bundle(
 
     let hook_path = paths.initramfs_driver_dir.join("pane-initramfs-hook.sh");
     let header_path = paths.initramfs_driver_dir.join("pane-port-block.h");
+    let init_source_path = paths.initramfs_driver_dir.join("pane-init.c");
     let probe_source_path = paths.initramfs_driver_dir.join("pane-port-probe.c");
     let build_script_path = paths.initramfs_driver_dir.join("build-pane-initramfs.sh");
     let readme_path = paths.initramfs_driver_dir.join("README.md");
 
     fs::write(&hook_path, pane_initramfs_hook_source())?;
     fs::write(&header_path, pane_port_block_header_source())?;
+    fs::write(&init_source_path, pane_init_source())?;
     fs::write(&probe_source_path, pane_port_probe_source())?;
     fs::write(&build_script_path, pane_initramfs_build_script())?;
     fs::write(&readme_path, pane_initramfs_driver_readme())?;
@@ -3858,11 +3862,13 @@ fn write_pane_initramfs_driver_bundle(
         driver_dir: paths.initramfs_driver_dir.display().to_string(),
         hook_path: hook_path.display().to_string(),
         header_path: header_path.display().to_string(),
+        init_source_path: init_source_path.display().to_string(),
         probe_source_path: probe_source_path.display().to_string(),
         build_script_path: build_script_path.display().to_string(),
         readme_path: readme_path.display().to_string(),
         hook_sha256: sha256_file(&hook_path)?,
         header_sha256: sha256_file(&header_path)?,
+        init_source_sha256: sha256_file(&init_source_path)?,
         probe_source_sha256: sha256_file(&probe_source_path)?,
         build_script_sha256: sha256_file(&build_script_path)?,
         readme_sha256: sha256_file(&readme_path)?,
@@ -3910,6 +3916,11 @@ fn load_verified_pane_initramfs_driver_metadata(
     for (label, path, expected_sha256) in [
         ("hook", &metadata.hook_path, &metadata.hook_sha256),
         ("header", &metadata.header_path, &metadata.header_sha256),
+        (
+            "init source",
+            &metadata.init_source_path,
+            &metadata.init_source_sha256,
+        ),
         (
             "probe source",
             &metadata.probe_source_path,
@@ -4028,6 +4039,171 @@ fn pane_port_block_header_source() -> String {
     )
 }
 
+fn pane_init_source() -> String {
+    r#"#include "pane-port-block.h"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/io.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#define COM1_PORT 0x3f8
+#define COM1_PORT_COUNT 8
+#define COM1_LINE_STATUS 5
+#define COM1_TRANSMIT_EMPTY 0x20
+
+static int com1_enabled = 0;
+
+static void com1_init(void) {
+    if (ioperm(COM1_PORT, COM1_PORT_COUNT, 1) != 0) {
+        return;
+    }
+
+    outb(0x00, COM1_PORT + 1);
+    outb(0x80, COM1_PORT + 3);
+    outb(0x03, COM1_PORT + 0);
+    outb(0x00, COM1_PORT + 1);
+    outb(0x03, COM1_PORT + 3);
+    outb(0xc7, COM1_PORT + 2);
+    outb(0x0b, COM1_PORT + 4);
+    com1_enabled = 1;
+}
+
+static void com1_write_byte(char value) {
+    if (!com1_enabled) {
+        return;
+    }
+    for (unsigned int spin = 0; spin < 100000; spin++) {
+        if ((inb(COM1_PORT + COM1_LINE_STATUS) & COM1_TRANSMIT_EMPTY) != 0) {
+            break;
+        }
+    }
+    outb((unsigned char)value, COM1_PORT);
+}
+
+static void log_line(const char *value) {
+    write(STDOUT_FILENO, value, strlen(value));
+    write(STDOUT_FILENO, "\n", 1);
+    while (*value) {
+        if (*value == '\n') {
+            com1_write_byte('\r');
+        }
+        com1_write_byte(*value++);
+    }
+    com1_write_byte('\r');
+    com1_write_byte('\n');
+}
+
+static void log_key_value(const char *key, const char *value) {
+    char line[512];
+    snprintf(line, sizeof(line), "%s=%s", key, value[0] ? value : "<missing>");
+    log_line(line);
+}
+
+static int read_cmdline(char *buffer, size_t size) {
+    int fd = open("/proc/cmdline", O_RDONLY);
+    if (fd < 0) {
+        return -1;
+    }
+    ssize_t count = read(fd, buffer, size - 1);
+    close(fd);
+    if (count < 0) {
+        return -1;
+    }
+    buffer[count] = '\0';
+    return 0;
+}
+
+static int find_arg(const char *cmdline, const char *key, char *value, size_t value_size) {
+    size_t key_len = strlen(key);
+    const char *cursor = cmdline;
+    while (*cursor) {
+        while (*cursor == ' ') {
+            cursor++;
+        }
+        if (strncmp(cursor, key, key_len) == 0 && cursor[key_len] == '=') {
+            cursor += key_len + 1;
+            size_t index = 0;
+            while (*cursor && *cursor != ' ' && index + 1 < value_size) {
+                value[index++] = *cursor++;
+            }
+            value[index] = '\0';
+            return 0;
+        }
+        while (*cursor && *cursor != ' ') {
+            cursor++;
+        }
+    }
+    return -1;
+}
+
+static void wait_forever(void) {
+    log_line("PANE_INITRAMFS_DISCOVERY_WAITING");
+    for (;;) {
+        pause();
+    }
+}
+
+int main(void) {
+    char cmdline[4096];
+    char storage_contract[128] = {0};
+    char block_io[128] = {0};
+    char root_device[128] = {0};
+    char user_device[128] = {0};
+
+    com1_init();
+    log_line("PANE_INITRAMFS_DISCOVERY_START");
+    mkdir("/proc", 0555);
+    mount("proc", "/proc", "proc", 0, "");
+
+    if (read_cmdline(cmdline, sizeof(cmdline)) != 0) {
+        log_line("PANE_INITRAMFS_CMDLINE_FAILED");
+        wait_forever();
+    }
+    find_arg(cmdline, "pane.storage_contract", storage_contract, sizeof(storage_contract));
+    find_arg(cmdline, "pane.block_io", block_io, sizeof(block_io));
+    find_arg(cmdline, "pane.root", root_device, sizeof(root_device));
+    find_arg(cmdline, "pane.user", user_device, sizeof(user_device));
+
+    log_key_value("pane.storage_contract", storage_contract);
+    log_key_value("pane.block_io", block_io);
+    log_key_value("pane.root", root_device);
+    log_key_value("pane.user", user_device);
+
+    if (storage_contract[0] == '\0' || block_io[0] == '\0' || root_device[0] == '\0') {
+        log_line("PANE_INITRAMFS_DISCOVERY_FAILED");
+        wait_forever();
+    }
+
+    if (ioperm(PANE_BLOCK_IO_BASE_PORT, PANE_BLOCK_IO_PORT_COUNT, 1) != 0) {
+        char line[128];
+        snprintf(line, sizeof(line), "PANE_BLOCK_IO_PROBE_IOPERM_FAILED errno=%d", errno);
+        log_line(line);
+        wait_forever();
+    }
+
+    unsigned int units = inb(PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_BLOCK_SIZE_UNITS_OFFSET);
+    unsigned int bytes = units * 512U;
+    if (bytes != PANE_BLOCK_IO_BLOCK_SIZE_BYTES) {
+        char line[128];
+        snprintf(line, sizeof(line), "PANE_BLOCK_IO_PROBE_BAD_SIZE bytes=%u", bytes);
+        log_line(line);
+        wait_forever();
+    }
+
+    log_line("PANE_BLOCK_IO_PROBE_OK");
+    log_line("PANE_INITRAMFS_DISCOVERY_DONE");
+    wait_forever();
+}
+"#
+    .to_string()
+}
+
 fn pane_port_probe_source() -> String {
     r#"#include "pane-port-block.h"
 
@@ -4078,20 +4254,10 @@ workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
 
 mkdir -p "$workdir/bin" "$workdir/proc" "$workdir/run/pane"
+cc -Os -static -o "$workdir/init" pane-init.c
 cc -Os -static -o "$workdir/bin/pane-port-probe" pane-port-probe.c
 cp pane-initramfs-hook.sh "$workdir/bin/pane-initramfs-hook"
-chmod +x "$workdir/bin/pane-initramfs-hook" "$workdir/bin/pane-port-probe"
-
-cat > "$workdir/init" <<'EOF'
-#!/bin/sh
-set -eu
-mount -t proc proc /proc 2>/dev/null || true
-/bin/pane-initramfs-hook
-/bin/pane-port-probe || echo "pane-initramfs: port probe failed" >&2
-echo "pane-initramfs: discovery complete; root mount driver is the next milestone" >&2
-exec sh
-EOF
-chmod +x "$workdir/init"
+chmod +x "$workdir/init" "$workdir/bin/pane-initramfs-hook" "$workdir/bin/pane-port-probe"
 
 (cd "$workdir" && find . -print | cpio -o -H newc > "$OLDPWD/$output")
 printf 'wrote %s\n' "$output"
@@ -4104,11 +4270,11 @@ fn pane_initramfs_driver_readme() -> String {
 
 This bundle is generated by `pane runtime --write-initramfs-driver`.
 
-It defines the guest-side discovery hook and C probe source for Pane's native
-block-port ABI. It is intentionally not the final root-mountable Linux block
-driver yet. The next milestone is to compile/package this bundle into a
-verified initramfs, then promote the probe into a real early block-device path
-that can expose `/dev/pane0` and `/dev/pane1`.
+It defines the guest-side discovery hook, C probe source, and self-contained C
+`/init` source for Pane's native block-port ABI. It is intentionally not the
+final root-mountable Linux block driver yet. The next milestone is to promote
+the probe into a real early block-device path that can expose `/dev/pane0` and
+`/dev/pane1`.
 
 Expected kernel arguments:
 
@@ -4125,6 +4291,12 @@ sh build-pane-initramfs.sh ./pane-storage-discovery.cpio
 
 The generated cpio is a discovery/probe initramfs, not the final Arch
 root-mount initramfs.
+
+Expected serial-observable milestones:
+
+- `PANE_INITRAMFS_DISCOVERY_START`
+- `PANE_BLOCK_IO_PROBE_OK`
+- `PANE_INITRAMFS_DISCOVERY_DONE`
 "#
     .to_string()
 }
@@ -6546,6 +6718,10 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
                     .ok()
                     .as_deref()
                     == Some(metadata.header_sha256.as_str())
+                && sha256_file(Path::new(&metadata.init_source_path))
+                    .ok()
+                    .as_deref()
+                    == Some(metadata.init_source_sha256.as_str())
                 && sha256_file(Path::new(&metadata.probe_source_path))
                     .ok()
                     .as_deref()
@@ -11492,6 +11668,7 @@ mod tests {
             .initramfs_driver_dir
             .join("pane-port-block.h")
             .is_file());
+        assert!(paths.initramfs_driver_dir.join("pane-init.c").is_file());
         assert!(paths
             .initramfs_driver_dir
             .join("pane-port-probe.c")
@@ -11510,10 +11687,16 @@ mod tests {
             std::fs::read_to_string(paths.initramfs_driver_dir.join("pane-port-block.h")).unwrap();
         assert!(header.contains("#define PANE_BLOCK_IO_BASE_PORT 3328"));
         assert!(header.contains("#define PANE_BLOCK_IO_DATA_OFFSET 12"));
+        let init_source =
+            std::fs::read_to_string(paths.initramfs_driver_dir.join("pane-init.c")).unwrap();
+        assert!(init_source.contains("PANE_INITRAMFS_DISCOVERY_START"));
+        assert!(init_source.contains("PANE_BLOCK_IO_PROBE_OK"));
+        assert!(init_source.contains("#define COM1_PORT 0x3f8"));
         let build_script =
             std::fs::read_to_string(paths.initramfs_driver_dir.join("build-pane-initramfs.sh"))
                 .unwrap();
         assert!(build_script.contains("cpio -o -H newc"));
+        assert!(build_script.contains("-o \"$workdir/init\" pane-init.c"));
         assert!(build_script.contains("pane-port-probe"));
         assert!(artifacts.initramfs_driver_bundle_exists);
         assert!(artifacts.initramfs_driver_metadata_exists);

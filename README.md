@@ -216,7 +216,7 @@ What exists today:
 - verified kernel/initramfs boot-plan metadata,
 - materialized Linux kernel boot layout,
 - kernel-layout attachment for the verified Arch base image plus guest-mapped Pane sparse user disk and block-port ABI contract,
-- generated Pane initramfs driver source and build-script bundle for guest-side native storage discovery,
+- generated Pane initramfs driver source and build-script bundle with a self-contained discovery `/init` for guest-side native storage discovery,
 - fixed linear framebuffer contract mapped into guest memory for the future Pane-rendered display path,
 - keyboard/pointer input queue contract mapped into guest memory for the future app-owned input path,
 - Linux bzImage setup header copying into boot params,
@@ -299,7 +299,7 @@ cargo run -- native-boot-spike --execute --run-kernel-layout
 ```
 
 That path is still a kernel-entry probe. It is not a completed Arch boot until Pane proves deterministic early Linux serial output, root filesystem mounting, userspace start, and eventually display.
-Storage-backed kernel layouts require the generated Pane initramfs driver bundle so root discovery is not treated as ready without guest-side support.
+Storage-backed kernel layouts require the generated Pane initramfs driver bundle so root discovery is not treated as ready without guest-side support. The generated discovery initramfs now boots a C `/init` directly and emits deterministic serial milestones such as `PANE_INITRAMFS_DISCOVERY_START`, `PANE_BLOCK_IO_PROBE_OK`, and `PANE_INITRAMFS_DISCOVERY_DONE`.
 
 ## Command Reference
 

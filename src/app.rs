@@ -4110,6 +4110,7 @@ fn pane_init_source() -> String {
 #include <sys/io.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <unistd.h>
 
@@ -4265,6 +4266,42 @@ static int wait_for_device(const char *path) {
     return -1;
 }
 
+static int load_pane_block_module(void) {
+    const char *module_path = "/lib/modules/pane-block.ko";
+    int fd = open(module_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ENOENT) {
+            log_line("PANE_BLOCK_MODULE_NOT_PRESENT");
+            return 0;
+        }
+        char line[160];
+        snprintf(line, sizeof(line), "PANE_BLOCK_MODULE_OPEN_FAILED errno=%d", errno);
+        log_line(line);
+        return -1;
+    }
+
+    log_line("PANE_BLOCK_MODULE_LOAD_ATTEMPT");
+#ifdef SYS_finit_module
+    if (syscall(SYS_finit_module, fd, "", 0) == 0) {
+        close(fd);
+        log_line("PANE_BLOCK_MODULE_LOAD_OK");
+        return 0;
+    }
+    if (errno == EEXIST) {
+        close(fd);
+        log_line("PANE_BLOCK_MODULE_ALREADY_LOADED");
+        return 0;
+    }
+#else
+    errno = ENOSYS;
+#endif
+    char line[160];
+    snprintf(line, sizeof(line), "PANE_BLOCK_MODULE_LOAD_FAILED errno=%d", errno);
+    log_line(line);
+    close(fd);
+    return -1;
+}
+
 static int try_mount_root(const char *root_device) {
     const char *filesystems[] = {"ext4", "btrfs", "xfs", "f2fs", NULL};
     for (unsigned int index = 0; filesystems[index] != NULL; index++) {
@@ -4350,6 +4387,7 @@ int main(void) {
     }
 
     log_line("PANE_BLOCK_IO_PROBE_OK");
+    load_pane_block_module();
     log_line("PANE_INITRAMFS_DISCOVERY_DONE");
     write_native_storage_env(storage_contract, block_io, root_device, user_device);
 
@@ -4723,9 +4761,11 @@ It defines the guest-side discovery hook, C probe source, self-contained C
 block-port ABI. The generated `/init` discovers the Pane storage contract,
 writes `/run/pane/native-storage.env`, waits for the declared root device,
 attempts to mount it at `/newroot`, moves proc/sys/dev into the new root, and
-executes the real Linux init once `/dev/pane0` exists. The generated
-`pane-block.c` is the early guest device contract that maps Pane's read-only
-base OS to `/dev/pane0` and the writable user disk to `/dev/pane1`.
+executes the real Linux init once `/dev/pane0` exists. If `pane-block.ko` is
+present in the initramfs, `/init` attempts to load it before waiting for the
+root device. The generated `pane-block.c` is the early guest device contract
+that maps Pane's read-only base OS to `/dev/pane0` and the writable user disk to
+`/dev/pane1`.
 
 Expected kernel arguments:
 
@@ -4755,6 +4795,7 @@ Expected serial-observable milestones:
 
 - `PANE_INITRAMFS_DISCOVERY_START`
 - `PANE_BLOCK_IO_PROBE_OK`
+- `PANE_BLOCK_MODULE_NOT_PRESENT` or `PANE_BLOCK_MODULE_LOAD_OK`
 - `PANE_INITRAMFS_DISCOVERY_DONE`
 - `PANE_ROOT_MOUNT_ATTEMPT`
 - `PANE_ROOT_MOUNT_OK`
@@ -12291,6 +12332,9 @@ mod tests {
             std::fs::read_to_string(paths.initramfs_driver_dir.join("pane-init.c")).unwrap();
         assert!(init_source.contains("PANE_INITRAMFS_DISCOVERY_START"));
         assert!(init_source.contains("PANE_BLOCK_IO_PROBE_OK"));
+        assert!(init_source.contains("PANE_BLOCK_MODULE_LOAD_ATTEMPT"));
+        assert!(init_source.contains("PANE_BLOCK_MODULE_LOAD_OK"));
+        assert!(init_source.contains("PANE_BLOCK_MODULE_NOT_PRESENT"));
         assert!(init_source.contains("PANE_ROOT_MOUNT_ATTEMPT"));
         assert!(init_source.contains("PANE_ROOT_MOUNT_OK"));
         assert!(init_source.contains("execl(\"/sbin/init\""));

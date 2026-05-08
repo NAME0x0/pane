@@ -4275,6 +4275,8 @@ pane_storage_contract="$(pane_cmdline_value pane.storage_contract || true)"
 pane_block_io="$(pane_cmdline_value pane.block_io || true)"
 pane_root="$(pane_cmdline_value pane.root || true)"
 pane_user="$(pane_cmdline_value pane.user || true)"
+pane_framebuffer="$(pane_cmdline_value pane.framebuffer || true)"
+pane_input_queue="$(pane_cmdline_value pane.input_queue || true)"
 
 mkdir -p /run/pane
 cat > /run/pane/native-storage.env <<EOF
@@ -4282,6 +4284,8 @@ PANE_STORAGE_CONTRACT=$pane_storage_contract
 PANE_BLOCK_IO=$pane_block_io
 PANE_ROOT=$pane_root
 PANE_USER=$pane_user
+PANE_FRAMEBUFFER=$pane_framebuffer
+PANE_INPUT_QUEUE=$pane_input_queue
 PANE_BLOCK_IO_PROTOCOL={}
 PANE_BLOCK_IO_STATUS_OFFSET={}
 PANE_BLOCK_IO_DATA_OFFSET={}
@@ -4423,7 +4427,9 @@ static void write_native_storage_env(
     const char *storage_contract,
     const char *block_io,
     const char *root_device,
-    const char *user_device
+    const char *user_device,
+    const char *framebuffer,
+    const char *input_queue
 ) {
     mkdir_if_missing("/run", 0755);
     mkdir_if_missing("/run/pane", 0755);
@@ -4436,6 +4442,8 @@ static void write_native_storage_env(
     dprintf(fd, "PANE_BLOCK_IO=%s\n", block_io);
     dprintf(fd, "PANE_ROOT=%s\n", root_device);
     dprintf(fd, "PANE_USER=%s\n", user_device);
+    dprintf(fd, "PANE_FRAMEBUFFER=%s\n", framebuffer);
+    dprintf(fd, "PANE_INPUT_QUEUE=%s\n", input_queue);
     dprintf(fd, "PANE_BLOCK_IO_PROTOCOL=%s\n", PANE_BLOCK_IO_PROTOCOL);
     dprintf(fd, "PANE_BLOCK_IO_BASE_PORT=0x%x\n", PANE_BLOCK_IO_BASE_PORT);
     dprintf(fd, "PANE_BLOCK_IO_BLOCK_SIZE_BYTES=%u\n", PANE_BLOCK_IO_BLOCK_SIZE_BYTES);
@@ -4590,6 +4598,8 @@ int main(void) {
     char block_io[128] = {0};
     char root_device[128] = {0};
     char user_device[128] = {0};
+    char framebuffer[128] = {0};
+    char input_queue[128] = {0};
 
     com1_init();
     log_line("PANE_INITRAMFS_DISCOVERY_START");
@@ -4603,11 +4613,15 @@ int main(void) {
     find_arg(cmdline, "pane.block_io", block_io, sizeof(block_io));
     find_arg(cmdline, "pane.root", root_device, sizeof(root_device));
     find_arg(cmdline, "pane.user", user_device, sizeof(user_device));
+    find_arg(cmdline, "pane.framebuffer", framebuffer, sizeof(framebuffer));
+    find_arg(cmdline, "pane.input_queue", input_queue, sizeof(input_queue));
 
     log_key_value("pane.storage_contract", storage_contract);
     log_key_value("pane.block_io", block_io);
     log_key_value("pane.root", root_device);
     log_key_value("pane.user", user_device);
+    log_key_value("pane.framebuffer", framebuffer);
+    log_key_value("pane.input_queue", input_queue);
 
     if (storage_contract[0] == '\0' || block_io[0] == '\0' || root_device[0] == '\0') {
         log_line("PANE_INITRAMFS_DISCOVERY_FAILED");
@@ -4633,7 +4647,12 @@ int main(void) {
     log_line("PANE_BLOCK_IO_PROBE_OK");
     load_pane_block_module();
     log_line("PANE_INITRAMFS_DISCOVERY_DONE");
-    write_native_storage_env(storage_contract, block_io, root_device, user_device);
+    if (framebuffer[0] != '\0' && input_queue[0] != '\0') {
+        log_line("PANE_DISPLAY_CONTRACT_DISCOVERED");
+    } else {
+        log_line("PANE_DISPLAY_CONTRACT_MISSING");
+    }
+    write_native_storage_env(storage_contract, block_io, root_device, user_device, framebuffer, input_queue);
 
     log_line("PANE_ROOT_MOUNT_ATTEMPT");
     if (wait_for_device(root_device) != 0) {
@@ -5041,6 +5060,7 @@ Expected serial-observable milestones:
 - `PANE_BLOCK_IO_PROBE_OK`
 - `PANE_BLOCK_MODULE_NOT_PRESENT` or `PANE_BLOCK_MODULE_LOAD_OK`
 - `PANE_INITRAMFS_DISCOVERY_DONE`
+- `PANE_DISPLAY_CONTRACT_DISCOVERED`
 - `PANE_ROOT_MOUNT_ATTEMPT`
 - `PANE_ROOT_MOUNT_OK`
 - `PANE_INIT_EXEC`
@@ -5054,6 +5074,7 @@ fn pane_initramfs_expected_serial_milestones() -> Vec<String> {
         "PANE_BLOCK_IO_PROBE_OK".to_string(),
         "PANE_BLOCK_MODULE_LOAD_OK".to_string(),
         "PANE_INITRAMFS_DISCOVERY_DONE".to_string(),
+        "PANE_DISPLAY_CONTRACT_DISCOVERED".to_string(),
         "PANE_ROOT_MOUNT_ATTEMPT".to_string(),
         "PANE_ROOT_MOUNT_OK".to_string(),
         "PANE_INIT_EXEC".to_string(),
@@ -12655,6 +12676,8 @@ mod tests {
                 .unwrap();
         assert!(hook.contains("pane.storage_contract"));
         assert!(hook.contains("pane.block_io"));
+        assert!(hook.contains("pane.framebuffer"));
+        assert!(hook.contains("pane.input_queue"));
         let header =
             std::fs::read_to_string(paths.initramfs_driver_dir.join("pane-port-block.h")).unwrap();
         assert!(header.contains("#define PANE_BLOCK_IO_BASE_PORT 3328"));
@@ -12666,6 +12689,9 @@ mod tests {
         assert!(init_source.contains("PANE_BLOCK_MODULE_LOAD_ATTEMPT"));
         assert!(init_source.contains("PANE_BLOCK_MODULE_LOAD_OK"));
         assert!(init_source.contains("PANE_BLOCK_MODULE_NOT_PRESENT"));
+        assert!(init_source.contains("PANE_DISPLAY_CONTRACT_DISCOVERED"));
+        assert!(init_source.contains("PANE_FRAMEBUFFER"));
+        assert!(init_source.contains("PANE_INPUT_QUEUE"));
         assert!(init_source.contains("PANE_ROOT_MOUNT_ATTEMPT"));
         assert!(init_source.contains("PANE_ROOT_MOUNT_OK"));
         assert!(init_source.contains("execl(\"/sbin/init\""));

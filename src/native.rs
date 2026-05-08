@@ -3577,6 +3577,7 @@ mod windows_whp {
                 "PANE_BLOCK_IO_PROBE_OK".to_string(),
                 "PANE_BLOCK_MODULE_LOAD_OK".to_string(),
                 "PANE_INITRAMFS_DISCOVERY_DONE".to_string(),
+                "PANE_DISPLAY_CONTRACT_DISCOVERED".to_string(),
                 "PANE_ROOT_MOUNT_ATTEMPT".to_string(),
                 "PANE_ROOT_MOUNT_OK".to_string(),
                 "PANE_INIT_EXEC".to_string(),
@@ -3589,7 +3590,7 @@ mod windows_whp {
             assert!(!linux_entry_probe_passed(&report));
 
             report.serial_text = Some(
-                "PANE_INITRAMFS_DISCOVERY_START\nPANE_BLOCK_IO_PROBE_OK\nPANE_BLOCK_MODULE_LOAD_OK\nPANE_INITRAMFS_DISCOVERY_DONE\nPANE_ROOT_MOUNT_ATTEMPT\nPANE_ROOT_MOUNT_OK fs=ext4\nPANE_INIT_EXEC\n"
+                "PANE_INITRAMFS_DISCOVERY_START\nPANE_BLOCK_IO_PROBE_OK\nPANE_BLOCK_MODULE_LOAD_OK\nPANE_INITRAMFS_DISCOVERY_DONE\nPANE_DISPLAY_CONTRACT_DISCOVERED\nPANE_ROOT_MOUNT_ATTEMPT\nPANE_ROOT_MOUNT_OK fs=ext4\nPANE_INIT_EXEC\n"
                     .to_string(),
             );
             report.serial_markers_observed = serial_markers_observed(&report);

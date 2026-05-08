@@ -219,6 +219,7 @@ What exists today:
 - generated Pane initramfs driver source/build-script bundle with a self-contained discovery/root-handoff `/init`, a Pane block-driver source/build contract for `/dev/pane0` and `/dev/pane1`, a build/register path for the discovery cpio, and kernel-layout serial milestone gates for guest-side native storage discovery,
 - fixed linear framebuffer contract mapped into guest memory for the future Pane-rendered display path,
 - keyboard/pointer input queue contract mapped into guest memory for the future app-owned input path,
+- host-side framebuffer snapshot reporting for the mapped Pane framebuffer region after guarded WHP kernel-layout runs,
 - Linux bzImage setup header copying into boot params,
 - Pane runtime contract discovery arguments on the Linux kernel command line,
 - E820 memory map including boot params, GDT, initramfs, RAM, APIC stubs, framebuffer memory, and input queue memory,

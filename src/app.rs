@@ -10968,6 +10968,13 @@ fn print_native_boot_spike_report(report: &NativeBootSpikeReport) {
     if let Some(text) = &report.partition_smoke.serial_text {
         println!("  Serial Text    {:?}", text);
     }
+    if let Some(snapshot) = &report.partition_smoke.framebuffer_snapshot {
+        println!("  Framebuffer    {}", snapshot.label);
+        println!("  FB Guest GPA   {}", snapshot.guest_gpa);
+        println!("  FB Bytes       {}", snapshot.bytes);
+        println!("  FB Nonzero     {}", snapshot.nonzero_bytes);
+        println!("  FB All Zero    {}", yes_no(snapshot.all_zero));
+    }
     println!(
         "  vCPU Deleted   {}",
         yes_no(report.partition_smoke.virtual_processor_deleted)

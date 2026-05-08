@@ -635,6 +635,10 @@ struct InputContract {
     guest_queue_gpa: String,
     queue_size_bytes: u64,
     event_record_bytes: u32,
+    #[serde(default = "default_input_queue_header_bytes")]
+    queue_header_bytes: u32,
+    #[serde(default = "default_input_queue_magic")]
+    queue_magic: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3327,7 +3331,17 @@ fn default_input_contract() -> InputContract {
         guest_queue_gpa: "0x0dff0000".to_string(),
         queue_size_bytes: 0x00001000,
         event_record_bytes: 32,
+        queue_header_bytes: default_input_queue_header_bytes(),
+        queue_magic: default_input_queue_magic(),
     }
+}
+
+fn default_input_queue_header_bytes() -> u32 {
+    64
+}
+
+fn default_input_queue_magic() -> String {
+    "PANEINQ1".to_string()
 }
 
 fn write_framebuffer_contract(paths: &RuntimePaths) -> AppResult<()> {
@@ -6079,15 +6093,24 @@ fn linux_guest_mapped_regions(
                 "storage-contract" | "framebuffer" | "input-queue" => range.label.clone(),
                 _ => format!("linux-{}", range.label),
             };
-            let bytes = if range.region_type == "storage-contract" {
-                layout
+            let bytes = match range.region_type.as_str() {
+                "storage-contract" => layout
                     .storage
                     .as_ref()
                     .map(storage_contract_page_bytes)
                     .transpose()?
-                    .unwrap_or_else(|| vec![0_u8; size])
-            } else {
-                vec![0_u8; size]
+                    .unwrap_or_else(|| vec![0_u8; size]),
+                "input-queue" => layout
+                    .input
+                    .as_ref()
+                    .map(|input| input_queue_page_bytes(input, size))
+                    .transpose()?
+                    .ok_or_else(|| {
+                        AppError::message(
+                            "Kernel layout maps a Pane input queue but has no input contract.",
+                        )
+                    })?,
+                _ => vec![0_u8; size],
             };
             Ok(crate::native::NativeGuestMemoryRegion {
                 label,
@@ -6110,6 +6133,54 @@ fn storage_contract_page_bytes(storage: &KernelStorageAttachment) -> AppResult<V
         ));
     }
     page[..payload.len()].copy_from_slice(&payload);
+    Ok(page)
+}
+
+fn input_queue_page_bytes(input: &InputContract, size: usize) -> AppResult<Vec<u8>> {
+    let header_bytes = input.queue_header_bytes as usize;
+    let queue_size: usize = input
+        .queue_size_bytes
+        .try_into()
+        .map_err(|_| AppError::message("Pane input queue is too large to map on this host."))?;
+    let record_bytes = input.event_record_bytes as usize;
+    let magic = input.queue_magic.as_bytes();
+
+    if magic.len() != 8 {
+        return Err(AppError::message(
+            "Pane input queue magic must be exactly 8 bytes.",
+        ));
+    }
+    if header_bytes < 64 {
+        return Err(AppError::message(
+            "Pane input queue header must be at least 64 bytes.",
+        ));
+    }
+    if record_bytes == 0 {
+        return Err(AppError::message(
+            "Pane input queue event record size must be greater than zero.",
+        ));
+    }
+    if queue_size > size {
+        return Err(AppError::message(
+            "Pane input queue contract is larger than the mapped guest page.",
+        ));
+    }
+    if queue_size < header_bytes + record_bytes {
+        return Err(AppError::message(
+            "Pane input queue must have room for its header and at least one event record.",
+        ));
+    }
+
+    let capacity_records = ((queue_size - header_bytes) / record_bytes) as u64;
+    let mut page = vec![0_u8; size];
+    page[0..8].copy_from_slice(magic);
+    page[8..12].copy_from_slice(&input.schema_version.to_le_bytes());
+    page[12..16].copy_from_slice(&input.queue_header_bytes.to_le_bytes());
+    page[16..24].copy_from_slice(&input.queue_size_bytes.to_le_bytes());
+    page[24..28].copy_from_slice(&input.event_record_bytes.to_le_bytes());
+    page[32..40].copy_from_slice(&0_u64.to_le_bytes());
+    page[40..48].copy_from_slice(&0_u64.to_le_bytes());
+    page[48..56].copy_from_slice(&capacity_records.to_le_bytes());
     Ok(page)
 }
 
@@ -6166,7 +6237,13 @@ fn augment_kernel_cmdline_for_runtime_contracts(
     );
     append_kernel_arg(
         &mut cmdline,
-        format!("pane.input_queue={}", input.guest_queue_gpa),
+        format!(
+            "pane.input_queue={},{},{},{}",
+            input.guest_queue_gpa,
+            input.queue_size_bytes,
+            input.event_record_bytes,
+            input.queue_header_bytes
+        ),
     );
     validate_kernel_cmdline(&cmdline)?;
     Ok(cmdline)
@@ -7665,6 +7742,8 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
                 && contract.coordinate_space == "framebuffer-pixels"
                 && contract.queue_size_bytes >= u64::from(contract.event_record_bytes)
                 && contract.event_record_bytes > 0
+                && contract.queue_header_bytes >= 64
+                && contract.queue_magic == default_input_queue_magic()
                 && parse_guest_physical_address(&contract.guest_queue_gpa).is_ok()
         })
         .unwrap_or(false);
@@ -7763,6 +7842,9 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
                         && contract.pointer_device == "pane-absolute-pointer-v1"
                         && contract.guest_queue_gpa == "0x0dff0000"
                         && contract.queue_size_bytes == 0x00001000
+                        && contract.event_record_bytes == 32
+                        && contract.queue_header_bytes == default_input_queue_header_bytes()
+                        && contract.queue_magic == default_input_queue_magic()
                 })
         })
         .unwrap_or(false);
@@ -10828,6 +10910,8 @@ fn print_native_kernel_plan_report(report: &NativeKernelPlanReport) {
             println!("  Pointer        {}", input.pointer_device);
             println!("  Queue GPA      {}", input.guest_queue_gpa);
             println!("  Queue Bytes    {}", input.queue_size_bytes);
+            println!("  Queue Header   {}", input.queue_header_bytes);
+            println!("  Queue Magic    {}", input.queue_magic);
         }
         println!("  Serial Device  {}", layout.expected_serial_device);
         println!("  Cmdline        {:?}", layout.cmdline);
@@ -11522,7 +11606,7 @@ mod tests {
         create_user_disk_snapshot, default_framebuffer_contract, default_input_contract,
         default_linux_guest_memory_map, determine_app_lifecycle, ensure_wsl_conf_setting,
         execute_native_block_io_command, export_user_disk_package, format_doctor_blockers,
-        import_user_disk_package, initialize_managed_arch_environment,
+        import_user_disk_package, initialize_managed_arch_environment, input_queue_page_bytes,
         inspect_kernel_image_artifact, inspect_workspace, inventory_contains_distro,
         kernel_layout_execution_image, linux_guest_mapped_regions,
         load_kernel_layout_boot_image_artifact, load_verified_pane_block_module_metadata,
@@ -12302,9 +12386,41 @@ mod tests {
             region.label == "pane-input-queue"
                 && region.guest_gpa == 0x0dff_0000
                 && region.bytes.len() == 0x0000_1000
+                && &region.bytes[0..8] == b"PANEINQ1"
+                && &region.bytes[8..12] == &1_u32.to_le_bytes()
+                && &region.bytes[12..16] == &64_u32.to_le_bytes()
+                && &region.bytes[16..24] == &0x1000_u64.to_le_bytes()
+                && &region.bytes[24..28] == &32_u32.to_le_bytes()
                 && region.writable
                 && !region.executable
         }));
+    }
+
+    #[test]
+    fn input_queue_page_bytes_writes_stable_abi_header() {
+        let input = default_input_contract();
+        let page = input_queue_page_bytes(&input, input.queue_size_bytes as usize).unwrap();
+
+        assert_eq!(&page[0..8], b"PANEINQ1");
+        assert_eq!(
+            u32::from_le_bytes(page[8..12].try_into().unwrap()),
+            input.schema_version
+        );
+        assert_eq!(
+            u32::from_le_bytes(page[12..16].try_into().unwrap()),
+            input.queue_header_bytes
+        );
+        assert_eq!(
+            u64::from_le_bytes(page[16..24].try_into().unwrap()),
+            input.queue_size_bytes
+        );
+        assert_eq!(
+            u32::from_le_bytes(page[24..28].try_into().unwrap()),
+            input.event_record_bytes
+        );
+        assert_eq!(u64::from_le_bytes(page[32..40].try_into().unwrap()), 0);
+        assert_eq!(u64::from_le_bytes(page[40..48].try_into().unwrap()), 0);
+        assert_eq!(u64::from_le_bytes(page[48..56].try_into().unwrap()), 126);
     }
 
     #[test]
@@ -13158,7 +13274,9 @@ mod tests {
         assert!(layout
             .cmdline
             .contains("pane.framebuffer=0x0e000000,1024,768,32,x8r8g8b8"));
-        assert!(layout.cmdline.contains("pane.input_queue=0x0dff0000"));
+        assert!(layout
+            .cmdline
+            .contains("pane.input_queue=0x0dff0000,4096,32,64"));
         assert!(storage.readonly_base);
         assert!(storage.writable_user_disk);
         assert_eq!(storage.root_handoff.mode, "base-device");

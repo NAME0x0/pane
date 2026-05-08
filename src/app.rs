@@ -6327,6 +6327,9 @@ fn build_linux_boot_params_page(
         );
     }
 
+    if let Some(framebuffer) = &layout.framebuffer {
+        write_linux_screen_info(&mut boot_params, framebuffer)?;
+    }
     write_linux_e820_table(&mut boot_params, &layout.guest_memory_map)?;
 
     Ok(boot_params)
@@ -6366,6 +6369,56 @@ fn linux_setup_header_end(kernel_bytes: &[u8]) -> AppResult<usize> {
         )));
     }
     Ok(header_end)
+}
+
+fn write_linux_screen_info(
+    boot_params: &mut [u8],
+    framebuffer: &FramebufferContract,
+) -> AppResult<()> {
+    let width: u16 = framebuffer
+        .width
+        .try_into()
+        .map_err(|_| AppError::message("Framebuffer width is too large for Linux screen_info."))?;
+    let height: u16 = framebuffer
+        .height
+        .try_into()
+        .map_err(|_| AppError::message("Framebuffer height is too large for Linux screen_info."))?;
+    let depth: u16 = (framebuffer.bytes_per_pixel * 8)
+        .try_into()
+        .map_err(|_| AppError::message("Framebuffer depth is too large for Linux screen_info."))?;
+    let stride: u16 = framebuffer
+        .stride_bytes
+        .try_into()
+        .map_err(|_| AppError::message("Framebuffer stride is too large for Linux screen_info."))?;
+    let lfb_size: u32 = framebuffer
+        .size_bytes
+        .try_into()
+        .map_err(|_| AppError::message("Framebuffer size is too large for Linux screen_info."))?;
+
+    boot_params[0x0f] = 0x23;
+    write_u16_le(boot_params, 0x12, width);
+    write_u16_le(boot_params, 0x14, height);
+    write_u16_le(boot_params, 0x16, depth);
+    write_u32_le(
+        boot_params,
+        0x18,
+        checked_u32_gpa(&framebuffer.guest_gpa, "framebuffer")?,
+    );
+    write_u32_le(boot_params, 0x1c, lfb_size);
+    write_u16_le(boot_params, 0x24, stride);
+
+    if framebuffer.format == "x8r8g8b8" {
+        boot_params[0x26] = 8;
+        boot_params[0x27] = 16;
+        boot_params[0x28] = 8;
+        boot_params[0x29] = 8;
+        boot_params[0x2a] = 8;
+        boot_params[0x2b] = 0;
+        boot_params[0x2c] = 8;
+        boot_params[0x2d] = 24;
+    }
+
+    Ok(())
 }
 
 fn write_linux_e820_table(
@@ -12212,6 +12265,21 @@ mod tests {
         assert_eq!(page[0x234], 1);
         assert_eq!(&page[0x236..0x238], &0x0001_u16.to_le_bytes());
         assert_eq!(&page[0x258..0x260], &0x0100_0000_u64.to_le_bytes());
+        assert_eq!(page[0x0f], 0x23);
+        assert_eq!(&page[0x12..0x14], &1024_u16.to_le_bytes());
+        assert_eq!(&page[0x14..0x16], &768_u16.to_le_bytes());
+        assert_eq!(&page[0x16..0x18], &32_u16.to_le_bytes());
+        assert_eq!(&page[0x18..0x1c], &0x0e00_0000_u32.to_le_bytes());
+        assert_eq!(&page[0x1c..0x20], &0x0030_0000_u32.to_le_bytes());
+        assert_eq!(&page[0x24..0x26], &4096_u16.to_le_bytes());
+        assert_eq!(page[0x26], 8);
+        assert_eq!(page[0x27], 16);
+        assert_eq!(page[0x28], 8);
+        assert_eq!(page[0x29], 8);
+        assert_eq!(page[0x2a], 8);
+        assert_eq!(page[0x2b], 0);
+        assert_eq!(page[0x2c], 8);
+        assert_eq!(page[0x2d], 24);
         assert_eq!(&page[0x228..0x22c], &0x0002_0000_u32.to_le_bytes());
         assert_eq!(&page[0x218..0x21c], &0x0400_0000_u32.to_le_bytes());
         assert_eq!(&page[0x21c..0x220], &1234_u32.to_le_bytes());

@@ -5052,7 +5052,11 @@ fn pane_initramfs_expected_serial_milestones() -> Vec<String> {
     vec![
         "PANE_INITRAMFS_DISCOVERY_START".to_string(),
         "PANE_BLOCK_IO_PROBE_OK".to_string(),
+        "PANE_BLOCK_MODULE_LOAD_OK".to_string(),
         "PANE_INITRAMFS_DISCOVERY_DONE".to_string(),
+        "PANE_ROOT_MOUNT_ATTEMPT".to_string(),
+        "PANE_ROOT_MOUNT_OK".to_string(),
+        "PANE_INIT_EXEC".to_string(),
     ]
 }
 

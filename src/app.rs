@@ -7781,6 +7781,7 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
                 && contract.width > 0
                 && contract.height > 0
                 && contract.bytes_per_pixel == 4
+                && contract.format == "x8r8g8b8"
                 && contract.stride_bytes == contract.width * contract.bytes_per_pixel
                 && contract.size_bytes
                     == u64::from(contract.stride_bytes) * u64::from(contract.height)
@@ -7890,6 +7891,7 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
                 && layout.framebuffer.as_ref().is_some_and(|contract| {
                     contract.schema_version == 1
                         && contract.device == "pane-linear-framebuffer-v1"
+                        && contract.format == "x8r8g8b8"
                         && contract.size_bytes
                             == u64::from(contract.stride_bytes) * u64::from(contract.height)
                 })
@@ -11966,6 +11968,21 @@ mod tests {
             std::fs::read(&paths.serial_boot_image).unwrap(),
             crate::native::serial_boot_test_image_bytes()
         );
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn runtime_artifacts_reject_unsupported_framebuffer_format() {
+        let paths = temp_runtime_paths("unsupported-framebuffer-format");
+        super::prepare_runtime_paths(&paths).unwrap();
+        let mut framebuffer = default_framebuffer_contract();
+        framebuffer.format = "r5g6b5".to_string();
+        write_json_file(&paths.framebuffer_contract, &framebuffer).unwrap();
+
+        let artifacts = build_runtime_artifact_report(&paths);
+        assert!(artifacts.framebuffer_contract_exists);
+        assert!(!artifacts.framebuffer_contract_ready);
 
         let _ = std::fs::remove_dir_all(&paths.root);
     }

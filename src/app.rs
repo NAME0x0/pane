@@ -6375,6 +6375,13 @@ fn write_linux_screen_info(
     boot_params: &mut [u8],
     framebuffer: &FramebufferContract,
 ) -> AppResult<()> {
+    if framebuffer.format != "x8r8g8b8" {
+        return Err(AppError::message(format!(
+            "Framebuffer format `{}` cannot be advertised through Linux screen_info yet.",
+            framebuffer.format
+        )));
+    }
+
     let width: u16 = framebuffer
         .width
         .try_into()
@@ -6406,17 +6413,14 @@ fn write_linux_screen_info(
     );
     write_u32_le(boot_params, 0x1c, lfb_size);
     write_u16_le(boot_params, 0x24, stride);
-
-    if framebuffer.format == "x8r8g8b8" {
-        boot_params[0x26] = 8;
-        boot_params[0x27] = 16;
-        boot_params[0x28] = 8;
-        boot_params[0x29] = 8;
-        boot_params[0x2a] = 8;
-        boot_params[0x2b] = 0;
-        boot_params[0x2c] = 8;
-        boot_params[0x2d] = 24;
-    }
+    boot_params[0x26] = 8;
+    boot_params[0x27] = 16;
+    boot_params[0x28] = 8;
+    boot_params[0x29] = 8;
+    boot_params[0x2a] = 8;
+    boot_params[0x2b] = 0;
+    boot_params[0x2c] = 8;
+    boot_params[0x2d] = 24;
 
     Ok(())
 }
@@ -12326,6 +12330,54 @@ mod tests {
             &page[local_apic_offset + 16..local_apic_offset + 20],
             &2_u32.to_le_bytes()
         );
+    }
+
+    #[test]
+    fn linux_boot_params_rejects_unsupported_framebuffer_format() {
+        let mut framebuffer = default_framebuffer_contract();
+        framebuffer.format = "r5g6b5".to_string();
+        let layout = KernelBootLayout {
+            schema_version: 1,
+            layout_kind: "pane-linux-kernel-boot-layout-v1".to_string(),
+            session_name: "pane".to_string(),
+            boot_params_gpa: "0x00007000".to_string(),
+            cmdline_gpa: "0x00020000".to_string(),
+            kernel_load_gpa: "0x00100000".to_string(),
+            initramfs_load_gpa: None,
+            kernel_path: "kernel".to_string(),
+            kernel_bytes: 4096,
+            kernel_sha256: "0".repeat(64),
+            kernel_format: "linux-bzimage".to_string(),
+            linux_boot_protocol: Some("0x020f".to_string()),
+            linux_setup_sectors: Some(4),
+            linux_setup_bytes: Some(2560),
+            linux_protected_mode_offset: Some(2560),
+            linux_protected_mode_bytes: Some(1536),
+            linux_loadflags: Some(0x80),
+            linux_preferred_load_address: Some("0x0000000001000000".to_string()),
+            linux_entry_point_gpa: Some("0x00100000".to_string()),
+            linux_boot_params_register: Some("rsi".to_string()),
+            linux_expected_entry_mode: Some("x86-protected-mode-32".to_string()),
+            guest_memory_map: default_linux_guest_memory_map(0),
+            initramfs_path: None,
+            initramfs_bytes: None,
+            initramfs_sha256: None,
+            cmdline: "console=ttyS0 panic=-1".to_string(),
+            expected_serial_device: "ttyS0".to_string(),
+            expected_serial_milestones: Vec::new(),
+            storage: None,
+            initramfs_driver: None,
+            framebuffer: Some(framebuffer),
+            input: Some(default_input_contract()),
+            materialized_at_epoch_seconds: Some(1),
+            notes: Vec::new(),
+        };
+
+        let kernel = fake_linux_bzimage();
+        let error = build_linux_boot_params_page(&layout, Some(&kernel)).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("cannot be advertised through Linux screen_info"));
     }
 
     #[test]

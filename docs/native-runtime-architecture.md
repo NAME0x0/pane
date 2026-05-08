@@ -25,7 +25,7 @@ Pane currently owns:
 - a verified kernel/initramfs boot-plan contract with a serial-console cmdline for the next WHP kernel-entry milestone,
 - a materialized kernel boot-layout contract for boot params, cmdline, kernel, and optional initramfs guest-memory placement,
 - a materialized storage attachment in the kernel layout when the verified Arch base image and Pane user disk are present, including a guest-mapped storage contract page, Pane block-port ABI discovery, root handoff decision, sparse disk geometry, and header verification data,
-- a first Pane-owned framebuffer contract mapped into guest memory for the future app-rendered display boundary, plus host-side framebuffer snapshot reporting after guarded WHP runs,
+- a first Pane-owned framebuffer contract and input queue mapped into guest memory for the future app-rendered display boundary, plus host-side framebuffer/input snapshot reporting after guarded WHP runs,
 - a first keyboard/pointer input queue contract mapped into guest memory for the future app-owned input path,
 - Pane runtime contract discovery arguments added to the Linux kernel command line for early boot consumers,
 - native host preflight through `pane native-preflight`,

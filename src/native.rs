@@ -580,6 +580,7 @@ pub(crate) struct NativePartitionSmokeReport {
     pub(crate) serial_markers_observed: bool,
     pub(crate) serial_io_exit_count: u32,
     pub(crate) framebuffer_snapshot: Option<NativeFramebufferSnapshotReport>,
+    pub(crate) input_queue_snapshot: Option<NativeInputQueueSnapshotReport>,
     pub(crate) halt_observed: bool,
     pub(crate) calls: Vec<NativeWhpCallReport>,
     pub(crate) blocker: Option<String>,
@@ -598,6 +599,16 @@ pub(crate) struct NativeGuestRegionReport {
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct NativeFramebufferSnapshotReport {
+    pub(crate) label: String,
+    pub(crate) guest_gpa: String,
+    pub(crate) bytes: u64,
+    pub(crate) nonzero_bytes: u64,
+    pub(crate) first_nonzero_offset: Option<u64>,
+    pub(crate) all_zero: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct NativeInputQueueSnapshotReport {
     pub(crate) label: String,
     pub(crate) guest_gpa: String,
     pub(crate) bytes: u64,
@@ -921,6 +932,7 @@ fn planned_partition_smoke_report(run_fixture: bool) -> NativePartitionSmokeRepo
         serial_markers_observed: false,
         serial_io_exit_count: 0,
         framebuffer_snapshot: None,
+        input_queue_snapshot: None,
         halt_observed: false,
         calls: Vec::new(),
         blocker: None,
@@ -980,6 +992,7 @@ fn skipped_partition_smoke_report(
         serial_markers_observed: false,
         serial_io_exit_count: 0,
         framebuffer_snapshot: None,
+        input_queue_snapshot: None,
         halt_observed: false,
         calls: Vec::new(),
         blocker: Some(blocker.into()),
@@ -1056,10 +1069,11 @@ mod windows_whp {
     use super::{
         base_export_checks, NativeBlockIoHandler, NativeExportCheck,
         NativeFramebufferSnapshotReport, NativeGuestEntryMode, NativeGuestMemoryRegion,
-        NativeGuestRegionReport, NativePartitionSmokeReport, NativePartitionSmokeStatus,
-        NativeSerialBootImage, NativeWhpCallReport, WhpPreflightReport, LINUX_BOOT_CODE_SELECTOR,
-        LINUX_BOOT_DATA_SELECTOR, LINUX_BOOT_GDT_GPA, LINUX_BOOT_STACK_GPA, REQUIRED_WHP_EXPORTS,
-        SERIAL_BOOT_BANNER_TEXT, SERIAL_BOOT_TEST_IMAGE_SIZE,
+        NativeGuestRegionReport, NativeInputQueueSnapshotReport, NativePartitionSmokeReport,
+        NativePartitionSmokeStatus, NativeSerialBootImage, NativeWhpCallReport, WhpPreflightReport,
+        LINUX_BOOT_CODE_SELECTOR, LINUX_BOOT_DATA_SELECTOR, LINUX_BOOT_GDT_GPA,
+        LINUX_BOOT_STACK_GPA, REQUIRED_WHP_EXPORTS, SERIAL_BOOT_BANNER_TEXT,
+        SERIAL_BOOT_TEST_IMAGE_SIZE,
     };
     use crate::native::{
         native_block_io_exit_can_resume, pane_block_io_port_offset,
@@ -1282,6 +1296,7 @@ mod windows_whp {
             serial_markers_observed: false,
             serial_io_exit_count: 0,
             framebuffer_snapshot: None,
+            input_queue_snapshot: None,
             halt_observed: false,
             calls: Vec::new(),
             blocker: None,
@@ -1549,7 +1564,7 @@ mod windows_whp {
             }
 
             if run_fixture && report.memory_mapped {
-                capture_framebuffer_snapshot(&guest_regions, &mut report);
+                capture_runtime_surface_snapshots(&guest_regions, &mut report);
             }
 
             if run_fixture && report.memory_mapped {
@@ -1896,30 +1911,72 @@ mod windows_whp {
         })
     }
 
-    fn capture_framebuffer_snapshot(
+    fn input_queue_snapshot_report(
+        label: &str,
+        guest_gpa: u64,
+        bytes: &[u8],
+    ) -> Option<NativeInputQueueSnapshotReport> {
+        if label != "pane-input-queue" {
+            return None;
+        }
+        let nonzero_bytes = bytes.iter().filter(|byte| **byte != 0).count() as u64;
+        let first_nonzero_offset = bytes
+            .iter()
+            .position(|byte| *byte != 0)
+            .map(|offset| offset as u64);
+        Some(NativeInputQueueSnapshotReport {
+            label: label.to_string(),
+            guest_gpa: format!("{guest_gpa:#010x}"),
+            bytes: bytes.len() as u64,
+            nonzero_bytes,
+            first_nonzero_offset,
+            all_zero: nonzero_bytes == 0,
+        })
+    }
+
+    fn capture_runtime_surface_snapshots(
         mapped_regions: &[MappedGuestRegion],
         report: &mut NativePartitionSmokeReport,
     ) {
-        if report.framebuffer_snapshot.is_some() {
-            return;
-        }
         for region in mapped_regions {
-            if let Some(snapshot) = framebuffer_snapshot_report(
-                &region.label,
-                region.guest_gpa,
-                region._memory.as_slice(),
-            ) {
-                report.calls.push(NativeWhpCallReport {
-                    name: "PaneFramebufferSnapshot",
-                    hresult: None,
-                    ok: true,
-                    detail: format!(
-                        "Captured {} bytes from `{}` at {}; nonzero_bytes={}.",
-                        snapshot.bytes, snapshot.label, snapshot.guest_gpa, snapshot.nonzero_bytes
-                    ),
-                });
-                report.framebuffer_snapshot = Some(snapshot);
-                return;
+            let bytes = region._memory.as_slice();
+            if report.framebuffer_snapshot.is_none() {
+                if let Some(snapshot) =
+                    framebuffer_snapshot_report(&region.label, region.guest_gpa, bytes)
+                {
+                    report.calls.push(NativeWhpCallReport {
+                        name: "PaneFramebufferSnapshot",
+                        hresult: None,
+                        ok: true,
+                        detail: format!(
+                            "Captured {} bytes from `{}` at {}; nonzero_bytes={}.",
+                            snapshot.bytes,
+                            snapshot.label,
+                            snapshot.guest_gpa,
+                            snapshot.nonzero_bytes
+                        ),
+                    });
+                    report.framebuffer_snapshot = Some(snapshot);
+                }
+            }
+            if report.input_queue_snapshot.is_none() {
+                if let Some(snapshot) =
+                    input_queue_snapshot_report(&region.label, region.guest_gpa, bytes)
+                {
+                    report.calls.push(NativeWhpCallReport {
+                        name: "PaneInputQueueSnapshot",
+                        hresult: None,
+                        ok: true,
+                        detail: format!(
+                            "Captured {} bytes from `{}` at {}; nonzero_bytes={}.",
+                            snapshot.bytes,
+                            snapshot.label,
+                            snapshot.guest_gpa,
+                            snapshot.nonzero_bytes
+                        ),
+                    });
+                    report.input_queue_snapshot = Some(snapshot);
+                }
             }
         }
     }
@@ -3179,13 +3236,13 @@ mod windows_whp {
     mod tests {
         use super::{
             decode_exit_context, framebuffer_snapshot_report, guest_contract_passed,
-            linux_entry_probe_detail, linux_entry_probe_passed, linux_protected_mode_registers,
-            serial_contract_passed, serial_markers_observed, Com1SerialState, DecodedExit,
-            CPUID_DEFAULT_RAX_OFFSET, CPUID_DEFAULT_RBX_OFFSET, CPUID_DEFAULT_RCX_OFFSET,
-            CPUID_DEFAULT_RDX_OFFSET, CPUID_RAX_OFFSET, CPUID_RCX_OFFSET, IO_ACCESS_INFO_OFFSET,
-            IO_PORT_OFFSET, IO_RAX_OFFSET, MEMORY_ACCESS_INFO_OFFSET, MEMORY_GPA_OFFSET,
-            MEMORY_GVA_OFFSET, MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET, MSR_RAX_OFFSET,
-            MSR_RDX_OFFSET, SERIAL_COM1_PORT, VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET,
+            input_queue_snapshot_report, linux_entry_probe_detail, linux_entry_probe_passed,
+            linux_protected_mode_registers, serial_contract_passed, serial_markers_observed,
+            Com1SerialState, DecodedExit, CPUID_DEFAULT_RAX_OFFSET, CPUID_DEFAULT_RBX_OFFSET,
+            CPUID_DEFAULT_RCX_OFFSET, CPUID_DEFAULT_RDX_OFFSET, CPUID_RAX_OFFSET, CPUID_RCX_OFFSET,
+            IO_ACCESS_INFO_OFFSET, IO_PORT_OFFSET, IO_RAX_OFFSET, MEMORY_ACCESS_INFO_OFFSET,
+            MEMORY_GPA_OFFSET, MEMORY_GVA_OFFSET, MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET,
+            MSR_RAX_OFFSET, MSR_RDX_OFFSET, SERIAL_COM1_PORT, VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET,
             VP_CONTEXT_RIP_OFFSET, WHV_REGISTER_CR0, WHV_REGISTER_CR3, WHV_REGISTER_CR4,
             WHV_REGISTER_CS, WHV_REGISTER_DS, WHV_REGISTER_ES, WHV_REGISTER_GDTR,
             WHV_REGISTER_IDTR, WHV_REGISTER_RBP, WHV_REGISTER_RBX, WHV_REGISTER_RDI,
@@ -3602,6 +3659,7 @@ mod windows_whp {
                 serial_markers_observed: false,
                 serial_io_exit_count: 0,
                 framebuffer_snapshot: None,
+                input_queue_snapshot: None,
                 halt_observed: false,
                 calls: Vec::new(),
                 blocker: None,
@@ -3689,6 +3747,20 @@ mod windows_whp {
             assert_eq!(snapshot.first_nonzero_offset, Some(2));
             assert!(!snapshot.all_zero);
             assert!(framebuffer_snapshot_report("pane-input-queue", 0x0dff_0000, &[1]).is_none());
+        }
+
+        #[test]
+        fn input_queue_snapshot_reports_host_event_boundary() {
+            let snapshot = input_queue_snapshot_report("pane-input-queue", 0x0dff_0000, &[0, 3, 0])
+                .expect("input queue snapshot");
+
+            assert_eq!(snapshot.label, "pane-input-queue");
+            assert_eq!(snapshot.guest_gpa, "0x0dff0000");
+            assert_eq!(snapshot.bytes, 3);
+            assert_eq!(snapshot.nonzero_bytes, 1);
+            assert_eq!(snapshot.first_nonzero_offset, Some(1));
+            assert!(!snapshot.all_zero);
+            assert!(input_queue_snapshot_report("pane-framebuffer", 0x0e00_0000, &[1]).is_none());
         }
 
         #[test]

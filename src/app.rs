@@ -10975,6 +10975,13 @@ fn print_native_boot_spike_report(report: &NativeBootSpikeReport) {
         println!("  FB Nonzero     {}", snapshot.nonzero_bytes);
         println!("  FB All Zero    {}", yes_no(snapshot.all_zero));
     }
+    if let Some(snapshot) = &report.partition_smoke.input_queue_snapshot {
+        println!("  Input Queue    {}", snapshot.label);
+        println!("  Input GPA      {}", snapshot.guest_gpa);
+        println!("  Input Bytes    {}", snapshot.bytes);
+        println!("  Input Nonzero  {}", snapshot.nonzero_bytes);
+        println!("  Input All Zero {}", yes_no(snapshot.all_zero));
+    }
     println!(
         "  vCPU Deleted   {}",
         yes_no(report.partition_smoke.virtual_processor_deleted)

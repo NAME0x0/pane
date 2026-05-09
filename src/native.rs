@@ -1089,7 +1089,9 @@ mod windows_whp {
     const WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS: u32 = 0x0000_0002;
     const WHV_RUN_VP_EXIT_REASON_UNRECOVERABLE_EXCEPTION: u32 = 0x0000_0004;
     const WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE: u32 = 0x0000_0005;
+    const WHV_RUN_VP_EXIT_REASON_X64_INTERRUPT_WINDOW: u32 = 0x0000_0007;
     const WHV_RUN_VP_EXIT_REASON_X64_HALT: u32 = 0x0000_0008;
+    const WHV_RUN_VP_EXIT_REASON_X64_APIC_EOI: u32 = 0x0000_0009;
     const WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS: u32 = 0x0000_1000;
     const WHV_RUN_VP_EXIT_REASON_X64_CPUID: u32 = 0x0000_1001;
     const GUEST_PAGE_SIZE: usize = SERIAL_BOOT_TEST_IMAGE_SIZE;
@@ -2282,6 +2284,8 @@ mod windows_whp {
                 }
                 DecodedExit::MsrAccess { .. } => break,
                 DecodedExit::Cpuid { .. } => break,
+                DecodedExit::InterruptWindow => break,
+                DecodedExit::ApicEoi => break,
                 DecodedExit::Other => break,
             }
 
@@ -2569,6 +2573,26 @@ mod windows_whp {
                     ) {
                         break;
                     }
+                }
+                DecodedExit::InterruptWindow => {
+                    report.calls.push(NativeWhpCallReport {
+                        name: "InterruptWindowResumed",
+                        hresult: None,
+                        ok: true,
+                        detail:
+                            "Guest reached an interrupt-window exit; Pane has no pending interrupt to inject and will resume the vCPU."
+                                .to_string(),
+                    });
+                }
+                DecodedExit::ApicEoi => {
+                    report.calls.push(NativeWhpCallReport {
+                        name: "ApicEoiObserved",
+                        hresult: None,
+                        ok: true,
+                        detail:
+                            "Guest reached an APIC EOI exit; Pane observed it and will resume the vCPU."
+                                .to_string(),
+                    });
                 }
                 DecodedExit::Other => break,
             }
@@ -2950,6 +2974,14 @@ mod windows_whp {
                     .calls
                     .iter()
                     .any(|call| matches!(call.name, "MsrRead" | "MsrWrite") && call.ok),
+                Some(WHV_RUN_VP_EXIT_REASON_X64_INTERRUPT_WINDOW) => report
+                    .calls
+                    .iter()
+                    .any(|call| call.name == "InterruptWindowResumed" && call.ok),
+                Some(WHV_RUN_VP_EXIT_REASON_X64_APIC_EOI) => report
+                    .calls
+                    .iter()
+                    .any(|call| call.name == "ApicEoiObserved" && call.ok),
                 _ => true,
             }
     }
@@ -2991,6 +3023,12 @@ mod windows_whp {
                 }
                 Some(WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS) => {
                     "inspect MSR state handling and guest RIP advancement"
+                }
+                Some(WHV_RUN_VP_EXIT_REASON_X64_INTERRUPT_WINDOW) => {
+                    "resume the vCPU or inject a queued interrupt when Pane owns timer delivery"
+                }
+                Some(WHV_RUN_VP_EXIT_REASON_X64_APIC_EOI) => {
+                    "resume the vCPU after observing APIC end-of-interrupt"
                 }
                 Some(WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE) => {
                     "correct the protected-mode register setup"
@@ -3041,6 +3079,8 @@ mod windows_whp {
             default_rcx: u64,
             default_rdx: u64,
         },
+        InterruptWindow,
+        ApicEoi,
         Other,
     }
 
@@ -3167,6 +3207,24 @@ mod windows_whp {
                 default_rcx,
                 default_rdx,
             }
+        } else if exit_reason == WHV_RUN_VP_EXIT_REASON_X64_INTERRUPT_WINDOW {
+            report.calls.push(NativeWhpCallReport {
+                name: "DecodeX64InterruptWindow",
+                hresult: None,
+                ok: true,
+                detail:
+                    "Guest reached an interrupt-window exit; no instruction emulation is required."
+                        .to_string(),
+            });
+            DecodedExit::InterruptWindow
+        } else if exit_reason == WHV_RUN_VP_EXIT_REASON_X64_APIC_EOI {
+            report.calls.push(NativeWhpCallReport {
+                name: "DecodeX64ApicEoi",
+                hresult: None,
+                ok: true,
+                detail: "Guest reached an APIC end-of-interrupt exit.".to_string(),
+            });
+            DecodedExit::ApicEoi
         } else {
             report.calls.push(NativeWhpCallReport {
                 name: "DecodeVpExit",
@@ -3186,9 +3244,9 @@ mod windows_whp {
             WHV_RUN_VP_EXIT_REASON_UNRECOVERABLE_EXCEPTION => "unrecoverable-exception",
             WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE => "invalid-vp-register-value",
             0x0000_0006 => "unsupported-feature",
-            0x0000_0007 => "x64-interrupt-window",
+            WHV_RUN_VP_EXIT_REASON_X64_INTERRUPT_WINDOW => "x64-interrupt-window",
             WHV_RUN_VP_EXIT_REASON_X64_HALT => "x64-halt",
-            0x0000_0009 => "x64-apic-eoi",
+            WHV_RUN_VP_EXIT_REASON_X64_APIC_EOI => "x64-apic-eoi",
             WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS => "x64-msr-access",
             WHV_RUN_VP_EXIT_REASON_X64_CPUID => "x64-cpuid",
             0x0000_1002 => "exception",
@@ -3248,8 +3306,9 @@ mod windows_whp {
             WHV_REGISTER_IDTR, WHV_REGISTER_RBP, WHV_REGISTER_RBX, WHV_REGISTER_RDI,
             WHV_REGISTER_RFLAGS, WHV_REGISTER_RIP, WHV_REGISTER_RSI, WHV_REGISTER_RSP,
             WHV_REGISTER_SS, WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE,
-            WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS, WHV_RUN_VP_EXIT_REASON_X64_CPUID,
-            WHV_RUN_VP_EXIT_REASON_X64_HALT, WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS,
+            WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS, WHV_RUN_VP_EXIT_REASON_X64_APIC_EOI,
+            WHV_RUN_VP_EXIT_REASON_X64_CPUID, WHV_RUN_VP_EXIT_REASON_X64_HALT,
+            WHV_RUN_VP_EXIT_REASON_X64_INTERRUPT_WINDOW, WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS,
             WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS,
         };
         use crate::native::{
@@ -3802,6 +3861,64 @@ mod windows_whp {
                 assert!(!linux_entry_probe_passed(&report));
                 assert!(linux_entry_probe_detail(&report).contains(expected_next_step));
             }
+        }
+
+        #[test]
+        fn linux_entry_probe_accepts_resumed_interrupt_window_exit() {
+            let mut report = base_report();
+            report.exit_reason = Some(WHV_RUN_VP_EXIT_REASON_X64_INTERRUPT_WINDOW);
+            report.exit_reason_label = Some("x64-interrupt-window".to_string());
+            report.calls.push(crate::native::NativeWhpCallReport {
+                name: "InterruptWindowResumed",
+                hresult: None,
+                ok: true,
+                detail: "resumed".to_string(),
+            });
+
+            assert!(linux_entry_probe_passed(&report));
+        }
+
+        #[test]
+        fn linux_entry_probe_accepts_observed_apic_eoi_exit() {
+            let mut report = base_report();
+            report.exit_reason = Some(WHV_RUN_VP_EXIT_REASON_X64_APIC_EOI);
+            report.exit_reason_label = Some("x64-apic-eoi".to_string());
+            report.calls.push(crate::native::NativeWhpCallReport {
+                name: "ApicEoiObserved",
+                hresult: None,
+                ok: true,
+                detail: "observed".to_string(),
+            });
+
+            assert!(linux_entry_probe_passed(&report));
+        }
+
+        #[test]
+        fn decodes_interrupt_window_and_apic_eoi_exits() {
+            let mut interrupt_context = [0_u8; 128];
+            interrupt_context[..4]
+                .copy_from_slice(&WHV_RUN_VP_EXIT_REASON_X64_INTERRUPT_WINDOW.to_le_bytes());
+            let mut interrupt_report = base_report();
+            assert!(matches!(
+                decode_exit_context(&interrupt_context, &mut interrupt_report),
+                DecodedExit::InterruptWindow
+            ));
+            assert!(interrupt_report
+                .calls
+                .iter()
+                .any(|call| call.name == "DecodeX64InterruptWindow" && call.ok));
+
+            let mut eoi_context = [0_u8; 128];
+            eoi_context[..4].copy_from_slice(&WHV_RUN_VP_EXIT_REASON_X64_APIC_EOI.to_le_bytes());
+            let mut eoi_report = base_report();
+            assert!(matches!(
+                decode_exit_context(&eoi_context, &mut eoi_report),
+                DecodedExit::ApicEoi
+            ));
+            assert!(eoi_report
+                .calls
+                .iter()
+                .any(|call| call.name == "DecodeX64ApicEoi" && call.ok));
         }
 
         #[test]

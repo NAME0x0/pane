@@ -225,6 +225,7 @@ What exists today:
 - Pane runtime contract discovery arguments on the Linux kernel command line,
 - E820 memory map including boot params, GDT, initramfs, RAM, APIC stubs, framebuffer memory, and input queue memory,
 - protected-mode register handoff with boot params in `rsi`,
+- resumable WHP interrupt-window and APIC-EOI exit handling so early Linux interrupt plumbing is observed instead of treated as an unknown hard stop,
 - minimal COM1 UART behavior for early serial setup,
 - guarded WHP partition/vCPU execution with deterministic fixture validation.
 

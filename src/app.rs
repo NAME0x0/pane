@@ -11078,6 +11078,12 @@ fn print_native_boot_spike_report(report: &NativeBootSpikeReport) {
         "  Serial Exits   {}",
         report.partition_smoke.serial_io_exit_count
     );
+    if report.partition_smoke.guest_exit_budget > 0 {
+        println!(
+            "  Guest Exits    {}/{}",
+            report.partition_smoke.guest_exit_count, report.partition_smoke.guest_exit_budget
+        );
+    }
     println!(
         "  Halt Observed  {}",
         yes_no(report.partition_smoke.halt_observed)

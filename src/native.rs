@@ -579,6 +579,8 @@ pub(crate) struct NativePartitionSmokeReport {
     pub(crate) serial_expected_markers: Vec<String>,
     pub(crate) serial_markers_observed: bool,
     pub(crate) serial_io_exit_count: u32,
+    pub(crate) guest_exit_count: u32,
+    pub(crate) guest_exit_budget: u32,
     pub(crate) framebuffer_snapshot: Option<NativeFramebufferSnapshotReport>,
     pub(crate) input_queue_snapshot: Option<NativeInputQueueSnapshotReport>,
     pub(crate) halt_observed: bool,
@@ -931,6 +933,8 @@ fn planned_partition_smoke_report(run_fixture: bool) -> NativePartitionSmokeRepo
         serial_expected_markers: Vec::new(),
         serial_markers_observed: false,
         serial_io_exit_count: 0,
+        guest_exit_count: 0,
+        guest_exit_budget: 0,
         framebuffer_snapshot: None,
         input_queue_snapshot: None,
         halt_observed: false,
@@ -991,6 +995,8 @@ fn skipped_partition_smoke_report(
             .unwrap_or_default(),
         serial_markers_observed: false,
         serial_io_exit_count: 0,
+        guest_exit_count: 0,
+        guest_exit_budget: 0,
         framebuffer_snapshot: None,
         input_queue_snapshot: None,
         halt_observed: false,
@@ -1095,6 +1101,8 @@ mod windows_whp {
     const WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS: u32 = 0x0000_1000;
     const WHV_RUN_VP_EXIT_REASON_X64_CPUID: u32 = 0x0000_1001;
     const GUEST_PAGE_SIZE: usize = SERIAL_BOOT_TEST_IMAGE_SIZE;
+    const LINUX_ENTRY_PROBE_EXIT_BUDGET: usize = 4096;
+    const LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET: usize = 256;
     const SERIAL_COM1_PORT: u16 = 0x03f8;
     const SERIAL_COM1_LAST_PORT: u16 = SERIAL_COM1_PORT + 7;
     const SERIAL_LINE_STATUS_PORT: u16 = SERIAL_COM1_PORT + 5;
@@ -1297,6 +1305,8 @@ mod windows_whp {
                 .unwrap_or_default(),
             serial_markers_observed: false,
             serial_io_exit_count: 0,
+            guest_exit_count: 0,
+            guest_exit_budget: 0,
             framebuffer_snapshot: None,
             input_queue_snapshot: None,
             halt_observed: false,
@@ -2176,8 +2186,10 @@ mod windows_whp {
     ) {
         report.serial_expected_text = Some(expected_serial_text.to_string());
         let max_serial_boot_exits = expected_serial_text.len() + 2;
+        report.guest_exit_budget = max_serial_boot_exits as u32;
 
         for exit_index in 0..max_serial_boot_exits {
+            report.guest_exit_count = (exit_index + 1) as u32;
             let mut exit_context = [0_u8; 1024];
             let hresult = unsafe {
                 run_virtual_processor(
@@ -2312,12 +2324,14 @@ mod windows_whp {
         report: &mut NativePartitionSmokeReport,
     ) {
         report.serial_expected_text = None;
-        let max_guest_exits = 32;
+        let max_guest_exits = linux_entry_probe_exit_budget(report);
+        report.guest_exit_budget = max_guest_exits as u32;
         let mut msr_state = default_linux_msr_state();
         let mut serial_state = Com1SerialState::default();
         let mut block_state = NativeBlockIoPortState::default();
 
         for exit_index in 0..max_guest_exits {
+            report.guest_exit_count = (exit_index + 1) as u32;
             let mut exit_context = [0_u8; 1024];
             let hresult = unsafe {
                 run_virtual_processor(
@@ -2635,6 +2649,14 @@ mod windows_whp {
             ok: linux_entry_probe_passed(report),
             detail: linux_entry_probe_detail(report),
         });
+    }
+
+    fn linux_entry_probe_exit_budget(report: &NativePartitionSmokeReport) -> usize {
+        if report.serial_expected_markers.is_empty() {
+            LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET
+        } else {
+            LINUX_ENTRY_PROBE_EXIT_BUDGET
+        }
     }
 
     fn set_guest_rip(
@@ -3294,22 +3316,23 @@ mod windows_whp {
     mod tests {
         use super::{
             decode_exit_context, framebuffer_snapshot_report, guest_contract_passed,
-            input_queue_snapshot_report, linux_entry_probe_detail, linux_entry_probe_passed,
-            linux_protected_mode_registers, serial_contract_passed, serial_markers_observed,
-            Com1SerialState, DecodedExit, CPUID_DEFAULT_RAX_OFFSET, CPUID_DEFAULT_RBX_OFFSET,
-            CPUID_DEFAULT_RCX_OFFSET, CPUID_DEFAULT_RDX_OFFSET, CPUID_RAX_OFFSET, CPUID_RCX_OFFSET,
-            IO_ACCESS_INFO_OFFSET, IO_PORT_OFFSET, IO_RAX_OFFSET, MEMORY_ACCESS_INFO_OFFSET,
-            MEMORY_GPA_OFFSET, MEMORY_GVA_OFFSET, MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET,
-            MSR_RAX_OFFSET, MSR_RDX_OFFSET, SERIAL_COM1_PORT, VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET,
-            VP_CONTEXT_RIP_OFFSET, WHV_REGISTER_CR0, WHV_REGISTER_CR3, WHV_REGISTER_CR4,
-            WHV_REGISTER_CS, WHV_REGISTER_DS, WHV_REGISTER_ES, WHV_REGISTER_GDTR,
-            WHV_REGISTER_IDTR, WHV_REGISTER_RBP, WHV_REGISTER_RBX, WHV_REGISTER_RDI,
-            WHV_REGISTER_RFLAGS, WHV_REGISTER_RIP, WHV_REGISTER_RSI, WHV_REGISTER_RSP,
-            WHV_REGISTER_SS, WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE,
-            WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS, WHV_RUN_VP_EXIT_REASON_X64_APIC_EOI,
-            WHV_RUN_VP_EXIT_REASON_X64_CPUID, WHV_RUN_VP_EXIT_REASON_X64_HALT,
-            WHV_RUN_VP_EXIT_REASON_X64_INTERRUPT_WINDOW, WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS,
-            WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS,
+            input_queue_snapshot_report, linux_entry_probe_detail, linux_entry_probe_exit_budget,
+            linux_entry_probe_passed, linux_protected_mode_registers, serial_contract_passed,
+            serial_markers_observed, Com1SerialState, DecodedExit, CPUID_DEFAULT_RAX_OFFSET,
+            CPUID_DEFAULT_RBX_OFFSET, CPUID_DEFAULT_RCX_OFFSET, CPUID_DEFAULT_RDX_OFFSET,
+            CPUID_RAX_OFFSET, CPUID_RCX_OFFSET, IO_ACCESS_INFO_OFFSET, IO_PORT_OFFSET,
+            IO_RAX_OFFSET, LINUX_ENTRY_PROBE_EXIT_BUDGET, LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET,
+            MEMORY_ACCESS_INFO_OFFSET, MEMORY_GPA_OFFSET, MEMORY_GVA_OFFSET,
+            MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET, MSR_RAX_OFFSET, MSR_RDX_OFFSET,
+            SERIAL_COM1_PORT, VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET, VP_CONTEXT_RIP_OFFSET,
+            WHV_REGISTER_CR0, WHV_REGISTER_CR3, WHV_REGISTER_CR4, WHV_REGISTER_CS, WHV_REGISTER_DS,
+            WHV_REGISTER_ES, WHV_REGISTER_GDTR, WHV_REGISTER_IDTR, WHV_REGISTER_RBP,
+            WHV_REGISTER_RBX, WHV_REGISTER_RDI, WHV_REGISTER_RFLAGS, WHV_REGISTER_RIP,
+            WHV_REGISTER_RSI, WHV_REGISTER_RSP, WHV_REGISTER_SS,
+            WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE, WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS,
+            WHV_RUN_VP_EXIT_REASON_X64_APIC_EOI, WHV_RUN_VP_EXIT_REASON_X64_CPUID,
+            WHV_RUN_VP_EXIT_REASON_X64_HALT, WHV_RUN_VP_EXIT_REASON_X64_INTERRUPT_WINDOW,
+            WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS, WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS,
         };
         use crate::native::{
             evaluate_native_block_io, linux_boot_gdt_page_bytes, native_block_io_exit_can_resume,
@@ -3717,6 +3740,8 @@ mod windows_whp {
                 serial_expected_markers: Vec::new(),
                 serial_markers_observed: false,
                 serial_io_exit_count: 0,
+                guest_exit_count: 0,
+                guest_exit_budget: 0,
                 framebuffer_snapshot: None,
                 input_queue_snapshot: None,
                 halt_observed: false,
@@ -3791,6 +3816,23 @@ mod windows_whp {
 
             assert!(report.serial_markers_observed);
             assert!(linux_entry_probe_passed(&report));
+        }
+
+        #[test]
+        fn linux_entry_probe_uses_extended_budget_for_serial_milestones() {
+            let mut report = base_report();
+            assert_eq!(
+                linux_entry_probe_exit_budget(&report),
+                LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET
+            );
+
+            report.serial_expected_markers = vec!["PANE_INIT_EXEC".to_string()];
+
+            assert_eq!(
+                linux_entry_probe_exit_budget(&report),
+                LINUX_ENTRY_PROBE_EXIT_BUDGET
+            );
+            assert!(LINUX_ENTRY_PROBE_EXIT_BUDGET > LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET);
         }
 
         #[test]

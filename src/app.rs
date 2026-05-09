@@ -4834,6 +4834,7 @@ static blk_status_t pane_block_queue_rq(struct blk_mq_hw_ctx *hctx,
     struct bio_vec bvec;
     struct req_iterator iter;
     blk_status_t status = BLK_STS_OK;
+    unsigned char *bounce;
     int operation;
 
     if (rq_data_dir(rq) == READ)
@@ -4847,30 +4848,67 @@ static blk_status_t pane_block_queue_rq(struct blk_mq_hw_ctx *hctx,
     }
 
     blk_mq_start_request(rq);
+    bounce = vmalloc(PANE_BLOCK_IO_BLOCK_SIZE_BYTES);
+    if (!bounce) {
+        blk_mq_end_request(rq, BLK_STS_RESOURCE);
+        return BLK_STS_RESOURCE;
+    }
 
     rq_for_each_segment(bvec, rq, iter) {
-        unsigned int offset;
-        sector_t sector = iter.iter.bi_sector;
-        u64 block_index;
+        u64 absolute_byte = (u64)iter.iter.bi_sector * PANE_BLOCK_SECTOR_SIZE;
+        unsigned int remaining = bvec.bv_len;
+        unsigned int segment_offset = 0;
         unsigned char *mapped = kmap_local_page(bvec.bv_page);
         unsigned char *segment = mapped + bvec.bv_offset;
 
-        if ((bvec.bv_len % PANE_BLOCK_IO_BLOCK_SIZE_BYTES) != 0) {
-            kunmap_local(mapped);
-            status = BLK_STS_IOERR;
-            break;
-        }
+        while (remaining > 0) {
+            u64 block_index = absolute_byte / PANE_BLOCK_IO_BLOCK_SIZE_BYTES;
+            unsigned int block_offset =
+                (unsigned int)(absolute_byte % PANE_BLOCK_IO_BLOCK_SIZE_BYTES);
+            unsigned int chunk = PANE_BLOCK_IO_BLOCK_SIZE_BYTES - block_offset;
 
-        for (offset = 0; offset < bvec.bv_len; offset += PANE_BLOCK_IO_BLOCK_SIZE_BYTES) {
-            block_index = sector / (PANE_BLOCK_IO_BLOCK_SIZE_BYTES / PANE_BLOCK_SECTOR_SIZE);
-            if (pane_block_transfer(pane_disk->pane_device_id,
-                                    operation,
-                                    block_index,
-                                    segment + offset) != 0) {
-                status = BLK_STS_IOERR;
-                break;
+            if (chunk > remaining)
+                chunk = remaining;
+
+            if (operation == PANE_BLOCK_OPERATION_READ) {
+                if (pane_block_transfer(pane_disk->pane_device_id,
+                                        PANE_BLOCK_OPERATION_READ,
+                                        block_index,
+                                        bounce) != 0) {
+                    status = BLK_STS_IOERR;
+                    break;
+                }
+                memcpy(segment + segment_offset, bounce + block_offset, chunk);
+            } else if (block_offset == 0 && chunk == PANE_BLOCK_IO_BLOCK_SIZE_BYTES) {
+                if (pane_block_transfer(pane_disk->pane_device_id,
+                                        PANE_BLOCK_OPERATION_WRITE,
+                                        block_index,
+                                        segment + segment_offset) != 0) {
+                    status = BLK_STS_IOERR;
+                    break;
+                }
+            } else {
+                /* Preserve untouched bytes for partial filesystem writes. */
+                if (pane_block_transfer(pane_disk->pane_device_id,
+                                        PANE_BLOCK_OPERATION_READ,
+                                        block_index,
+                                        bounce) != 0) {
+                    status = BLK_STS_IOERR;
+                    break;
+                }
+                memcpy(bounce + block_offset, segment + segment_offset, chunk);
+                if (pane_block_transfer(pane_disk->pane_device_id,
+                                        PANE_BLOCK_OPERATION_WRITE,
+                                        block_index,
+                                        bounce) != 0) {
+                    status = BLK_STS_IOERR;
+                    break;
+                }
             }
-            sector += PANE_BLOCK_IO_BLOCK_SIZE_BYTES / PANE_BLOCK_SECTOR_SIZE;
+
+            absolute_byte += chunk;
+            segment_offset += chunk;
+            remaining -= chunk;
         }
 
         kunmap_local(mapped);
@@ -4878,6 +4916,7 @@ static blk_status_t pane_block_queue_rq(struct blk_mq_hw_ctx *hctx,
             break;
     }
 
+    vfree(bounce);
     blk_mq_end_request(rq, status);
     return status;
 }
@@ -13029,6 +13068,9 @@ mod tests {
         assert!(block_driver.contains("PANE_BLOCK_IO_BASE_PORT"));
         assert!(block_driver.contains("PANE_BLOCK_STATUS_SERVICED"));
         assert!(block_driver.contains("blk_mq"));
+        assert!(block_driver.contains("vmalloc(PANE_BLOCK_IO_BLOCK_SIZE_BYTES)"));
+        assert!(block_driver.contains("absolute_byte"));
+        assert!(block_driver.contains("partial filesystem writes"));
         assert!(block_driver.contains("add_disk"));
         assert!(block_driver.contains("/dev/pane0"));
         assert!(block_driver.contains("/dev/pane1"));

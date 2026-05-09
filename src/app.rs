@@ -4289,6 +4289,7 @@ pane_storage_contract="$(pane_cmdline_value pane.storage_contract || true)"
 pane_block_io="$(pane_cmdline_value pane.block_io || true)"
 pane_root="$(pane_cmdline_value pane.root || true)"
 pane_user="$(pane_cmdline_value pane.user || true)"
+pane_block_devices="$(pane_cmdline_value pane.block_devices || true)"
 pane_framebuffer="$(pane_cmdline_value pane.framebuffer || true)"
 pane_input_queue="$(pane_cmdline_value pane.input_queue || true)"
 
@@ -4298,6 +4299,7 @@ PANE_STORAGE_CONTRACT=$pane_storage_contract
 PANE_BLOCK_IO=$pane_block_io
 PANE_ROOT=$pane_root
 PANE_USER=$pane_user
+PANE_BLOCK_DEVICES=$pane_block_devices
 PANE_FRAMEBUFFER=$pane_framebuffer
 PANE_INPUT_QUEUE=$pane_input_queue
 PANE_BLOCK_IO_PROTOCOL={}
@@ -4532,8 +4534,9 @@ static int wait_for_device(const char *path) {
     return -1;
 }
 
-static int load_pane_block_module(void) {
+static int load_pane_block_module(const char *device_blocks) {
     const char *module_path = "/lib/modules/pane-block.ko";
+    char params[128] = {0};
     int fd = open(module_path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         if (errno == ENOENT) {
@@ -4547,8 +4550,11 @@ static int load_pane_block_module(void) {
     }
 
     log_line("PANE_BLOCK_MODULE_LOAD_ATTEMPT");
+    if (device_blocks && device_blocks[0] != '\0') {
+        snprintf(params, sizeof(params), "device_blocks=%s", device_blocks);
+    }
 #ifdef SYS_finit_module
-    if (syscall(SYS_finit_module, fd, "", 0) == 0) {
+    if (syscall(SYS_finit_module, fd, params, 0) == 0) {
         close(fd);
         log_line("PANE_BLOCK_MODULE_LOAD_OK");
         return 0;
@@ -4612,6 +4618,7 @@ int main(void) {
     char block_io[128] = {0};
     char root_device[128] = {0};
     char user_device[128] = {0};
+    char block_devices[128] = {0};
     char framebuffer[128] = {0};
     char input_queue[128] = {0};
 
@@ -4627,6 +4634,7 @@ int main(void) {
     find_arg(cmdline, "pane.block_io", block_io, sizeof(block_io));
     find_arg(cmdline, "pane.root", root_device, sizeof(root_device));
     find_arg(cmdline, "pane.user", user_device, sizeof(user_device));
+    find_arg(cmdline, "pane.block_devices", block_devices, sizeof(block_devices));
     find_arg(cmdline, "pane.framebuffer", framebuffer, sizeof(framebuffer));
     find_arg(cmdline, "pane.input_queue", input_queue, sizeof(input_queue));
 
@@ -4634,6 +4642,7 @@ int main(void) {
     log_key_value("pane.block_io", block_io);
     log_key_value("pane.root", root_device);
     log_key_value("pane.user", user_device);
+    log_key_value("pane.block_devices", block_devices);
     log_key_value("pane.framebuffer", framebuffer);
     log_key_value("pane.input_queue", input_queue);
 
@@ -4659,7 +4668,7 @@ int main(void) {
     }
 
     log_line("PANE_BLOCK_IO_PROBE_OK");
-    load_pane_block_module();
+    load_pane_block_module(block_devices);
     log_line("PANE_INITRAMFS_DISCOVERY_DONE");
     if (framebuffer[0] != '\0' && input_queue[0] != '\0') {
         log_line("PANE_DISPLAY_CONTRACT_DISCOVERED");
@@ -6223,6 +6232,17 @@ fn augment_kernel_cmdline_for_runtime_contracts(
                 storage.block_io_block_size_bytes
             ),
         );
+        append_kernel_arg(
+            &mut cmdline,
+            format!(
+                "pane.block_devices={},{}",
+                pane_block_device_blocks(storage.base_os_bytes, storage.block_io_block_size_bytes)?,
+                pane_block_device_blocks(
+                    storage.user_disk_logical_size_bytes,
+                    storage.block_io_block_size_bytes
+                )?
+            ),
+        );
     }
     append_kernel_arg(
         &mut cmdline,
@@ -6247,6 +6267,15 @@ fn augment_kernel_cmdline_for_runtime_contracts(
     );
     validate_kernel_cmdline(&cmdline)?;
     Ok(cmdline)
+}
+
+fn pane_block_device_blocks(bytes: u64, block_size_bytes: u64) -> AppResult<u64> {
+    if block_size_bytes == 0 {
+        return Err(AppError::message(
+            "Pane block device geometry requires a non-zero block size.",
+        ));
+    }
+    Ok(bytes.saturating_add(block_size_bytes - 1) / block_size_bytes)
 }
 
 fn append_kernel_arg(cmdline: &mut String, arg: String) {
@@ -11675,16 +11704,16 @@ mod tests {
         inspect_kernel_image_artifact, inspect_workspace, inventory_contains_distro,
         kernel_layout_execution_image, linux_guest_mapped_regions,
         load_kernel_layout_boot_image_artifact, load_verified_pane_block_module_metadata,
-        pane_initramfs_expected_serial_milestones, parse_guest_physical_address,
-        preferred_transport, read_base_os_block, read_json_file, read_user_disk_block,
-        register_base_os_image, register_boot_loader_image, register_kernel_boot_plan,
-        register_pane_block_module, register_pane_discovery_initramfs_artifact,
-        repair_user_disk_metadata, resize_user_disk, resolve_bundle_output_path,
-        resolve_init_source, resolve_launch_target, resolve_managed_environment_for_reset,
-        resolve_saved_launch, resolve_session_context, resolve_status_distro,
-        restore_user_disk_snapshot, runtime_contract_guest_memory_ranges, runtime_storage_budget,
-        sha256_file, status_port_for, user_disk_artifact_ready, validate_setup_password,
-        validate_setup_username, windows_transport_check, write_json_file,
+        pane_block_device_blocks, pane_initramfs_expected_serial_milestones,
+        parse_guest_physical_address, preferred_transport, read_base_os_block, read_json_file,
+        read_user_disk_block, register_base_os_image, register_boot_loader_image,
+        register_kernel_boot_plan, register_pane_block_module,
+        register_pane_discovery_initramfs_artifact, repair_user_disk_metadata, resize_user_disk,
+        resolve_bundle_output_path, resolve_init_source, resolve_launch_target,
+        resolve_managed_environment_for_reset, resolve_saved_launch, resolve_session_context,
+        resolve_status_distro, restore_user_disk_snapshot, runtime_contract_guest_memory_ranges,
+        runtime_storage_budget, sha256_file, status_port_for, user_disk_artifact_ready,
+        validate_setup_password, validate_setup_username, windows_transport_check, write_json_file,
         write_pane_initramfs_driver_bundle, write_user_disk_block, AppLifecyclePhase,
         AppNextAction, BaseOsImageMetadata, CheckStatus, DistroHealth, DoctorCheck, DoctorReport,
         FramebufferContract, InitSource, KernelBootLayout, KernelBootMetadata, NativeRuntimeState,
@@ -12909,6 +12938,15 @@ mod tests {
     }
 
     #[test]
+    fn pane_block_device_blocks_rounds_up_to_io_blocks() {
+        assert_eq!(pane_block_device_blocks(0, 4096).unwrap(), 0);
+        assert_eq!(pane_block_device_blocks(1, 4096).unwrap(), 1);
+        assert_eq!(pane_block_device_blocks(4096, 4096).unwrap(), 1);
+        assert_eq!(pane_block_device_blocks(4097, 4096).unwrap(), 2);
+        assert!(pane_block_device_blocks(4096, 0).is_err());
+    }
+
+    #[test]
     fn writes_pane_initramfs_driver_source_bundle() {
         let paths = temp_runtime_paths("runtime-pane-initramfs-driver");
         super::prepare_runtime_paths(&paths).unwrap();
@@ -12949,6 +12987,7 @@ mod tests {
                 .unwrap();
         assert!(hook.contains("pane.storage_contract"));
         assert!(hook.contains("pane.block_io"));
+        assert!(hook.contains("pane.block_devices"));
         assert!(hook.contains("pane.framebuffer"));
         assert!(hook.contains("pane.input_queue"));
         let header =
@@ -12962,6 +13001,8 @@ mod tests {
         assert!(init_source.contains("PANE_BLOCK_MODULE_LOAD_ATTEMPT"));
         assert!(init_source.contains("PANE_BLOCK_MODULE_LOAD_OK"));
         assert!(init_source.contains("PANE_BLOCK_MODULE_NOT_PRESENT"));
+        assert!(init_source.contains("device_blocks=%s"));
+        assert!(init_source.contains("pane.block_devices"));
         assert!(init_source.contains("PANE_DISPLAY_CONTRACT_DISCOVERED"));
         assert!(init_source.contains("PANE_FRAMEBUFFER"));
         assert!(init_source.contains("PANE_INPUT_QUEUE"));
@@ -13414,6 +13455,7 @@ mod tests {
         assert!(layout.cmdline.contains("pane.root_mode=base-device"));
         assert!(layout.cmdline.contains("pane.user=/dev/pane1"));
         assert!(layout.cmdline.contains("pane.block_io=0x0d00,16,4096"));
+        assert!(layout.cmdline.contains("pane.block_devices=1,786432"));
         assert!(layout
             .cmdline
             .contains("pane.framebuffer=0x0e000000,1024,768,32,x8r8g8b8"));

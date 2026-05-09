@@ -216,7 +216,7 @@ What exists today:
 - verified kernel/initramfs boot-plan metadata,
 - materialized Linux kernel boot layout,
 - kernel-layout attachment for the verified Arch base image plus guest-mapped Pane sparse user disk and block-port ABI contract,
-- generated Pane initramfs driver source/build-script bundle with a self-contained discovery/root-handoff `/init`, exact `/dev/pane0` and `/dev/pane1` geometry handoff via `pane.block_devices`, a Pane block-driver source/build contract with partial read/write handling for Linux partition/filesystem probes, a build/register path for the discovery cpio, and kernel-layout serial milestone gates for guest-side native storage discovery,
+- generated Pane initramfs driver source/build-script bundle with a self-contained discovery/root-handoff `/init`, exact `/dev/pane0` and `/dev/pane1` geometry handoff via `pane.block_devices`, a Pane block-driver source/build contract with partial read/write handling plus flush/discard tolerance for Linux partition/filesystem probes, a build/register path for the discovery cpio, and kernel-layout serial milestone gates for guest-side native storage discovery,
 - fixed linear framebuffer contract mapped into guest memory for the future Pane-rendered display path,
 - Linux `boot_params.screen_info` population for the Pane `x8r8g8b8` framebuffer so early Linux boot receives a standard framebuffer description rather than only Pane-specific cmdline metadata,
 - keyboard/pointer input queue contract mapped into guest memory for the future app-owned input path, including a `PANEINQ1` ABI header with queue size, record size, producer/consumer indexes, and capacity metadata,

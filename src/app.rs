@@ -4837,11 +4837,15 @@ static blk_status_t pane_block_queue_rq(struct blk_mq_hw_ctx *hctx,
     unsigned char *bounce;
     int operation;
 
-    if (rq_data_dir(rq) == READ)
+    if (req_op(rq) == REQ_OP_READ)
         operation = PANE_BLOCK_OPERATION_READ;
-    else if (rq_data_dir(rq) == WRITE)
+    else if (req_op(rq) == REQ_OP_WRITE)
         operation = PANE_BLOCK_OPERATION_WRITE;
-    else {
+    else if (req_op(rq) == REQ_OP_FLUSH || req_op(rq) == REQ_OP_DISCARD) {
+        blk_mq_start_request(rq);
+        blk_mq_end_request(rq, BLK_STS_OK);
+        return BLK_STS_OK;
+    } else {
         blk_mq_start_request(rq);
         blk_mq_end_request(rq, BLK_STS_IOERR);
         return BLK_STS_IOERR;
@@ -13067,6 +13071,8 @@ mod tests {
         assert!(block_driver.contains("PANE_BLOCK_OPERATION_WRITE"));
         assert!(block_driver.contains("PANE_BLOCK_IO_BASE_PORT"));
         assert!(block_driver.contains("PANE_BLOCK_STATUS_SERVICED"));
+        assert!(block_driver.contains("REQ_OP_FLUSH"));
+        assert!(block_driver.contains("REQ_OP_DISCARD"));
         assert!(block_driver.contains("blk_mq"));
         assert!(block_driver.contains("vmalloc(PANE_BLOCK_IO_BLOCK_SIZE_BYTES)"));
         assert!(block_driver.contains("absolute_byte"));

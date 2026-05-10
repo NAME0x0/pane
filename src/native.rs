@@ -1114,6 +1114,8 @@ mod windows_whp {
     const PIT_CHANNEL1_PORT: u16 = 0x0041;
     const PIT_CHANNEL2_PORT: u16 = 0x0042;
     const PIT_COMMAND_PORT: u16 = 0x0043;
+    const PS2_DATA_PORT: u16 = 0x0060;
+    const PS2_STATUS_COMMAND_PORT: u16 = 0x0064;
     const SYSTEM_CONTROL_PORT_B: u16 = 0x0061;
     const CMOS_ADDRESS_PORT: u16 = 0x0070;
     const CMOS_DATA_PORT: u16 = 0x0071;
@@ -2870,6 +2872,8 @@ mod windows_whp {
                     self.pit_command = value;
                     true
                 }
+                PS2_DATA_PORT => true,
+                PS2_STATUS_COMMAND_PORT => true,
                 SYSTEM_CONTROL_PORT_B => {
                     self.system_control_b = value;
                     true
@@ -2906,6 +2910,8 @@ mod windows_whp {
                 PIT_CHANNEL1_PORT => Some(self.pit_latch[1]),
                 PIT_CHANNEL2_PORT => Some(self.pit_latch[2]),
                 PIT_COMMAND_PORT => Some(self.pit_command),
+                PS2_DATA_PORT => Some(0),
+                PS2_STATUS_COMMAND_PORT => Some(0),
                 SYSTEM_CONTROL_PORT_B => Some(self.system_control_b),
                 CMOS_DATA_PORT => Some(self.cmos_value()),
                 POST_DELAY_PORT => Some(0),
@@ -3594,16 +3600,17 @@ mod windows_whp {
             LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET, MEMORY_ACCESS_INFO_OFFSET, MEMORY_GPA_OFFSET,
             MEMORY_GVA_OFFSET, MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET, MSR_RAX_OFFSET,
             MSR_RDX_OFFSET, PCI_CONFIG_ADDRESS_PORT, PCI_CONFIG_DATA_START_PORT, PIC1_DATA_PORT,
-            PIC2_DATA_PORT, PIT_CHANNEL0_PORT, PIT_COMMAND_PORT, POST_DELAY_PORT, SERIAL_COM1_PORT,
-            SYSTEM_CONTROL_PORT_B, VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET, VP_CONTEXT_RIP_OFFSET,
-            WHV_REGISTER_CR0, WHV_REGISTER_CR3, WHV_REGISTER_CR4, WHV_REGISTER_CS, WHV_REGISTER_DS,
-            WHV_REGISTER_ES, WHV_REGISTER_GDTR, WHV_REGISTER_IDTR, WHV_REGISTER_RBP,
-            WHV_REGISTER_RBX, WHV_REGISTER_RDI, WHV_REGISTER_RFLAGS, WHV_REGISTER_RIP,
-            WHV_REGISTER_RSI, WHV_REGISTER_RSP, WHV_REGISTER_SS,
-            WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE, WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS,
-            WHV_RUN_VP_EXIT_REASON_X64_APIC_EOI, WHV_RUN_VP_EXIT_REASON_X64_CPUID,
-            WHV_RUN_VP_EXIT_REASON_X64_HALT, WHV_RUN_VP_EXIT_REASON_X64_INTERRUPT_WINDOW,
-            WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS, WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS,
+            PIC2_DATA_PORT, PIT_CHANNEL0_PORT, PIT_COMMAND_PORT, POST_DELAY_PORT, PS2_DATA_PORT,
+            PS2_STATUS_COMMAND_PORT, SERIAL_COM1_PORT, SYSTEM_CONTROL_PORT_B,
+            VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET, VP_CONTEXT_RIP_OFFSET, WHV_REGISTER_CR0,
+            WHV_REGISTER_CR3, WHV_REGISTER_CR4, WHV_REGISTER_CS, WHV_REGISTER_DS, WHV_REGISTER_ES,
+            WHV_REGISTER_GDTR, WHV_REGISTER_IDTR, WHV_REGISTER_RBP, WHV_REGISTER_RBX,
+            WHV_REGISTER_RDI, WHV_REGISTER_RFLAGS, WHV_REGISTER_RIP, WHV_REGISTER_RSI,
+            WHV_REGISTER_RSP, WHV_REGISTER_SS, WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE,
+            WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS, WHV_RUN_VP_EXIT_REASON_X64_APIC_EOI,
+            WHV_RUN_VP_EXIT_REASON_X64_CPUID, WHV_RUN_VP_EXIT_REASON_X64_HALT,
+            WHV_RUN_VP_EXIT_REASON_X64_INTERRUPT_WINDOW, WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS,
+            WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS,
         };
         use crate::native::{
             evaluate_native_block_io, linux_boot_gdt_page_bytes, native_block_io_exit_can_resume,
@@ -3748,6 +3755,20 @@ mod windows_whp {
                 io.access(PCI_CONFIG_DATA_START_PORT + 3, false, 1, 0),
                 Some(0xff)
             );
+        }
+
+        #[test]
+        fn legacy_device_io_model_handles_ps2_controller_probe() {
+            let mut io = LegacyDeviceIoState::default();
+
+            assert_eq!(io.access(PS2_STATUS_COMMAND_PORT, false, 1, 0), Some(0));
+            assert_eq!(io.access(PS2_DATA_PORT, false, 1, 0), Some(0));
+            assert_eq!(
+                io.access(PS2_STATUS_COMMAND_PORT, true, 1, 0xad),
+                Some(0xad)
+            );
+            assert_eq!(io.access(PS2_DATA_PORT, true, 1, 0xf4), Some(0xf4));
+            assert_eq!(io.access(PS2_STATUS_COMMAND_PORT, false, 1, 0), Some(0));
         }
 
         #[test]

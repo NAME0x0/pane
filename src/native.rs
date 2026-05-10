@@ -2456,18 +2456,9 @@ mod windows_whp {
                     if access_size != 1
                         || !(SERIAL_COM1_PORT..=SERIAL_COM1_LAST_PORT).contains(&port)
                     {
-                        if access_size != 1 {
-                            report.calls.push(NativeWhpCallReport {
-                                name: "UnsupportedIoPort",
-                                hresult: None,
-                                ok: false,
-                                detail: format!(
-                                    "Unsupported I/O access size {access_size} on port 0x{port:04x}."
-                                ),
-                            });
-                            break;
-                        }
-                        if let Some(value) = legacy_io_state.access(port, is_write, serial_byte) {
+                        if let Some(value) =
+                            legacy_io_state.access(port, is_write, access_size, rax)
+                        {
                             if instruction_length == 0 {
                                 report.calls.push(NativeWhpCallReport {
                                     name: "AdvanceGuestRip",
@@ -2485,12 +2476,13 @@ mod windows_whp {
                                 hresult: None,
                                 ok: true,
                                 detail: format!(
-                                    "{} legacy port 0x{port:04x} value=0x{value:02x}.",
+                                    "{} {}-byte legacy port 0x{port:04x} value=0x{value:08x}.",
                                     if is_write {
                                         "Accepted write to"
                                     } else {
                                         "Returned read from"
-                                    }
+                                    },
+                                    access_size
                                 ),
                             });
                             if is_write {
@@ -2502,11 +2494,12 @@ mod windows_whp {
                                 ) {
                                     break;
                                 }
-                            } else if !set_guest_rax_low_byte_and_rip(
+                            } else if !set_guest_rax_low_value_and_rip(
                                 partition,
                                 set_virtual_processor_registers,
                                 rax,
                                 value,
+                                access_size,
                                 next_rip,
                                 report,
                             ) {
@@ -2829,14 +2822,28 @@ mod windows_whp {
     }
 
     impl LegacyDeviceIoState {
-        fn access(&mut self, port: u16, is_write: bool, value: u8) -> Option<u8> {
-            if is_write {
-                return self.write(port, value).then_some(value);
+        fn access(&mut self, port: u16, is_write: bool, access_size: u32, rax: u64) -> Option<u32> {
+            if !matches!(access_size, 1 | 2 | 4) {
+                return None;
             }
-            self.read(port)
+            let value = (rax & access_mask(access_size)) as u32;
+            if is_write {
+                return self.write_value(port, access_size, value).then_some(value);
+            }
+            self.read_value(port, access_size)
         }
 
-        fn write(&mut self, port: u16, value: u8) -> bool {
+        fn write_value(&mut self, port: u16, access_size: u32, value: u32) -> bool {
+            let bytes = value.to_le_bytes();
+            for offset in 0..access_size {
+                if !self.write_byte(port + offset as u16, bytes[offset as usize]) {
+                    return false;
+                }
+            }
+            true
+        }
+
+        fn write_byte(&mut self, port: u16, value: u8) -> bool {
             match port {
                 PIC1_COMMAND_PORT | PIC2_COMMAND_PORT => true,
                 PIC1_DATA_PORT => {
@@ -2882,7 +2889,15 @@ mod windows_whp {
             }
         }
 
-        fn read(&self, port: u16) -> Option<u8> {
+        fn read_value(&self, port: u16, access_size: u32) -> Option<u32> {
+            let mut bytes = [0_u8; 4];
+            for offset in 0..access_size {
+                bytes[offset as usize] = self.read_byte(port + offset as u16)?;
+            }
+            Some(u32::from_le_bytes(bytes) & access_mask(access_size) as u32)
+        }
+
+        fn read_byte(&self, port: u16) -> Option<u8> {
             match port {
                 PIC1_COMMAND_PORT | PIC2_COMMAND_PORT => Some(0),
                 PIC1_DATA_PORT => Some(self.pic1_mask),
@@ -2929,6 +2944,15 @@ mod windows_whp {
         }
     }
 
+    fn access_mask(access_size: u32) -> u64 {
+        match access_size {
+            1 => 0xff,
+            2 => 0xffff,
+            4 => 0xffff_ffff,
+            _ => 0,
+        }
+    }
+
     fn set_guest_rax_low_byte_and_rip(
         partition: *mut c_void,
         set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
@@ -2969,6 +2993,50 @@ mod windows_whp {
             ok,
             detail: format!("Returned COM1 byte 0x{value:02x} to guest AL."),
         });
+        ok
+    }
+
+    fn set_guest_rax_low_value_and_rip(
+        partition: *mut c_void,
+        set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
+        previous_rax: u64,
+        value: u32,
+        access_size: u32,
+        rip: u64,
+        report: &mut NativePartitionSmokeReport,
+    ) -> bool {
+        let mask = match access_size {
+            1 => 0xff_u64,
+            2 => 0xffff_u64,
+            4 => 0xffff_ffff_u64,
+            _ => return false,
+        };
+        let register_names = [WHV_REGISTER_RAX, WHV_REGISTER_RIP];
+        let register_values = [
+            WhvRegisterValue {
+                reg64: (previous_rax & !mask) | (u64::from(value) & mask),
+            },
+            WhvRegisterValue { reg64: rip },
+        ];
+        let hresult = unsafe {
+            set_virtual_processor_registers(
+                partition,
+                0,
+                register_names.as_ptr(),
+                register_names.len() as u32,
+                register_values.as_ptr(),
+            )
+        };
+        let ok = hresult_succeeded(hresult);
+        report.calls.push(hresult_call(
+            "WHvSetVirtualProcessorRegisters(LegacyIO)",
+            hresult,
+            if ok {
+                "Returned emulated legacy I/O input and advanced RIP."
+            } else {
+                "Could not return emulated legacy I/O input to guest registers."
+            },
+        ));
         ok
     }
 
@@ -3641,50 +3709,43 @@ mod windows_whp {
         fn legacy_device_io_model_handles_early_linux_ports() {
             let mut io = LegacyDeviceIoState::default();
 
-            assert_eq!(io.access(PIC1_DATA_PORT, true, 0xfe), Some(0xfe));
-            assert_eq!(io.access(PIC1_DATA_PORT, false, 0), Some(0xfe));
-            assert_eq!(io.access(PIC2_DATA_PORT, true, 0xff), Some(0xff));
-            assert_eq!(io.access(PIC2_DATA_PORT, false, 0), Some(0xff));
-            assert_eq!(io.access(PIT_COMMAND_PORT, true, 0x36), Some(0x36));
-            assert_eq!(io.access(PIT_CHANNEL0_PORT, true, 0x34), Some(0x34));
-            assert_eq!(io.access(PIT_CHANNEL0_PORT, false, 0), Some(0x34));
-            assert_eq!(io.access(SYSTEM_CONTROL_PORT_B, true, 0x03), Some(0x03));
-            assert_eq!(io.access(SYSTEM_CONTROL_PORT_B, false, 0), Some(0x03));
-            assert_eq!(io.access(CMOS_ADDRESS_PORT, true, 0x0d), Some(0x0d));
-            assert_eq!(io.access(CMOS_DATA_PORT, false, 0), Some(0x80));
-            assert_eq!(io.access(0x1234, false, 0), None);
+            assert_eq!(io.access(PIC1_DATA_PORT, true, 1, 0xfe), Some(0xfe));
+            assert_eq!(io.access(PIC1_DATA_PORT, false, 1, 0), Some(0xfe));
+            assert_eq!(io.access(PIC2_DATA_PORT, true, 1, 0xff), Some(0xff));
+            assert_eq!(io.access(PIC2_DATA_PORT, false, 1, 0), Some(0xff));
+            assert_eq!(io.access(PIT_COMMAND_PORT, true, 1, 0x36), Some(0x36));
+            assert_eq!(io.access(PIT_CHANNEL0_PORT, true, 1, 0x34), Some(0x34));
+            assert_eq!(io.access(PIT_CHANNEL0_PORT, false, 1, 0), Some(0x34));
+            assert_eq!(io.access(SYSTEM_CONTROL_PORT_B, true, 1, 0x03), Some(0x03));
+            assert_eq!(io.access(SYSTEM_CONTROL_PORT_B, false, 1, 0), Some(0x03));
+            assert_eq!(io.access(CMOS_ADDRESS_PORT, true, 1, 0x0d), Some(0x0d));
+            assert_eq!(io.access(CMOS_DATA_PORT, false, 1, 0), Some(0x80));
+            assert_eq!(io.access(0x1234, false, 1, 0), None);
         }
 
         #[test]
         fn legacy_device_io_model_reports_empty_pci_config_space() {
             let mut io = LegacyDeviceIoState::default();
 
-            assert_eq!(io.access(POST_DELAY_PORT, true, 0), Some(0));
-            assert_eq!(io.access(PCI_CONFIG_ADDRESS_PORT, true, 0x00), Some(0x00));
+            assert_eq!(io.access(POST_DELAY_PORT, true, 1, 0), Some(0));
             assert_eq!(
-                io.access(PCI_CONFIG_ADDRESS_PORT + 1, true, 0x00),
-                Some(0x00)
+                io.access(PCI_CONFIG_ADDRESS_PORT, true, 4, 0x8000_0000),
+                Some(0x8000_0000)
             );
             assert_eq!(
-                io.access(PCI_CONFIG_ADDRESS_PORT + 2, true, 0x00),
-                Some(0x00)
+                io.access(PCI_CONFIG_ADDRESS_PORT, false, 4, 0),
+                Some(0x8000_0000)
             );
             assert_eq!(
-                io.access(PCI_CONFIG_ADDRESS_PORT + 3, true, 0x80),
-                Some(0x80)
-            );
-            assert_eq!(io.access(PCI_CONFIG_ADDRESS_PORT + 3, false, 0), Some(0x80));
-            assert_eq!(io.access(PCI_CONFIG_DATA_START_PORT, false, 0), Some(0xff));
-            assert_eq!(
-                io.access(PCI_CONFIG_DATA_START_PORT + 1, false, 0),
-                Some(0xff)
+                io.access(PCI_CONFIG_DATA_START_PORT, false, 4, 0),
+                Some(0xffff_ffff)
             );
             assert_eq!(
-                io.access(PCI_CONFIG_DATA_START_PORT + 2, false, 0),
-                Some(0xff)
+                io.access(PCI_CONFIG_DATA_START_PORT + 2, false, 2, 0),
+                Some(0xffff)
             );
             assert_eq!(
-                io.access(PCI_CONFIG_DATA_START_PORT + 3, false, 0),
+                io.access(PCI_CONFIG_DATA_START_PORT + 3, false, 1, 0),
                 Some(0xff)
             );
         }

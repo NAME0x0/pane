@@ -1108,6 +1108,17 @@ mod windows_whp {
     const SERIAL_LINE_STATUS_PORT: u16 = SERIAL_COM1_PORT + 5;
     const SERIAL_INTERRUPT_ID_PORT: u16 = SERIAL_COM1_PORT + 2;
     const SERIAL_MODEM_STATUS_PORT: u16 = SERIAL_COM1_PORT + 6;
+    const PIC1_COMMAND_PORT: u16 = 0x0020;
+    const PIC1_DATA_PORT: u16 = 0x0021;
+    const PIT_CHANNEL0_PORT: u16 = 0x0040;
+    const PIT_CHANNEL1_PORT: u16 = 0x0041;
+    const PIT_CHANNEL2_PORT: u16 = 0x0042;
+    const PIT_COMMAND_PORT: u16 = 0x0043;
+    const SYSTEM_CONTROL_PORT_B: u16 = 0x0061;
+    const CMOS_ADDRESS_PORT: u16 = 0x0070;
+    const CMOS_DATA_PORT: u16 = 0x0071;
+    const PIC2_COMMAND_PORT: u16 = 0x00a0;
+    const PIC2_DATA_PORT: u16 = 0x00a1;
     const VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET: usize = 10;
     const VP_CONTEXT_RIP_OFFSET: usize = 32;
     const MEMORY_CONTEXT_OFFSET: usize = 48;
@@ -2329,6 +2340,7 @@ mod windows_whp {
         let mut msr_state = default_linux_msr_state();
         let mut serial_state = Com1SerialState::default();
         let mut block_state = NativeBlockIoPortState::default();
+        let mut legacy_io_state = LegacyDeviceIoState::default();
 
         for exit_index in 0..max_guest_exits {
             report.guest_exit_count = (exit_index + 1) as u32;
@@ -2439,6 +2451,72 @@ mod windows_whp {
                     if access_size != 1
                         || !(SERIAL_COM1_PORT..=SERIAL_COM1_LAST_PORT).contains(&port)
                     {
+                        if access_size != 1 {
+                            report.calls.push(NativeWhpCallReport {
+                                name: "UnsupportedIoPort",
+                                hresult: None,
+                                ok: false,
+                                detail: format!(
+                                    "Unsupported I/O access size {access_size} on port 0x{port:04x}."
+                                ),
+                            });
+                            break;
+                        }
+                        if let Some(value) = legacy_io_state.access(port, is_write, serial_byte) {
+                            if instruction_length == 0 {
+                                report.calls.push(NativeWhpCallReport {
+                                    name: "AdvanceGuestRip",
+                                    hresult: None,
+                                    ok: false,
+                                    detail:
+                                        "WHP reported a zero-length legacy I/O instruction; refusing to resume."
+                                            .to_string(),
+                                });
+                                break;
+                            }
+                            let next_rip = rip + u64::from(instruction_length);
+                            report.calls.push(NativeWhpCallReport {
+                                name: "LegacyDeviceIo",
+                                hresult: None,
+                                ok: true,
+                                detail: format!(
+                                    "{} legacy port 0x{port:04x} value=0x{value:02x}.",
+                                    if is_write {
+                                        "Accepted write to"
+                                    } else {
+                                        "Returned read from"
+                                    }
+                                ),
+                            });
+                            if is_write {
+                                if !set_guest_rip(
+                                    partition,
+                                    set_virtual_processor_registers,
+                                    next_rip,
+                                    report,
+                                ) {
+                                    break;
+                                }
+                            } else if !set_guest_rax_low_byte_and_rip(
+                                partition,
+                                set_virtual_processor_registers,
+                                rax,
+                                value,
+                                next_rip,
+                                report,
+                            ) {
+                                break;
+                            }
+                            continue;
+                        }
+                        report.calls.push(NativeWhpCallReport {
+                            name: "UnsupportedIoPort",
+                            hresult: None,
+                            ok: false,
+                            detail: format!(
+                                "No Pane device model currently handles I/O port 0x{port:04x}."
+                            ),
+                        });
                         break;
                     }
 
@@ -2734,6 +2812,90 @@ mod windows_whp {
         }
     }
 
+    #[derive(Default)]
+    struct LegacyDeviceIoState {
+        pic1_mask: u8,
+        pic2_mask: u8,
+        pit_latch: [u8; 3],
+        pit_command: u8,
+        system_control_b: u8,
+        cmos_index: u8,
+    }
+
+    impl LegacyDeviceIoState {
+        fn access(&mut self, port: u16, is_write: bool, value: u8) -> Option<u8> {
+            if is_write {
+                return self.write(port, value).then_some(value);
+            }
+            self.read(port)
+        }
+
+        fn write(&mut self, port: u16, value: u8) -> bool {
+            match port {
+                PIC1_COMMAND_PORT | PIC2_COMMAND_PORT => true,
+                PIC1_DATA_PORT => {
+                    self.pic1_mask = value;
+                    true
+                }
+                PIC2_DATA_PORT => {
+                    self.pic2_mask = value;
+                    true
+                }
+                PIT_CHANNEL0_PORT => {
+                    self.pit_latch[0] = value;
+                    true
+                }
+                PIT_CHANNEL1_PORT => {
+                    self.pit_latch[1] = value;
+                    true
+                }
+                PIT_CHANNEL2_PORT => {
+                    self.pit_latch[2] = value;
+                    true
+                }
+                PIT_COMMAND_PORT => {
+                    self.pit_command = value;
+                    true
+                }
+                SYSTEM_CONTROL_PORT_B => {
+                    self.system_control_b = value;
+                    true
+                }
+                CMOS_ADDRESS_PORT => {
+                    self.cmos_index = value & 0x7f;
+                    true
+                }
+                CMOS_DATA_PORT => true,
+                _ => false,
+            }
+        }
+
+        fn read(&self, port: u16) -> Option<u8> {
+            match port {
+                PIC1_COMMAND_PORT | PIC2_COMMAND_PORT => Some(0),
+                PIC1_DATA_PORT => Some(self.pic1_mask),
+                PIC2_DATA_PORT => Some(self.pic2_mask),
+                PIT_CHANNEL0_PORT => Some(self.pit_latch[0]),
+                PIT_CHANNEL1_PORT => Some(self.pit_latch[1]),
+                PIT_CHANNEL2_PORT => Some(self.pit_latch[2]),
+                PIT_COMMAND_PORT => Some(self.pit_command),
+                SYSTEM_CONTROL_PORT_B => Some(self.system_control_b),
+                CMOS_DATA_PORT => Some(self.cmos_value()),
+                _ => None,
+            }
+        }
+
+        fn cmos_value(&self) -> u8 {
+            match self.cmos_index {
+                0x0a => 0x26, // Status A: divider/rate, update not in progress.
+                0x0b => 0x02, // Status B: 24-hour BCD mode, no periodic interrupts.
+                0x0c => 0x00, // Status C: no pending RTC interrupt.
+                0x0d => 0x80, // Status D: CMOS battery valid.
+                _ => 0,
+            }
+        }
+    }
+
     fn set_guest_rax_low_byte_and_rip(
         partition: *mut c_void,
         set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
@@ -2977,7 +3139,10 @@ mod windows_whp {
             && report.exit_reason.is_some()
             && (report.serial_expected_markers.is_empty() || report.serial_markers_observed)
             && !report.calls.iter().any(|call| {
-                matches!(call.name, "LinuxEntryProbeExitBudget" | "AdvanceGuestRip") && !call.ok
+                matches!(
+                    call.name,
+                    "LinuxEntryProbeExitBudget" | "AdvanceGuestRip" | "UnsupportedIoPort"
+                ) && !call.ok
             })
             && !matches!(
                 report.exit_reason,
@@ -3045,6 +3210,9 @@ mod windows_whp {
                 }
                 Some(WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS) => {
                     "inspect MSR state handling and guest RIP advancement"
+                }
+                Some(WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS) => {
+                    "add a Pane device model for the unsupported I/O port or fix port decoding"
                 }
                 Some(WHV_RUN_VP_EXIT_REASON_X64_INTERRUPT_WINDOW) => {
                     "resume the vCPU or inject a queued interrupt when Pane owns timer delivery"
@@ -3318,21 +3486,23 @@ mod windows_whp {
             decode_exit_context, framebuffer_snapshot_report, guest_contract_passed,
             input_queue_snapshot_report, linux_entry_probe_detail, linux_entry_probe_exit_budget,
             linux_entry_probe_passed, linux_protected_mode_registers, serial_contract_passed,
-            serial_markers_observed, Com1SerialState, DecodedExit, CPUID_DEFAULT_RAX_OFFSET,
-            CPUID_DEFAULT_RBX_OFFSET, CPUID_DEFAULT_RCX_OFFSET, CPUID_DEFAULT_RDX_OFFSET,
-            CPUID_RAX_OFFSET, CPUID_RCX_OFFSET, IO_ACCESS_INFO_OFFSET, IO_PORT_OFFSET,
-            IO_RAX_OFFSET, LINUX_ENTRY_PROBE_EXIT_BUDGET, LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET,
-            MEMORY_ACCESS_INFO_OFFSET, MEMORY_GPA_OFFSET, MEMORY_GVA_OFFSET,
-            MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET, MSR_RAX_OFFSET, MSR_RDX_OFFSET,
-            SERIAL_COM1_PORT, VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET, VP_CONTEXT_RIP_OFFSET,
-            WHV_REGISTER_CR0, WHV_REGISTER_CR3, WHV_REGISTER_CR4, WHV_REGISTER_CS, WHV_REGISTER_DS,
-            WHV_REGISTER_ES, WHV_REGISTER_GDTR, WHV_REGISTER_IDTR, WHV_REGISTER_RBP,
-            WHV_REGISTER_RBX, WHV_REGISTER_RDI, WHV_REGISTER_RFLAGS, WHV_REGISTER_RIP,
-            WHV_REGISTER_RSI, WHV_REGISTER_RSP, WHV_REGISTER_SS,
-            WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE, WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS,
-            WHV_RUN_VP_EXIT_REASON_X64_APIC_EOI, WHV_RUN_VP_EXIT_REASON_X64_CPUID,
-            WHV_RUN_VP_EXIT_REASON_X64_HALT, WHV_RUN_VP_EXIT_REASON_X64_INTERRUPT_WINDOW,
-            WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS, WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS,
+            serial_markers_observed, Com1SerialState, DecodedExit, LegacyDeviceIoState,
+            CMOS_ADDRESS_PORT, CMOS_DATA_PORT, CPUID_DEFAULT_RAX_OFFSET, CPUID_DEFAULT_RBX_OFFSET,
+            CPUID_DEFAULT_RCX_OFFSET, CPUID_DEFAULT_RDX_OFFSET, CPUID_RAX_OFFSET, CPUID_RCX_OFFSET,
+            IO_ACCESS_INFO_OFFSET, IO_PORT_OFFSET, IO_RAX_OFFSET, LINUX_ENTRY_PROBE_EXIT_BUDGET,
+            LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET, MEMORY_ACCESS_INFO_OFFSET, MEMORY_GPA_OFFSET,
+            MEMORY_GVA_OFFSET, MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET, MSR_RAX_OFFSET,
+            MSR_RDX_OFFSET, PIC1_DATA_PORT, PIC2_DATA_PORT, PIT_CHANNEL0_PORT, PIT_COMMAND_PORT,
+            SERIAL_COM1_PORT, SYSTEM_CONTROL_PORT_B, VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET,
+            VP_CONTEXT_RIP_OFFSET, WHV_REGISTER_CR0, WHV_REGISTER_CR3, WHV_REGISTER_CR4,
+            WHV_REGISTER_CS, WHV_REGISTER_DS, WHV_REGISTER_ES, WHV_REGISTER_GDTR,
+            WHV_REGISTER_IDTR, WHV_REGISTER_RBP, WHV_REGISTER_RBX, WHV_REGISTER_RDI,
+            WHV_REGISTER_RFLAGS, WHV_REGISTER_RIP, WHV_REGISTER_RSI, WHV_REGISTER_RSP,
+            WHV_REGISTER_SS, WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE,
+            WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS, WHV_RUN_VP_EXIT_REASON_X64_APIC_EOI,
+            WHV_RUN_VP_EXIT_REASON_X64_CPUID, WHV_RUN_VP_EXIT_REASON_X64_HALT,
+            WHV_RUN_VP_EXIT_REASON_X64_INTERRUPT_WINDOW, WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS,
+            WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS,
         };
         use crate::native::{
             evaluate_native_block_io, linux_boot_gdt_page_bytes, native_block_io_exit_can_resume,
@@ -3432,6 +3602,24 @@ mod windows_whp {
             assert!(!serial.write(SERIAL_COM1_PORT + 1, 0x00));
             assert_eq!(serial.read(SERIAL_COM1_PORT), 0x01);
             assert_eq!(serial.read(SERIAL_COM1_PORT + 1), 0x00);
+        }
+
+        #[test]
+        fn legacy_device_io_model_handles_early_linux_ports() {
+            let mut io = LegacyDeviceIoState::default();
+
+            assert_eq!(io.access(PIC1_DATA_PORT, true, 0xfe), Some(0xfe));
+            assert_eq!(io.access(PIC1_DATA_PORT, false, 0), Some(0xfe));
+            assert_eq!(io.access(PIC2_DATA_PORT, true, 0xff), Some(0xff));
+            assert_eq!(io.access(PIC2_DATA_PORT, false, 0), Some(0xff));
+            assert_eq!(io.access(PIT_COMMAND_PORT, true, 0x36), Some(0x36));
+            assert_eq!(io.access(PIT_CHANNEL0_PORT, true, 0x34), Some(0x34));
+            assert_eq!(io.access(PIT_CHANNEL0_PORT, false, 0), Some(0x34));
+            assert_eq!(io.access(SYSTEM_CONTROL_PORT_B, true, 0x03), Some(0x03));
+            assert_eq!(io.access(SYSTEM_CONTROL_PORT_B, false, 0), Some(0x03));
+            assert_eq!(io.access(CMOS_ADDRESS_PORT, true, 0x0d), Some(0x0d));
+            assert_eq!(io.access(CMOS_DATA_PORT, false, 0), Some(0x80));
+            assert_eq!(io.access(0x1234, false, 0), None);
         }
 
         #[test]
@@ -3784,6 +3972,22 @@ mod windows_whp {
                 crate::native::NativeGuestEntryMode::LinuxProtectedMode32
             ));
             assert!(report.serial_expected_text.is_none());
+        }
+
+        #[test]
+        fn linux_entry_probe_rejects_unsupported_io_port_blocker() {
+            let mut report = base_report();
+            report.exit_reason = Some(WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS);
+            report.exit_reason_label = Some("x64-io-port-access".to_string());
+            report.calls.push(crate::native::NativeWhpCallReport {
+                name: "UnsupportedIoPort",
+                hresult: None,
+                ok: false,
+                detail: "unsupported".to_string(),
+            });
+
+            assert!(!linux_entry_probe_passed(&report));
+            assert!(linux_entry_probe_detail(&report).contains("unsupported I/O port"));
         }
 
         #[test]

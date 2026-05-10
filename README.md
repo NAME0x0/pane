@@ -226,6 +226,7 @@ What exists today:
 - E820 memory map including boot params, GDT, initramfs, RAM, APIC stubs, framebuffer memory, and input queue memory,
 - protected-mode register handoff with boot params in `rsi`,
 - resumable WHP interrupt-window and APIC-EOI exit handling so early Linux interrupt plumbing is observed instead of treated as an unknown hard stop,
+- minimal legacy PIC/PIT/CMOS/system-control port handling with explicit unsupported-I/O blockers for the next device-model gap,
 - milestone-aware Linux probe exit budgeting and reporting so storage-backed Arch boot gets enough WHP exits to reach initramfs/root-handoff markers,
 - minimal COM1 UART behavior for early serial setup,
 - guarded WHP partition/vCPU execution with deterministic fixture validation.

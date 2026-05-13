@@ -2280,6 +2280,8 @@ fn prepare_native_runtime_boundary(session_name: &str, capacity_gib: u64) -> App
     write_native_runtime_manifest(&paths, session_name)?;
     write_framebuffer_contract(&paths)?;
     write_input_contract(&paths)?;
+    create_user_disk_descriptor(&paths, &budget, false)?;
+    create_serial_boot_image_artifact(&paths, false)?;
     let report = build_runtime_report(session_name, capacity_gib, false)?;
     write_runtime_manifest(&paths, &report)
 }
@@ -3237,9 +3239,9 @@ fn build_runtime_report(
                 .to_string(),
             "Register a Pane-approved Arch base OS image with `pane runtime --register-base-image <path> --expected-sha256 <sha256>`."
                 .to_string(),
-            "Create the Pane-owned sparse user disk with `pane runtime --create-user-disk`."
+            "Keep the Pane-owned sparse user disk from `--prepare-runtime`, or recreate it explicitly with `pane runtime --create-user-disk` if metadata repair is needed."
                 .to_string(),
-            "Create the runtime-backed serial boot image with `pane runtime --create-serial-boot-image`."
+            "Keep the runtime-backed serial boot image from `--prepare-runtime`, or recreate it explicitly with `pane runtime --create-serial-boot-image` if fixture metadata is stale."
                 .to_string(),
             "Run `pane native-boot-spike --prepare-runtime --execute --run-fixture` to prove WHP guest memory, register setup, vCPU execution, and serial I/O."
                 .to_string(),

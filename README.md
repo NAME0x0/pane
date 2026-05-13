@@ -276,6 +276,8 @@ Check WHP host and runtime readiness:
 cargo run -- native-preflight --prepare-runtime --json
 ```
 
+`--prepare-runtime` creates the runtime directories, manifests, framebuffer/input contracts, sparse user disk, and serial fixture before reporting the remaining native boot blockers.
+
 Run the safe plan-only boot-spike report:
 
 ```powershell

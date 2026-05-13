@@ -335,7 +335,7 @@ pub struct NativePreflightArgs {
     /// Session slug for the Pane-owned runtime reservation.
     #[arg(long, default_value = "pane")]
     pub session_name: String,
-    /// Prepare the Pane-owned runtime directories, manifests, framebuffer contract, and input contract before reporting readiness.
+    /// Prepare the Pane-owned runtime directories, manifests, framebuffer/input contracts, sparse user disk, and serial fixture before reporting readiness.
     #[arg(long)]
     pub prepare_runtime: bool,
     /// Emit structured JSON instead of a human-readable summary.
@@ -348,7 +348,7 @@ pub struct NativeBootSpikeArgs {
     /// Session slug for the Pane-owned runtime reservation.
     #[arg(long, default_value = "pane")]
     pub session_name: String,
-    /// Prepare the Pane-owned runtime directories, manifests, framebuffer contract, and input contract before evaluating boot artifacts.
+    /// Prepare the Pane-owned runtime directories, manifests, framebuffer/input contracts, sparse user disk, and serial fixture before evaluating boot artifacts.
     #[arg(long)]
     pub prepare_runtime: bool,
     /// Actually create and tear down a WHP partition/vCPU. Without this flag, Pane prints the plan only.

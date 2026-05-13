@@ -72,7 +72,7 @@ It must remain side-effect-free. It reports blockers; it does not enable Windows
 
 ## Implementation Sequence
 
-1. Native preflight: dynamically load WHP and report host/runtime blockers without linking Pane to WHP at startup. `pane native-preflight --prepare-runtime` also creates the Pane-owned runtime directories, manifests, framebuffer contract, and input contract so kernel-layout work starts from a valid app-owned boundary.
+1. Native preflight: dynamically load WHP and report host/runtime blockers without linking Pane to WHP at startup. `pane native-preflight --prepare-runtime` also creates the Pane-owned runtime directories, manifests, framebuffer contract, input contract, sparse user disk, and serial fixture so kernel-layout work starts from a valid app-owned boundary.
 2. Partition smoke: create a WHP partition, configure one vCPU, create that vCPU, and tear everything down cleanly.
 3. Runtime-backed serial test image: materialize `serial-boot.paneimg` under the Pane runtime, map it as guest memory, configure vCPU registers, run it, decode the `PANE_BOOT_OK` COM1 banner across repeated I/O exits, observe HLT, unmap memory, and tear everything down cleanly.
 4. Runtime-provided boot-loader candidate: register a verified `boot-to-serial-loader.paneimg`, require a SHA-256 match and expected serial text, then execute that artifact through WHP with `--run-boot-loader`.

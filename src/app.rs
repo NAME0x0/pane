@@ -2194,7 +2194,7 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
     }
     if args.run_kernel_layout && !runtime.artifacts.kernel_boot_layout_ready {
         blockers.push(
-            "No materialized Pane kernel boot layout exists. Run `pane native-kernel-plan --materialize` after registering a verified kernel plan."
+            "No materialized Pane kernel boot layout exists. Run `pane native-kernel-plan --prepare-runtime --materialize` after registering a verified kernel plan."
                 .to_string(),
         );
     }
@@ -2356,7 +2356,7 @@ fn native_boot_spike_next_steps(
                 .to_string(),
             "Run `pane native-boot-spike --prepare-runtime --execute --run-boot-loader` to prove Pane can execute a runtime-provided boot candidate."
                 .to_string(),
-            "Materialize a kernel boot layout with `pane native-kernel-plan --materialize`, then run `pane native-boot-spike --prepare-runtime --execute --run-kernel-layout` with a controlled small candidate."
+            "Materialize a kernel boot layout with `pane native-kernel-plan --prepare-runtime --materialize`, then run `pane native-boot-spike --prepare-runtime --execute --run-kernel-layout` with a controlled small candidate."
                 .to_string(),
             "Connect that loader to Pane's verified Arch base image and user disk only after its serial contract is deterministic."
                 .to_string(),
@@ -2368,7 +2368,7 @@ fn native_boot_spike_next_steps(
             .to_string(),
         "Run `pane native-boot-spike --prepare-runtime --execute --run-boot-loader` to prove Pane can execute a runtime-provided boot candidate."
             .to_string(),
-        "Materialize a kernel boot layout with `pane native-kernel-plan --materialize`, then run `pane native-boot-spike --prepare-runtime --execute --run-kernel-layout` with a controlled small candidate."
+        "Materialize a kernel boot layout with `pane native-kernel-plan --prepare-runtime --materialize`, then run `pane native-boot-spike --prepare-runtime --execute --run-kernel-layout` with a controlled small candidate."
             .to_string(),
         "Connect that loader to Pane's verified Arch base image and user disk only after its serial contract is deterministic."
             .to_string(),
@@ -2378,6 +2378,9 @@ fn native_boot_spike_next_steps(
 fn native_kernel_plan(args: NativeKernelPlanArgs) -> AppResult<()> {
     let session_name = crate::plan::sanitize_session_name(&args.session_name);
     let paths = crate::plan::runtime_for(&session_name);
+    if args.prepare_runtime {
+        prepare_native_runtime_boundary(&session_name, DEFAULT_RUNTIME_CAPACITY_GIB)?;
+    }
     let runtime = build_runtime_report(&session_name, DEFAULT_RUNTIME_CAPACITY_GIB, false)?;
     let mut blockers = Vec::new();
 
@@ -3261,7 +3264,7 @@ fn build_runtime_report(
                 .to_string(),
             "Register a verified kernel/initramfs boot plan with `pane runtime --register-kernel` and an explicit serial console cmdline."
                 .to_string(),
-            "Materialize the WHP kernel boot layout with `pane native-kernel-plan --materialize`."
+            "Materialize the WHP kernel boot layout with `pane native-kernel-plan --prepare-runtime --materialize`."
                 .to_string(),
             "Use the kernel layout storage attachment to connect the verified Arch base image and Pane user disk to the native boot path."
                 .to_string(),
@@ -6201,7 +6204,7 @@ fn load_kernel_layout_boot_image_artifact(
     let artifacts = build_runtime_artifact_report(paths);
     if !artifacts.kernel_boot_layout_ready {
         return Err(AppError::message(
-            "Pane kernel boot layout is missing or stale. Run `pane native-kernel-plan --materialize` after registering a verified kernel plan.",
+            "Pane kernel boot layout is missing or stale. Run `pane native-kernel-plan --prepare-runtime --materialize` after registering a verified kernel plan.",
         ));
     }
     let layout = read_json_file::<KernelBootLayout>(&paths.kernel_boot_layout)?;
@@ -6217,7 +6220,7 @@ fn load_kernel_layout_boot_image_artifact(
     let actual_sha256 = sha256_bytes(&bytes);
     if layout.kernel_bytes != bytes.len() as u64 || layout.kernel_sha256 != actual_sha256 {
         return Err(AppError::message(
-            "Kernel layout no longer matches the registered kernel artifact. Re-run `pane native-kernel-plan --materialize`.",
+            "Kernel layout no longer matches the registered kernel artifact. Re-run `pane native-kernel-plan --prepare-runtime --materialize`.",
         ));
     }
 

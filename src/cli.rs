@@ -382,6 +382,9 @@ pub struct NativeKernelPlanArgs {
     /// Write the resolved guest-memory layout into the runtime state directory.
     #[arg(long)]
     pub materialize: bool,
+    /// Prepare the Pane-owned runtime directories, manifests, framebuffer/input contracts, sparse user disk, and serial fixture before planning.
+    #[arg(long)]
+    pub prepare_runtime: bool,
     /// Emit structured JSON instead of a human-readable summary.
     #[arg(long)]
     pub json: bool,
@@ -636,6 +639,25 @@ mod tests {
                 assert!(args.run_kernel_layout);
             }
             _ => panic!("expected native-boot-spike command"),
+        }
+    }
+
+    #[test]
+    fn native_kernel_plan_accepts_prepare_runtime_flag() {
+        let cli = Cli::try_parse_from([
+            "pane",
+            "native-kernel-plan",
+            "--prepare-runtime",
+            "--materialize",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::NativeKernelPlan(args) => {
+                assert!(args.prepare_runtime);
+                assert!(args.materialize);
+            }
+            _ => panic!("expected native-kernel-plan command"),
         }
     }
 }

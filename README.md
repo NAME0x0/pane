@@ -308,7 +308,7 @@ cargo run -- runtime --write-initramfs-driver
 cargo run -- runtime --build-pane-block-module --kernel-build-dir C:\path\to\arch-kernel-build-dir
 cargo run -- runtime --register-pane-block-module C:\path\to\pane-block.ko --pane-block-module-expected-sha256 <64-char-sha256>
 cargo run -- runtime --build-discovery-initramfs
-cargo run -- native-kernel-plan --materialize
+cargo run -- native-kernel-plan --prepare-runtime --materialize
 cargo run -- native-boot-spike --prepare-runtime --execute --run-kernel-layout
 ```
 

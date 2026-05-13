@@ -264,7 +264,7 @@ Pane should not be treated as a first public release until:
 - registered Linux kernels are inspected as bzImage artifacts so Pane records boot-protocol/setup metadata before WHP entry work,
 - materialized Linux layouts split bzImage setup bytes from protected-mode payload bytes, copy the original setup header into boot params, and declare the protected-mode entry contract,
 - materialized Linux layouts include an explicit E820 memory map, reserve boot params/GDT/initramfs/APIC stub ranges, and WHP maps the usable RAM, framebuffer memory, input queue memory, plus boot-protocol support pages needed by protected-mode entry probes,
-- `pane native-kernel-plan --materialize` can persist the guest-memory boot layout that the WHP kernel-entry runner must execute next,
+- `pane native-kernel-plan --prepare-runtime --materialize` can prepare the runtime boundary and persist the guest-memory boot layout that the WHP kernel-entry runner must execute next,
 - `pane native-boot-spike --run-kernel-layout` can consume that layout through the guarded WHP runner and preserve the selected guest-entry contract in reports,
 - controlled candidates enter with the real-mode serial/HALT register contract, while Linux bzImage payloads enter with the Linux 32-bit protected-mode probe contract, a boot-protocol GDT, zeroed `%ebx/%ebp/%edi`, and boot params in `rsi`,
 - Linux protected-mode probes emulate enough COM1 UART behavior to let early serial code configure and poll the port before deterministic serial text is required,

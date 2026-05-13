@@ -1120,8 +1120,11 @@ mod windows_whp {
     const CMOS_ADDRESS_PORT: u16 = 0x0070;
     const CMOS_DATA_PORT: u16 = 0x0071;
     const POST_DELAY_PORT: u16 = 0x0080;
+    const SYSTEM_CONTROL_PORT_A: u16 = 0x0092;
     const PIC2_COMMAND_PORT: u16 = 0x00a0;
     const PIC2_DATA_PORT: u16 = 0x00a1;
+    const ALT_POST_DELAY_PORT: u16 = 0x00eb;
+    const ALT_DELAY_PORT: u16 = 0x00ed;
     const VGA_ATTRIBUTE_PORT: u16 = 0x03c0;
     const VGA_ATTRIBUTE_DATA_READ_PORT: u16 = 0x03c1;
     const VGA_MISC_OUTPUT_WRITE_PORT: u16 = 0x03c2;
@@ -2836,6 +2839,7 @@ mod windows_whp {
         pic2_mask: u8,
         pit_latch: [u8; 3],
         pit_command: u8,
+        system_control_a: u8,
         system_control_b: u8,
         cmos_index: u8,
         pci_config_address: u32,
@@ -2913,7 +2917,11 @@ mod windows_whp {
                     true
                 }
                 CMOS_DATA_PORT => true,
-                POST_DELAY_PORT => true,
+                POST_DELAY_PORT | ALT_POST_DELAY_PORT | ALT_DELAY_PORT => true,
+                SYSTEM_CONTROL_PORT_A => {
+                    self.system_control_a = value;
+                    true
+                }
                 PCI_CONFIG_ADDRESS_PORT..=PCI_CONFIG_ADDRESS_END_PORT
                 | PCI_CONFIG_DATA_START_PORT..=PCI_CONFIG_DATA_END_PORT => {
                     self.write_pci_config_port(port, value);
@@ -2992,9 +3000,10 @@ mod windows_whp {
                 PIT_COMMAND_PORT => Some(self.pit_command),
                 PS2_DATA_PORT => Some(0),
                 PS2_STATUS_COMMAND_PORT => Some(0),
+                SYSTEM_CONTROL_PORT_A => Some(self.system_control_a),
                 SYSTEM_CONTROL_PORT_B => Some(self.system_control_b),
                 CMOS_DATA_PORT => Some(self.cmos_value()),
-                POST_DELAY_PORT => Some(0),
+                POST_DELAY_PORT | ALT_POST_DELAY_PORT | ALT_DELAY_PORT => Some(0),
                 PCI_CONFIG_ADDRESS_PORT..=PCI_CONFIG_ADDRESS_END_PORT
                 | PCI_CONFIG_DATA_START_PORT..=PCI_CONFIG_DATA_END_PORT => {
                     Some(self.read_pci_config_port(port))
@@ -3705,18 +3714,19 @@ mod windows_whp {
             input_queue_snapshot_report, linux_entry_probe_detail, linux_entry_probe_exit_budget,
             linux_entry_probe_passed, linux_protected_mode_registers, serial_contract_passed,
             serial_markers_observed, Com1SerialState, DecodedExit, LegacyDeviceIoState,
-            CMOS_ADDRESS_PORT, CMOS_DATA_PORT, CPUID_DEFAULT_RAX_OFFSET, CPUID_DEFAULT_RBX_OFFSET,
-            CPUID_DEFAULT_RCX_OFFSET, CPUID_DEFAULT_RDX_OFFSET, CPUID_RAX_OFFSET, CPUID_RCX_OFFSET,
-            IO_ACCESS_INFO_OFFSET, IO_PORT_OFFSET, IO_RAX_OFFSET, LINUX_ENTRY_PROBE_EXIT_BUDGET,
+            ALT_DELAY_PORT, ALT_POST_DELAY_PORT, CMOS_ADDRESS_PORT, CMOS_DATA_PORT,
+            CPUID_DEFAULT_RAX_OFFSET, CPUID_DEFAULT_RBX_OFFSET, CPUID_DEFAULT_RCX_OFFSET,
+            CPUID_DEFAULT_RDX_OFFSET, CPUID_RAX_OFFSET, CPUID_RCX_OFFSET, IO_ACCESS_INFO_OFFSET,
+            IO_PORT_OFFSET, IO_RAX_OFFSET, LINUX_ENTRY_PROBE_EXIT_BUDGET,
             LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET, MEMORY_ACCESS_INFO_OFFSET, MEMORY_GPA_OFFSET,
             MEMORY_GVA_OFFSET, MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET, MSR_RAX_OFFSET,
             MSR_RDX_OFFSET, PCI_CONFIG_ADDRESS_PORT, PCI_CONFIG_DATA_START_PORT, PIC1_DATA_PORT,
             PIC2_DATA_PORT, PIT_CHANNEL0_PORT, PIT_COMMAND_PORT, POST_DELAY_PORT, PS2_DATA_PORT,
-            PS2_STATUS_COMMAND_PORT, SERIAL_COM1_PORT, SYSTEM_CONTROL_PORT_B,
-            VGA_ATTRIBUTE_DATA_READ_PORT, VGA_ATTRIBUTE_PORT, VGA_CRTC_COLOR_DATA_PORT,
-            VGA_CRTC_COLOR_INDEX_PORT, VGA_GRAPHICS_DATA_PORT, VGA_GRAPHICS_INDEX_PORT,
-            VGA_INPUT_STATUS_COLOR_PORT, VGA_MISC_OUTPUT_READ_PORT, VGA_MISC_OUTPUT_WRITE_PORT,
-            VGA_SEQUENCER_DATA_PORT, VGA_SEQUENCER_INDEX_PORT,
+            PS2_STATUS_COMMAND_PORT, SERIAL_COM1_PORT, SYSTEM_CONTROL_PORT_A,
+            SYSTEM_CONTROL_PORT_B, VGA_ATTRIBUTE_DATA_READ_PORT, VGA_ATTRIBUTE_PORT,
+            VGA_CRTC_COLOR_DATA_PORT, VGA_CRTC_COLOR_INDEX_PORT, VGA_GRAPHICS_DATA_PORT,
+            VGA_GRAPHICS_INDEX_PORT, VGA_INPUT_STATUS_COLOR_PORT, VGA_MISC_OUTPUT_READ_PORT,
+            VGA_MISC_OUTPUT_WRITE_PORT, VGA_SEQUENCER_DATA_PORT, VGA_SEQUENCER_INDEX_PORT,
             VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET, VP_CONTEXT_RIP_OFFSET, WHV_REGISTER_CR0,
             WHV_REGISTER_CR3, WHV_REGISTER_CR4, WHV_REGISTER_CS, WHV_REGISTER_DS, WHV_REGISTER_ES,
             WHV_REGISTER_GDTR, WHV_REGISTER_IDTR, WHV_REGISTER_RBP, WHV_REGISTER_RBX,
@@ -3838,10 +3848,15 @@ mod windows_whp {
             assert_eq!(io.access(PIT_COMMAND_PORT, true, 1, 0x36), Some(0x36));
             assert_eq!(io.access(PIT_CHANNEL0_PORT, true, 1, 0x34), Some(0x34));
             assert_eq!(io.access(PIT_CHANNEL0_PORT, false, 1, 0), Some(0x34));
+            assert_eq!(io.access(SYSTEM_CONTROL_PORT_A, true, 1, 0x02), Some(0x02));
+            assert_eq!(io.access(SYSTEM_CONTROL_PORT_A, false, 1, 0), Some(0x02));
             assert_eq!(io.access(SYSTEM_CONTROL_PORT_B, true, 1, 0x03), Some(0x03));
             assert_eq!(io.access(SYSTEM_CONTROL_PORT_B, false, 1, 0), Some(0x03));
             assert_eq!(io.access(CMOS_ADDRESS_PORT, true, 1, 0x0d), Some(0x0d));
             assert_eq!(io.access(CMOS_DATA_PORT, false, 1, 0), Some(0x80));
+            assert_eq!(io.access(POST_DELAY_PORT, true, 1, 0), Some(0));
+            assert_eq!(io.access(ALT_POST_DELAY_PORT, true, 1, 0), Some(0));
+            assert_eq!(io.access(ALT_DELAY_PORT, true, 1, 0), Some(0));
             assert_eq!(io.access(0x1234, false, 1, 0), None);
         }
 

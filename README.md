@@ -229,7 +229,7 @@ What exists today:
 - protected-mode register handoff with boot params in `rsi`,
 - explicit default MSR state for APIC base, PAT, SYSENTER, EFER, TSC AUX, and MTRR probes during early Linux CPU bring-up,
 - resumable WHP interrupt-window and APIC-EOI exit handling so early Linux interrupt plumbing is observed instead of treated as an unknown hard stop,
-- width-aware legacy PIC/PIT/ELCR/CMOS RTC/system-control A/B/delay/PCI-config/i8042/VGA probe port handling with explicit unsupported-I/O blockers for the next device-model gap,
+- width-aware legacy PIC/PIT/ELCR/CMOS RTC/system-control A/B/delay/PCI-config/i8042/VGA/ACPI PM probe port handling with explicit unsupported-I/O blockers for the next device-model gap,
 - deterministic i8042 command-byte, controller self-test, interface-test, and output-port responses for Linux PS/2 controller probing,
 - milestone-aware Linux probe exit budgeting and reporting so storage-backed Arch boot gets enough WHP exits to reach initramfs/root-handoff markers,
 - minimal COM1 UART behavior for early serial setup,

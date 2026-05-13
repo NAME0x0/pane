@@ -1143,6 +1143,14 @@ mod windows_whp {
     const VGA_CRTC_COLOR_INDEX_PORT: u16 = 0x03d4;
     const VGA_CRTC_COLOR_DATA_PORT: u16 = 0x03d5;
     const VGA_INPUT_STATUS_COLOR_PORT: u16 = 0x03da;
+    const ACPI_PM1_STATUS_PORT: u16 = 0x0400;
+    const ACPI_PM1_STATUS_END_PORT: u16 = 0x0401;
+    const ACPI_PM1_ENABLE_PORT: u16 = 0x0402;
+    const ACPI_PM1_ENABLE_END_PORT: u16 = 0x0403;
+    const ACPI_PM1_CONTROL_PORT: u16 = 0x0404;
+    const ACPI_PM1_CONTROL_END_PORT: u16 = 0x0405;
+    const ACPI_PM_TIMER_PORT: u16 = 0x0408;
+    const ACPI_PM_TIMER_END_PORT: u16 = 0x040b;
     const ELCR1_PORT: u16 = 0x04d0;
     const ELCR2_PORT: u16 = 0x04d1;
     const PCI_CONFIG_ADDRESS_PORT: u16 = 0x0cf8;
@@ -2862,6 +2870,10 @@ mod windows_whp {
         vga_graphics: [u8; 0x10],
         vga_crtc_index: u8,
         vga_crtc: [u8; 0x20],
+        acpi_pm1_status: u16,
+        acpi_pm1_enable: u16,
+        acpi_pm1_control: u16,
+        acpi_pm_timer: u32,
         elcr1: u8,
         elcr2: u8,
     }
@@ -2998,6 +3010,25 @@ mod windows_whp {
                     self.vga_crtc[index] = value;
                     true
                 }
+                ACPI_PM1_STATUS_PORT..=ACPI_PM1_STATUS_END_PORT => {
+                    let shift = (port - ACPI_PM1_STATUS_PORT) * 8;
+                    self.acpi_pm1_status &= !(0xff_u16 << shift);
+                    self.acpi_pm1_status |= u16::from(value) << shift;
+                    true
+                }
+                ACPI_PM1_ENABLE_PORT..=ACPI_PM1_ENABLE_END_PORT => {
+                    let shift = (port - ACPI_PM1_ENABLE_PORT) * 8;
+                    self.acpi_pm1_enable &= !(0xff_u16 << shift);
+                    self.acpi_pm1_enable |= u16::from(value) << shift;
+                    true
+                }
+                ACPI_PM1_CONTROL_PORT..=ACPI_PM1_CONTROL_END_PORT => {
+                    let shift = (port - ACPI_PM1_CONTROL_PORT) * 8;
+                    self.acpi_pm1_control &= !(0xff_u16 << shift);
+                    self.acpi_pm1_control |= u16::from(value) << shift;
+                    true
+                }
+                ACPI_PM_TIMER_PORT..=ACPI_PM_TIMER_END_PORT => true,
                 ELCR1_PORT => {
                     self.elcr1 = value;
                     true
@@ -3060,6 +3091,25 @@ mod windows_whp {
                 VGA_INPUT_STATUS_MONO_PORT | VGA_INPUT_STATUS_COLOR_PORT => {
                     self.vga_attribute_flip_flop = false;
                     Some(0)
+                }
+                ACPI_PM1_STATUS_PORT..=ACPI_PM1_STATUS_END_PORT => {
+                    let shift = (port - ACPI_PM1_STATUS_PORT) * 8;
+                    Some(((self.acpi_pm1_status >> shift) & 0xff) as u8)
+                }
+                ACPI_PM1_ENABLE_PORT..=ACPI_PM1_ENABLE_END_PORT => {
+                    let shift = (port - ACPI_PM1_ENABLE_PORT) * 8;
+                    Some(((self.acpi_pm1_enable >> shift) & 0xff) as u8)
+                }
+                ACPI_PM1_CONTROL_PORT..=ACPI_PM1_CONTROL_END_PORT => {
+                    let shift = (port - ACPI_PM1_CONTROL_PORT) * 8;
+                    Some(((self.acpi_pm1_control >> shift) & 0xff) as u8)
+                }
+                ACPI_PM_TIMER_PORT..=ACPI_PM_TIMER_END_PORT => {
+                    if port == ACPI_PM_TIMER_PORT {
+                        self.acpi_pm_timer = self.acpi_pm_timer.wrapping_add(0x100) & 0x00ff_ffff;
+                    }
+                    let shift = u32::from(port - ACPI_PM_TIMER_PORT) * 8;
+                    Some(((self.acpi_pm_timer >> shift) & 0xff) as u8)
                 }
                 ELCR1_PORT => Some(self.elcr1),
                 ELCR2_PORT => Some(self.elcr2),
@@ -3767,15 +3817,16 @@ mod windows_whp {
             guest_contract_passed, input_queue_snapshot_report, linux_entry_probe_detail,
             linux_entry_probe_exit_budget, linux_entry_probe_passed,
             linux_protected_mode_registers, serial_contract_passed, serial_markers_observed,
-            Com1SerialState, DecodedExit, LegacyDeviceIoState, ALT_DELAY_PORT, ALT_POST_DELAY_PORT,
-            CMOS_ADDRESS_PORT, CMOS_DATA_PORT, CPUID_DEFAULT_RAX_OFFSET, CPUID_DEFAULT_RBX_OFFSET,
-            CPUID_DEFAULT_RCX_OFFSET, CPUID_DEFAULT_RDX_OFFSET, CPUID_RAX_OFFSET, CPUID_RCX_OFFSET,
-            ELCR1_PORT, ELCR2_PORT, IO_ACCESS_INFO_OFFSET, IO_PORT_OFFSET, IO_RAX_OFFSET,
-            LINUX_ENTRY_PROBE_EXIT_BUDGET, LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET,
-            MEMORY_ACCESS_INFO_OFFSET, MEMORY_GPA_OFFSET, MEMORY_GVA_OFFSET,
-            MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET, MSR_RAX_OFFSET, MSR_RDX_OFFSET,
-            PCI_CONFIG_ADDRESS_PORT, PCI_CONFIG_DATA_START_PORT, PIC1_DATA_PORT, PIC2_DATA_PORT,
-            PIT_CHANNEL0_PORT, PIT_COMMAND_PORT, POST_DELAY_PORT, PS2_DATA_PORT,
+            Com1SerialState, DecodedExit, LegacyDeviceIoState, ACPI_PM1_CONTROL_PORT,
+            ACPI_PM1_ENABLE_PORT, ACPI_PM1_STATUS_PORT, ACPI_PM_TIMER_PORT, ALT_DELAY_PORT,
+            ALT_POST_DELAY_PORT, CMOS_ADDRESS_PORT, CMOS_DATA_PORT, CPUID_DEFAULT_RAX_OFFSET,
+            CPUID_DEFAULT_RBX_OFFSET, CPUID_DEFAULT_RCX_OFFSET, CPUID_DEFAULT_RDX_OFFSET,
+            CPUID_RAX_OFFSET, CPUID_RCX_OFFSET, ELCR1_PORT, ELCR2_PORT, IO_ACCESS_INFO_OFFSET,
+            IO_PORT_OFFSET, IO_RAX_OFFSET, LINUX_ENTRY_PROBE_EXIT_BUDGET,
+            LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET, MEMORY_ACCESS_INFO_OFFSET, MEMORY_GPA_OFFSET,
+            MEMORY_GVA_OFFSET, MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET, MSR_RAX_OFFSET,
+            MSR_RDX_OFFSET, PCI_CONFIG_ADDRESS_PORT, PCI_CONFIG_DATA_START_PORT, PIC1_DATA_PORT,
+            PIC2_DATA_PORT, PIT_CHANNEL0_PORT, PIT_COMMAND_PORT, POST_DELAY_PORT, PS2_DATA_PORT,
             PS2_STATUS_COMMAND_PORT, SERIAL_COM1_PORT, SYSTEM_CONTROL_PORT_A,
             SYSTEM_CONTROL_PORT_B, VGA_ATTRIBUTE_DATA_READ_PORT, VGA_ATTRIBUTE_PORT,
             VGA_CRTC_COLOR_DATA_PORT, VGA_CRTC_COLOR_INDEX_PORT, VGA_GRAPHICS_DATA_PORT,
@@ -3916,6 +3967,38 @@ mod windows_whp {
             assert_eq!(io.access(ALT_POST_DELAY_PORT, true, 1, 0), Some(0));
             assert_eq!(io.access(ALT_DELAY_PORT, true, 1, 0), Some(0));
             assert_eq!(io.access(0x1234, false, 1, 0), None);
+        }
+
+        #[test]
+        fn legacy_device_io_model_handles_acpi_pm_ports() {
+            let mut io = LegacyDeviceIoState::default();
+
+            assert_eq!(
+                io.access(ACPI_PM1_STATUS_PORT, true, 2, 0x0001),
+                Some(0x0001)
+            );
+            assert_eq!(io.access(ACPI_PM1_STATUS_PORT, false, 2, 0), Some(0x0001));
+            assert_eq!(
+                io.access(ACPI_PM1_ENABLE_PORT, true, 2, 0x0021),
+                Some(0x0021)
+            );
+            assert_eq!(io.access(ACPI_PM1_ENABLE_PORT, false, 2, 0), Some(0x0021));
+            assert_eq!(
+                io.access(ACPI_PM1_CONTROL_PORT, true, 2, 0x1c00),
+                Some(0x1c00)
+            );
+            assert_eq!(io.access(ACPI_PM1_CONTROL_PORT, false, 2, 0), Some(0x1c00));
+
+            let first = io
+                .access(ACPI_PM_TIMER_PORT, false, 4, 0)
+                .expect("pm timer read");
+            let second = io
+                .access(ACPI_PM_TIMER_PORT, false, 4, 0)
+                .expect("pm timer read");
+
+            assert!(second > first);
+            assert_eq!(first & 0xff00_0000, 0);
+            assert_eq!(second & 0xff00_0000, 0);
         }
 
         #[test]

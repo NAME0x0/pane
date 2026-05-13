@@ -260,6 +260,7 @@ struct RuntimeArtifactReport {
     base_os_image_sha256: Option<String>,
     base_os_image_format: Option<String>,
     base_os_bootable_disk_hint: Option<bool>,
+    base_os_root_partition_hint: Option<bool>,
     base_os_image_verified: bool,
     base_os_metadata_exists: bool,
     serial_boot_image_exists: bool,
@@ -1923,8 +1924,13 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
             &paths,
             source_image,
             args.expected_sha256.as_deref(),
+            args.require_native_root_disk,
             args.force,
         )?;
+    } else if args.require_native_root_disk {
+        return Err(AppError::message(
+            "--require-native-root-disk requires --register-base-image.",
+        ));
     } else if args.expected_sha256.is_some() {
         return Err(AppError::message(
             "--expected-sha256 requires --register-base-image.",
@@ -3237,7 +3243,7 @@ fn build_runtime_report(
         next_steps: vec![
             "Run `pane native-preflight --prepare-runtime --json` to prepare the Pane-owned runtime boundary and prove the host can support the first WHP boot-to-serial spike."
                 .to_string(),
-            "Register a Pane-approved Arch base OS image with `pane runtime --register-base-image <path> --expected-sha256 <sha256>`."
+            "Register a Pane-approved Arch raw disk image with `pane runtime --register-base-image <path> --expected-sha256 <sha256> --require-native-root-disk`."
                 .to_string(),
             "Keep the Pane-owned sparse user disk from `--prepare-runtime`, or recreate it explicitly with `pane runtime --create-user-disk` if metadata repair is needed."
                 .to_string(),
@@ -3391,6 +3397,7 @@ fn register_base_os_image(
     paths: &RuntimePaths,
     source_image: &Path,
     expected_sha256: Option<&str>,
+    require_native_root_disk: bool,
     force: bool,
 ) -> AppResult<()> {
     if !source_image.is_file() {
@@ -3413,6 +3420,11 @@ fn register_base_os_image(
                 "Base OS image SHA-256 mismatch. expected {expected}, got {actual_sha256}."
             )));
         }
+    }
+
+    let source_inspection = inspect_base_os_image_artifact(source_image)?;
+    if require_native_root_disk {
+        validate_native_root_disk_image(source_image, &source_inspection)?;
     }
 
     if let Some(parent) = paths.base_os_image.parent() {
@@ -3444,7 +3456,11 @@ fn register_base_os_image(
     }
 
     let bytes = fs::metadata(&paths.base_os_image)?.len();
-    let inspection = inspect_base_os_image_artifact(&paths.base_os_image)?;
+    let inspection = if same_target {
+        source_inspection
+    } else {
+        inspect_base_os_image_artifact(&paths.base_os_image)?
+    };
     let metadata = BaseOsImageMetadata {
         schema_version: 1,
         distro_family: DistroFamily::Arch,
@@ -3467,6 +3483,28 @@ fn register_base_os_image(
         notes: inspection.notes,
     };
     write_json_file(&paths.base_os_metadata, &metadata)
+}
+
+fn validate_native_root_disk_image(
+    path: &Path,
+    inspection: &BaseOsImageInspection,
+) -> AppResult<()> {
+    if !inspection.bootable_disk_hint {
+        return Err(AppError::message(format!(
+            "Pane native boot requires a bootable raw disk image with a detectable Linux root partition. `{}` was registered as `{}`. Convert the Arch rootfs to a raw disk image or register a bootable Arch disk image, then retry.",
+            path.display(),
+            inspection.image_format
+        )));
+    }
+
+    if inspection.root_partition_hint.is_none() {
+        return Err(AppError::message(format!(
+            "Pane native boot found a raw disk image at {}, but no Linux root partition was detected. Register an Arch raw disk image with an MBR Linux partition or GPT Linux root partition before continuing.",
+            path.display()
+        )));
+    }
+
+    Ok(())
 }
 
 fn inspect_base_os_image_artifact(path: &Path) -> AppResult<BaseOsImageInspection> {
@@ -8029,6 +8067,9 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
         base_os_bootable_disk_hint: base_metadata
             .as_ref()
             .map(|metadata| metadata.bootable_disk_hint),
+        base_os_root_partition_hint: base_metadata
+            .as_ref()
+            .map(|metadata| metadata.root_partition_hint.is_some()),
         base_os_image_verified,
         base_os_metadata_exists: paths.base_os_metadata.is_file(),
         serial_boot_image_exists: paths.serial_boot_image.is_file(),
@@ -8140,6 +8181,13 @@ fn build_native_runtime_report(
                 "Pane has a base OS image, but it is not trusted. Re-register it with --expected-sha256 so Pane can verify the image before boot."
                     .to_string(),
             );
+        } else if artifacts.base_os_bootable_disk_hint != Some(true)
+            || artifacts.base_os_root_partition_hint != Some(true)
+        {
+            blockers.push(
+                "Pane has a verified base OS image, but native Arch boot requires a raw disk with a detectable Linux root partition. Re-register it with `pane runtime --register-base-image <path> --expected-sha256 <sha256> --require-native-root-disk`."
+                    .to_string(),
+            );
         }
         if !artifacts.user_disk_ready {
             blockers.push(
@@ -8234,6 +8282,8 @@ fn build_native_runtime_report(
 
     let ready_for_boot_spike = prepared
         && artifacts.base_os_image_verified
+        && artifacts.base_os_bootable_disk_hint == Some(true)
+        && artifacts.base_os_root_partition_hint == Some(true)
         && artifacts.user_disk_ready
         && artifacts.serial_boot_image_ready
         && artifacts.runtime_config_exists
@@ -10687,6 +10737,9 @@ fn print_runtime_report(report: &RuntimeReport) {
     if let Some(bootable) = report.artifacts.base_os_bootable_disk_hint {
         println!("  Base Boot Hint {}", yes_no(bootable));
     }
+    if let Some(root_partition) = report.artifacts.base_os_root_partition_hint {
+        println!("  Base Root Hint {}", yes_no(root_partition));
+    }
     println!(
         "  Serial Boot    {}",
         yes_no(report.artifacts.serial_boot_image_exists)
@@ -11873,6 +11926,16 @@ mod tests {
         bytes
     }
 
+    fn fake_mbr_linux_root_disk_image() -> Vec<u8> {
+        let mut image = vec![0_u8; 4 * 1024 * 1024];
+        image[446] = 0x80;
+        image[450] = 0x83;
+        image[454..458].copy_from_slice(&2048_u32.to_le_bytes());
+        image[458..462].copy_from_slice(&4096_u32.to_le_bytes());
+        image[510..512].copy_from_slice(&[0x55, 0xaa]);
+        image
+    }
+
     fn register_fake_discovery_initramfs(paths: &RuntimePaths) {
         let discovery_initramfs = paths
             .initramfs_driver_dir
@@ -12712,10 +12775,10 @@ mod tests {
         let paths = temp_runtime_paths("runtime-artifacts");
         super::prepare_runtime_paths(&paths).unwrap();
         let source = paths.downloads.join("arch.img");
-        std::fs::write(&source, b"pane arch image").unwrap();
+        std::fs::write(&source, fake_mbr_linux_root_disk_image()).unwrap();
         let expected = sha256_file(&source).unwrap();
 
-        register_base_os_image(&paths, &source, Some(&expected), false).unwrap();
+        register_base_os_image(&paths, &source, Some(&expected), true, false).unwrap();
         create_user_disk_descriptor(&paths, &runtime_storage_budget(8), false).unwrap();
         create_serial_boot_image_artifact(&paths, false).unwrap();
         super::write_runtime_config(&paths, "pane", &runtime_storage_budget(8)).unwrap();
@@ -12728,8 +12791,12 @@ mod tests {
             artifacts.base_os_image_sha256.as_deref(),
             Some(expected.as_str())
         );
-        assert_eq!(artifacts.base_os_image_format.as_deref(), Some("unknown"));
-        assert_eq!(artifacts.base_os_bootable_disk_hint, Some(false));
+        assert_eq!(
+            artifacts.base_os_image_format.as_deref(),
+            Some("raw-mbr-disk")
+        );
+        assert_eq!(artifacts.base_os_bootable_disk_hint, Some(true));
+        assert_eq!(artifacts.base_os_root_partition_hint, Some(true));
         assert!(artifacts.user_disk_exists);
         assert!(artifacts.user_disk_ready);
         assert_eq!(artifacts.user_disk_capacity_gib, Some(3));
@@ -12783,7 +12850,7 @@ mod tests {
         std::fs::write(&source, image).unwrap();
         let expected = sha256_file(&source).unwrap();
 
-        register_base_os_image(&paths, &source, Some(&expected), false).unwrap();
+        register_base_os_image(&paths, &source, Some(&expected), false, false).unwrap();
 
         let metadata = read_json_file::<BaseOsImageMetadata>(&paths.base_os_metadata).unwrap();
         let artifacts = build_runtime_artifact_report(&paths);
@@ -12803,16 +12870,10 @@ mod tests {
         let paths = temp_runtime_paths("runtime-base-image-mbr-root");
         super::prepare_runtime_paths(&paths).unwrap();
         let source = paths.downloads.join("arch-mbr.img");
-        let mut image = vec![0_u8; 4096];
-        image[446] = 0x80;
-        image[450] = 0x83;
-        image[454..458].copy_from_slice(&2048_u32.to_le_bytes());
-        image[458..462].copy_from_slice(&4096_u32.to_le_bytes());
-        image[510..512].copy_from_slice(&[0x55, 0xaa]);
-        std::fs::write(&source, image).unwrap();
+        std::fs::write(&source, fake_mbr_linux_root_disk_image()).unwrap();
         let expected = sha256_file(&source).unwrap();
 
-        register_base_os_image(&paths, &source, Some(&expected), false).unwrap();
+        register_base_os_image(&paths, &source, Some(&expected), false, false).unwrap();
 
         let metadata = read_json_file::<BaseOsImageMetadata>(&paths.base_os_metadata).unwrap();
         assert_eq!(metadata.image_format, "raw-mbr-disk");
@@ -12824,6 +12885,44 @@ mod tests {
         assert_eq!(root.byte_offset, 2048 * 512);
         assert_eq!(root.byte_length, 4096 * 512);
         assert!(root.root_candidate);
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn base_os_registration_accepts_required_native_root_disk() {
+        let paths = temp_runtime_paths("runtime-base-image-required-root");
+        super::prepare_runtime_paths(&paths).unwrap();
+        let source = paths.downloads.join("arch-root.img");
+        std::fs::write(&source, fake_mbr_linux_root_disk_image()).unwrap();
+        let expected = sha256_file(&source).unwrap();
+
+        register_base_os_image(&paths, &source, Some(&expected), true, false).unwrap();
+
+        let metadata = read_json_file::<BaseOsImageMetadata>(&paths.base_os_metadata).unwrap();
+        assert_eq!(metadata.image_format, "raw-mbr-disk");
+        assert!(metadata.bootable_disk_hint);
+        assert!(metadata.root_partition_hint.is_some());
+        assert!(paths.base_os_image.is_file());
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn base_os_registration_rejects_required_native_root_disk_without_mutating_store() {
+        let paths = temp_runtime_paths("runtime-base-image-required-reject");
+        super::prepare_runtime_paths(&paths).unwrap();
+        let source = paths.downloads.join("arch-rootfs.tar");
+        std::fs::write(&source, b"not a bootable disk").unwrap();
+        let expected = sha256_file(&source).unwrap();
+
+        let error = register_base_os_image(&paths, &source, Some(&expected), true, false)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("requires a bootable raw disk image"));
+        assert!(!paths.base_os_image.exists());
+        assert!(!paths.base_os_metadata.exists());
 
         let _ = std::fs::remove_dir_all(&paths.root);
     }
@@ -12849,7 +12948,7 @@ mod tests {
         std::fs::write(&source, image).unwrap();
         let expected = sha256_file(&source).unwrap();
 
-        register_base_os_image(&paths, &source, Some(&expected), false).unwrap();
+        register_base_os_image(&paths, &source, Some(&expected), false, false).unwrap();
 
         let metadata = read_json_file::<BaseOsImageMetadata>(&paths.base_os_metadata).unwrap();
         assert_eq!(metadata.image_format, "raw-gpt-disk");
@@ -12874,7 +12973,7 @@ mod tests {
         image[4096..4112].copy_from_slice(b"PANE_TAIL_BLOCK_");
         std::fs::write(&source, image).unwrap();
         let expected = sha256_file(&source).unwrap();
-        register_base_os_image(&paths, &source, Some(&expected), false).unwrap();
+        register_base_os_image(&paths, &source, Some(&expected), false, false).unwrap();
 
         let first = read_base_os_block(&paths, 0).unwrap();
         let second = read_base_os_block(&paths, 1).unwrap();
@@ -12951,7 +13050,7 @@ mod tests {
         image[..16].copy_from_slice(b"PANE_BASE_ADAPT_");
         std::fs::write(&base, image).unwrap();
         let base_sha = sha256_file(&base).unwrap();
-        register_base_os_image(&paths, &base, Some(&base_sha), false).unwrap();
+        register_base_os_image(&paths, &base, Some(&base_sha), false, false).unwrap();
         create_user_disk_descriptor(&paths, &runtime_storage_budget(8), false).unwrap();
 
         let base_read = execute_native_block_io_command(
@@ -13499,7 +13598,7 @@ mod tests {
         let base_sha = sha256_file(&base).unwrap();
         let kernel_sha = sha256_file(&kernel).unwrap();
 
-        register_base_os_image(&paths, &base, Some(&base_sha), false).unwrap();
+        register_base_os_image(&paths, &base, Some(&base_sha), false, false).unwrap();
         create_user_disk_descriptor(&paths, &runtime_storage_budget(8), false).unwrap();
         write_pane_initramfs_driver_bundle(&paths).unwrap();
         register_kernel_boot_plan(
@@ -13626,7 +13725,7 @@ mod tests {
         let base_sha = sha256_file(&base).unwrap();
         let kernel_sha = sha256_file(&kernel).unwrap();
 
-        register_base_os_image(&paths, &base, Some(&base_sha), false).unwrap();
+        register_base_os_image(&paths, &base, Some(&base_sha), false, false).unwrap();
         create_user_disk_descriptor(&paths, &runtime_storage_budget(8), false).unwrap();
         register_kernel_boot_plan(
             &paths,
@@ -13687,7 +13786,7 @@ mod tests {
         let base_sha = sha256_file(&base).unwrap();
         let kernel_sha = sha256_file(&kernel).unwrap();
 
-        register_base_os_image(&paths, &base, Some(&base_sha), false).unwrap();
+        register_base_os_image(&paths, &base, Some(&base_sha), false, false).unwrap();
         create_user_disk_descriptor(&paths, &runtime_storage_budget(8), false).unwrap();
         write_pane_initramfs_driver_bundle(&paths).unwrap();
         register_kernel_boot_plan(
@@ -13729,7 +13828,7 @@ mod tests {
         let base_sha = sha256_file(&base).unwrap();
         let kernel_sha = sha256_file(&kernel).unwrap();
 
-        register_base_os_image(&paths, &base, Some(&base_sha), false).unwrap();
+        register_base_os_image(&paths, &base, Some(&base_sha), false, false).unwrap();
         create_user_disk_descriptor(&paths, &runtime_storage_budget(8), false).unwrap();
         write_pane_initramfs_driver_bundle(&paths).unwrap();
         register_kernel_boot_plan(
@@ -13787,10 +13886,10 @@ mod tests {
         let paths = temp_runtime_paths("runtime-host-not-ready");
         super::prepare_runtime_paths(&paths).unwrap();
         let source = paths.downloads.join("arch.img");
-        std::fs::write(&source, b"pane arch image").unwrap();
+        std::fs::write(&source, fake_mbr_linux_root_disk_image()).unwrap();
         let expected = sha256_file(&source).unwrap();
 
-        register_base_os_image(&paths, &source, Some(&expected), false).unwrap();
+        register_base_os_image(&paths, &source, Some(&expected), true, false).unwrap();
         create_user_disk_descriptor(&paths, &runtime_storage_budget(8), false).unwrap();
         create_serial_boot_image_artifact(&paths, false).unwrap();
         super::write_runtime_config(&paths, "pane", &runtime_storage_budget(8)).unwrap();
@@ -13822,6 +13921,7 @@ mod tests {
             &paths,
             &source,
             Some("0000000000000000000000000000000000000000000000000000000000000000"),
+            false,
             false,
         )
         .unwrap_err()

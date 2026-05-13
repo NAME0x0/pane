@@ -253,6 +253,9 @@ pub struct RuntimeArgs {
     /// Expected SHA-256 digest for --register-base-image. Without this, the image is recorded but not trusted.
     #[arg(long)]
     pub expected_sha256: Option<String>,
+    /// Require --register-base-image to be a bootable raw disk with a detectable Linux root partition.
+    #[arg(long)]
+    pub require_native_root_disk: bool,
     /// Copy a controlled boot-to-serial loader candidate into Pane's runtime engine store.
     #[arg(long)]
     pub register_boot_loader: Option<PathBuf>,
@@ -556,6 +559,31 @@ mod tests {
     use clap::Parser;
 
     use super::{Cli, Commands};
+
+    #[test]
+    fn runtime_accepts_required_native_root_disk_flag() {
+        let cli = Cli::try_parse_from([
+            "pane",
+            "runtime",
+            "--register-base-image",
+            "C:\\arch.img",
+            "--expected-sha256",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--require-native-root-disk",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Runtime(args) => {
+                assert_eq!(
+                    args.register_base_image.as_deref(),
+                    Some(std::path::Path::new("C:\\arch.img"))
+                );
+                assert!(args.require_native_root_disk);
+            }
+            _ => panic!("expected runtime command"),
+        }
+    }
 
     #[test]
     fn native_preflight_accepts_prepare_runtime_flag() {

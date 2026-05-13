@@ -1067,7 +1067,7 @@ pub(crate) fn test_native_host_report(ready: bool) -> NativeHostPreflightReport 
 mod windows_whp {
     use std::{
         alloc::{alloc_zeroed, dealloc, Layout},
-        collections::HashMap,
+        collections::{HashMap, VecDeque},
         ffi::{c_char, c_void, CString},
         mem,
     };
@@ -2841,6 +2841,11 @@ mod windows_whp {
         pic2_mask: u8,
         pit_latch: [u8; 3],
         pit_command: u8,
+        ps2_command_byte: u8,
+        ps2_output_port: u8,
+        ps2_awaiting_command_byte_write: bool,
+        ps2_awaiting_output_port_write: bool,
+        ps2_response: VecDeque<u8>,
         system_control_a: u8,
         system_control_b: u8,
         cmos_index: u8,
@@ -2910,8 +2915,20 @@ mod windows_whp {
                     self.pit_command = value;
                     true
                 }
-                PS2_DATA_PORT => true,
-                PS2_STATUS_COMMAND_PORT => true,
+                PS2_DATA_PORT => {
+                    if self.ps2_awaiting_command_byte_write {
+                        self.ps2_command_byte = value;
+                        self.ps2_awaiting_command_byte_write = false;
+                    } else if self.ps2_awaiting_output_port_write {
+                        self.ps2_output_port = value;
+                        self.ps2_awaiting_output_port_write = false;
+                    }
+                    true
+                }
+                PS2_STATUS_COMMAND_PORT => {
+                    self.write_ps2_command(value);
+                    true
+                }
                 SYSTEM_CONTROL_PORT_B => {
                     self.system_control_b = value;
                     true
@@ -3010,8 +3027,8 @@ mod windows_whp {
                 PIT_CHANNEL1_PORT => Some(self.pit_latch[1]),
                 PIT_CHANNEL2_PORT => Some(self.pit_latch[2]),
                 PIT_COMMAND_PORT => Some(self.pit_command),
-                PS2_DATA_PORT => Some(0),
-                PS2_STATUS_COMMAND_PORT => Some(0),
+                PS2_DATA_PORT => Some(self.ps2_response.pop_front().unwrap_or(0)),
+                PS2_STATUS_COMMAND_PORT => Some(u8::from(!self.ps2_response.is_empty())),
                 SYSTEM_CONTROL_PORT_A => Some(self.system_control_a),
                 SYSTEM_CONTROL_PORT_B => Some(self.system_control_b),
                 CMOS_DATA_PORT => Some(self.cmos_value()),
@@ -3064,6 +3081,19 @@ mod windows_whp {
                 0x0d => 0x80, // Status D: CMOS battery valid.
                 0x32 => 0x20, // Century
                 _ => 0,
+            }
+        }
+
+        fn write_ps2_command(&mut self, value: u8) {
+            match value {
+                0x20 => self.ps2_response.push_back(self.ps2_command_byte),
+                0x60 => self.ps2_awaiting_command_byte_write = true,
+                0xa7 | 0xa8 | 0xad | 0xae => {}
+                0xaa => self.ps2_response.push_back(0x55),
+                0xab | 0xa9 => self.ps2_response.push_back(0x00),
+                0xd0 => self.ps2_response.push_back(self.ps2_output_port),
+                0xd1 => self.ps2_awaiting_output_port_write = true,
+                _ => {}
             }
         }
 
@@ -3921,6 +3951,27 @@ mod windows_whp {
 
             assert_eq!(io.access(PS2_STATUS_COMMAND_PORT, false, 1, 0), Some(0));
             assert_eq!(io.access(PS2_DATA_PORT, false, 1, 0), Some(0));
+            assert_eq!(
+                io.access(PS2_STATUS_COMMAND_PORT, true, 1, 0x60),
+                Some(0x60)
+            );
+            assert_eq!(io.access(PS2_DATA_PORT, true, 1, 0x47), Some(0x47));
+            assert_eq!(
+                io.access(PS2_STATUS_COMMAND_PORT, true, 1, 0x20),
+                Some(0x20)
+            );
+            assert_eq!(io.access(PS2_STATUS_COMMAND_PORT, false, 1, 0), Some(1));
+            assert_eq!(io.access(PS2_DATA_PORT, false, 1, 0), Some(0x47));
+            assert_eq!(
+                io.access(PS2_STATUS_COMMAND_PORT, true, 1, 0xaa),
+                Some(0xaa)
+            );
+            assert_eq!(io.access(PS2_DATA_PORT, false, 1, 0), Some(0x55));
+            assert_eq!(
+                io.access(PS2_STATUS_COMMAND_PORT, true, 1, 0xab),
+                Some(0xab)
+            );
+            assert_eq!(io.access(PS2_DATA_PORT, false, 1, 0), Some(0x00));
             assert_eq!(
                 io.access(PS2_STATUS_COMMAND_PORT, true, 1, 0xad),
                 Some(0xad)

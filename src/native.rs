@@ -2925,10 +2925,17 @@ mod windows_whp {
 
         fn cmos_value(&self) -> u8 {
             match self.cmos_index {
+                0x00 => 0x00, // Seconds
+                0x02 => 0x00, // Minutes
+                0x04 => 0x00, // Hours
+                0x07 => 0x01, // Day of month
+                0x08 => 0x01, // Month
+                0x09 => 0x26, // Year
                 0x0a => 0x26, // Status A: divider/rate, update not in progress.
                 0x0b => 0x02, // Status B: 24-hour BCD mode, no periodic interrupts.
                 0x0c => 0x00, // Status C: no pending RTC interrupt.
                 0x0d => 0x80, // Status D: CMOS battery valid.
+                0x32 => 0x20, // Century
                 _ => 0,
             }
         }
@@ -3769,6 +3776,27 @@ mod windows_whp {
             );
             assert_eq!(io.access(PS2_DATA_PORT, true, 1, 0xf4), Some(0xf4));
             assert_eq!(io.access(PS2_STATUS_COMMAND_PORT, false, 1, 0), Some(0));
+        }
+
+        #[test]
+        fn legacy_device_io_model_reports_deterministic_cmos_rtc() {
+            let mut io = LegacyDeviceIoState::default();
+
+            for (index, value) in [
+                (0x00_u32, 0x00),
+                (0x02, 0x00),
+                (0x04, 0x00),
+                (0x07, 0x01),
+                (0x08, 0x01),
+                (0x09, 0x26),
+                (0x32, 0x20),
+            ] {
+                assert_eq!(
+                    io.access(CMOS_ADDRESS_PORT, true, 1, u64::from(index)),
+                    Some(index)
+                );
+                assert_eq!(io.access(CMOS_DATA_PORT, false, 1, 0), Some(value));
+            }
         }
 
         #[test]

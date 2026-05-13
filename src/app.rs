@@ -6930,6 +6930,19 @@ fn build_kernel_storage_attachment(
         AppError::message("Verified base OS image is missing its recorded byte length.")
     })?;
     let base_metadata = read_json_file::<BaseOsImageMetadata>(&paths.base_os_metadata)?;
+    if !base_metadata.bootable_disk_hint {
+        return Err(AppError::message(format!(
+            "Pane native storage requires a verified raw disk base image with a Linux root partition hint; `{}` was registered as `{}`. Convert the Arch rootfs to a raw disk image or register a bootable raw Arch image before materializing a storage-backed kernel layout.",
+            paths.base_os_image.display(),
+            base_metadata.image_format
+        )));
+    }
+    if base_metadata.root_partition_hint.is_none() {
+        return Err(AppError::message(format!(
+            "Pane native storage found a verified raw disk base image at {}, but no Linux root partition hint. Register an Arch raw disk image with a detectable Linux root partition before materializing the kernel layout.",
+            paths.base_os_image.display()
+        )));
+    }
     let root_handoff = build_kernel_root_handoff(&base_metadata);
     let root_device = root_handoff.root_device.clone();
 
@@ -13475,7 +13488,13 @@ mod tests {
         super::prepare_runtime_paths(&paths).unwrap();
         let base = paths.downloads.join("arch-base.img");
         let kernel = paths.downloads.join("vmlinuz-linux");
-        std::fs::write(&base, b"pane arch base image").unwrap();
+        let mut base_image = vec![0_u8; 4 * 1024 * 1024];
+        base_image[446] = 0x80;
+        base_image[450] = 0x83;
+        base_image[454..458].copy_from_slice(&2048_u32.to_le_bytes());
+        base_image[458..462].copy_from_slice(&4096_u32.to_le_bytes());
+        base_image[510..512].copy_from_slice(&[0x55, 0xaa]);
+        std::fs::write(&base, base_image).unwrap();
         std::fs::write(&kernel, fake_linux_bzimage()).unwrap();
         let base_sha = sha256_file(&base).unwrap();
         let kernel_sha = sha256_file(&kernel).unwrap();
@@ -13508,7 +13527,7 @@ mod tests {
             layout.expected_serial_milestones,
             pane_initramfs_expected_serial_milestones()
         );
-        assert_eq!(storage.root_device, "/dev/pane0");
+        assert_eq!(storage.root_device, "/dev/pane0p1");
         assert_eq!(storage.user_device, "/dev/pane1");
         assert_eq!(storage.contract_gpa, "0x0dfe0000");
         assert_eq!(storage.base_os_block_size_bytes, 4096);
@@ -13519,11 +13538,12 @@ mod tests {
         assert_eq!(storage.block_io_data_port_offset, 12);
         assert_eq!(storage.block_io_block_size_bytes, 4096);
         assert!(layout.cmdline.contains("pane.storage_contract=0x0dfe0000"));
-        assert!(layout.cmdline.contains("pane.root=/dev/pane0"));
-        assert!(layout.cmdline.contains("pane.root_mode=base-device"));
+        assert!(layout.cmdline.contains("pane.root=/dev/pane0p1"));
+        assert!(layout.cmdline.contains("pane.root_mode=base-partition"));
+        assert!(layout.cmdline.contains("pane.root_partition=1"));
         assert!(layout.cmdline.contains("pane.user=/dev/pane1"));
         assert!(layout.cmdline.contains("pane.block_io=0x0d00,16,4096"));
-        assert!(layout.cmdline.contains("pane.block_devices=1,786432"));
+        assert!(layout.cmdline.contains("pane.block_devices=1024,786432"));
         assert!(layout
             .cmdline
             .contains("pane.framebuffer=0x0e000000,1024,768,32,x8r8g8b8"));
@@ -13532,11 +13552,12 @@ mod tests {
             .contains("pane.input_queue=0x0dff0000,4096,32,64"));
         assert!(storage.readonly_base);
         assert!(storage.writable_user_disk);
-        assert_eq!(storage.root_handoff.mode, "base-device");
-        assert_eq!(storage.root_handoff.root_device, "/dev/pane0");
+        assert_eq!(storage.root_handoff.mode, "base-partition");
+        assert_eq!(storage.root_handoff.root_device, "/dev/pane0p1");
+        assert_eq!(storage.root_handoff.partition_index, Some(1));
         assert_eq!(
             storage.root_handoff.filesystem_hint.as_deref(),
-            Some("unknown")
+            Some("0x83")
         );
         assert!(storage.root_handoff.requires_initramfs_driver);
         assert_eq!(storage.base_os_sha256, base_sha);
@@ -13594,7 +13615,13 @@ mod tests {
         super::prepare_runtime_paths(&paths).unwrap();
         let base = paths.downloads.join("arch-base.img");
         let kernel = paths.downloads.join("vmlinuz-linux");
-        std::fs::write(&base, b"pane arch base image").unwrap();
+        let mut base_image = vec![0_u8; 4 * 1024 * 1024];
+        base_image[446] = 0x80;
+        base_image[450] = 0x83;
+        base_image[454..458].copy_from_slice(&2048_u32.to_le_bytes());
+        base_image[458..462].copy_from_slice(&4096_u32.to_le_bytes());
+        base_image[510..512].copy_from_slice(&[0x55, 0xaa]);
+        std::fs::write(&base, base_image).unwrap();
         std::fs::write(&kernel, fake_linux_bzimage()).unwrap();
         let base_sha = sha256_file(&base).unwrap();
         let kernel_sha = sha256_file(&kernel).unwrap();
@@ -13645,6 +13672,42 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("--build-discovery-initramfs"));
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn kernel_boot_layout_rejects_non_disk_base_image_for_native_storage() {
+        let paths = temp_runtime_paths("kernel-layout-nondisk-base");
+        super::prepare_runtime_paths(&paths).unwrap();
+        let base = paths.downloads.join("arch-rootfs.tar");
+        let kernel = paths.downloads.join("vmlinuz-linux");
+        std::fs::write(&base, b"pane arch rootfs archive placeholder").unwrap();
+        std::fs::write(&kernel, fake_linux_bzimage()).unwrap();
+        let base_sha = sha256_file(&base).unwrap();
+        let kernel_sha = sha256_file(&kernel).unwrap();
+
+        register_base_os_image(&paths, &base, Some(&base_sha), false).unwrap();
+        create_user_disk_descriptor(&paths, &runtime_storage_budget(8), false).unwrap();
+        write_pane_initramfs_driver_bundle(&paths).unwrap();
+        register_kernel_boot_plan(
+            &paths,
+            Some(&kernel),
+            Some(&kernel_sha),
+            None,
+            None,
+            Some("console=ttyS0 root=/dev/pane0 rw"),
+            false,
+        )
+        .unwrap();
+        register_fake_pane_block_module(&paths);
+        register_fake_discovery_initramfs(&paths);
+
+        let error = build_kernel_boot_layout(&paths, "pane", true)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("requires a verified raw disk base image"));
 
         let _ = std::fs::remove_dir_all(&paths.root);
     }

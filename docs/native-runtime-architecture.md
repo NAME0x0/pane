@@ -16,7 +16,7 @@ Pane currently owns:
 - base OS image registration, SHA-256 verification metadata, raw disk/rootfs format inspection, Linux root partition hints, and kernel-layout root handoff decisions,
 - a sparse Pane user disk artifact for future Linux system, package, account, and customization data,
 - a sparse user disk block I/O primitive with zero-filled unallocated blocks for Pane-owned runtime storage,
-- a read-only base OS image block I/O primitive with EOF zero-fill behavior for verified Arch images,
+- a read-only base OS image block I/O primitive with EOF zero-fill behavior for verified Arch raw disk images, with storage-backed kernel layouts gated on a detectable Linux root partition before Pane exposes `/dev/pane0pN` as root,
 - a native block I/O command policy, stateful Pane block-port register protocol, WHP Pane block-port classification boundary, storage contract discovery fields, host callback submission path, serviced-exit resume, guest-visible read response streaming, and guest-to-host write-payload collection for the future storage device,
 - a host-side native block I/O adapter that services allowed kernel-layout read/write commands through verified base-image/user-disk artifacts while preserving base-image read-only policy,
 - verified Pane user disk snapshots, restore validation, portable export/import packages, conservative grow-only resize, and metadata repair under the runtime snapshot/storage boundary,

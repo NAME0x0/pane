@@ -208,6 +208,7 @@ What exists today:
 - sparse Pane user disk artifact for future Linux packages, accounts, and customization data,
 - sparse user disk block I/O primitive with zero-fill semantics for Pane-owned runtime storage,
 - read-only base OS image block I/O primitive with EOF zero-fill semantics for verified Arch images,
+- native storage-backed kernel layouts now require the verified Arch base image to be a raw disk with a detectable Linux root partition before Pane exposes it as `/dev/pane0pN`,
 - native block I/O policy, stateful Pane block-port protocol, WHP block-port classification, storage contract discovery fields, host callback submission, serviced-exit resume, guest-visible read response streaming, and guest-to-host write-payload collection for the future storage device,
 - host-side native block I/O adapter that services allowed kernel-layout read/write commands through verified base/user artifacts while preserving base-image read-only policy,
 - verified Pane user disk snapshots under the runtime snapshot store,

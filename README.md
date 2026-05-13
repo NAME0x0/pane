@@ -214,6 +214,7 @@ What exists today:
 - verified Pane user disk snapshots under the runtime snapshot store,
 - runtime-backed serial boot image,
 - verified boot-to-serial loader candidate slot,
+- verified native Arch boot-set registration for the raw disk, Linux kernel, initramfs, and serial-safe cmdline,
 - verified kernel/initramfs boot-plan metadata,
 - materialized Linux kernel boot layout,
 - kernel-layout attachment for the verified Arch base image plus guest-mapped Pane sparse user disk and block-port ABI contract,

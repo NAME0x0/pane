@@ -1894,6 +1894,7 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
     let paths = crate::plan::runtime_for(&session_name);
     let budget = runtime_storage_budget(args.capacity_gib);
     let has_runtime_mutation = args.register_base_image.is_some()
+        || args.register_native_boot_set
         || args.register_boot_loader.is_some()
         || args.register_kernel.is_some()
         || args.register_initramfs.is_some()
@@ -1919,7 +1920,9 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
         write_input_contract(&paths)?;
     }
 
-    if let Some(source_image) = args.register_base_image.as_deref() {
+    if args.register_native_boot_set {
+        register_native_boot_set(&paths, &args)?;
+    } else if let Some(source_image) = args.register_base_image.as_deref() {
         register_base_os_image(
             &paths,
             source_image,
@@ -1958,9 +1961,10 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
         ));
     }
 
-    if args.register_kernel.is_some()
-        || args.register_initramfs.is_some()
-        || args.kernel_cmdline.is_some()
+    if !args.register_native_boot_set
+        && (args.register_kernel.is_some()
+            || args.register_initramfs.is_some()
+            || args.kernel_cmdline.is_some())
     {
         register_kernel_boot_plan(
             &paths,
@@ -1971,7 +1975,9 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
             args.kernel_cmdline.as_deref(),
             args.force,
         )?;
-    } else if args.kernel_expected_sha256.is_some() || args.initramfs_expected_sha256.is_some() {
+    } else if !args.register_native_boot_set
+        && (args.kernel_expected_sha256.is_some() || args.initramfs_expected_sha256.is_some())
+    {
         return Err(AppError::message(
             "--kernel-expected-sha256 requires --register-kernel, and --initramfs-expected-sha256 requires --register-initramfs.",
         ));
@@ -3243,7 +3249,7 @@ fn build_runtime_report(
         next_steps: vec![
             "Run `pane native-preflight --prepare-runtime --json` to prepare the Pane-owned runtime boundary and prove the host can support the first WHP boot-to-serial spike."
                 .to_string(),
-            "Register a Pane-approved Arch raw disk image with `pane runtime --register-base-image <path> --expected-sha256 <sha256> --require-native-root-disk`."
+            "Register a Pane-approved native Arch boot set with `pane runtime --register-native-boot-set --register-base-image <arch.img> --expected-sha256 <sha256> --register-kernel <vmlinuz-linux> --kernel-expected-sha256 <sha256> --register-initramfs <initramfs.img> --initramfs-expected-sha256 <sha256> --kernel-cmdline \"console=ttyS0 panic=-1\"`."
                 .to_string(),
             "Keep the Pane-owned sparse user disk from `--prepare-runtime`, or recreate it explicitly with `pane runtime --create-user-disk` if metadata repair is needed."
                 .to_string(),
@@ -3391,6 +3397,167 @@ fn runtime_paths_prepared(paths: &RuntimePaths) -> bool {
     ]
     .iter()
     .all(|path| path.is_dir())
+}
+
+fn register_native_boot_set(paths: &RuntimePaths, args: &RuntimeArgs) -> AppResult<()> {
+    let base_image = args.register_base_image.as_deref().ok_or_else(|| {
+        AppError::message("--register-native-boot-set requires --register-base-image.")
+    })?;
+    let base_expected_sha256 = args.expected_sha256.as_deref().ok_or_else(|| {
+        AppError::message("--register-native-boot-set requires --expected-sha256.")
+    })?;
+    let kernel = args.register_kernel.as_deref().ok_or_else(|| {
+        AppError::message("--register-native-boot-set requires --register-kernel.")
+    })?;
+    let kernel_expected_sha256 = args.kernel_expected_sha256.as_deref().ok_or_else(|| {
+        AppError::message("--register-native-boot-set requires --kernel-expected-sha256.")
+    })?;
+    let initramfs = args.register_initramfs.as_deref().ok_or_else(|| {
+        AppError::message("--register-native-boot-set requires --register-initramfs.")
+    })?;
+    let initramfs_expected_sha256 = args.initramfs_expected_sha256.as_deref().ok_or_else(|| {
+        AppError::message("--register-native-boot-set requires --initramfs-expected-sha256.")
+    })?;
+    let cmdline = args.kernel_cmdline.as_deref().ok_or_else(|| {
+        AppError::message("--register-native-boot-set requires --kernel-cmdline.")
+    })?;
+
+    register_native_boot_set_artifacts(
+        paths,
+        base_image,
+        base_expected_sha256,
+        kernel,
+        kernel_expected_sha256,
+        initramfs,
+        initramfs_expected_sha256,
+        cmdline,
+        args.force,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn register_native_boot_set_artifacts(
+    paths: &RuntimePaths,
+    base_image: &Path,
+    base_expected_sha256: &str,
+    kernel: &Path,
+    kernel_expected_sha256: &str,
+    initramfs: &Path,
+    initramfs_expected_sha256: &str,
+    cmdline: &str,
+    force: bool,
+) -> AppResult<()> {
+    validate_native_boot_set_inputs(
+        paths,
+        base_image,
+        base_expected_sha256,
+        kernel,
+        kernel_expected_sha256,
+        initramfs,
+        initramfs_expected_sha256,
+        cmdline,
+        force,
+    )?;
+
+    register_base_os_image(paths, base_image, Some(base_expected_sha256), true, force)?;
+    register_kernel_boot_plan(
+        paths,
+        Some(kernel),
+        Some(kernel_expected_sha256),
+        Some(initramfs),
+        Some(initramfs_expected_sha256),
+        Some(cmdline),
+        force,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_native_boot_set_inputs(
+    paths: &RuntimePaths,
+    base_image: &Path,
+    base_expected_sha256: &str,
+    kernel: &Path,
+    kernel_expected_sha256: &str,
+    initramfs: &Path,
+    initramfs_expected_sha256: &str,
+    cmdline: &str,
+    force: bool,
+) -> AppResult<()> {
+    validate_expected_artifact_sha256(base_image, base_expected_sha256, "Base OS image")?;
+    validate_expected_artifact_sha256(kernel, kernel_expected_sha256, "Kernel")?;
+    validate_expected_artifact_sha256(initramfs, initramfs_expected_sha256, "Initramfs")?;
+
+    let base_inspection = inspect_base_os_image_artifact(base_image)?;
+    validate_native_root_disk_image(base_image, &base_inspection)?;
+
+    let kernel_inspection = inspect_kernel_image_artifact(kernel)?;
+    if kernel_inspection.format != "linux-bzimage" {
+        return Err(AppError::message(format!(
+            "Pane native Arch boot sets require a Linux bzImage kernel. `{}` was inspected as `{}`.",
+            kernel.display(),
+            kernel_inspection.format
+        )));
+    }
+
+    if fs::metadata(initramfs)?.len() == 0 {
+        return Err(AppError::message(format!(
+            "Pane native Arch boot sets require a non-empty initramfs artifact: {}",
+            initramfs.display()
+        )));
+    }
+    validate_kernel_cmdline(cmdline)?;
+
+    validate_runtime_artifact_target_available(
+        &paths.base_os_image,
+        base_image,
+        force,
+        "base OS image",
+    )?;
+    validate_runtime_artifact_target_available(&paths.kernel_image, kernel, force, "Kernel")?;
+    validate_runtime_artifact_target_available(
+        &paths.initramfs_image,
+        initramfs,
+        force,
+        "Initramfs",
+    )
+}
+
+fn validate_expected_artifact_sha256(
+    source: &Path,
+    expected_sha256: &str,
+    label: &str,
+) -> AppResult<()> {
+    if !source.is_file() {
+        return Err(AppError::message(format!(
+            "{label} source does not exist or is not a file: {}",
+            source.display()
+        )));
+    }
+    let expected_sha256 = normalize_sha256_hex(expected_sha256)?;
+    let actual_sha256 = sha256_file(source)?;
+    if expected_sha256 != actual_sha256 {
+        return Err(AppError::message(format!(
+            "{label} SHA-256 mismatch. expected {expected_sha256}, got {actual_sha256}."
+        )));
+    }
+    Ok(())
+}
+
+fn validate_runtime_artifact_target_available(
+    destination: &Path,
+    source: &Path,
+    force: bool,
+    label: &str,
+) -> AppResult<()> {
+    let same_target =
+        destination.exists() && source.canonicalize().ok() == destination.canonicalize().ok();
+    if destination.exists() && !force && !same_target {
+        return Err(AppError::message(format!(
+            "A registered {label} artifact already exists at {}. Pass --force to replace it.",
+            destination.display()
+        )));
+    }
+    Ok(())
 }
 
 fn register_base_os_image(
@@ -11836,7 +12003,7 @@ mod tests {
         pane_block_device_blocks, pane_initramfs_expected_serial_milestones,
         parse_guest_physical_address, preferred_transport, read_base_os_block, read_json_file,
         read_user_disk_block, register_base_os_image, register_boot_loader_image,
-        register_kernel_boot_plan, register_pane_block_module,
+        register_kernel_boot_plan, register_native_boot_set_artifacts, register_pane_block_module,
         register_pane_discovery_initramfs_artifact, repair_user_disk_metadata, resize_user_disk,
         resolve_bundle_output_path, resolve_init_source, resolve_launch_target,
         resolve_managed_environment_for_reset, resolve_saved_launch, resolve_session_context,
@@ -12923,6 +13090,89 @@ mod tests {
         assert!(error.contains("requires a bootable raw disk image"));
         assert!(!paths.base_os_image.exists());
         assert!(!paths.base_os_metadata.exists());
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn registers_native_arch_boot_set_artifacts() {
+        let paths = temp_runtime_paths("runtime-native-boot-set");
+        super::prepare_runtime_paths(&paths).unwrap();
+        let base = paths.downloads.join("arch-root.img");
+        let kernel = paths.downloads.join("vmlinuz-linux");
+        let initramfs = paths.downloads.join("initramfs-linux.img");
+        std::fs::write(&base, fake_mbr_linux_root_disk_image()).unwrap();
+        std::fs::write(&kernel, fake_linux_bzimage()).unwrap();
+        std::fs::write(&initramfs, b"fake pane discovery initramfs").unwrap();
+        let base_sha = sha256_file(&base).unwrap();
+        let kernel_sha = sha256_file(&kernel).unwrap();
+        let initramfs_sha = sha256_file(&initramfs).unwrap();
+
+        register_native_boot_set_artifacts(
+            &paths,
+            &base,
+            &base_sha,
+            &kernel,
+            &kernel_sha,
+            &initramfs,
+            &initramfs_sha,
+            "console=ttyS0 earlyprintk=serial panic=-1",
+            false,
+        )
+        .unwrap();
+
+        let artifacts = build_runtime_artifact_report(&paths);
+        assert!(artifacts.base_os_image_verified);
+        assert_eq!(artifacts.base_os_bootable_disk_hint, Some(true));
+        assert_eq!(artifacts.base_os_root_partition_hint, Some(true));
+        assert!(artifacts.kernel_image_verified);
+        assert!(artifacts.initramfs_image_verified);
+        assert!(artifacts.kernel_boot_plan_ready);
+
+        let metadata = read_json_file::<KernelBootMetadata>(&paths.kernel_boot_metadata).unwrap();
+        assert_eq!(metadata.kernel_format, "linux-bzimage");
+        assert_eq!(
+            metadata.initramfs_sha256.as_deref(),
+            Some(initramfs_sha.as_str())
+        );
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn native_arch_boot_set_rejects_bad_root_disk_before_mutating_store() {
+        let paths = temp_runtime_paths("runtime-native-boot-set-reject");
+        super::prepare_runtime_paths(&paths).unwrap();
+        let base = paths.downloads.join("arch-rootfs.tar");
+        let kernel = paths.downloads.join("vmlinuz-linux");
+        let initramfs = paths.downloads.join("initramfs-linux.img");
+        std::fs::write(&base, b"not a raw disk").unwrap();
+        std::fs::write(&kernel, fake_linux_bzimage()).unwrap();
+        std::fs::write(&initramfs, b"fake pane discovery initramfs").unwrap();
+        let base_sha = sha256_file(&base).unwrap();
+        let kernel_sha = sha256_file(&kernel).unwrap();
+        let initramfs_sha = sha256_file(&initramfs).unwrap();
+
+        let error = register_native_boot_set_artifacts(
+            &paths,
+            &base,
+            &base_sha,
+            &kernel,
+            &kernel_sha,
+            &initramfs,
+            &initramfs_sha,
+            "console=ttyS0 earlyprintk=serial panic=-1",
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("requires a bootable raw disk image"));
+        assert!(!paths.base_os_image.exists());
+        assert!(!paths.kernel_image.exists());
+        assert!(!paths.initramfs_image.exists());
+        assert!(!paths.base_os_metadata.exists());
+        assert!(!paths.kernel_boot_metadata.exists());
 
         let _ = std::fs::remove_dir_all(&paths.root);
     }

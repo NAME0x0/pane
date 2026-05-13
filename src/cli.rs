@@ -256,6 +256,9 @@ pub struct RuntimeArgs {
     /// Require --register-base-image to be a bootable raw disk with a detectable Linux root partition.
     #[arg(long)]
     pub require_native_root_disk: bool,
+    /// Register the base disk, Linux kernel, initramfs, and cmdline as one prevalidated native Arch boot set.
+    #[arg(long)]
+    pub register_native_boot_set: bool,
     /// Copy a controlled boot-to-serial loader candidate into Pane's runtime engine store.
     #[arg(long)]
     pub register_boot_loader: Option<PathBuf>,
@@ -570,6 +573,17 @@ mod tests {
             "--expected-sha256",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "--require-native-root-disk",
+            "--register-native-boot-set",
+            "--register-kernel",
+            "C:\\vmlinuz-linux",
+            "--kernel-expected-sha256",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "--register-initramfs",
+            "C:\\initramfs-linux.img",
+            "--initramfs-expected-sha256",
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "--kernel-cmdline",
+            "console=ttyS0 earlyprintk=serial panic=-1",
         ])
         .unwrap();
 
@@ -580,6 +594,15 @@ mod tests {
                     Some(std::path::Path::new("C:\\arch.img"))
                 );
                 assert!(args.require_native_root_disk);
+                assert!(args.register_native_boot_set);
+                assert_eq!(
+                    args.register_kernel.as_deref(),
+                    Some(std::path::Path::new("C:\\vmlinuz-linux"))
+                );
+                assert_eq!(
+                    args.register_initramfs.as_deref(),
+                    Some(std::path::Path::new("C:\\initramfs-linux.img"))
+                );
             }
             _ => panic!("expected runtime command"),
         }

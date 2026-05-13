@@ -1122,6 +1122,24 @@ mod windows_whp {
     const POST_DELAY_PORT: u16 = 0x0080;
     const PIC2_COMMAND_PORT: u16 = 0x00a0;
     const PIC2_DATA_PORT: u16 = 0x00a1;
+    const VGA_ATTRIBUTE_PORT: u16 = 0x03c0;
+    const VGA_ATTRIBUTE_DATA_READ_PORT: u16 = 0x03c1;
+    const VGA_MISC_OUTPUT_WRITE_PORT: u16 = 0x03c2;
+    const VGA_SEQUENCER_INDEX_PORT: u16 = 0x03c4;
+    const VGA_SEQUENCER_DATA_PORT: u16 = 0x03c5;
+    const VGA_DAC_MASK_PORT: u16 = 0x03c6;
+    const VGA_DAC_STATE_PORT: u16 = 0x03c7;
+    const VGA_DAC_WRITE_INDEX_PORT: u16 = 0x03c8;
+    const VGA_DAC_DATA_PORT: u16 = 0x03c9;
+    const VGA_MISC_OUTPUT_READ_PORT: u16 = 0x03cc;
+    const VGA_GRAPHICS_INDEX_PORT: u16 = 0x03ce;
+    const VGA_GRAPHICS_DATA_PORT: u16 = 0x03cf;
+    const VGA_CRTC_MONO_INDEX_PORT: u16 = 0x03b4;
+    const VGA_CRTC_MONO_DATA_PORT: u16 = 0x03b5;
+    const VGA_INPUT_STATUS_MONO_PORT: u16 = 0x03ba;
+    const VGA_CRTC_COLOR_INDEX_PORT: u16 = 0x03d4;
+    const VGA_CRTC_COLOR_DATA_PORT: u16 = 0x03d5;
+    const VGA_INPUT_STATUS_COLOR_PORT: u16 = 0x03da;
     const PCI_CONFIG_ADDRESS_PORT: u16 = 0x0cf8;
     const PCI_CONFIG_ADDRESS_END_PORT: u16 = 0x0cfb;
     const PCI_CONFIG_DATA_START_PORT: u16 = 0x0cfc;
@@ -2821,6 +2839,18 @@ mod windows_whp {
         system_control_b: u8,
         cmos_index: u8,
         pci_config_address: u32,
+        vga_attribute_index: u8,
+        vga_attribute_flip_flop: bool,
+        vga_attribute: [u8; 0x20],
+        vga_misc_output: u8,
+        vga_sequencer_index: u8,
+        vga_sequencer: [u8; 0x08],
+        vga_dac_mask: u8,
+        vga_dac_index: u8,
+        vga_graphics_index: u8,
+        vga_graphics: [u8; 0x10],
+        vga_crtc_index: u8,
+        vga_crtc: [u8; 0x20],
     }
 
     impl LegacyDeviceIoState {
@@ -2889,11 +2919,61 @@ mod windows_whp {
                     self.write_pci_config_port(port, value);
                     true
                 }
+                VGA_ATTRIBUTE_PORT => {
+                    if self.vga_attribute_flip_flop {
+                        let index = usize::from(self.vga_attribute_index & 0x1f);
+                        self.vga_attribute[index] = value;
+                    } else {
+                        self.vga_attribute_index = value & 0x1f;
+                    }
+                    self.vga_attribute_flip_flop = !self.vga_attribute_flip_flop;
+                    true
+                }
+                VGA_MISC_OUTPUT_WRITE_PORT => {
+                    self.vga_misc_output = value;
+                    true
+                }
+                VGA_SEQUENCER_INDEX_PORT => {
+                    self.vga_sequencer_index = value & 0x07;
+                    true
+                }
+                VGA_SEQUENCER_DATA_PORT => {
+                    let index = usize::from(self.vga_sequencer_index);
+                    self.vga_sequencer[index] = value;
+                    true
+                }
+                VGA_DAC_MASK_PORT => {
+                    self.vga_dac_mask = value;
+                    true
+                }
+                VGA_DAC_STATE_PORT | VGA_DAC_WRITE_INDEX_PORT => {
+                    self.vga_dac_index = value;
+                    true
+                }
+                VGA_DAC_DATA_PORT => true,
+                VGA_GRAPHICS_INDEX_PORT => {
+                    self.vga_graphics_index = value & 0x0f;
+                    true
+                }
+                VGA_GRAPHICS_DATA_PORT => {
+                    let index = usize::from(self.vga_graphics_index);
+                    self.vga_graphics[index] = value;
+                    true
+                }
+                VGA_CRTC_MONO_INDEX_PORT | VGA_CRTC_COLOR_INDEX_PORT => {
+                    self.vga_crtc_index = value & 0x1f;
+                    true
+                }
+                VGA_CRTC_MONO_DATA_PORT | VGA_CRTC_COLOR_DATA_PORT => {
+                    let index = usize::from(self.vga_crtc_index);
+                    self.vga_crtc[index] = value;
+                    true
+                }
                 _ => false,
             }
         }
 
-        fn read_value(&self, port: u16, access_size: u32) -> Option<u32> {
+        fn read_value(&mut self, port: u16, access_size: u32) -> Option<u32> {
             let mut bytes = [0_u8; 4];
             for offset in 0..access_size {
                 bytes[offset as usize] = self.read_byte(port + offset as u16)?;
@@ -2901,7 +2981,7 @@ mod windows_whp {
             Some(u32::from_le_bytes(bytes) & access_mask(access_size) as u32)
         }
 
-        fn read_byte(&self, port: u16) -> Option<u8> {
+        fn read_byte(&mut self, port: u16) -> Option<u8> {
             match port {
                 PIC1_COMMAND_PORT | PIC2_COMMAND_PORT => Some(0),
                 PIC1_DATA_PORT => Some(self.pic1_mask),
@@ -2918,6 +2998,30 @@ mod windows_whp {
                 PCI_CONFIG_ADDRESS_PORT..=PCI_CONFIG_ADDRESS_END_PORT
                 | PCI_CONFIG_DATA_START_PORT..=PCI_CONFIG_DATA_END_PORT => {
                     Some(self.read_pci_config_port(port))
+                }
+                VGA_ATTRIBUTE_DATA_READ_PORT => {
+                    Some(self.vga_attribute[usize::from(self.vga_attribute_index & 0x1f)])
+                }
+                VGA_MISC_OUTPUT_READ_PORT => Some(self.vga_misc_output),
+                VGA_SEQUENCER_INDEX_PORT => Some(self.vga_sequencer_index),
+                VGA_SEQUENCER_DATA_PORT => {
+                    Some(self.vga_sequencer[usize::from(self.vga_sequencer_index)])
+                }
+                VGA_DAC_MASK_PORT => Some(self.vga_dac_mask),
+                VGA_DAC_STATE_PORT => Some(0),
+                VGA_DAC_WRITE_INDEX_PORT => Some(self.vga_dac_index),
+                VGA_DAC_DATA_PORT => Some(0),
+                VGA_GRAPHICS_INDEX_PORT => Some(self.vga_graphics_index),
+                VGA_GRAPHICS_DATA_PORT => {
+                    Some(self.vga_graphics[usize::from(self.vga_graphics_index)])
+                }
+                VGA_CRTC_MONO_INDEX_PORT | VGA_CRTC_COLOR_INDEX_PORT => Some(self.vga_crtc_index),
+                VGA_CRTC_MONO_DATA_PORT | VGA_CRTC_COLOR_DATA_PORT => {
+                    Some(self.vga_crtc[usize::from(self.vga_crtc_index)])
+                }
+                VGA_INPUT_STATUS_MONO_PORT | VGA_INPUT_STATUS_COLOR_PORT => {
+                    self.vga_attribute_flip_flop = false;
+                    Some(0)
                 }
                 _ => None,
             }
@@ -3609,6 +3713,10 @@ mod windows_whp {
             MSR_RDX_OFFSET, PCI_CONFIG_ADDRESS_PORT, PCI_CONFIG_DATA_START_PORT, PIC1_DATA_PORT,
             PIC2_DATA_PORT, PIT_CHANNEL0_PORT, PIT_COMMAND_PORT, POST_DELAY_PORT, PS2_DATA_PORT,
             PS2_STATUS_COMMAND_PORT, SERIAL_COM1_PORT, SYSTEM_CONTROL_PORT_B,
+            VGA_ATTRIBUTE_DATA_READ_PORT, VGA_ATTRIBUTE_PORT, VGA_CRTC_COLOR_DATA_PORT,
+            VGA_CRTC_COLOR_INDEX_PORT, VGA_GRAPHICS_DATA_PORT, VGA_GRAPHICS_INDEX_PORT,
+            VGA_INPUT_STATUS_COLOR_PORT, VGA_MISC_OUTPUT_READ_PORT, VGA_MISC_OUTPUT_WRITE_PORT,
+            VGA_SEQUENCER_DATA_PORT, VGA_SEQUENCER_INDEX_PORT,
             VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET, VP_CONTEXT_RIP_OFFSET, WHV_REGISTER_CR0,
             WHV_REGISTER_CR3, WHV_REGISTER_CR4, WHV_REGISTER_CS, WHV_REGISTER_DS, WHV_REGISTER_ES,
             WHV_REGISTER_GDTR, WHV_REGISTER_IDTR, WHV_REGISTER_RBP, WHV_REGISTER_RBX,
@@ -3797,6 +3905,55 @@ mod windows_whp {
                 );
                 assert_eq!(io.access(CMOS_DATA_PORT, false, 1, 0), Some(value));
             }
+        }
+
+        #[test]
+        fn legacy_device_io_model_handles_vga_probe_ports() {
+            let mut io = LegacyDeviceIoState::default();
+
+            assert_eq!(
+                io.access(VGA_MISC_OUTPUT_WRITE_PORT, true, 1, 0x67),
+                Some(0x67)
+            );
+            assert_eq!(
+                io.access(VGA_MISC_OUTPUT_READ_PORT, false, 1, 0),
+                Some(0x67)
+            );
+
+            assert_eq!(
+                io.access(VGA_SEQUENCER_INDEX_PORT, true, 1, 0x04),
+                Some(0x04)
+            );
+            assert_eq!(
+                io.access(VGA_SEQUENCER_DATA_PORT, true, 1, 0x06),
+                Some(0x06)
+            );
+            assert_eq!(io.access(VGA_SEQUENCER_DATA_PORT, false, 1, 0), Some(0x06));
+
+            assert_eq!(
+                io.access(VGA_GRAPHICS_INDEX_PORT, true, 1, 0x05),
+                Some(0x05)
+            );
+            assert_eq!(io.access(VGA_GRAPHICS_DATA_PORT, true, 1, 0x40), Some(0x40));
+            assert_eq!(io.access(VGA_GRAPHICS_DATA_PORT, false, 1, 0), Some(0x40));
+
+            assert_eq!(
+                io.access(VGA_CRTC_COLOR_INDEX_PORT, true, 1, 0x11),
+                Some(0x11)
+            );
+            assert_eq!(
+                io.access(VGA_CRTC_COLOR_DATA_PORT, true, 1, 0x20),
+                Some(0x20)
+            );
+            assert_eq!(io.access(VGA_CRTC_COLOR_DATA_PORT, false, 1, 0), Some(0x20));
+
+            assert_eq!(io.access(VGA_INPUT_STATUS_COLOR_PORT, false, 1, 0), Some(0));
+            assert_eq!(io.access(VGA_ATTRIBUTE_PORT, true, 1, 0x10), Some(0x10));
+            assert_eq!(io.access(VGA_ATTRIBUTE_PORT, true, 1, 0x41), Some(0x41));
+            assert_eq!(
+                io.access(VGA_ATTRIBUTE_DATA_READ_PORT, false, 1, 0),
+                Some(0x41)
+            );
         }
 
         #[test]

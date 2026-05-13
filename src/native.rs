@@ -1143,6 +1143,8 @@ mod windows_whp {
     const VGA_CRTC_COLOR_INDEX_PORT: u16 = 0x03d4;
     const VGA_CRTC_COLOR_DATA_PORT: u16 = 0x03d5;
     const VGA_INPUT_STATUS_COLOR_PORT: u16 = 0x03da;
+    const ELCR1_PORT: u16 = 0x04d0;
+    const ELCR2_PORT: u16 = 0x04d1;
     const PCI_CONFIG_ADDRESS_PORT: u16 = 0x0cf8;
     const PCI_CONFIG_ADDRESS_END_PORT: u16 = 0x0cfb;
     const PCI_CONFIG_DATA_START_PORT: u16 = 0x0cfc;
@@ -2855,6 +2857,8 @@ mod windows_whp {
         vga_graphics: [u8; 0x10],
         vga_crtc_index: u8,
         vga_crtc: [u8; 0x20],
+        elcr1: u8,
+        elcr2: u8,
     }
 
     impl LegacyDeviceIoState {
@@ -2977,6 +2981,14 @@ mod windows_whp {
                     self.vga_crtc[index] = value;
                     true
                 }
+                ELCR1_PORT => {
+                    self.elcr1 = value;
+                    true
+                }
+                ELCR2_PORT => {
+                    self.elcr2 = value;
+                    true
+                }
                 _ => false,
             }
         }
@@ -3032,6 +3044,8 @@ mod windows_whp {
                     self.vga_attribute_flip_flop = false;
                     Some(0)
                 }
+                ELCR1_PORT => Some(self.elcr1),
+                ELCR2_PORT => Some(self.elcr2),
                 _ => None,
             }
         }
@@ -3726,11 +3740,12 @@ mod windows_whp {
             Com1SerialState, DecodedExit, LegacyDeviceIoState, ALT_DELAY_PORT, ALT_POST_DELAY_PORT,
             CMOS_ADDRESS_PORT, CMOS_DATA_PORT, CPUID_DEFAULT_RAX_OFFSET, CPUID_DEFAULT_RBX_OFFSET,
             CPUID_DEFAULT_RCX_OFFSET, CPUID_DEFAULT_RDX_OFFSET, CPUID_RAX_OFFSET, CPUID_RCX_OFFSET,
-            IO_ACCESS_INFO_OFFSET, IO_PORT_OFFSET, IO_RAX_OFFSET, LINUX_ENTRY_PROBE_EXIT_BUDGET,
-            LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET, MEMORY_ACCESS_INFO_OFFSET, MEMORY_GPA_OFFSET,
-            MEMORY_GVA_OFFSET, MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET, MSR_RAX_OFFSET,
-            MSR_RDX_OFFSET, PCI_CONFIG_ADDRESS_PORT, PCI_CONFIG_DATA_START_PORT, PIC1_DATA_PORT,
-            PIC2_DATA_PORT, PIT_CHANNEL0_PORT, PIT_COMMAND_PORT, POST_DELAY_PORT, PS2_DATA_PORT,
+            ELCR1_PORT, ELCR2_PORT, IO_ACCESS_INFO_OFFSET, IO_PORT_OFFSET, IO_RAX_OFFSET,
+            LINUX_ENTRY_PROBE_EXIT_BUDGET, LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET,
+            MEMORY_ACCESS_INFO_OFFSET, MEMORY_GPA_OFFSET, MEMORY_GVA_OFFSET,
+            MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET, MSR_RAX_OFFSET, MSR_RDX_OFFSET,
+            PCI_CONFIG_ADDRESS_PORT, PCI_CONFIG_DATA_START_PORT, PIC1_DATA_PORT, PIC2_DATA_PORT,
+            PIT_CHANNEL0_PORT, PIT_COMMAND_PORT, POST_DELAY_PORT, PS2_DATA_PORT,
             PS2_STATUS_COMMAND_PORT, SERIAL_COM1_PORT, SYSTEM_CONTROL_PORT_A,
             SYSTEM_CONTROL_PORT_B, VGA_ATTRIBUTE_DATA_READ_PORT, VGA_ATTRIBUTE_PORT,
             VGA_CRTC_COLOR_DATA_PORT, VGA_CRTC_COLOR_INDEX_PORT, VGA_GRAPHICS_DATA_PORT,
@@ -3863,6 +3878,10 @@ mod windows_whp {
             assert_eq!(io.access(SYSTEM_CONTROL_PORT_B, false, 1, 0), Some(0x03));
             assert_eq!(io.access(CMOS_ADDRESS_PORT, true, 1, 0x0d), Some(0x0d));
             assert_eq!(io.access(CMOS_DATA_PORT, false, 1, 0), Some(0x80));
+            assert_eq!(io.access(ELCR1_PORT, true, 1, 0x00), Some(0x00));
+            assert_eq!(io.access(ELCR1_PORT, false, 1, 0), Some(0x00));
+            assert_eq!(io.access(ELCR2_PORT, true, 1, 0x0e), Some(0x0e));
+            assert_eq!(io.access(ELCR2_PORT, false, 1, 0), Some(0x0e));
             assert_eq!(io.access(POST_DELAY_PORT, true, 1, 0), Some(0));
             assert_eq!(io.access(ALT_POST_DELAY_PORT, true, 1, 0), Some(0));
             assert_eq!(io.access(ALT_DELAY_PORT, true, 1, 0), Some(0));

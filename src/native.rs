@@ -3239,7 +3239,15 @@ mod windows_whp {
     fn default_linux_msr_state() -> HashMap<u32, u64> {
         HashMap::from([
             (0x0000_0010, 0),                     // IA32_TIME_STAMP_COUNTER
+            (0x0000_0017, 0),                     // IA32_PLATFORM_ID
             (0x0000_001b, 0x0000_0000_fee0_0900), // IA32_APIC_BASE: BSP + enabled
+            (0x0000_00ce, 0),                     // IA32_PLATFORM_INFO
+            (0x0000_00fe, 0),                     // IA32_MTRR_CAP: fixed/range MTRRs absent
+            (0x0000_0174, 0),                     // IA32_SYSENTER_CS
+            (0x0000_0175, 0),                     // IA32_SYSENTER_ESP
+            (0x0000_0176, 0),                     // IA32_SYSENTER_EIP
+            (0x0000_0277, 0x0007_0406_0007_0406), // IA32_PAT reset memory types
+            (0x0000_02ff, 0),                     // IA32_MTRR_DEF_TYPE: MTRRs disabled
             (0xc000_0080, 0),                     // IA32_EFER
             (0xc000_0081, 0),                     // IA32_STAR
             (0xc000_0082, 0),                     // IA32_LSTAR
@@ -3247,6 +3255,7 @@ mod windows_whp {
             (0xc000_0100, 0),                     // FS base
             (0xc000_0101, 0),                     // GS base
             (0xc000_0102, 0),                     // Kernel GS base
+            (0xc000_0103, 0),                     // TSC AUX
         ])
     }
 
@@ -3710,14 +3719,14 @@ mod windows_whp {
     #[cfg(test)]
     mod tests {
         use super::{
-            decode_exit_context, framebuffer_snapshot_report, guest_contract_passed,
-            input_queue_snapshot_report, linux_entry_probe_detail, linux_entry_probe_exit_budget,
-            linux_entry_probe_passed, linux_protected_mode_registers, serial_contract_passed,
-            serial_markers_observed, Com1SerialState, DecodedExit, LegacyDeviceIoState,
-            ALT_DELAY_PORT, ALT_POST_DELAY_PORT, CMOS_ADDRESS_PORT, CMOS_DATA_PORT,
-            CPUID_DEFAULT_RAX_OFFSET, CPUID_DEFAULT_RBX_OFFSET, CPUID_DEFAULT_RCX_OFFSET,
-            CPUID_DEFAULT_RDX_OFFSET, CPUID_RAX_OFFSET, CPUID_RCX_OFFSET, IO_ACCESS_INFO_OFFSET,
-            IO_PORT_OFFSET, IO_RAX_OFFSET, LINUX_ENTRY_PROBE_EXIT_BUDGET,
+            decode_exit_context, default_linux_msr_state, framebuffer_snapshot_report,
+            guest_contract_passed, input_queue_snapshot_report, linux_entry_probe_detail,
+            linux_entry_probe_exit_budget, linux_entry_probe_passed,
+            linux_protected_mode_registers, serial_contract_passed, serial_markers_observed,
+            Com1SerialState, DecodedExit, LegacyDeviceIoState, ALT_DELAY_PORT, ALT_POST_DELAY_PORT,
+            CMOS_ADDRESS_PORT, CMOS_DATA_PORT, CPUID_DEFAULT_RAX_OFFSET, CPUID_DEFAULT_RBX_OFFSET,
+            CPUID_DEFAULT_RCX_OFFSET, CPUID_DEFAULT_RDX_OFFSET, CPUID_RAX_OFFSET, CPUID_RCX_OFFSET,
+            IO_ACCESS_INFO_OFFSET, IO_PORT_OFFSET, IO_RAX_OFFSET, LINUX_ENTRY_PROBE_EXIT_BUDGET,
             LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET, MEMORY_ACCESS_INFO_OFFSET, MEMORY_GPA_OFFSET,
             MEMORY_GVA_OFFSET, MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET, MSR_RAX_OFFSET,
             MSR_RDX_OFFSET, PCI_CONFIG_ADDRESS_PORT, PCI_CONFIG_DATA_START_PORT, PIC1_DATA_PORT,
@@ -4620,6 +4629,20 @@ mod windows_whp {
                 .calls
                 .iter()
                 .any(|call| call.name == "DecodeX64MsrAccess" && call.ok));
+        }
+
+        #[test]
+        fn linux_msr_defaults_cover_common_cpu_bringup_reads() {
+            let msrs = default_linux_msr_state();
+
+            assert_eq!(msrs.get(&0x0000_001b), Some(&0x0000_0000_fee0_0900));
+            assert_eq!(msrs.get(&0x0000_0277), Some(&0x0007_0406_0007_0406));
+            assert_eq!(msrs.get(&0x0000_00fe), Some(&0));
+            assert_eq!(msrs.get(&0x0000_0174), Some(&0));
+            assert_eq!(msrs.get(&0x0000_0175), Some(&0));
+            assert_eq!(msrs.get(&0x0000_0176), Some(&0));
+            assert_eq!(msrs.get(&0xc000_0080), Some(&0));
+            assert_eq!(msrs.get(&0xc000_0103), Some(&0));
         }
 
         #[test]

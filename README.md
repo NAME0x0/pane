@@ -225,6 +225,7 @@ What exists today:
 - Pane runtime contract discovery arguments on the Linux kernel command line,
 - E820 memory map including boot params, GDT, initramfs, RAM, APIC stubs, framebuffer memory, and input queue memory,
 - protected-mode register handoff with boot params in `rsi`,
+- explicit default MSR state for APIC base, PAT, SYSENTER, EFER, TSC AUX, and MTRR probes during early Linux CPU bring-up,
 - resumable WHP interrupt-window and APIC-EOI exit handling so early Linux interrupt plumbing is observed instead of treated as an unknown hard stop,
 - width-aware legacy PIC/PIT/CMOS RTC/system-control A/B/delay/PCI-config/i8042/VGA probe port handling with explicit unsupported-I/O blockers for the next device-model gap,
 - milestone-aware Linux probe exit budgeting and reporting so storage-backed Arch boot gets enough WHP exits to reach initramfs/root-handoff markers,

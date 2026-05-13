@@ -2055,6 +2055,9 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
 
 fn native_preflight(args: NativePreflightArgs) -> AppResult<()> {
     let session_name = crate::plan::sanitize_session_name(&args.session_name);
+    if args.prepare_runtime {
+        prepare_native_runtime_boundary(&session_name, DEFAULT_RUNTIME_CAPACITY_GIB)?;
+    }
     let runtime = build_runtime_report(&session_name, DEFAULT_RUNTIME_CAPACITY_GIB, false)?;
     let host = runtime.native_host.clone();
     let ready_for_boot_spike = runtime.native_runtime.ready_for_boot_spike;
@@ -2087,6 +2090,9 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
     let runtime_paths = crate::plan::runtime_for(&session_name);
     let runtime_budget = runtime_storage_budget(DEFAULT_RUNTIME_CAPACITY_GIB);
     let run_guest_image = args.run_fixture || args.run_boot_loader || args.run_kernel_layout;
+    if args.prepare_runtime {
+        prepare_native_runtime_boundary(&session_name, DEFAULT_RUNTIME_CAPACITY_GIB)?;
+    }
     let mut runtime = build_runtime_report(&session_name, DEFAULT_RUNTIME_CAPACITY_GIB, false)?;
     let boot_image = if args.execute && args.run_fixture {
         prepare_runtime_paths(&runtime_paths)?;
@@ -2183,7 +2189,7 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
     if run_guest_image {
         if !runtime.prepared {
             blockers.push(
-                "Dedicated runtime directories have not been prepared. Run `pane runtime --prepare`."
+                "Dedicated runtime directories have not been prepared. Run `pane native-boot-spike --prepare-runtime`, or `pane runtime --prepare`."
                     .to_string(),
             );
         }
@@ -2266,6 +2272,18 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
     Ok(())
 }
 
+fn prepare_native_runtime_boundary(session_name: &str, capacity_gib: u64) -> AppResult<()> {
+    let paths = crate::plan::runtime_for(session_name);
+    let budget = runtime_storage_budget(capacity_gib);
+    prepare_runtime_paths(&paths)?;
+    write_runtime_config(&paths, session_name, &budget)?;
+    write_native_runtime_manifest(&paths, session_name)?;
+    write_framebuffer_contract(&paths)?;
+    write_input_contract(&paths)?;
+    let report = build_runtime_report(session_name, capacity_gib, false)?;
+    write_runtime_manifest(&paths, &report)
+}
+
 fn native_boot_spike_next_steps(
     execute: bool,
     run_fixture: bool,
@@ -2275,7 +2293,7 @@ fn native_boot_spike_next_steps(
     if !execute {
         if run_kernel_layout {
             return vec![
-                "Rerun with `--execute --run-kernel-layout` to consume the materialized kernel layout in WHP."
+                "Rerun with `--prepare-runtime --execute --run-kernel-layout` to prepare the runtime boundary and consume the materialized kernel layout in WHP."
                     .to_string(),
                 "Use only a controlled small serial/HALT candidate until the Linux boot-protocol runner exists."
                     .to_string(),
@@ -2284,7 +2302,7 @@ fn native_boot_spike_next_steps(
         return vec![
             "Rerun with `--execute` to create and tear down the guarded WHP partition/vCPU."
                 .to_string(),
-            "Then rerun with `--execute --run-fixture` to prove guest memory, register setup, vCPU execution, and serial I/O exit handling."
+            "Then rerun with `--prepare-runtime --execute --run-fixture` to prepare runtime contracts and prove guest memory, register setup, vCPU execution, and serial I/O exit handling."
                 .to_string(),
         ];
     }
@@ -2311,7 +2329,7 @@ fn native_boot_spike_next_steps(
 
     if !run_fixture {
         return vec![
-            "Rerun with `--execute --run-fixture` to map guest memory and execute the deterministic serial test image."
+            "Rerun with `--prepare-runtime --execute --run-fixture` to prepare runtime contracts, map guest memory, and execute the deterministic serial test image."
                 .to_string(),
             "Only after the serial test image passes, replace it with a boot-to-serial kernel or loader."
                 .to_string(),
@@ -2322,9 +2340,9 @@ fn native_boot_spike_next_steps(
         return vec![
             "Register a controlled boot-to-serial loader with `pane runtime --register-boot-loader <path> --boot-loader-expected-sha256 <sha256>`."
                 .to_string(),
-            "Run `pane native-boot-spike --execute --run-boot-loader` to prove Pane can execute a runtime-provided boot candidate."
+            "Run `pane native-boot-spike --prepare-runtime --execute --run-boot-loader` to prove Pane can execute a runtime-provided boot candidate."
                 .to_string(),
-            "Materialize a kernel boot layout with `pane native-kernel-plan --materialize`, then run `pane native-boot-spike --execute --run-kernel-layout` with a controlled small candidate."
+            "Materialize a kernel boot layout with `pane native-kernel-plan --materialize`, then run `pane native-boot-spike --prepare-runtime --execute --run-kernel-layout` with a controlled small candidate."
                 .to_string(),
             "Connect that loader to Pane's verified Arch base image and user disk only after its serial contract is deterministic."
                 .to_string(),
@@ -2334,9 +2352,9 @@ fn native_boot_spike_next_steps(
     vec![
         "Register a controlled boot-to-serial loader with `pane runtime --register-boot-loader <path> --boot-loader-expected-sha256 <sha256>`."
             .to_string(),
-        "Run `pane native-boot-spike --execute --run-boot-loader` to prove Pane can execute a runtime-provided boot candidate."
+        "Run `pane native-boot-spike --prepare-runtime --execute --run-boot-loader` to prove Pane can execute a runtime-provided boot candidate."
             .to_string(),
-        "Materialize a kernel boot layout with `pane native-kernel-plan --materialize`, then run `pane native-boot-spike --execute --run-kernel-layout` with a controlled small candidate."
+        "Materialize a kernel boot layout with `pane native-kernel-plan --materialize`, then run `pane native-boot-spike --prepare-runtime --execute --run-kernel-layout` with a controlled small candidate."
             .to_string(),
         "Connect that loader to Pane's verified Arch base image and user disk only after its serial contract is deterministic."
             .to_string(),
@@ -3215,7 +3233,7 @@ fn build_runtime_report(
         native_runtime,
         current_limitation: "Pane owns the runtime storage layout, config, manifests, and host preflight now. It still cannot boot a Pane-owned OS image or draw a Pane-owned desktop window without the current WSL/XRDP bridge.",
         next_steps: vec![
-            "Run `pane native-preflight --json` to prove the host can support the first WHP boot-to-serial spike."
+            "Run `pane native-preflight --prepare-runtime --json` to prepare the Pane-owned runtime boundary and prove the host can support the first WHP boot-to-serial spike."
                 .to_string(),
             "Register a Pane-approved Arch base OS image with `pane runtime --register-base-image <path> --expected-sha256 <sha256>`."
                 .to_string(),
@@ -3223,9 +3241,9 @@ fn build_runtime_report(
                 .to_string(),
             "Create the runtime-backed serial boot image with `pane runtime --create-serial-boot-image`."
                 .to_string(),
-            "Run `pane native-boot-spike --execute --run-fixture` to prove WHP guest memory, register setup, vCPU execution, and serial I/O."
+            "Run `pane native-boot-spike --prepare-runtime --execute --run-fixture` to prove WHP guest memory, register setup, vCPU execution, and serial I/O."
                 .to_string(),
-            "Register and run a controlled boot-to-serial loader candidate with `pane runtime --register-boot-loader` and `pane native-boot-spike --execute --run-boot-loader`."
+            "Register and run a controlled boot-to-serial loader candidate with `pane runtime --register-boot-loader` and `pane native-boot-spike --prepare-runtime --execute --run-boot-loader`."
                 .to_string(),
             "Register a verified kernel/initramfs boot plan with `pane runtime --register-kernel` and an explicit serial console cmdline."
                 .to_string(),

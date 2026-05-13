@@ -30,8 +30,8 @@ Pane currently owns:
 - Pane runtime contract discovery arguments added to the Linux kernel command line for early boot consumers,
 - native host preflight through `pane native-preflight`,
 - a guarded WHP partition/vCPU lifecycle smoke through `pane native-boot-spike --execute`,
-- a guarded WHP guest-memory/register/vCPU execution test image through `pane native-boot-spike --execute --run-fixture`,
-- a guarded WHP boot-loader candidate execution path through `pane native-boot-spike --execute --run-boot-loader`.
+- a guarded WHP guest-memory/register/vCPU execution test image through `pane native-boot-spike --prepare-runtime --execute --run-fixture`,
+- a guarded WHP boot-loader candidate execution path through `pane native-boot-spike --prepare-runtime --execute --run-boot-loader`.
 
 Pane does not yet own:
 
@@ -72,7 +72,7 @@ It must remain side-effect-free. It reports blockers; it does not enable Windows
 
 ## Implementation Sequence
 
-1. Native preflight: dynamically load WHP and report host/runtime blockers without linking Pane to WHP at startup.
+1. Native preflight: dynamically load WHP and report host/runtime blockers without linking Pane to WHP at startup. `pane native-preflight --prepare-runtime` also creates the Pane-owned runtime directories, manifests, framebuffer contract, and input contract so kernel-layout work starts from a valid app-owned boundary.
 2. Partition smoke: create a WHP partition, configure one vCPU, create that vCPU, and tear everything down cleanly.
 3. Runtime-backed serial test image: materialize `serial-boot.paneimg` under the Pane runtime, map it as guest memory, configure vCPU registers, run it, decode the `PANE_BOOT_OK` COM1 banner across repeated I/O exits, observe HLT, unmap memory, and tear everything down cleanly.
 4. Runtime-provided boot-loader candidate: register a verified `boot-to-serial-loader.paneimg`, require a SHA-256 match and expected serial text, then execute that artifact through WHP with `--run-boot-loader`.
@@ -92,8 +92,8 @@ Pane cannot claim the native runtime is real until:
 
 - a clean Windows machine can run `pane native-preflight` and receive actionable host checks,
 - `pane native-boot-spike --execute` can create and tear down a WHP partition and vCPU without leaking resources,
-- `pane native-boot-spike --execute --run-fixture` can load the runtime-backed serial boot image, map guest memory, set registers, run guest code, decode the deterministic `PANE_BOOT_OK` serial banner, observe HLT, unmap memory, and release all WHP resources,
-- `pane native-boot-spike --execute --run-boot-loader` can load a verified runtime-provided boot-loader candidate, validate its expected serial output, observe HLT, and release all WHP resources,
+- `pane native-boot-spike --prepare-runtime --execute --run-fixture` can load the runtime-backed serial boot image, map guest memory, set registers, run guest code, decode the deterministic `PANE_BOOT_OK` serial banner, observe HLT, unmap memory, and release all WHP resources,
+- `pane native-boot-spike --prepare-runtime --execute --run-boot-loader` can load a verified runtime-provided boot-loader candidate, validate its expected serial output, observe HLT, and release all WHP resources,
 - `pane runtime --register-kernel` can prepare a verified kernel/initramfs boot plan with serial console output required before any WHP kernel-entry work starts,
 - `pane runtime --write-initramfs-driver` can generate a reproducible Pane initramfs driver source/build-script bundle with a self-contained C `/init` that discovers `pane.storage_contract`, `pane.block_io`, `pane.block_devices`, `pane.root`, and `pane.user`, writes `/run/pane/native-storage.env`, loads `pane-block.ko` with exact base/user `device_blocks` geometry when present, waits for the declared root device, mounts it at `/newroot`, executes the real init once the Pane block device exists, and includes the Pane block-driver source/build contract that exposes the verified base OS as `/dev/pane0` plus the writable user disk as `/dev/pane1` with partial read/write handling and flush/discard tolerance for partition scanners and filesystems,
 - `pane runtime --build-pane-block-module --kernel-build-dir <path>` can run the generated module build script against a target Arch kernel build tree and register the resulting `pane-block.ko` with a computed SHA,
@@ -102,7 +102,7 @@ Pane cannot claim the native runtime is real until:
 - `pane native-kernel-plan --materialize` can write and re-validate the deterministic kernel boot layout before the WHP runner maps those guest addresses; storage-backed layouts now require verified Pane initramfs driver bundle metadata plus a verified Pane block module before reporting ready,
 - materialized kernel layouts attach the verified base OS image and Pane user disk when both exist, instead of treating the kernel entry path as detached from future Arch storage,
 - runtime preparation writes explicit framebuffer and input contracts, the kernel boot params advertise the framebuffer through Linux `screen_info`, and the mapped input queue begins with a deterministic `PANEINQ1` header, so display/input work has a stable guest/device boundary instead of an undefined "draw pixels somehow" milestone,
-- `pane native-boot-spike --execute --run-kernel-layout` can consume that layout, map boot params, cmdline, kernel, optional initramfs, non-overlapping RAM regions, reserved initramfs E820 placement, a boot-protocol GDT, reserved APIC MMIO stub pages, framebuffer memory, and input queue memory, then select the correct guest-entry contract: real-mode serial/HALT validation for the controlled candidate or a protected-mode Linux entry probe with boot params in `rsi` for a bzImage payload; storage-backed Linux layouts must report module-load, display-contract, root-mount, and init-exec serial milestones before being treated as Arch userspace boot progress,
+- `pane native-boot-spike --prepare-runtime --execute --run-kernel-layout` can consume that layout after ensuring the runtime boundary exists, map boot params, cmdline, kernel, optional initramfs, non-overlapping RAM regions, reserved initramfs E820 placement, a boot-protocol GDT, reserved APIC MMIO stub pages, framebuffer memory, and input queue memory, then select the correct guest-entry contract: real-mode serial/HALT validation for the controlled candidate or a protected-mode Linux entry probe with boot params in `rsi` for a bzImage payload; storage-backed Linux layouts must report module-load, display-contract, root-mount, and init-exec serial milestones before being treated as Arch userspace boot progress,
 - a test image can boot under a Pane-owned WHP host without WSL, XRDP, `mstsc.exe`, QEMU, VirtualBox, or Hyper-V Manager,
 - Pane can boot a verified Arch base image plus a Pane-owned user disk,
 - Pane renders the guest through its own app surface,

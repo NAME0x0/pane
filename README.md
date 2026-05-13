@@ -273,7 +273,7 @@ cargo run -- runtime --repair-user-disk
 Check WHP host and runtime readiness:
 
 ```powershell
-cargo run -- native-preflight --json
+cargo run -- native-preflight --prepare-runtime --json
 ```
 
 Run the safe plan-only boot-spike report:
@@ -305,7 +305,7 @@ cargo run -- runtime --build-pane-block-module --kernel-build-dir C:\path\to\arc
 cargo run -- runtime --register-pane-block-module C:\path\to\pane-block.ko --pane-block-module-expected-sha256 <64-char-sha256>
 cargo run -- runtime --build-discovery-initramfs
 cargo run -- native-kernel-plan --materialize
-cargo run -- native-boot-spike --execute --run-kernel-layout
+cargo run -- native-boot-spike --prepare-runtime --execute --run-kernel-layout
 ```
 
 `--build-pane-block-module` runs the generated `build-pane-block-module.sh` with `KERNEL_BUILD_DIR` set to the target Arch kernel build tree, then registers the resulting module with a computed SHA. `--register-pane-block-module` is the manual equivalent for externally built modules; it copies a compiled and SHA-verified `pane-block.ko` into the generated initramfs driver bundle, binding it to the currently verified target kernel and generated `pane-block.c` source hash. `--build-discovery-initramfs` runs the generated `build-pane-initramfs.sh` with `sh`, `cc`, and `cpio`, includes that verified module when present, then registers the produced cpio as a verified initramfs artifact in the existing kernel boot plan. If those tools are unavailable, build the cpio externally from the generated bundle and register it with `--register-initramfs`.
@@ -398,7 +398,7 @@ Useful smoke checks:
 ```powershell
 cargo run -- app-status --json
 cargo run -- runtime --json
-cargo run -- native-preflight --json
+cargo run -- native-preflight --prepare-runtime --json
 cargo run -- native-boot-spike --json
 cargo run -- launch --dry-run --de xfce
 ```

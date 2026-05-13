@@ -335,6 +335,9 @@ pub struct NativePreflightArgs {
     /// Session slug for the Pane-owned runtime reservation.
     #[arg(long, default_value = "pane")]
     pub session_name: String,
+    /// Prepare the Pane-owned runtime directories, manifests, framebuffer contract, and input contract before reporting readiness.
+    #[arg(long)]
+    pub prepare_runtime: bool,
     /// Emit structured JSON instead of a human-readable summary.
     #[arg(long)]
     pub json: bool,
@@ -345,6 +348,9 @@ pub struct NativeBootSpikeArgs {
     /// Session slug for the Pane-owned runtime reservation.
     #[arg(long, default_value = "pane")]
     pub session_name: String,
+    /// Prepare the Pane-owned runtime directories, manifests, framebuffer contract, and input contract before evaluating boot artifacts.
+    #[arg(long)]
+    pub prepare_runtime: bool,
     /// Actually create and tear down a WHP partition/vCPU. Without this flag, Pane prints the plan only.
     #[arg(long)]
     pub execute: bool,
@@ -543,4 +549,42 @@ pub struct BundleArgs {
     /// Optional zip path for the generated support bundle.
     #[arg(long)]
     pub output: Option<PathBuf>,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Commands};
+
+    #[test]
+    fn native_preflight_accepts_prepare_runtime_flag() {
+        let cli = Cli::try_parse_from(["pane", "native-preflight", "--prepare-runtime"]).unwrap();
+
+        match cli.command {
+            Commands::NativePreflight(args) => assert!(args.prepare_runtime),
+            _ => panic!("expected native-preflight command"),
+        }
+    }
+
+    #[test]
+    fn native_boot_spike_accepts_prepare_runtime_flag() {
+        let cli = Cli::try_parse_from([
+            "pane",
+            "native-boot-spike",
+            "--prepare-runtime",
+            "--execute",
+            "--run-kernel-layout",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::NativeBootSpike(args) => {
+                assert!(args.prepare_runtime);
+                assert!(args.execute);
+                assert!(args.run_kernel_layout);
+            }
+            _ => panic!("expected native-boot-spike command"),
+        }
+    }
 }

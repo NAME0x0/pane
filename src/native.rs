@@ -869,7 +869,7 @@ fn build_native_host_preflight_report(
         );
     }
     next_steps.extend([
-        "Run `pane native-boot-spike --execute --run-fixture` to prove WHP guest memory, register setup, vCPU execution, and serial I/O on this host."
+        "Run `pane native-boot-spike --prepare-runtime --execute --run-fixture` to prepare runtime contracts and prove WHP guest memory, register setup, vCPU execution, and serial I/O on this host."
             .to_string(),
         "Replace the synthetic serial test image with a boot-to-serial kernel or loader."
             .to_string(),
@@ -1003,7 +1003,7 @@ fn skipped_partition_smoke_report(
         calls: Vec::new(),
         blocker: Some(blocker.into()),
         next_step: if run_fixture {
-            "Resolve the blocker, then rerun `pane native-boot-spike --execute --run-fixture`."
+            "Resolve the blocker, then rerun `pane native-boot-spike --prepare-runtime --execute --run-fixture`."
                 .to_string()
         } else {
             "Resolve the blocker, then rerun `pane native-boot-spike --execute`.".to_string()

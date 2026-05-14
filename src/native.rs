@@ -11,6 +11,7 @@ const REQUIRED_WHP_EXPORTS: &[&str] = &[
     "WHvSetVirtualProcessorRegisters",
     "WHvRunVirtualProcessor",
     "WHvCancelRunVirtualProcessor",
+    "WHvRequestInterrupt",
     "WHvMapGpaRange",
     "WHvUnmapGpaRange",
 ];
@@ -1166,6 +1167,8 @@ mod windows_whp {
 
     const WHV_CAPABILITY_CODE_HYPERVISOR_PRESENT: u32 = 0;
     const WHV_PARTITION_PROPERTY_CODE_PROCESSOR_COUNT: u32 = 0x0000_1fff;
+    const WHV_PARTITION_PROPERTY_CODE_LOCAL_APIC_EMULATION_MODE: u32 = 0x0000_1005;
+    const WHV_X64_LOCAL_APIC_EMULATION_MODE_XAPIC: u32 = 1;
     const WHV_MAP_GPA_RANGE_FLAG_READ: u32 = 0x0000_0001;
     const WHV_MAP_GPA_RANGE_FLAG_WRITE: u32 = 0x0000_0002;
     const WHV_MAP_GPA_RANGE_FLAG_EXECUTE: u32 = 0x0000_0004;
@@ -1193,6 +1196,11 @@ mod windows_whp {
     const SERIAL_MODEM_STATUS_PORT: u16 = SERIAL_COM1_PORT + 6;
     const PIC1_COMMAND_PORT: u16 = 0x0020;
     const PIC1_DATA_PORT: u16 = 0x0021;
+    const PIC_ICW1_INIT: u8 = 0x10;
+    const PIC_IRQ0_TIMER_BIT: u8 = 0x01;
+    const PIC1_DEFAULT_VECTOR_OFFSET: u8 = 0x08;
+    const PIC2_DEFAULT_VECTOR_OFFSET: u8 = 0x70;
+    const PIC1_SAFE_TIMER_VECTOR_OFFSET: u8 = 0x20;
     const PIT_CHANNEL0_PORT: u16 = 0x0040;
     const PIT_CHANNEL1_PORT: u16 = 0x0041;
     const PIT_CHANNEL2_PORT: u16 = 0x0042;
@@ -1301,6 +1309,8 @@ mod windows_whp {
     type WhvRunVirtualProcessor =
         unsafe extern "system" fn(*mut c_void, u32, *mut c_void, u32) -> i32;
     type WhvCancelRunVirtualProcessor = unsafe extern "system" fn(*mut c_void, u32, u32) -> i32;
+    type WhvRequestInterrupt =
+        unsafe extern "system" fn(*mut c_void, *const WhvInterruptControl, u32) -> i32;
     type WhvMapGpaRange = unsafe extern "system" fn(*mut c_void, *mut c_void, u64, u64, u32) -> i32;
     type WhvUnmapGpaRange = unsafe extern "system" fn(*mut c_void, u64, u64) -> i32;
 
@@ -1327,6 +1337,14 @@ mod windows_whp {
         reg64: u64,
         segment: WhvX64SegmentRegister,
         table: WhvX64TableRegister,
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct WhvInterruptControl {
+        control: u64,
+        destination: u32,
+        vector: u32,
     }
 
     #[link(name = "kernel32")]
@@ -1584,6 +1602,21 @@ mod windows_whp {
             } else {
                 None
             };
+            let request_interrupt = if run_fixture {
+                match resolve_whp_function::<WhvRequestInterrupt>(
+                    module,
+                    "WHvRequestInterrupt",
+                    &mut report,
+                ) {
+                    Some(function) => Some(function),
+                    None => {
+                        FreeLibrary(module);
+                        return report;
+                    }
+                }
+            } else {
+                None
+            };
             let map_gpa_range = if run_fixture {
                 match resolve_whp_function::<WhvMapGpaRange>(module, "WHvMapGpaRange", &mut report)
                 {
@@ -1612,6 +1645,7 @@ mod windows_whp {
                 None
             };
 
+            let mut interrupt_controller_configured = !run_fixture;
             let mut partition: *mut c_void = std::ptr::null_mut();
             let hresult = create_partition(&mut partition);
             report.partition_created = hresult_succeeded(hresult) && !partition.is_null();
@@ -1646,6 +1680,29 @@ mod windows_whp {
             }
 
             if report.partition_created && report.processor_count_configured {
+                let apic_mode = WHV_X64_LOCAL_APIC_EMULATION_MODE_XAPIC;
+                let hresult = set_partition_property(
+                    partition,
+                    WHV_PARTITION_PROPERTY_CODE_LOCAL_APIC_EMULATION_MODE,
+                    (&apic_mode as *const u32).cast::<c_void>(),
+                    mem::size_of::<u32>() as u32,
+                );
+                interrupt_controller_configured = hresult_succeeded(hresult);
+                report.calls.push(hresult_call(
+                    "WHvSetPartitionProperty(LocalApicEmulationMode=XApic)",
+                    hresult,
+                    if interrupt_controller_configured {
+                        "Configured WHP xAPIC emulation so Pane can request native timer interrupts."
+                    } else {
+                        "Could not configure WHP xAPIC emulation for native interrupt delivery."
+                    },
+                ));
+            }
+
+            if report.partition_created
+                && report.processor_count_configured
+                && interrupt_controller_configured
+            {
                 let hresult = setup_partition(partition);
                 report.partition_setup = hresult_succeeded(hresult);
                 report.calls.push(hresult_call(
@@ -1717,6 +1774,7 @@ mod windows_whp {
                             partition,
                             run_virtual_processor,
                             cancel_run_virtual_processor,
+                            request_interrupt,
                             set_virtual_processor_registers,
                             boot_image,
                             block_io_handler,
@@ -2308,6 +2366,7 @@ mod windows_whp {
         partition: *mut c_void,
         run_virtual_processor: WhvRunVirtualProcessor,
         cancel_run_virtual_processor: Option<WhvCancelRunVirtualProcessor>,
+        request_interrupt: Option<WhvRequestInterrupt>,
         set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
         boot_image: &NativeSerialBootImage,
         block_io_handler: Option<&NativeBlockIoHandler<'_>>,
@@ -2325,6 +2384,7 @@ mod windows_whp {
                 partition,
                 run_virtual_processor,
                 cancel_run_virtual_processor,
+                request_interrupt,
                 set_virtual_processor_registers,
                 block_io_handler,
                 report,
@@ -2476,6 +2536,7 @@ mod windows_whp {
         partition: *mut c_void,
         run_virtual_processor: WhvRunVirtualProcessor,
         cancel_run_virtual_processor: Option<WhvCancelRunVirtualProcessor>,
+        request_interrupt: Option<WhvRequestInterrupt>,
         set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
         block_io_handler: Option<&NativeBlockIoHandler<'_>>,
         report: &mut NativePartitionSmokeReport,
@@ -2908,12 +2969,28 @@ mod windows_whp {
                     });
                 }
                 DecodedExit::Canceled => {
+                    if let Some(request_interrupt) = request_interrupt {
+                        request_native_timer_interrupt(
+                            partition,
+                            request_interrupt,
+                            legacy_io_state.timer_interrupt_vector(),
+                            legacy_io_state.timer_interrupt_unmasked(),
+                            report,
+                        );
+                    } else {
+                        report.calls.push(NativeWhpCallReport {
+                            name: "WHvRequestInterrupt",
+                            hresult: None,
+                            ok: false,
+                            detail: "WHvRequestInterrupt is unavailable, so Pane cannot deliver the first native timer interrupt at the time-slice boundary.".to_string(),
+                        });
+                    }
                     report.calls.push(NativeWhpCallReport {
                         name: "LinuxEntryProbeTimesliceBoundary",
                         hresult: None,
                         ok: false,
                         detail: format!(
-                            "Pane regained control after a {LINUX_ENTRY_PROBE_TIMESLICE_MILLIS}ms WHP vCPU time slice. The probe stops here because resuming this Arch kernel path can re-enter a long non-returning guest run until Pane owns timer/interrupt delivery."
+                            "Pane regained control after a {LINUX_ENTRY_PROBE_TIMESLICE_MILLIS}ms WHP vCPU time slice. The probe stops after requesting the first native timer interrupt because the next milestone must safely resume and observe guest acknowledgement instead of re-entering a long non-returning run."
                         ),
                     });
                     if let Some(path) = checkpoint_path.as_deref() {
@@ -2988,6 +3065,46 @@ mod windows_whp {
         if let Some(controller) = &run_controller {
             controller.stop();
         }
+    }
+
+    fn request_native_timer_interrupt(
+        partition: *mut c_void,
+        request_interrupt: WhvRequestInterrupt,
+        vector: u8,
+        unmasked: bool,
+        report: &mut NativePartitionSmokeReport,
+    ) -> bool {
+        let interrupt = WhvInterruptControl {
+            control: 0,
+            destination: 0,
+            vector: u32::from(vector),
+        };
+        let hresult = unsafe {
+            request_interrupt(
+                partition,
+                &interrupt,
+                mem::size_of::<WhvInterruptControl>() as u32,
+            )
+        };
+        let ok = hresult_succeeded(hresult);
+        report.calls.push(hresult_call(
+            "WHvRequestInterrupt(timer)",
+            hresult,
+            if ok {
+                "Requested a fixed edge-triggered timer interrupt for vCPU 0."
+            } else {
+                "Could not request the native timer interrupt through WHP."
+            },
+        ));
+        report.calls.push(NativeWhpCallReport {
+            name: "LinuxEntryProbeTimerInterruptRequested",
+            hresult: None,
+            ok,
+            detail: format!(
+                "Requested native timer interrupt vector 0x{vector:02x} from the emulated PIC/PIT state; irq0_unmasked={unmasked}."
+            ),
+        });
+        ok
     }
 
     struct LinuxEntryProbeRunController {
@@ -3270,10 +3387,13 @@ mod windows_whp {
         }
     }
 
-    #[derive(Default)]
     struct LegacyDeviceIoState {
         pic1_mask: u8,
         pic2_mask: u8,
+        pic1_vector_offset: u8,
+        pic2_vector_offset: u8,
+        pic1_init_step: u8,
+        pic2_init_step: u8,
         pit_latch: [u8; 3],
         pit_command: u8,
         ps2_command_byte: u8,
@@ -3306,6 +3426,49 @@ mod windows_whp {
         elcr2: u8,
     }
 
+    impl Default for LegacyDeviceIoState {
+        fn default() -> Self {
+            Self {
+                pic1_mask: 0,
+                pic2_mask: 0,
+                pic1_vector_offset: PIC1_DEFAULT_VECTOR_OFFSET,
+                pic2_vector_offset: PIC2_DEFAULT_VECTOR_OFFSET,
+                pic1_init_step: 0,
+                pic2_init_step: 0,
+                pit_latch: [0; 3],
+                pit_command: 0,
+                ps2_command_byte: 0,
+                ps2_output_port: 0,
+                ps2_awaiting_command_byte_write: false,
+                ps2_awaiting_output_port_write: false,
+                ps2_response: VecDeque::new(),
+                system_control_a: 0,
+                system_control_b: 0,
+                cmos_index: 0,
+                pci_config_address: 0,
+                vga_attribute_index: 0,
+                vga_attribute_flip_flop: false,
+                vga_attribute: [0; 0x20],
+                vga_misc_output: 0,
+                vga_sequencer_index: 0,
+                vga_sequencer: [0; 0x08],
+                vga_dac_mask: 0,
+                vga_dac_index: 0,
+                vga_graphics_index: 0,
+                vga_graphics: [0; 0x10],
+                vga_crtc_index: 0,
+                vga_crtc: [0; 0x20],
+                acpi_pm1_status: 0,
+                acpi_pm1_enable: 0,
+                acpi_pm1_control: 0,
+                acpi_pm_timer: 0,
+                dma_page_registers: [0; 0x10],
+                elcr1: 0,
+                elcr2: 0,
+            }
+        }
+    }
+
     impl LegacyDeviceIoState {
         fn access(&mut self, port: u16, is_write: bool, access_size: u32, rax: u64) -> Option<u32> {
             if !matches!(access_size, 1 | 2 | 4) {
@@ -3330,13 +3493,20 @@ mod windows_whp {
 
         fn write_byte(&mut self, port: u16, value: u8) -> bool {
             match port {
-                PIC1_COMMAND_PORT | PIC2_COMMAND_PORT => true,
+                PIC1_COMMAND_PORT => {
+                    self.write_pic_command(true, value);
+                    true
+                }
+                PIC2_COMMAND_PORT => {
+                    self.write_pic_command(false, value);
+                    true
+                }
                 PIC1_DATA_PORT => {
-                    self.pic1_mask = value;
+                    self.write_pic_data(true, value);
                     true
                 }
                 PIC2_DATA_PORT => {
-                    self.pic2_mask = value;
+                    self.write_pic_data(false, value);
                     true
                 }
                 port if Self::legacy_serial_port_offset(port).is_some() => true,
@@ -3474,6 +3644,55 @@ mod windows_whp {
                 }
                 _ => false,
             }
+        }
+
+        fn write_pic_command(&mut self, primary: bool, value: u8) {
+            if value & PIC_ICW1_INIT != 0 {
+                if primary {
+                    self.pic1_init_step = 2;
+                } else {
+                    self.pic2_init_step = 2;
+                }
+            }
+        }
+
+        fn write_pic_data(&mut self, primary: bool, value: u8) {
+            let init_step = if primary {
+                &mut self.pic1_init_step
+            } else {
+                &mut self.pic2_init_step
+            };
+
+            match *init_step {
+                2 => {
+                    if primary {
+                        self.pic1_vector_offset = value & 0xf8;
+                    } else {
+                        self.pic2_vector_offset = value & 0xf8;
+                    }
+                    *init_step = 3;
+                }
+                3 => {
+                    *init_step = 4;
+                }
+                4 => {
+                    *init_step = 0;
+                }
+                _ if primary => self.pic1_mask = value,
+                _ => self.pic2_mask = value,
+            }
+        }
+
+        fn timer_interrupt_vector(&self) -> u8 {
+            if self.pic1_vector_offset < 0x10 {
+                PIC1_SAFE_TIMER_VECTOR_OFFSET
+            } else {
+                self.pic1_vector_offset
+            }
+        }
+
+        fn timer_interrupt_unmasked(&self) -> bool {
+            self.pic1_mask & PIC_IRQ0_TIMER_BIT == 0
         }
 
         fn read_value(&mut self, port: u16, access_size: u32) -> Option<u32> {
@@ -4039,7 +4258,7 @@ mod windows_whp {
             .iter()
             .any(|call| call.name == "LinuxEntryProbeTimesliceBoundary" && !call.ok)
         {
-            "Linux protected-mode entry reached Pane's WHP time-slice boundary before the required initramfs milestones; next step: implement the timer/interrupt delivery model needed to resume this Arch kernel path safely.".to_string()
+            "Linux protected-mode entry reached Pane's WHP time-slice boundary before the required initramfs milestones; Pane requested a native timer interrupt, and the next step is to safely resume the guest and observe interrupt acknowledgement.".to_string()
         } else if !report.serial_expected_markers.is_empty() && !report.serial_markers_observed {
             format!(
                 "Linux protected-mode entry has not yet emitted the required serial milestones: {}.",
@@ -4352,18 +4571,18 @@ mod windows_whp {
             LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET, LINUX_ENTRY_PROBE_TRACE_HEAD,
             LINUX_ENTRY_PROBE_TRACE_TAIL, MEMORY_ACCESS_INFO_OFFSET, MEMORY_GPA_OFFSET,
             MEMORY_GVA_OFFSET, MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET, MSR_RAX_OFFSET,
-            MSR_RDX_OFFSET, PCI_CONFIG_ADDRESS_PORT, PCI_CONFIG_DATA_START_PORT, PIC1_DATA_PORT,
-            PIC2_DATA_PORT, PIT_CHANNEL0_PORT, PIT_COMMAND_PORT, POST_DELAY_PORT, PS2_DATA_PORT,
-            PS2_STATUS_COMMAND_PORT, SERIAL_COM1_PORT, SYSTEM_CONTROL_PORT_A,
-            SYSTEM_CONTROL_PORT_B, VGA_ATTRIBUTE_DATA_READ_PORT, VGA_ATTRIBUTE_PORT,
-            VGA_CRTC_COLOR_DATA_PORT, VGA_CRTC_COLOR_INDEX_PORT, VGA_GRAPHICS_DATA_PORT,
-            VGA_GRAPHICS_INDEX_PORT, VGA_INPUT_STATUS_COLOR_PORT, VGA_MISC_OUTPUT_READ_PORT,
-            VGA_MISC_OUTPUT_WRITE_PORT, VGA_SEQUENCER_DATA_PORT, VGA_SEQUENCER_INDEX_PORT,
-            VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET, VP_CONTEXT_RIP_OFFSET, WHV_REGISTER_CR0,
-            WHV_REGISTER_CR3, WHV_REGISTER_CR4, WHV_REGISTER_CS, WHV_REGISTER_DS, WHV_REGISTER_ES,
-            WHV_REGISTER_GDTR, WHV_REGISTER_IDTR, WHV_REGISTER_RBP, WHV_REGISTER_RBX,
-            WHV_REGISTER_RDI, WHV_REGISTER_RFLAGS, WHV_REGISTER_RIP, WHV_REGISTER_RSI,
-            WHV_REGISTER_RSP, WHV_REGISTER_SS, WHV_RUN_VP_EXIT_REASON_CANCELED,
+            MSR_RDX_OFFSET, PCI_CONFIG_ADDRESS_PORT, PCI_CONFIG_DATA_START_PORT, PIC1_COMMAND_PORT,
+            PIC1_DATA_PORT, PIC2_COMMAND_PORT, PIC2_DATA_PORT, PIT_CHANNEL0_PORT, PIT_COMMAND_PORT,
+            POST_DELAY_PORT, PS2_DATA_PORT, PS2_STATUS_COMMAND_PORT, SERIAL_COM1_PORT,
+            SYSTEM_CONTROL_PORT_A, SYSTEM_CONTROL_PORT_B, VGA_ATTRIBUTE_DATA_READ_PORT,
+            VGA_ATTRIBUTE_PORT, VGA_CRTC_COLOR_DATA_PORT, VGA_CRTC_COLOR_INDEX_PORT,
+            VGA_GRAPHICS_DATA_PORT, VGA_GRAPHICS_INDEX_PORT, VGA_INPUT_STATUS_COLOR_PORT,
+            VGA_MISC_OUTPUT_READ_PORT, VGA_MISC_OUTPUT_WRITE_PORT, VGA_SEQUENCER_DATA_PORT,
+            VGA_SEQUENCER_INDEX_PORT, VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET, VP_CONTEXT_RIP_OFFSET,
+            WHV_REGISTER_CR0, WHV_REGISTER_CR3, WHV_REGISTER_CR4, WHV_REGISTER_CS, WHV_REGISTER_DS,
+            WHV_REGISTER_ES, WHV_REGISTER_GDTR, WHV_REGISTER_IDTR, WHV_REGISTER_RBP,
+            WHV_REGISTER_RBX, WHV_REGISTER_RDI, WHV_REGISTER_RFLAGS, WHV_REGISTER_RIP,
+            WHV_REGISTER_RSI, WHV_REGISTER_RSP, WHV_REGISTER_SS, WHV_RUN_VP_EXIT_REASON_CANCELED,
             WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE, WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS,
             WHV_RUN_VP_EXIT_REASON_X64_APIC_EOI, WHV_RUN_VP_EXIT_REASON_X64_CPUID,
             WHV_RUN_VP_EXIT_REASON_X64_HALT, WHV_RUN_VP_EXIT_REASON_X64_INTERRUPT_WINDOW,
@@ -4510,6 +4729,28 @@ mod windows_whp {
             assert_eq!(io.access(ALT_POST_DELAY_PORT, true, 1, 0), Some(0));
             assert_eq!(io.access(ALT_DELAY_PORT, true, 1, 0), Some(0));
             assert_eq!(io.access(0x1234, false, 1, 0), None);
+        }
+
+        #[test]
+        fn legacy_device_io_model_tracks_pic_timer_vector() {
+            let mut io = LegacyDeviceIoState::default();
+
+            assert_eq!(io.timer_interrupt_vector(), 0x20);
+            assert!(io.timer_interrupt_unmasked());
+
+            assert_eq!(io.access(PIC1_COMMAND_PORT, true, 1, 0x11), Some(0x11));
+            assert_eq!(io.access(PIC2_COMMAND_PORT, true, 1, 0x11), Some(0x11));
+            assert_eq!(io.access(PIC1_DATA_PORT, true, 1, 0x20), Some(0x20));
+            assert_eq!(io.access(PIC2_DATA_PORT, true, 1, 0x28), Some(0x28));
+            assert_eq!(io.access(PIC1_DATA_PORT, true, 1, 0x04), Some(0x04));
+            assert_eq!(io.access(PIC2_DATA_PORT, true, 1, 0x02), Some(0x02));
+            assert_eq!(io.access(PIC1_DATA_PORT, true, 1, 0x01), Some(0x01));
+            assert_eq!(io.access(PIC2_DATA_PORT, true, 1, 0x01), Some(0x01));
+
+            assert_eq!(io.timer_interrupt_vector(), 0x20);
+            assert!(io.timer_interrupt_unmasked());
+            assert_eq!(io.access(PIC1_DATA_PORT, true, 1, 0xff), Some(0xff));
+            assert!(!io.timer_interrupt_unmasked());
         }
 
         #[test]

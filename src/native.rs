@@ -1178,10 +1178,11 @@ mod windows_whp {
     const WHV_RUN_VP_EXIT_REASON_X64_APIC_EOI: u32 = 0x0000_0009;
     const WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS: u32 = 0x0000_1000;
     const WHV_RUN_VP_EXIT_REASON_X64_CPUID: u32 = 0x0000_1001;
+    const WHV_RUN_VP_EXIT_REASON_CANCELED: u32 = 0x0000_2001;
     const GUEST_PAGE_SIZE: usize = SERIAL_BOOT_TEST_IMAGE_SIZE;
     const LINUX_ENTRY_PROBE_EXIT_BUDGET: usize = 131072;
     const LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET: usize = 256;
-    const LINUX_ENTRY_PROBE_WATCHDOG_SECONDS: u64 = 30;
+    const LINUX_ENTRY_PROBE_TIMESLICE_MILLIS: u64 = 250;
     const LINUX_ENTRY_PROBE_WALL_CLOCK_BUDGET_SECONDS: u64 = 90;
     const LINUX_ENTRY_PROBE_TRACE_HEAD: usize = 384;
     const LINUX_ENTRY_PROBE_TRACE_TAIL: usize = 384;
@@ -2452,6 +2453,7 @@ mod windows_whp {
                 DecodedExit::Cpuid { .. } => break,
                 DecodedExit::InterruptWindow => break,
                 DecodedExit::ApicEoi => break,
+                DecodedExit::Canceled => break,
                 DecodedExit::Other => break,
             }
 
@@ -2481,30 +2483,9 @@ mod windows_whp {
         report.serial_expected_text = None;
         let max_guest_exits = linux_entry_probe_exit_budget(report);
         report.guest_exit_budget = max_guest_exits as u32;
-        let watchdog_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let checkpoint_path = linux_entry_probe_checkpoint_path();
-        if let Some(cancel_run_virtual_processor) = cancel_run_virtual_processor {
-            let watchdog_done = std::sync::Arc::clone(&watchdog_done);
-            let checkpoint_path = checkpoint_path.clone();
-            let partition_address = partition as usize;
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_secs(
-                    LINUX_ENTRY_PROBE_WATCHDOG_SECONDS,
-                ));
-                if !watchdog_done.load(std::sync::atomic::Ordering::SeqCst) {
-                    if let Some(path) = checkpoint_path.as_deref() {
-                        write_linux_entry_probe_watchdog_checkpoint(
-                            path,
-                            "watchdog-cancel-requested",
-                        );
-                    }
-                    let partition = partition_address as *mut c_void;
-                    unsafe {
-                        cancel_run_virtual_processor(partition, 0, 0);
-                    }
-                }
-            });
-        }
+        let run_controller = cancel_run_virtual_processor
+            .map(|cancel| LinuxEntryProbeRunController::start(partition, cancel));
         let mut msr_state = default_linux_msr_state();
         let mut serial_state = Com1SerialState::default();
         let mut block_state = NativeBlockIoPortState::default();
@@ -2539,6 +2520,13 @@ mod windows_whp {
 
             report.guest_exit_count = (exit_index + 1) as u32;
             let mut exit_context = [0_u8; 1024];
+            let cancel_count_before = run_controller
+                .as_ref()
+                .map(LinuxEntryProbeRunController::cancel_request_count)
+                .unwrap_or(0);
+            if let Some(controller) = &run_controller {
+                controller.begin_run();
+            }
             let hresult = unsafe {
                 run_virtual_processor(
                     partition,
@@ -2547,20 +2535,50 @@ mod windows_whp {
                     exit_context.len() as u32,
                 )
             };
+            if let Some(controller) = &run_controller {
+                controller.end_run();
+            }
             let run_ok = hresult_succeeded(hresult);
-            report.virtual_processor_ran |= run_ok;
-            report.calls.push(hresult_call(
-                "WHvRunVirtualProcessor(linux-entry-probe)",
-                hresult,
-                if run_ok {
-                    "vCPU returned with a WHP exit context for the Linux protected-mode entry probe."
-                } else {
-                    "vCPU execution failed before the Linux protected-mode entry probe produced a WHP exit context."
-                },
-            ));
+            let cancel_count_after = run_controller
+                .as_ref()
+                .map(LinuxEntryProbeRunController::cancel_request_count)
+                .unwrap_or(cancel_count_before);
+            let timeslice_cancelled = !run_ok && cancel_count_after > cancel_count_before;
+            if timeslice_cancelled {
+                report.virtual_processor_ran = true;
+                report.calls.push(NativeWhpCallReport {
+                    name: "LinuxEntryProbeTimeslice",
+                    hresult: Some(format_hresult(hresult)),
+                    ok: true,
+                    detail: format!(
+                        "Pane cancelled a long WHP run after {LINUX_ENTRY_PROBE_TIMESLICE_MILLIS}ms to regain host control; the vCPU remains resumable."
+                    ),
+                });
+                if let Some(path) = checkpoint_path.as_deref() {
+                    write_linux_entry_probe_checkpoint(
+                        path,
+                        report,
+                        "timeslice-cancelled",
+                        probe_started_at,
+                    );
+                    last_checkpoint_at = Instant::now();
+                }
+                continue;
+            } else {
+                report.virtual_processor_ran |= run_ok;
+                report.calls.push(hresult_call(
+                    "WHvRunVirtualProcessor(linux-entry-probe)",
+                    hresult,
+                    if run_ok {
+                        "vCPU returned with a WHP exit context for the Linux protected-mode entry probe."
+                    } else {
+                        "vCPU execution failed before the Linux protected-mode entry probe produced a WHP exit context."
+                    },
+                ));
 
-            if !run_ok {
-                break;
+                if !run_ok {
+                    break;
+                }
             }
 
             match decode_exit_context(&exit_context, report) {
@@ -2889,6 +2907,25 @@ mod windows_whp {
                                 .to_string(),
                     });
                 }
+                DecodedExit::Canceled => {
+                    report.calls.push(NativeWhpCallReport {
+                        name: "LinuxEntryProbeTimesliceBoundary",
+                        hresult: None,
+                        ok: false,
+                        detail: format!(
+                            "Pane regained control after a {LINUX_ENTRY_PROBE_TIMESLICE_MILLIS}ms WHP vCPU time slice. The probe stops here because resuming this Arch kernel path can re-enter a long non-returning guest run until Pane owns timer/interrupt delivery."
+                        ),
+                    });
+                    if let Some(path) = checkpoint_path.as_deref() {
+                        write_linux_entry_probe_checkpoint(
+                            path,
+                            report,
+                            "timeslice-boundary",
+                            probe_started_at,
+                        );
+                    }
+                    break;
+                }
                 DecodedExit::Other => break,
             }
 
@@ -2948,7 +2985,70 @@ mod windows_whp {
             ok: linux_entry_probe_passed(report),
             detail: linux_entry_probe_detail(report),
         });
-        watchdog_done.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(controller) = &run_controller {
+            controller.stop();
+        }
+    }
+
+    struct LinuxEntryProbeRunController {
+        done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        cancel_requests: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl LinuxEntryProbeRunController {
+        fn start(
+            partition: *mut c_void,
+            cancel_run_virtual_processor: WhvCancelRunVirtualProcessor,
+        ) -> Self {
+            let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let cancel_requests = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let thread_done = std::sync::Arc::clone(&done);
+            let thread_running = std::sync::Arc::clone(&running);
+            let thread_cancel_requests = std::sync::Arc::clone(&cancel_requests);
+            let partition_address = partition as usize;
+            std::thread::spawn(move || {
+                while !thread_done.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(LINUX_ENTRY_PROBE_TIMESLICE_MILLIS));
+                    if thread_done.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    if thread_running.load(std::sync::atomic::Ordering::SeqCst) {
+                        thread_cancel_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let partition = partition_address as *mut c_void;
+                        unsafe {
+                            cancel_run_virtual_processor(partition, 0, 0);
+                        }
+                    }
+                }
+            });
+            Self {
+                done,
+                running,
+                cancel_requests,
+            }
+        }
+
+        fn begin_run(&self) {
+            self.running
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn end_run(&self) {
+            self.running
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn cancel_request_count(&self) -> u64 {
+            self.cancel_requests
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn stop(&self) {
+            self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.end_run();
+        }
     }
 
     fn linux_entry_probe_exit_budget(report: &NativePartitionSmokeReport) -> usize {
@@ -2995,6 +3095,7 @@ mod windows_whp {
             "serial_io_exit_count": report.serial_io_exit_count,
             "serial_markers_observed": report.serial_markers_observed,
             "serial_expected_markers": &report.serial_expected_markers,
+            "timeslice_cancel_count": report.calls.iter().filter(|call| matches!(call.name, "LinuxEntryProbeTimeslice" | "LinuxEntryProbeTimesliceBoundary")).count(),
             "exit_reason_label": &report.exit_reason_label,
             "serial_text_bytes": serial_text.len(),
             "serial_text_tail": &serial_text[serial_tail_start..],
@@ -3008,25 +3109,6 @@ mod windows_whp {
         {
             let _ = fs::create_dir_all(parent);
         }
-        if let Ok(serialized) = serde_json::to_string_pretty(&checkpoint) {
-            let _ = fs::write(path, serialized);
-        }
-    }
-
-    fn write_linux_entry_probe_watchdog_checkpoint(path: &Path, reason: &str) {
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            let _ = fs::create_dir_all(parent);
-        }
-        let checkpoint = serde_json::json!({
-            "schema_version": 1,
-            "kind": "pane-native-boot-trace-checkpoint",
-            "reason": reason,
-            "watchdog_seconds": LINUX_ENTRY_PROBE_WATCHDOG_SECONDS,
-            "detail": "WHP did not return control to Pane before the native boot watchdog fired; Pane requested vCPU cancellation.",
-        });
         if let Ok(serialized) = serde_json::to_string_pretty(&checkpoint) {
             let _ = fs::write(path, serialized);
         }
@@ -3109,6 +3191,7 @@ mod windows_whp {
                     | "WHvSetVirtualProcessorRegisters(RIP)"
                     | "WHvSetVirtualProcessorRegisters(RAX,RIP)"
                     | "LegacyDeviceIo"
+                    | "DecodeCanceled"
             )
     }
 
@@ -3951,6 +4034,12 @@ mod windows_whp {
                 LINUX_ENTRY_PROBE_WALL_CLOCK_BUDGET_SECONDS,
                 report.serial_expected_markers.join(", ")
             )
+        } else if report
+            .calls
+            .iter()
+            .any(|call| call.name == "LinuxEntryProbeTimesliceBoundary" && !call.ok)
+        {
+            "Linux protected-mode entry reached Pane's WHP time-slice boundary before the required initramfs milestones; next step: implement the timer/interrupt delivery model needed to resume this Arch kernel path safely.".to_string()
         } else if !report.serial_expected_markers.is_empty() && !report.serial_markers_observed {
             format!(
                 "Linux protected-mode entry has not yet emitted the required serial milestones: {}.",
@@ -4028,6 +4117,7 @@ mod windows_whp {
         },
         InterruptWindow,
         ApicEoi,
+        Canceled,
         Other,
     }
 
@@ -4172,6 +4262,14 @@ mod windows_whp {
                 detail: "Guest reached an APIC end-of-interrupt exit.".to_string(),
             });
             DecodedExit::ApicEoi
+        } else if exit_reason == WHV_RUN_VP_EXIT_REASON_CANCELED {
+            report.calls.push(NativeWhpCallReport {
+                name: "DecodeCanceled",
+                hresult: None,
+                ok: true,
+                detail: "WHP returned after the vCPU run was cancelled by Pane.".to_string(),
+            });
+            DecodedExit::Canceled
         } else {
             report.calls.push(NativeWhpCallReport {
                 name: "DecodeVpExit",
@@ -4197,7 +4295,7 @@ mod windows_whp {
             WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS => "x64-msr-access",
             WHV_RUN_VP_EXIT_REASON_X64_CPUID => "x64-cpuid",
             0x0000_1002 => "exception",
-            0x0000_2001 => "canceled",
+            WHV_RUN_VP_EXIT_REASON_CANCELED => "canceled",
             _ => "unknown",
         }
     }
@@ -4265,11 +4363,11 @@ mod windows_whp {
             WHV_REGISTER_CR3, WHV_REGISTER_CR4, WHV_REGISTER_CS, WHV_REGISTER_DS, WHV_REGISTER_ES,
             WHV_REGISTER_GDTR, WHV_REGISTER_IDTR, WHV_REGISTER_RBP, WHV_REGISTER_RBX,
             WHV_REGISTER_RDI, WHV_REGISTER_RFLAGS, WHV_REGISTER_RIP, WHV_REGISTER_RSI,
-            WHV_REGISTER_RSP, WHV_REGISTER_SS, WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE,
-            WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS, WHV_RUN_VP_EXIT_REASON_X64_APIC_EOI,
-            WHV_RUN_VP_EXIT_REASON_X64_CPUID, WHV_RUN_VP_EXIT_REASON_X64_HALT,
-            WHV_RUN_VP_EXIT_REASON_X64_INTERRUPT_WINDOW, WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS,
-            WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS,
+            WHV_REGISTER_RSP, WHV_REGISTER_SS, WHV_RUN_VP_EXIT_REASON_CANCELED,
+            WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE, WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS,
+            WHV_RUN_VP_EXIT_REASON_X64_APIC_EOI, WHV_RUN_VP_EXIT_REASON_X64_CPUID,
+            WHV_RUN_VP_EXIT_REASON_X64_HALT, WHV_RUN_VP_EXIT_REASON_X64_INTERRUPT_WINDOW,
+            WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS, WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS,
         };
         use crate::native::{
             evaluate_native_block_io, linux_boot_gdt_page_bytes, native_block_io_exit_can_resume,
@@ -5231,6 +5329,23 @@ mod windows_whp {
                 .calls
                 .iter()
                 .any(|call| call.name == "DecodeX64ApicEoi" && call.ok));
+        }
+
+        #[test]
+        fn decodes_canceled_exit_as_timeslice_boundary() {
+            let mut exit_context = [0_u8; 128];
+            exit_context[..4].copy_from_slice(&WHV_RUN_VP_EXIT_REASON_CANCELED.to_le_bytes());
+            let mut report = base_report();
+
+            assert!(matches!(
+                decode_exit_context(&exit_context, &mut report),
+                DecodedExit::Canceled
+            ));
+            assert_eq!(report.exit_reason_label.as_deref(), Some("canceled"));
+            assert!(report
+                .calls
+                .iter()
+                .any(|call| call.name == "DecodeCanceled" && call.ok));
         }
 
         #[test]

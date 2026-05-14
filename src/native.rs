@@ -8,6 +8,7 @@ const REQUIRED_WHP_EXPORTS: &[&str] = &[
     "WHvDeletePartition",
     "WHvCreateVirtualProcessor",
     "WHvDeleteVirtualProcessor",
+    "WHvGetVirtualProcessorRegisters",
     "WHvSetVirtualProcessorRegisters",
     "WHvRunVirtualProcessor",
     "WHvCancelRunVirtualProcessor",
@@ -1291,6 +1292,15 @@ mod windows_whp {
     const WHV_REGISTER_CR0: u32 = 0x0000_001c;
     const WHV_REGISTER_CR3: u32 = 0x0000_001e;
     const WHV_REGISTER_CR4: u32 = 0x0000_001f;
+    const WHV_REGISTER_PENDING_INTERRUPTION: u32 = 0x8000_0000;
+    const WHV_REGISTER_INTERRUPT_STATE: u32 = 0x8000_0001;
+    const WHV_REGISTER_PENDING_EVENT: u32 = 0x8000_0002;
+    const WHV_REGISTER_DELIVERABILITY_NOTIFICATIONS: u32 = 0x8000_0004;
+    const WHV_REGISTER_INTERNAL_ACTIVITY_STATE: u32 = 0x8000_0005;
+    const WHV_X64_REGISTER_APIC_TPR: u32 = 0x0000_3008;
+    const WHV_X64_REGISTER_APIC_PPR: u32 = 0x0000_300a;
+    const WHV_X64_REGISTER_APIC_ISR0: u32 = 0x0000_3010;
+    const WHV_X64_REGISTER_APIC_IRR0: u32 = 0x0000_3020;
     type WhvGetCapability = unsafe extern "system" fn(u32, *mut c_void, u32, *mut u32) -> i32;
     type WhvCreatePartition = unsafe extern "system" fn(*mut *mut c_void) -> i32;
     type WhvSetPartitionProperty =
@@ -1299,6 +1309,8 @@ mod windows_whp {
     type WhvDeletePartition = unsafe extern "system" fn(*mut c_void) -> i32;
     type WhvCreateVirtualProcessor = unsafe extern "system" fn(*mut c_void, u32, u32) -> i32;
     type WhvDeleteVirtualProcessor = unsafe extern "system" fn(*mut c_void, u32) -> i32;
+    type WhvGetVirtualProcessorRegisters =
+        unsafe extern "system" fn(*mut c_void, u32, *const u32, u32, *mut WhvRegisterValue) -> i32;
     type WhvSetVirtualProcessorRegisters = unsafe extern "system" fn(
         *mut c_void,
         u32,
@@ -1602,6 +1614,21 @@ mod windows_whp {
             } else {
                 None
             };
+            let get_virtual_processor_registers = if run_fixture {
+                match resolve_whp_function::<WhvGetVirtualProcessorRegisters>(
+                    module,
+                    "WHvGetVirtualProcessorRegisters",
+                    &mut report,
+                ) {
+                    Some(function) => Some(function),
+                    None => {
+                        FreeLibrary(module);
+                        return report;
+                    }
+                }
+            } else {
+                None
+            };
             let request_interrupt = if run_fixture {
                 match resolve_whp_function::<WhvRequestInterrupt>(
                     module,
@@ -1774,6 +1801,7 @@ mod windows_whp {
                             partition,
                             run_virtual_processor,
                             cancel_run_virtual_processor,
+                            get_virtual_processor_registers,
                             request_interrupt,
                             set_virtual_processor_registers,
                             boot_image,
@@ -2366,6 +2394,7 @@ mod windows_whp {
         partition: *mut c_void,
         run_virtual_processor: WhvRunVirtualProcessor,
         cancel_run_virtual_processor: Option<WhvCancelRunVirtualProcessor>,
+        get_virtual_processor_registers: Option<WhvGetVirtualProcessorRegisters>,
         request_interrupt: Option<WhvRequestInterrupt>,
         set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
         boot_image: &NativeSerialBootImage,
@@ -2384,6 +2413,7 @@ mod windows_whp {
                 partition,
                 run_virtual_processor,
                 cancel_run_virtual_processor,
+                get_virtual_processor_registers,
                 request_interrupt,
                 set_virtual_processor_registers,
                 block_io_handler,
@@ -2536,6 +2566,7 @@ mod windows_whp {
         partition: *mut c_void,
         run_virtual_processor: WhvRunVirtualProcessor,
         cancel_run_virtual_processor: Option<WhvCancelRunVirtualProcessor>,
+        get_virtual_processor_registers: Option<WhvGetVirtualProcessorRegisters>,
         request_interrupt: Option<WhvRequestInterrupt>,
         set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
         block_io_handler: Option<&NativeBlockIoHandler<'_>>,
@@ -2993,6 +3024,17 @@ mod windows_whp {
                                 "Pane resumed once after requesting the native timer interrupt, but WHP returned another canceled time-slice boundary after {LINUX_ENTRY_PROBE_TIMESLICE_MILLIS}ms without APIC EOI or required initramfs milestones."
                             )
                         };
+                        if let Some(get_virtual_processor_registers) =
+                            get_virtual_processor_registers
+                        {
+                            capture_interrupt_delivery_snapshot(
+                                partition,
+                                get_virtual_processor_registers,
+                                legacy_io_state.timer_interrupt_vector(),
+                                legacy_io_state.timer_interrupt_unmasked(),
+                                report,
+                            );
+                        }
                         report.calls.push(NativeWhpCallReport {
                             name: "LinuxEntryProbePostTimerResumeBoundary",
                             hresult: None,
@@ -3182,6 +3224,214 @@ mod windows_whp {
             ),
         });
         ok
+    }
+
+    fn capture_interrupt_delivery_snapshot(
+        partition: *mut c_void,
+        get_virtual_processor_registers: WhvGetVirtualProcessorRegisters,
+        timer_vector: u8,
+        irq0_unmasked: bool,
+        report: &mut NativePartitionSmokeReport,
+    ) -> bool {
+        let core_register_names = vec![
+            WHV_REGISTER_RFLAGS,
+            WHV_REGISTER_INTERRUPT_STATE,
+            WHV_REGISTER_PENDING_INTERRUPTION,
+            WHV_REGISTER_PENDING_EVENT,
+            WHV_REGISTER_DELIVERABILITY_NOTIFICATIONS,
+            WHV_REGISTER_INTERNAL_ACTIVITY_STATE,
+            WHV_X64_REGISTER_APIC_TPR,
+            WHV_X64_REGISTER_APIC_PPR,
+        ];
+        let core_values = read_virtual_processor_registers_resilient(
+            partition,
+            get_virtual_processor_registers,
+            &core_register_names,
+            "interrupt-core",
+            report,
+        );
+        let isr_register_names = (0..8)
+            .map(|offset| WHV_X64_REGISTER_APIC_ISR0 + offset)
+            .collect::<Vec<_>>();
+        let irr_register_names = (0..8)
+            .map(|offset| WHV_X64_REGISTER_APIC_IRR0 + offset)
+            .collect::<Vec<_>>();
+        let isr_words = read_virtual_processor_registers_resilient(
+            partition,
+            get_virtual_processor_registers,
+            &isr_register_names,
+            "apic-isr",
+            report,
+        );
+        let irr_words = read_virtual_processor_registers_resilient(
+            partition,
+            get_virtual_processor_registers,
+            &irr_register_names,
+            "apic-irr",
+            report,
+        );
+
+        let rflags = core_values[0].unwrap_or(0);
+        let interrupt_state = core_values[1].unwrap_or(0);
+        let pending_interruption = core_values[2].unwrap_or(0);
+        let pending_event = core_values[3].unwrap_or(0);
+        let deliverability = core_values[4].unwrap_or(0);
+        let internal_activity = core_values[5].unwrap_or(0);
+        let apic_tpr = core_values[6].unwrap_or(0);
+        let apic_ppr = core_values[7].unwrap_or(0);
+        let isr_available = isr_words.iter().any(Option::is_some);
+        let irr_available = irr_words.iter().any(Option::is_some);
+        let isr_words = isr_words
+            .into_iter()
+            .map(|value| value.unwrap_or(0))
+            .collect::<Vec<_>>();
+        let irr_words = irr_words
+            .into_iter()
+            .map(|value| value.unwrap_or(0))
+            .collect::<Vec<_>>();
+        let isr_vectors = apic_bitmap_vectors(&isr_words);
+        let irr_vectors = apic_bitmap_vectors(&irr_words);
+        let timer_in_irr = irr_vectors.contains(&timer_vector);
+        let timer_in_isr = isr_vectors.contains(&timer_vector);
+        let interrupts_enabled = rflags & 0x0200 != 0;
+        let interrupt_shadow = interrupt_state & 0x1 != 0;
+        let blocked_reason = interrupt_delivery_blocker(
+            interrupts_enabled,
+            interrupt_shadow,
+            irq0_unmasked,
+            timer_in_irr,
+            timer_in_isr,
+            pending_interruption,
+            deliverability,
+        );
+
+        report.calls.push(NativeWhpCallReport {
+            name: "LinuxEntryProbeInterruptDeliverySnapshot",
+            hresult: None,
+            ok: false,
+            detail: format!(
+                "timer_vector=0x{timer_vector:02x}, irq0_unmasked={irq0_unmasked}, rflags=0x{rflags:016x}, interrupts_enabled={interrupts_enabled}, interrupt_shadow={interrupt_shadow}, pending_interruption=0x{pending_interruption:016x}, pending_event=0x{pending_event:016x}, deliverability=0x{deliverability:016x}, internal_activity=0x{internal_activity:016x}, apic_tpr=0x{apic_tpr:016x}, apic_ppr=0x{apic_ppr:016x}, isr_available={isr_available}, irr_available={irr_available}, timer_in_irr={timer_in_irr}, timer_in_isr={timer_in_isr}, isr_vectors={}, irr_vectors={}, blocker={blocked_reason}.",
+                format_vector_list(&isr_vectors),
+                format_vector_list(&irr_vectors),
+            ),
+        });
+        true
+    }
+
+    fn read_virtual_processor_registers_resilient(
+        partition: *mut c_void,
+        get_virtual_processor_registers: WhvGetVirtualProcessorRegisters,
+        register_names: &[u32],
+        label: &'static str,
+        report: &mut NativePartitionSmokeReport,
+    ) -> Vec<Option<u64>> {
+        let mut register_values = vec![WhvRegisterValue { reg64: 0 }; register_names.len()];
+        let hresult = unsafe {
+            get_virtual_processor_registers(
+                partition,
+                0,
+                register_names.as_ptr(),
+                register_names.len() as u32,
+                register_values.as_mut_ptr(),
+            )
+        };
+        let ok = hresult_succeeded(hresult);
+        report.calls.push(hresult_call(
+            "WHvGetVirtualProcessorRegisters(interrupt-group)",
+            hresult,
+            if ok {
+                "Captured a guest interrupt/APIC register group after the guarded post-timer resume."
+            } else {
+                "Could not capture a guest interrupt/APIC register group; falling back to per-register reads."
+            },
+        ));
+        report.calls.push(NativeWhpCallReport {
+            name: "LinuxEntryProbeInterruptRegisterGroup",
+            hresult: Some(format_hresult(hresult)),
+            ok,
+            detail: format!("{label}: {} registers.", register_names.len()),
+        });
+        if ok {
+            return register_values
+                .iter()
+                .map(|value| Some(unsafe { value.reg64 }))
+                .collect();
+        }
+
+        register_names
+            .iter()
+            .map(|register_name| {
+                let mut value = WhvRegisterValue { reg64: 0 };
+                let hresult = unsafe {
+                    get_virtual_processor_registers(partition, 0, register_name, 1, &mut value)
+                };
+                let ok = hresult_succeeded(hresult);
+                report.calls.push(NativeWhpCallReport {
+                    name: "LinuxEntryProbeInterruptRegister",
+                    hresult: Some(format_hresult(hresult)),
+                    ok,
+                    detail: format!("{label}: register=0x{register_name:08x}."),
+                });
+                ok.then(|| unsafe { value.reg64 })
+            })
+            .collect()
+    }
+
+    fn apic_bitmap_vectors(words: &[u64]) -> Vec<u8> {
+        let mut vectors = Vec::new();
+        for (word_index, word) in words.iter().enumerate() {
+            for bit_index in 0..64 {
+                if (word >> bit_index) & 1 == 1 {
+                    let vector = word_index * 64 + bit_index;
+                    if vector <= u8::MAX as usize {
+                        vectors.push(vector as u8);
+                    }
+                }
+            }
+        }
+        vectors
+    }
+
+    fn format_vector_list(vectors: &[u8]) -> String {
+        if vectors.is_empty() {
+            return "[]".to_string();
+        }
+        format!(
+            "[{}]",
+            vectors
+                .iter()
+                .map(|vector| format!("0x{vector:02x}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    }
+
+    fn interrupt_delivery_blocker(
+        interrupts_enabled: bool,
+        interrupt_shadow: bool,
+        irq0_unmasked: bool,
+        timer_in_irr: bool,
+        timer_in_isr: bool,
+        pending_interruption: u64,
+        deliverability: u64,
+    ) -> &'static str {
+        if !irq0_unmasked {
+            "pic-irq0-masked"
+        } else if !interrupts_enabled {
+            "guest-interrupts-disabled"
+        } else if interrupt_shadow {
+            "guest-interrupt-shadow"
+        } else if timer_in_isr {
+            "timer-in-service-without-eoi"
+        } else if timer_in_irr {
+            "timer-pending-in-irr"
+        } else if pending_interruption != 0 {
+            "pending-interruption-not-delivered"
+        } else if deliverability != 0 {
+            "deliverability-notification-set"
+        } else {
+            "timer-not-visible-in-apic-state"
+        }
     }
 
     struct LinuxEntryProbeRunController {
@@ -4338,7 +4588,13 @@ mod windows_whp {
             .iter()
             .any(|call| call.name == "LinuxEntryProbePostTimerResumeBoundary" && !call.ok)
         {
-            "Linux protected-mode entry resumed once after Pane requested a native timer interrupt, but the guest did not acknowledge it with APIC EOI or reach the required initramfs milestones; next step: inspect APIC/PIC interrupt delivery state and guest interrupt enablement.".to_string()
+            if let Some(blocker) = interrupt_delivery_snapshot_blocker(report) {
+                format!(
+                    "Linux protected-mode entry resumed once after Pane requested a native timer interrupt, but the guest did not acknowledge it with APIC EOI or reach the required initramfs milestones; interrupt delivery snapshot blocker: {blocker}."
+                )
+            } else {
+                "Linux protected-mode entry resumed once after Pane requested a native timer interrupt, but the guest did not acknowledge it with APIC EOI or reach the required initramfs milestones; next step: inspect APIC/PIC interrupt delivery state and guest interrupt enablement.".to_string()
+            }
         } else if report
             .calls
             .iter()
@@ -4383,6 +4639,22 @@ mod windows_whp {
                 "Linux protected-mode entry reached failing WHP exit `{exit}`; next step: {next}."
             )
         }
+    }
+
+    fn interrupt_delivery_snapshot_blocker(report: &NativePartitionSmokeReport) -> Option<String> {
+        report
+            .calls
+            .iter()
+            .rev()
+            .find(|call| call.name == "LinuxEntryProbeInterruptDeliverySnapshot")
+            .and_then(|call| {
+                call.detail
+                    .split("blocker=")
+                    .nth(1)
+                    .and_then(|tail| tail.split('.').next())
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            })
     }
 
     enum DecodedExit {
@@ -4643,32 +4915,34 @@ mod windows_whp {
     #[cfg(test)]
     mod tests {
         use super::{
-            compact_linux_entry_probe_calls, decode_exit_context, default_linux_msr_state,
-            framebuffer_snapshot_report, guest_contract_failure_blocker, guest_contract_passed,
-            input_queue_snapshot_report, linux_entry_probe_detail, linux_entry_probe_exit_budget,
-            linux_entry_probe_passed, linux_protected_mode_registers, serial_contract_passed,
-            serial_markers_observed, Com1SerialState, DecodedExit, LegacyDeviceIoState,
-            ACPI_PM1_CONTROL_PORT, ACPI_PM1_ENABLE_PORT, ACPI_PM1_STATUS_PORT, ACPI_PM_TIMER_PORT,
-            ALT_DELAY_PORT, ALT_POST_DELAY_PORT, CMOS_ADDRESS_PORT, CMOS_DATA_PORT,
-            CPUID_DEFAULT_RAX_OFFSET, CPUID_DEFAULT_RBX_OFFSET, CPUID_DEFAULT_RCX_OFFSET,
-            CPUID_DEFAULT_RDX_OFFSET, CPUID_RAX_OFFSET, CPUID_RCX_OFFSET,
-            DMA_PAGE_REGISTER_START_PORT, ELCR1_PORT, ELCR2_PORT, IO_ACCESS_INFO_OFFSET,
-            IO_PORT_OFFSET, IO_RAX_OFFSET, LINUX_ENTRY_PROBE_EXIT_BUDGET,
-            LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET, LINUX_ENTRY_PROBE_TRACE_HEAD,
-            LINUX_ENTRY_PROBE_TRACE_TAIL, MEMORY_ACCESS_INFO_OFFSET, MEMORY_GPA_OFFSET,
-            MEMORY_GVA_OFFSET, MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET, MSR_RAX_OFFSET,
-            MSR_RDX_OFFSET, PCI_CONFIG_ADDRESS_PORT, PCI_CONFIG_DATA_START_PORT, PIC1_COMMAND_PORT,
-            PIC1_DATA_PORT, PIC2_COMMAND_PORT, PIC2_DATA_PORT, PIT_CHANNEL0_PORT, PIT_COMMAND_PORT,
-            POST_DELAY_PORT, PS2_DATA_PORT, PS2_STATUS_COMMAND_PORT, SERIAL_COM1_PORT,
-            SYSTEM_CONTROL_PORT_A, SYSTEM_CONTROL_PORT_B, VGA_ATTRIBUTE_DATA_READ_PORT,
-            VGA_ATTRIBUTE_PORT, VGA_CRTC_COLOR_DATA_PORT, VGA_CRTC_COLOR_INDEX_PORT,
-            VGA_GRAPHICS_DATA_PORT, VGA_GRAPHICS_INDEX_PORT, VGA_INPUT_STATUS_COLOR_PORT,
-            VGA_MISC_OUTPUT_READ_PORT, VGA_MISC_OUTPUT_WRITE_PORT, VGA_SEQUENCER_DATA_PORT,
-            VGA_SEQUENCER_INDEX_PORT, VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET, VP_CONTEXT_RIP_OFFSET,
-            WHV_REGISTER_CR0, WHV_REGISTER_CR3, WHV_REGISTER_CR4, WHV_REGISTER_CS, WHV_REGISTER_DS,
-            WHV_REGISTER_ES, WHV_REGISTER_GDTR, WHV_REGISTER_IDTR, WHV_REGISTER_RBP,
-            WHV_REGISTER_RBX, WHV_REGISTER_RDI, WHV_REGISTER_RFLAGS, WHV_REGISTER_RIP,
-            WHV_REGISTER_RSI, WHV_REGISTER_RSP, WHV_REGISTER_SS, WHV_RUN_VP_EXIT_REASON_CANCELED,
+            apic_bitmap_vectors, compact_linux_entry_probe_calls, decode_exit_context,
+            default_linux_msr_state, format_vector_list, framebuffer_snapshot_report,
+            guest_contract_failure_blocker, guest_contract_passed, input_queue_snapshot_report,
+            interrupt_delivery_blocker, interrupt_delivery_snapshot_blocker,
+            linux_entry_probe_detail, linux_entry_probe_exit_budget, linux_entry_probe_passed,
+            linux_protected_mode_registers, serial_contract_passed, serial_markers_observed,
+            Com1SerialState, DecodedExit, LegacyDeviceIoState, ACPI_PM1_CONTROL_PORT,
+            ACPI_PM1_ENABLE_PORT, ACPI_PM1_STATUS_PORT, ACPI_PM_TIMER_PORT, ALT_DELAY_PORT,
+            ALT_POST_DELAY_PORT, CMOS_ADDRESS_PORT, CMOS_DATA_PORT, CPUID_DEFAULT_RAX_OFFSET,
+            CPUID_DEFAULT_RBX_OFFSET, CPUID_DEFAULT_RCX_OFFSET, CPUID_DEFAULT_RDX_OFFSET,
+            CPUID_RAX_OFFSET, CPUID_RCX_OFFSET, DMA_PAGE_REGISTER_START_PORT, ELCR1_PORT,
+            ELCR2_PORT, IO_ACCESS_INFO_OFFSET, IO_PORT_OFFSET, IO_RAX_OFFSET,
+            LINUX_ENTRY_PROBE_EXIT_BUDGET, LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET,
+            LINUX_ENTRY_PROBE_TRACE_HEAD, LINUX_ENTRY_PROBE_TRACE_TAIL, MEMORY_ACCESS_INFO_OFFSET,
+            MEMORY_GPA_OFFSET, MEMORY_GVA_OFFSET, MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET,
+            MSR_RAX_OFFSET, MSR_RDX_OFFSET, PCI_CONFIG_ADDRESS_PORT, PCI_CONFIG_DATA_START_PORT,
+            PIC1_COMMAND_PORT, PIC1_DATA_PORT, PIC2_COMMAND_PORT, PIC2_DATA_PORT,
+            PIT_CHANNEL0_PORT, PIT_COMMAND_PORT, POST_DELAY_PORT, PS2_DATA_PORT,
+            PS2_STATUS_COMMAND_PORT, SERIAL_COM1_PORT, SYSTEM_CONTROL_PORT_A,
+            SYSTEM_CONTROL_PORT_B, VGA_ATTRIBUTE_DATA_READ_PORT, VGA_ATTRIBUTE_PORT,
+            VGA_CRTC_COLOR_DATA_PORT, VGA_CRTC_COLOR_INDEX_PORT, VGA_GRAPHICS_DATA_PORT,
+            VGA_GRAPHICS_INDEX_PORT, VGA_INPUT_STATUS_COLOR_PORT, VGA_MISC_OUTPUT_READ_PORT,
+            VGA_MISC_OUTPUT_WRITE_PORT, VGA_SEQUENCER_DATA_PORT, VGA_SEQUENCER_INDEX_PORT,
+            VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET, VP_CONTEXT_RIP_OFFSET, WHV_REGISTER_CR0,
+            WHV_REGISTER_CR3, WHV_REGISTER_CR4, WHV_REGISTER_CS, WHV_REGISTER_DS, WHV_REGISTER_ES,
+            WHV_REGISTER_GDTR, WHV_REGISTER_IDTR, WHV_REGISTER_RBP, WHV_REGISTER_RBX,
+            WHV_REGISTER_RDI, WHV_REGISTER_RFLAGS, WHV_REGISTER_RIP, WHV_REGISTER_RSI,
+            WHV_REGISTER_RSP, WHV_REGISTER_SS, WHV_RUN_VP_EXIT_REASON_CANCELED,
             WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE, WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS,
             WHV_RUN_VP_EXIT_REASON_X64_APIC_EOI, WHV_RUN_VP_EXIT_REASON_X64_CPUID,
             WHV_RUN_VP_EXIT_REASON_X64_HALT, WHV_RUN_VP_EXIT_REASON_X64_INTERRUPT_WINDOW,
@@ -5611,10 +5885,42 @@ mod windows_whp {
                 ok: false,
                 detail: "post timer boundary".to_string(),
             });
+            report.calls.push(crate::native::NativeWhpCallReport {
+                name: "LinuxEntryProbeInterruptDeliverySnapshot",
+                hresult: None,
+                ok: false,
+                detail: "timer_vector=0x20, blocker=guest-interrupts-disabled.".to_string(),
+            });
 
             assert!(!linux_entry_probe_passed(&report));
-            assert!(linux_entry_probe_detail(&report).contains("APIC/PIC"));
-            assert!(linux_entry_probe_detail(&report).contains("guest interrupt enablement"));
+            assert_eq!(
+                interrupt_delivery_snapshot_blocker(&report).as_deref(),
+                Some("guest-interrupts-disabled")
+            );
+            assert!(linux_entry_probe_detail(&report).contains("guest-interrupts-disabled"));
+        }
+
+        #[test]
+        fn interrupt_delivery_snapshot_helpers_classify_apic_state() {
+            let mut words = vec![0_u64; 8];
+            words[0] = 1_u64 << 0x20;
+            words[2] = 1_u64 << 1;
+
+            assert_eq!(apic_bitmap_vectors(&words), vec![0x20, 0x81]);
+            assert_eq!(format_vector_list(&[0x20, 0x81]), "[0x20,0x81]");
+            assert_eq!(format_vector_list(&[]), "[]");
+            assert_eq!(
+                interrupt_delivery_blocker(false, false, true, false, false, 0, 0),
+                "guest-interrupts-disabled"
+            );
+            assert_eq!(
+                interrupt_delivery_blocker(true, false, true, true, false, 0, 0),
+                "timer-pending-in-irr"
+            );
+            assert_eq!(
+                interrupt_delivery_blocker(true, false, true, false, true, 0, 0),
+                "timer-in-service-without-eoi"
+            );
         }
 
         #[test]

@@ -23,6 +23,7 @@ Pane currently owns:
 - a runtime-backed `serial-boot.paneimg` test image plus SHA-256 metadata for the WHP boot-spike runner,
 - a verified `boot-to-serial-loader.paneimg` candidate path for executing runtime-provided boot code under an explicit serial-output contract,
 - a prevalidated native Arch boot-set registration path for the root disk, Linux bzImage, initramfs, and serial-safe kernel cmdline,
+- manifest-based native Arch boot-set intake for reproducible artifact builders that emit the root disk, kernel, initramfs, SHA-256 values, and cmdline as one JSON handoff,
 - a verified kernel/initramfs boot-plan contract with a serial-console cmdline for the next WHP kernel-entry milestone,
 - a materialized kernel boot-layout contract for boot params, cmdline, kernel, and optional initramfs guest-memory placement,
 - a materialized storage attachment in the kernel layout when the verified Arch base image and Pane user disk are present, including a guest-mapped storage contract page, Pane block-port ABI discovery, root handoff decision, sparse disk geometry, and header verification data,

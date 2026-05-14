@@ -427,6 +427,20 @@ struct KernelBootMetadata {
     notes: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct NativeBootSetManifest {
+    schema_version: u32,
+    #[serde(default)]
+    distro_family: Option<String>,
+    base_image: PathBuf,
+    base_image_sha256: String,
+    kernel: PathBuf,
+    kernel_sha256: String,
+    initramfs: PathBuf,
+    initramfs_sha256: String,
+    kernel_cmdline: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct PaneInitramfsDriverMetadata {
     schema_version: u32,
@@ -1893,8 +1907,10 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
     let session_name = crate::plan::sanitize_session_name(&args.session_name);
     let paths = crate::plan::runtime_for(&session_name);
     let budget = runtime_storage_budget(args.capacity_gib);
+    let registering_native_boot_set =
+        args.register_native_boot_set || args.register_native_boot_set_manifest.is_some();
     let has_runtime_mutation = args.register_base_image.is_some()
-        || args.register_native_boot_set
+        || registering_native_boot_set
         || args.register_boot_loader.is_some()
         || args.register_kernel.is_some()
         || args.register_initramfs.is_some()
@@ -1920,7 +1936,9 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
         write_input_contract(&paths)?;
     }
 
-    if args.register_native_boot_set {
+    if let Some(manifest) = args.register_native_boot_set_manifest.as_deref() {
+        register_native_boot_set_from_manifest(&paths, manifest, &args)?;
+    } else if args.register_native_boot_set {
         register_native_boot_set(&paths, &args)?;
     } else if let Some(source_image) = args.register_base_image.as_deref() {
         register_base_os_image(
@@ -1961,7 +1979,7 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
         ));
     }
 
-    if !args.register_native_boot_set
+    if !registering_native_boot_set
         && (args.register_kernel.is_some()
             || args.register_initramfs.is_some()
             || args.kernel_cmdline.is_some())
@@ -1975,7 +1993,7 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
             args.kernel_cmdline.as_deref(),
             args.force,
         )?;
-    } else if !args.register_native_boot_set
+    } else if !registering_native_boot_set
         && (args.kernel_expected_sha256.is_some() || args.initramfs_expected_sha256.is_some())
     {
         return Err(AppError::message(
@@ -3252,7 +3270,7 @@ fn build_runtime_report(
         next_steps: vec![
             "Run `pane native-preflight --prepare-runtime --json` to prepare the Pane-owned runtime boundary and prove the host can support the first WHP boot-to-serial spike."
                 .to_string(),
-            "Register a Pane-approved native Arch boot set with `pane runtime --register-native-boot-set --register-base-image <arch.img> --expected-sha256 <sha256> --register-kernel <vmlinuz-linux> --kernel-expected-sha256 <sha256> --register-initramfs <initramfs.img> --initramfs-expected-sha256 <sha256> --kernel-cmdline \"console=ttyS0 panic=-1\"`."
+            "Register a Pane-approved native Arch boot set with `pane runtime --register-native-boot-set-manifest <pane-native-boot-set.json>`, or use `pane runtime --register-native-boot-set --register-base-image <arch.img> --expected-sha256 <sha256> --register-kernel <vmlinuz-linux> --kernel-expected-sha256 <sha256> --register-initramfs <initramfs.img> --initramfs-expected-sha256 <sha256> --kernel-cmdline \"console=ttyS0 panic=-1\"` for manual intake."
                 .to_string(),
             "Keep the Pane-owned sparse user disk from `--prepare-runtime`, or recreate it explicitly with `pane runtime --create-user-disk` if metadata repair is needed."
                 .to_string(),
@@ -3436,6 +3454,69 @@ fn register_native_boot_set(paths: &RuntimePaths, args: &RuntimeArgs) -> AppResu
         cmdline,
         args.force,
     )
+}
+
+fn register_native_boot_set_from_manifest(
+    paths: &RuntimePaths,
+    manifest_path: &Path,
+    args: &RuntimeArgs,
+) -> AppResult<()> {
+    if args.register_native_boot_set
+        || args.register_base_image.is_some()
+        || args.expected_sha256.is_some()
+        || args.require_native_root_disk
+        || args.register_kernel.is_some()
+        || args.kernel_expected_sha256.is_some()
+        || args.register_initramfs.is_some()
+        || args.initramfs_expected_sha256.is_some()
+        || args.kernel_cmdline.is_some()
+    {
+        return Err(AppError::message(
+            "--register-native-boot-set-manifest cannot be combined with individual native boot-set artifact flags. Use the manifest or the explicit flags, not both.",
+        ));
+    }
+
+    let manifest = read_json_file::<NativeBootSetManifest>(manifest_path)?;
+    if manifest.schema_version != 1 {
+        return Err(AppError::message(format!(
+            "Native boot-set manifest schema_version must be 1, got {}.",
+            manifest.schema_version
+        )));
+    }
+    if manifest
+        .distro_family
+        .as_deref()
+        .is_some_and(|family| !family.eq_ignore_ascii_case("arch"))
+    {
+        return Err(AppError::message(
+            "Pane native boot-set manifests currently support only distro_family `arch`.",
+        ));
+    }
+
+    let manifest_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
+    let base_image = resolve_manifest_path(manifest_dir, &manifest.base_image);
+    let kernel = resolve_manifest_path(manifest_dir, &manifest.kernel);
+    let initramfs = resolve_manifest_path(manifest_dir, &manifest.initramfs);
+
+    register_native_boot_set_artifacts(
+        paths,
+        &base_image,
+        &manifest.base_image_sha256,
+        &kernel,
+        &manifest.kernel_sha256,
+        &initramfs,
+        &manifest.initramfs_sha256,
+        &manifest.kernel_cmdline,
+        args.force,
+    )
+}
+
+fn resolve_manifest_path(manifest_dir: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        manifest_dir.join(path)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11990,10 +12071,10 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::{
-        cli::{InitArgs, ResetArgs},
+        cli::{InitArgs, ResetArgs, RuntimeArgs},
         model::{DesktopEnvironment, DistroFamily, DistroRecord},
         native::test_native_host_report,
-        plan::{LaunchPlan, RuntimePaths, WorkspacePaths},
+        plan::{LaunchPlan, RuntimePaths, WorkspacePaths, DEFAULT_RUNTIME_CAPACITY_GIB},
         state::{
             LaunchStage, LaunchTransport, ManagedEnvironmentOwnership, ManagedEnvironmentState,
             StoredLaunch,
@@ -12015,7 +12096,8 @@ mod tests {
         pane_block_device_blocks, pane_initramfs_expected_serial_milestones,
         parse_guest_physical_address, preferred_transport, read_base_os_block, read_json_file,
         read_user_disk_block, register_base_os_image, register_boot_loader_image,
-        register_kernel_boot_plan, register_native_boot_set_artifacts, register_pane_block_module,
+        register_kernel_boot_plan, register_native_boot_set_artifacts,
+        register_native_boot_set_from_manifest, register_pane_block_module,
         register_pane_discovery_initramfs_artifact, repair_user_disk_metadata, resize_user_disk,
         resolve_bundle_output_path, resolve_init_source, resolve_launch_target,
         resolve_managed_environment_for_reset, resolve_saved_launch, resolve_session_context,
@@ -12087,6 +12169,43 @@ mod tests {
             engines,
             logs,
             root,
+        }
+    }
+
+    fn default_runtime_args() -> RuntimeArgs {
+        RuntimeArgs {
+            session_name: "pane".to_string(),
+            capacity_gib: DEFAULT_RUNTIME_CAPACITY_GIB,
+            prepare: false,
+            register_base_image: None,
+            expected_sha256: None,
+            require_native_root_disk: false,
+            register_native_boot_set: false,
+            register_native_boot_set_manifest: None,
+            register_boot_loader: None,
+            boot_loader_expected_sha256: None,
+            boot_loader_expected_serial: None,
+            register_kernel: None,
+            kernel_expected_sha256: None,
+            register_initramfs: None,
+            initramfs_expected_sha256: None,
+            kernel_cmdline: None,
+            write_initramfs_driver: false,
+            build_discovery_initramfs: false,
+            build_pane_block_module: false,
+            kernel_build_dir: None,
+            register_pane_block_module: None,
+            pane_block_module_expected_sha256: None,
+            create_user_disk: false,
+            snapshot_user_disk: false,
+            restore_user_disk_snapshot: None,
+            export_user_disk: None,
+            import_user_disk: None,
+            resize_user_disk_gib: None,
+            repair_user_disk: false,
+            create_serial_boot_image: false,
+            force: false,
+            json: false,
         }
     }
 
@@ -13147,6 +13266,90 @@ mod tests {
             metadata.initramfs_sha256.as_deref(),
             Some(initramfs_sha.as_str())
         );
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn registers_native_arch_boot_set_from_manifest() {
+        let paths = temp_runtime_paths("runtime-native-boot-set-manifest");
+        super::prepare_runtime_paths(&paths).unwrap();
+        let base = paths.downloads.join("arch-root.img");
+        let kernel = paths.downloads.join("vmlinuz-linux");
+        let initramfs = paths.downloads.join("initramfs-linux.img");
+        let manifest = paths.downloads.join("pane-native-boot-set.json");
+        std::fs::write(&base, fake_mbr_linux_root_disk_image()).unwrap();
+        std::fs::write(&kernel, fake_linux_bzimage()).unwrap();
+        std::fs::write(&initramfs, b"fake pane discovery initramfs").unwrap();
+        let base_sha = sha256_file(&base).unwrap();
+        let kernel_sha = sha256_file(&kernel).unwrap();
+        let initramfs_sha = sha256_file(&initramfs).unwrap();
+        std::fs::write(
+            &manifest,
+            format!(
+                r#"{{
+  "schema_version": 1,
+  "distro_family": "arch",
+  "base_image": "arch-root.img",
+  "base_image_sha256": "{base_sha}",
+  "kernel": "vmlinuz-linux",
+  "kernel_sha256": "{kernel_sha}",
+  "initramfs": "initramfs-linux.img",
+  "initramfs_sha256": "{initramfs_sha}",
+  "kernel_cmdline": "console=ttyS0 earlyprintk=serial panic=-1"
+}}"#
+            ),
+        )
+        .unwrap();
+        let args = default_runtime_args();
+
+        register_native_boot_set_from_manifest(&paths, &manifest, &args).unwrap();
+
+        let artifacts = build_runtime_artifact_report(&paths);
+        assert!(artifacts.base_os_image_verified);
+        assert_eq!(artifacts.base_os_root_partition_hint, Some(true));
+        assert!(artifacts.kernel_image_verified);
+        assert!(artifacts.initramfs_image_verified);
+        assert!(artifacts.kernel_boot_plan_ready);
+
+        let metadata = read_json_file::<KernelBootMetadata>(&paths.kernel_boot_metadata).unwrap();
+        assert_eq!(metadata.kernel_format, "linux-bzimage");
+        assert_eq!(
+            metadata.initramfs_sha256.as_deref(),
+            Some(initramfs_sha.as_str())
+        );
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn native_arch_boot_set_manifest_rejects_mixed_explicit_flags() {
+        let paths = temp_runtime_paths("runtime-native-boot-set-manifest-conflict");
+        super::prepare_runtime_paths(&paths).unwrap();
+        let manifest = paths.downloads.join("pane-native-boot-set.json");
+        std::fs::write(
+            &manifest,
+            r#"{
+  "schema_version": 1,
+  "distro_family": "arch",
+  "base_image": "arch-root.img",
+  "base_image_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "kernel": "vmlinuz-linux",
+  "kernel_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "initramfs": "initramfs-linux.img",
+  "initramfs_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "kernel_cmdline": "console=ttyS0 panic=-1"
+}"#,
+        )
+        .unwrap();
+        let mut args = default_runtime_args();
+        args.register_kernel = Some(paths.downloads.join("vmlinuz-linux"));
+
+        let error = register_native_boot_set_from_manifest(&paths, &manifest, &args)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("cannot be combined"));
 
         let _ = std::fs::remove_dir_all(&paths.root);
     }

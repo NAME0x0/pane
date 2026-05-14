@@ -259,6 +259,9 @@ pub struct RuntimeArgs {
     /// Register the base disk, Linux kernel, initramfs, and cmdline as one prevalidated native Arch boot set.
     #[arg(long)]
     pub register_native_boot_set: bool,
+    /// Register a native Arch boot set from a JSON manifest emitted by a reproducible artifact builder.
+    #[arg(long)]
+    pub register_native_boot_set_manifest: Option<PathBuf>,
     /// Copy a controlled boot-to-serial loader candidate into Pane's runtime engine store.
     #[arg(long)]
     pub register_boot_loader: Option<PathBuf>,
@@ -605,6 +608,29 @@ mod tests {
                 assert_eq!(
                     args.register_initramfs.as_deref(),
                     Some(std::path::Path::new("C:\\initramfs-linux.img"))
+                );
+            }
+            _ => panic!("expected runtime command"),
+        }
+    }
+
+    #[test]
+    fn runtime_accepts_native_boot_set_manifest() {
+        let cli = Cli::try_parse_from([
+            "pane",
+            "runtime",
+            "--register-native-boot-set-manifest",
+            "C:\\pane-build\\pane-native-boot-set.json",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Runtime(args) => {
+                assert_eq!(
+                    args.register_native_boot_set_manifest.as_deref(),
+                    Some(std::path::Path::new(
+                        "C:\\pane-build\\pane-native-boot-set.json"
+                    ))
                 );
             }
             _ => panic!("expected runtime command"),

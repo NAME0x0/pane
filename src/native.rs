@@ -2551,6 +2551,9 @@ mod windows_whp {
         let mut serial_state = Com1SerialState::default();
         let mut block_state = NativeBlockIoPortState::default();
         let mut legacy_io_state = LegacyDeviceIoState::default();
+        let mut timer_interrupt_requested = false;
+        let mut timer_interrupt_acknowledged = false;
+        let mut post_timer_resume_attempted = false;
         let probe_started_at = Instant::now();
         let mut last_checkpoint_at = probe_started_at;
         if let Some(path) = checkpoint_path.as_deref() {
@@ -2957,8 +2960,19 @@ mod windows_whp {
                             "Guest reached an interrupt-window exit; Pane has no pending interrupt to inject and will resume the vCPU."
                                 .to_string(),
                     });
+                    if timer_interrupt_requested {
+                        report.calls.push(NativeWhpCallReport {
+                            name: "LinuxEntryProbeTimerInterruptWindow",
+                            hresult: None,
+                            ok: true,
+                            detail: "Guest reached an interrupt-window exit after Pane requested the native timer interrupt.".to_string(),
+                        });
+                    }
                 }
                 DecodedExit::ApicEoi => {
+                    if timer_interrupt_requested {
+                        timer_interrupt_acknowledged = true;
+                    }
                     report.calls.push(NativeWhpCallReport {
                         name: "ApicEoiObserved",
                         hresult: None,
@@ -2969,14 +2983,41 @@ mod windows_whp {
                     });
                 }
                 DecodedExit::Canceled => {
-                    if let Some(request_interrupt) = request_interrupt {
+                    if timer_interrupt_requested {
+                        let detail = if timer_interrupt_acknowledged {
+                            format!(
+                                "Pane resumed after the native timer interrupt and observed APIC EOI, but WHP returned another canceled time-slice boundary after {LINUX_ENTRY_PROBE_TIMESLICE_MILLIS}ms before the required initramfs milestones."
+                            )
+                        } else {
+                            format!(
+                                "Pane resumed once after requesting the native timer interrupt, but WHP returned another canceled time-slice boundary after {LINUX_ENTRY_PROBE_TIMESLICE_MILLIS}ms without APIC EOI or required initramfs milestones."
+                            )
+                        };
+                        report.calls.push(NativeWhpCallReport {
+                            name: "LinuxEntryProbePostTimerResumeBoundary",
+                            hresult: None,
+                            ok: false,
+                            detail,
+                        });
+                        if let Some(path) = checkpoint_path.as_deref() {
+                            write_linux_entry_probe_checkpoint(
+                                path,
+                                report,
+                                "post-timer-resume-boundary",
+                                probe_started_at,
+                            );
+                        }
+                        break;
+                    }
+
+                    let timer_request_ok = if let Some(request_interrupt) = request_interrupt {
                         request_native_timer_interrupt(
                             partition,
                             request_interrupt,
                             legacy_io_state.timer_interrupt_vector(),
                             legacy_io_state.timer_interrupt_unmasked(),
                             report,
-                        );
+                        )
                     } else {
                         report.calls.push(NativeWhpCallReport {
                             name: "WHvRequestInterrupt",
@@ -2984,24 +3025,47 @@ mod windows_whp {
                             ok: false,
                             detail: "WHvRequestInterrupt is unavailable, so Pane cannot deliver the first native timer interrupt at the time-slice boundary.".to_string(),
                         });
+                        false
+                    };
+
+                    if timer_request_ok && !post_timer_resume_attempted {
+                        timer_interrupt_requested = true;
+                        post_timer_resume_attempted = true;
+                        report.calls.push(NativeWhpCallReport {
+                            name: "LinuxEntryProbePostTimerResume",
+                            hresult: None,
+                            ok: true,
+                            detail: "Pane requested the first native timer interrupt and will attempt one guarded post-interrupt resume.".to_string(),
+                        });
+                        if let Some(path) = checkpoint_path.as_deref() {
+                            write_linux_entry_probe_checkpoint(
+                                path,
+                                report,
+                                "timer-interrupt-requested",
+                                probe_started_at,
+                            );
+                            last_checkpoint_at = Instant::now();
+                        }
+                        continue;
+                    } else {
+                        report.calls.push(NativeWhpCallReport {
+                            name: "LinuxEntryProbeTimesliceBoundary",
+                            hresult: None,
+                            ok: false,
+                            detail: format!(
+                                "Pane regained control after a {LINUX_ENTRY_PROBE_TIMESLICE_MILLIS}ms WHP vCPU time slice but could not arm a guarded post-interrupt resume."
+                            ),
+                        });
+                        if let Some(path) = checkpoint_path.as_deref() {
+                            write_linux_entry_probe_checkpoint(
+                                path,
+                                report,
+                                "timeslice-boundary",
+                                probe_started_at,
+                            );
+                        }
+                        break;
                     }
-                    report.calls.push(NativeWhpCallReport {
-                        name: "LinuxEntryProbeTimesliceBoundary",
-                        hresult: None,
-                        ok: false,
-                        detail: format!(
-                            "Pane regained control after a {LINUX_ENTRY_PROBE_TIMESLICE_MILLIS}ms WHP vCPU time slice. The probe stops after requesting the first native timer interrupt because the next milestone must safely resume and observe guest acknowledgement instead of re-entering a long non-returning run."
-                        ),
-                    });
-                    if let Some(path) = checkpoint_path.as_deref() {
-                        write_linux_entry_probe_checkpoint(
-                            path,
-                            report,
-                            "timeslice-boundary",
-                            probe_started_at,
-                        );
-                    }
-                    break;
                 }
                 DecodedExit::Other => break,
             }
@@ -3052,6 +3116,19 @@ mod windows_whp {
                         "Expected Linux serial milestones were not all observed yet: {}.",
                         report.serial_expected_markers.join(", ")
                     )
+                },
+            });
+        }
+        if timer_interrupt_requested {
+            report.calls.push(NativeWhpCallReport {
+                name: "LinuxEntryProbeTimerInterruptAcknowledgement",
+                hresult: None,
+                ok: timer_interrupt_acknowledged,
+                detail: if timer_interrupt_acknowledged {
+                    "Guest acknowledged the requested native timer interrupt with an APIC EOI exit."
+                        .to_string()
+                } else {
+                    "Pane requested a native timer interrupt, but the guest did not acknowledge it with APIC EOI before the probe boundary.".to_string()
                 },
             });
         }
@@ -3213,6 +3290,8 @@ mod windows_whp {
             "serial_markers_observed": report.serial_markers_observed,
             "serial_expected_markers": &report.serial_expected_markers,
             "timeslice_cancel_count": report.calls.iter().filter(|call| matches!(call.name, "LinuxEntryProbeTimeslice" | "LinuxEntryProbeTimesliceBoundary")).count(),
+            "timer_interrupt_requested": report.calls.iter().any(|call| call.name == "LinuxEntryProbeTimerInterruptRequested" && call.ok),
+            "timer_interrupt_acknowledged": report.calls.iter().any(|call| call.name == "LinuxEntryProbeTimerInterruptAcknowledgement" && call.ok),
             "exit_reason_label": &report.exit_reason_label,
             "serial_text_bytes": serial_text.len(),
             "serial_text_tail": &serial_text[serial_tail_start..],
@@ -4191,6 +4270,7 @@ mod windows_whp {
                         | "AdvanceGuestRip"
                         | "UnsupportedIoPort"
                         | "LinuxEntryProbeWallClockBudget"
+                        | "LinuxEntryProbePostTimerResumeBoundary"
                 ) && !call.ok
             })
             && !matches!(
@@ -4253,6 +4333,12 @@ mod windows_whp {
                 LINUX_ENTRY_PROBE_WALL_CLOCK_BUDGET_SECONDS,
                 report.serial_expected_markers.join(", ")
             )
+        } else if report
+            .calls
+            .iter()
+            .any(|call| call.name == "LinuxEntryProbePostTimerResumeBoundary" && !call.ok)
+        {
+            "Linux protected-mode entry resumed once after Pane requested a native timer interrupt, but the guest did not acknowledge it with APIC EOI or reach the required initramfs milestones; next step: inspect APIC/PIC interrupt delivery state and guest interrupt enablement.".to_string()
         } else if report
             .calls
             .iter()
@@ -5512,6 +5598,23 @@ mod windows_whp {
                 assert!(!linux_entry_probe_passed(&report));
                 assert!(linux_entry_probe_detail(&report).contains(expected_next_step));
             }
+        }
+
+        #[test]
+        fn linux_entry_probe_reports_post_timer_resume_boundary() {
+            let mut report = base_report();
+            report.exit_reason = Some(WHV_RUN_VP_EXIT_REASON_CANCELED);
+            report.exit_reason_label = Some("canceled".to_string());
+            report.calls.push(crate::native::NativeWhpCallReport {
+                name: "LinuxEntryProbePostTimerResumeBoundary",
+                hresult: None,
+                ok: false,
+                detail: "post timer boundary".to_string(),
+            });
+
+            assert!(!linux_entry_probe_passed(&report));
+            assert!(linux_entry_probe_detail(&report).contains("APIC/PIC"));
+            assert!(linux_entry_probe_detail(&report).contains("guest interrupt enablement"));
         }
 
         #[test]

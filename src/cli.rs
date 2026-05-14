@@ -262,6 +262,9 @@ pub struct RuntimeArgs {
     /// Register a native Arch boot set from a JSON manifest emitted by a reproducible artifact builder.
     #[arg(long)]
     pub register_native_boot_set_manifest: Option<PathBuf>,
+    /// Write a native Arch boot-set manifest template for reproducible artifact builders.
+    #[arg(long)]
+    pub write_native_boot_set_manifest_template: Option<PathBuf>,
     /// Copy a controlled boot-to-serial loader candidate into Pane's runtime engine store.
     #[arg(long)]
     pub register_boot_loader: Option<PathBuf>,
@@ -628,6 +631,29 @@ mod tests {
             Commands::Runtime(args) => {
                 assert_eq!(
                     args.register_native_boot_set_manifest.as_deref(),
+                    Some(std::path::Path::new(
+                        "C:\\pane-build\\pane-native-boot-set.json"
+                    ))
+                );
+            }
+            _ => panic!("expected runtime command"),
+        }
+    }
+
+    #[test]
+    fn runtime_accepts_native_boot_set_manifest_template_writer() {
+        let cli = Cli::try_parse_from([
+            "pane",
+            "runtime",
+            "--write-native-boot-set-manifest-template",
+            "C:\\pane-build\\pane-native-boot-set.json",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Runtime(args) => {
+                assert_eq!(
+                    args.write_native_boot_set_manifest_template.as_deref(),
                     Some(std::path::Path::new(
                         "C:\\pane-build\\pane-native-boot-set.json"
                     ))

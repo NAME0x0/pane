@@ -215,7 +215,7 @@ What exists today:
 - runtime-backed serial boot image,
 - verified boot-to-serial loader candidate slot,
 - verified native Arch boot-set registration for the raw disk, Linux kernel, initramfs, and serial-safe cmdline,
-- manifest-based native Arch boot-set registration so reproducible artifact builders can hand Pane one JSON file instead of six fragile CLI flags,
+- manifest-based native Arch boot-set registration plus a built-in manifest-template writer so reproducible artifact builders can hand Pane one reviewed JSON file instead of six fragile CLI flags,
 - verified kernel/initramfs boot-plan metadata,
 - materialized Linux kernel boot layout,
 - kernel-layout attachment for the verified Arch base image plus guest-mapped Pane sparse user disk and block-port ABI contract,

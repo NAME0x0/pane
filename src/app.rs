@@ -1911,6 +1911,7 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
         args.register_native_boot_set || args.register_native_boot_set_manifest.is_some();
     let has_runtime_mutation = args.register_base_image.is_some()
         || registering_native_boot_set
+        || args.write_native_boot_set_manifest_template.is_some()
         || args.register_boot_loader.is_some()
         || args.register_kernel.is_some()
         || args.register_initramfs.is_some()
@@ -1956,6 +1957,10 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
         return Err(AppError::message(
             "--expected-sha256 requires --register-base-image.",
         ));
+    }
+
+    if let Some(template_path) = args.write_native_boot_set_manifest_template.as_deref() {
+        write_native_boot_set_manifest_template(template_path, args.force)?;
     }
 
     if let Some(source_image) = args.register_boot_loader.as_deref() {
@@ -3517,6 +3522,31 @@ fn resolve_manifest_path(manifest_dir: &Path, path: &Path) -> PathBuf {
     } else {
         manifest_dir.join(path)
     }
+}
+
+fn write_native_boot_set_manifest_template(path: &Path, force: bool) -> AppResult<()> {
+    if path.exists() && !force {
+        return Err(AppError::message(format!(
+            "Native boot-set manifest template already exists at {}. Pass --force to replace it.",
+            path.display()
+        )));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let template = serde_json::json!({
+        "schema_version": 1,
+        "distro_family": "arch",
+        "base_image": "artifacts/arch-root.img",
+        "base_image_sha256": "replace-with-64-character-sha256",
+        "kernel": "artifacts/vmlinuz-linux",
+        "kernel_sha256": "replace-with-64-character-sha256",
+        "initramfs": "artifacts/initramfs-linux.img",
+        "initramfs_sha256": "replace-with-64-character-sha256",
+        "kernel_cmdline": "console=ttyS0 panic=-1"
+    });
+    write_json_file(path, &template)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -12104,13 +12134,14 @@ mod tests {
         resolve_status_distro, restore_user_disk_snapshot, runtime_contract_guest_memory_ranges,
         runtime_storage_budget, sha256_file, status_port_for, user_disk_artifact_ready,
         validate_setup_password, validate_setup_username, windows_transport_check, write_json_file,
-        write_pane_initramfs_driver_bundle, write_user_disk_block, AppLifecyclePhase,
-        AppNextAction, BaseOsImageMetadata, CheckStatus, DistroHealth, DoctorCheck, DoctorReport,
-        FramebufferContract, InitSource, KernelBootLayout, KernelBootMetadata, NativeRuntimeState,
-        PaneBlockModuleMetadata, PaneInitramfsDriverMetadata, StatusReport, UserDiskExportManifest,
-        UserDiskMetadata, UserDiskSnapshotMetadata, WorkspaceHealth, WslInventory,
-        EMBEDDED_APP_ASSETS, PANE_USER_DISK_EXPORT_DISK_FILENAME,
-        PANE_USER_DISK_EXPORT_MANIFEST_FILENAME, PANE_USER_DISK_EXPORT_METADATA_FILENAME,
+        write_native_boot_set_manifest_template, write_pane_initramfs_driver_bundle,
+        write_user_disk_block, AppLifecyclePhase, AppNextAction, BaseOsImageMetadata, CheckStatus,
+        DistroHealth, DoctorCheck, DoctorReport, FramebufferContract, InitSource, KernelBootLayout,
+        KernelBootMetadata, NativeRuntimeState, PaneBlockModuleMetadata,
+        PaneInitramfsDriverMetadata, StatusReport, UserDiskExportManifest, UserDiskMetadata,
+        UserDiskSnapshotMetadata, WorkspaceHealth, WslInventory, EMBEDDED_APP_ASSETS,
+        PANE_USER_DISK_EXPORT_DISK_FILENAME, PANE_USER_DISK_EXPORT_MANIFEST_FILENAME,
+        PANE_USER_DISK_EXPORT_METADATA_FILENAME,
     };
 
     fn empty_workspace_health() -> WorkspaceHealth {
@@ -12182,6 +12213,7 @@ mod tests {
             require_native_root_disk: false,
             register_native_boot_set: false,
             register_native_boot_set_manifest: None,
+            write_native_boot_set_manifest_template: None,
             register_boot_loader: None,
             boot_loader_expected_sha256: None,
             boot_loader_expected_serial: None,
@@ -13350,6 +13382,35 @@ mod tests {
             .to_string();
 
         assert!(error.contains("cannot be combined"));
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn writes_native_boot_set_manifest_template_without_overwriting_by_default() {
+        let paths = temp_runtime_paths("runtime-native-boot-set-template");
+        let template = paths.downloads.join("pane-native-boot-set.json");
+
+        write_native_boot_set_manifest_template(&template, false).unwrap();
+
+        let manifest = read_json_file::<serde_json::Value>(&template).unwrap();
+        assert_eq!(manifest["schema_version"], serde_json::json!(1));
+        assert_eq!(manifest["distro_family"], serde_json::json!("arch"));
+        assert_eq!(
+            manifest["base_image"],
+            serde_json::json!("artifacts/arch-root.img")
+        );
+        assert_eq!(
+            manifest["kernel_cmdline"],
+            serde_json::json!("console=ttyS0 panic=-1")
+        );
+
+        let error = write_native_boot_set_manifest_template(&template, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--force"));
+
+        write_native_boot_set_manifest_template(&template, true).unwrap();
 
         let _ = std::fs::remove_dir_all(&paths.root);
     }

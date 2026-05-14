@@ -373,6 +373,7 @@ Package outputs:
 - app launcher scripts,
 - shortcut installer,
 - support-bundle entrypoint,
+- native boot-set manifest handoff helper,
 - package validation and certification scripts,
 - core docs and icon assets.
 

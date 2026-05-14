@@ -15,6 +15,7 @@ $archivePath = Join-Path $distRoot "pane-windows-x86_64.zip"
 $exeAssetPath = Join-Path $distRoot "pane-windows-x86_64.exe"
 $validationScript = Join-Path $repoRoot "scripts\validate-package.ps1"
 $certificationScript = Join-Path $repoRoot "scripts\certify-fresh-machine.ps1"
+$nativeBootSetManifestScript = Join-Path $repoRoot "scripts\write-native-boot-set-manifest.ps1"
 $assetRoot = Join-Path $repoRoot "scripts\package-assets"
 $iconAssetRoot = Join-Path $repoRoot "assets"
 
@@ -61,6 +62,7 @@ try {
     Copy-Item (Join-Path $repoRoot "docs\native-runtime-architecture.md") (Join-Path $packageDir "native-runtime-architecture.md")
     Copy-Item $validationScript (Join-Path $packageDir "validate-package.ps1")
     Copy-Item $certificationScript (Join-Path $packageDir "certify-fresh-machine.ps1")
+    Copy-Item $nativeBootSetManifestScript (Join-Path $packageDir "write-native-boot-set-manifest.ps1")
     Copy-Item (Join-Path $assetRoot "*") $packageDir
     Copy-Item $iconAssetRoot (Join-Path $packageDir "assets") -Recurse
 

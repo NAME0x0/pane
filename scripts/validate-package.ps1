@@ -155,6 +155,7 @@ $requiredFiles = @(
     "native-runtime-architecture.md",
     "validate-package.ps1",
     "certify-fresh-machine.ps1",
+    "write-native-boot-set-manifest.ps1",
     "assets\pane-icon.png",
     "assets\pane-icon.ico",
     "Pane Control Center.ps1",

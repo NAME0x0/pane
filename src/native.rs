@@ -11,7 +11,6 @@ const REQUIRED_WHP_EXPORTS: &[&str] = &[
     "WHvSetVirtualProcessorRegisters",
     "WHvRunVirtualProcessor",
     "WHvCancelRunVirtualProcessor",
-    "WHvRequestInterrupt",
     "WHvMapGpaRange",
     "WHvUnmapGpaRange",
 ];
@@ -313,6 +312,15 @@ pub(crate) fn pane_block_io_port_offset(port: u16) -> Option<u16> {
     }
 }
 
+fn pane_block_io_access_mask(access_size: u32) -> u32 {
+    match access_size {
+        1 => 0xff,
+        2 => 0xffff,
+        4 => 0xffff_ffff,
+        _ => 0,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct NativeBlockIoPortState {
     device: NativeBlockDeviceId,
@@ -349,11 +357,29 @@ impl NativeBlockIoPortState {
         self.write_payload.clear();
     }
 
+    #[cfg(test)]
     pub(crate) fn write(&mut self, port: u16, value: u8) -> Option<NativeBlockIoSubmission> {
+        self.write_value(port, 1, u32::from(value))
+    }
+
+    pub(crate) fn write_value(
+        &mut self,
+        port: u16,
+        access_size: u32,
+        value: u32,
+    ) -> Option<NativeBlockIoSubmission> {
+        if !matches!(access_size, 1 | 2 | 4) {
+            self.status = PANE_BLOCK_IO_STATUS_INVALID;
+            return None;
+        }
         match pane_block_io_port_offset(port)? {
             0 => {
+                if access_size != 1 {
+                    self.status = PANE_BLOCK_IO_STATUS_INVALID;
+                    return None;
+                }
                 self.clear_transfer_buffers();
-                self.device = match value {
+                self.device = match value as u8 {
                     0 => NativeBlockDeviceId::BaseOs,
                     1 => NativeBlockDeviceId::UserDisk,
                     _ => {
@@ -365,8 +391,12 @@ impl NativeBlockIoPortState {
                 None
             }
             1 => {
+                if access_size != 1 {
+                    self.status = PANE_BLOCK_IO_STATUS_INVALID;
+                    return None;
+                }
                 self.clear_transfer_buffers();
-                self.operation = match value {
+                self.operation = match value as u8 {
                     0 => NativeBlockOperation::Read,
                     1 => NativeBlockOperation::Write,
                     _ => {
@@ -378,6 +408,10 @@ impl NativeBlockIoPortState {
                 None
             }
             2 => {
+                if access_size != 1 {
+                    self.status = PANE_BLOCK_IO_STATUS_INVALID;
+                    return None;
+                }
                 self.clear_response();
                 if value != 1 {
                     self.status = PANE_BLOCK_IO_STATUS_INVALID;
@@ -398,8 +432,15 @@ impl NativeBlockIoPortState {
                 })
             }
             4..=11 => {
+                let offset = usize::from(pane_block_io_port_offset(port)? - 4);
+                let access_size = access_size as usize;
+                if offset + access_size > self.block_index_bytes.len() {
+                    self.status = PANE_BLOCK_IO_STATUS_INVALID;
+                    return None;
+                }
                 self.clear_transfer_buffers();
-                self.block_index_bytes[usize::from(pane_block_io_port_offset(port)? - 4)] = value;
+                self.block_index_bytes[offset..offset + access_size]
+                    .copy_from_slice(&value.to_le_bytes()[..access_size]);
                 self.status = 0;
                 None
             }
@@ -413,7 +454,14 @@ impl NativeBlockIoPortState {
                     self.status = PANE_BLOCK_IO_STATUS_INVALID;
                     return None;
                 }
-                self.write_payload.push(value);
+                let access_size = access_size as usize;
+                if self.write_payload.len() + access_size > PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize
+                {
+                    self.status = PANE_BLOCK_IO_STATUS_INVALID;
+                    return None;
+                }
+                self.write_payload
+                    .extend_from_slice(&value.to_le_bytes()[..access_size]);
                 self.status = 0;
                 None
             }
@@ -431,36 +479,62 @@ impl NativeBlockIoPortState {
         };
     }
 
+    pub(crate) fn read_value(&mut self, port: u16, access_size: u32) -> Option<u32> {
+        if !matches!(access_size, 1 | 2 | 4) {
+            return None;
+        }
+        if pane_block_io_port_offset(port)? == 12 {
+            let mut bytes = [0_u8; 4];
+            for offset in 0..access_size as usize {
+                bytes[offset] = self.read_data_byte();
+            }
+            return Some(u32::from_le_bytes(bytes) & pane_block_io_access_mask(access_size));
+        }
+
+        let mut bytes = [0_u8; 4];
+        for offset in 0..access_size {
+            bytes[offset as usize] = self.read_byte(port + offset as u16)?;
+        }
+        Some(u32::from_le_bytes(bytes) & pane_block_io_access_mask(access_size))
+    }
+
+    #[cfg(test)]
     pub(crate) fn read(&mut self, port: u16) -> u8 {
+        self.read_value(port, 1).unwrap_or(0) as u8
+    }
+
+    fn read_byte(&mut self, port: u16) -> Option<u8> {
         match pane_block_io_port_offset(port) {
             Some(0) => match self.device {
-                NativeBlockDeviceId::BaseOs => 0,
-                NativeBlockDeviceId::UserDisk => 1,
+                NativeBlockDeviceId::BaseOs => Some(0),
+                NativeBlockDeviceId::UserDisk => Some(1),
             },
             Some(1) => match self.operation {
-                NativeBlockOperation::Read => 0,
-                NativeBlockOperation::Write => 1,
+                NativeBlockOperation::Read => Some(0),
+                NativeBlockOperation::Write => Some(1),
             },
-            Some(2) => self.status,
-            Some(3) => (PANE_BLOCK_IO_BLOCK_SIZE_BYTES / 512) as u8,
-            Some(offset @ 4..=11) => self.block_index_bytes[usize::from(offset - 4)],
-            Some(12) => {
-                let value = self
-                    .response_bytes
-                    .get(self.response_cursor)
-                    .copied()
-                    .unwrap_or(0);
-                self.response_cursor = self
-                    .response_cursor
-                    .saturating_add(1)
-                    .min(self.response_bytes.len());
-                value
-            }
-            Some(13) => (self.response_bytes.len() & 0xff) as u8,
-            Some(14) => ((self.response_bytes.len() >> 8) & 0xff) as u8,
-            Some(15) => ((self.response_bytes.len() >> 16) & 0xff) as u8,
-            _ => 0,
+            Some(2) => Some(self.status),
+            Some(3) => Some((PANE_BLOCK_IO_BLOCK_SIZE_BYTES / 512) as u8),
+            Some(offset @ 4..=11) => Some(self.block_index_bytes[usize::from(offset - 4)]),
+            Some(12) => Some(self.read_data_byte()),
+            Some(13) => Some((self.response_bytes.len() & 0xff) as u8),
+            Some(14) => Some(((self.response_bytes.len() >> 8) & 0xff) as u8),
+            Some(15) => Some(((self.response_bytes.len() >> 16) & 0xff) as u8),
+            _ => None,
         }
+    }
+
+    fn read_data_byte(&mut self) -> u8 {
+        let value = self
+            .response_bytes
+            .get(self.response_cursor)
+            .copied()
+            .unwrap_or(0);
+        self.response_cursor = self
+            .response_cursor
+            .saturating_add(1)
+            .min(self.response_bytes.len());
+        value
     }
 }
 
@@ -1071,7 +1145,9 @@ mod windows_whp {
         alloc::{alloc_zeroed, dealloc, Layout},
         collections::{HashMap, VecDeque},
         ffi::{c_char, c_void, CString},
-        mem,
+        fs, mem,
+        path::{Path, PathBuf},
+        time::{Duration, Instant},
     };
 
     use super::{
@@ -1084,7 +1160,7 @@ mod windows_whp {
         SERIAL_BOOT_TEST_IMAGE_SIZE,
     };
     use crate::native::{
-        native_block_io_exit_can_resume, pane_block_io_port_offset,
+        native_block_io_exit_can_resume, pane_block_io_access_mask, pane_block_io_port_offset,
         service_native_block_io_command, NativeBlockIoPortState,
     };
 
@@ -1105,7 +1181,7 @@ mod windows_whp {
     const GUEST_PAGE_SIZE: usize = SERIAL_BOOT_TEST_IMAGE_SIZE;
     const LINUX_ENTRY_PROBE_EXIT_BUDGET: usize = 131072;
     const LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET: usize = 256;
-    const LINUX_ENTRY_PROBE_WATCHDOG_SECONDS: u64 = 120;
+    const LINUX_ENTRY_PROBE_WATCHDOG_SECONDS: u64 = 30;
     const LINUX_ENTRY_PROBE_WALL_CLOCK_BUDGET_SECONDS: u64 = 90;
     const LINUX_ENTRY_PROBE_TRACE_HEAD: usize = 384;
     const LINUX_ENTRY_PROBE_TRACE_TAIL: usize = 384;
@@ -1116,7 +1192,6 @@ mod windows_whp {
     const SERIAL_MODEM_STATUS_PORT: u16 = SERIAL_COM1_PORT + 6;
     const PIC1_COMMAND_PORT: u16 = 0x0020;
     const PIC1_DATA_PORT: u16 = 0x0021;
-    const PIC_TIMER_INTERRUPT_VECTOR: u32 = 0x30;
     const PIT_CHANNEL0_PORT: u16 = 0x0040;
     const PIT_CHANNEL1_PORT: u16 = 0x0041;
     const PIT_CHANNEL2_PORT: u16 = 0x0042;
@@ -1225,8 +1300,6 @@ mod windows_whp {
     type WhvRunVirtualProcessor =
         unsafe extern "system" fn(*mut c_void, u32, *mut c_void, u32) -> i32;
     type WhvCancelRunVirtualProcessor = unsafe extern "system" fn(*mut c_void, u32, u32) -> i32;
-    type WhvRequestInterrupt =
-        unsafe extern "system" fn(*mut c_void, *const WhvInterruptControl, u32) -> i32;
     type WhvMapGpaRange = unsafe extern "system" fn(*mut c_void, *mut c_void, u64, u64, u32) -> i32;
     type WhvUnmapGpaRange = unsafe extern "system" fn(*mut c_void, u64, u64) -> i32;
 
@@ -1253,14 +1326,6 @@ mod windows_whp {
         reg64: u64,
         segment: WhvX64SegmentRegister,
         table: WhvX64TableRegister,
-    }
-
-    #[repr(C)]
-    #[derive(Copy, Clone)]
-    struct WhvInterruptControl {
-        control: u64,
-        destination: u32,
-        vector: u32,
     }
 
     #[link(name = "kernel32")]
@@ -1518,21 +1583,6 @@ mod windows_whp {
             } else {
                 None
             };
-            let request_interrupt = if run_fixture {
-                match resolve_whp_function::<WhvRequestInterrupt>(
-                    module,
-                    "WHvRequestInterrupt",
-                    &mut report,
-                ) {
-                    Some(function) => Some(function),
-                    None => {
-                        FreeLibrary(module);
-                        return report;
-                    }
-                }
-            } else {
-                None
-            };
             let map_gpa_range = if run_fixture {
                 match resolve_whp_function::<WhvMapGpaRange>(module, "WHvMapGpaRange", &mut report)
                 {
@@ -1666,7 +1716,6 @@ mod windows_whp {
                             partition,
                             run_virtual_processor,
                             cancel_run_virtual_processor,
-                            request_interrupt,
                             set_virtual_processor_registers,
                             boot_image,
                             block_io_handler,
@@ -2258,7 +2307,6 @@ mod windows_whp {
         partition: *mut c_void,
         run_virtual_processor: WhvRunVirtualProcessor,
         cancel_run_virtual_processor: Option<WhvCancelRunVirtualProcessor>,
-        request_interrupt: Option<WhvRequestInterrupt>,
         set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
         boot_image: &NativeSerialBootImage,
         block_io_handler: Option<&NativeBlockIoHandler<'_>>,
@@ -2276,7 +2324,6 @@ mod windows_whp {
                 partition,
                 run_virtual_processor,
                 cancel_run_virtual_processor,
-                request_interrupt,
                 set_virtual_processor_registers,
                 block_io_handler,
                 report,
@@ -2427,7 +2474,6 @@ mod windows_whp {
         partition: *mut c_void,
         run_virtual_processor: WhvRunVirtualProcessor,
         cancel_run_virtual_processor: Option<WhvCancelRunVirtualProcessor>,
-        request_interrupt: Option<WhvRequestInterrupt>,
         set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
         block_io_handler: Option<&NativeBlockIoHandler<'_>>,
         report: &mut NativePartitionSmokeReport,
@@ -2436,47 +2482,25 @@ mod windows_whp {
         let max_guest_exits = linux_entry_probe_exit_budget(report);
         report.guest_exit_budget = max_guest_exits as u32;
         let watchdog_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let timer_interrupt_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let checkpoint_path = linux_entry_probe_checkpoint_path();
         if let Some(cancel_run_virtual_processor) = cancel_run_virtual_processor {
             let watchdog_done = std::sync::Arc::clone(&watchdog_done);
+            let checkpoint_path = checkpoint_path.clone();
             let partition_address = partition as usize;
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_secs(
                     LINUX_ENTRY_PROBE_WATCHDOG_SECONDS,
                 ));
                 if !watchdog_done.load(std::sync::atomic::Ordering::SeqCst) {
+                    if let Some(path) = checkpoint_path.as_deref() {
+                        write_linux_entry_probe_watchdog_checkpoint(
+                            path,
+                            "watchdog-cancel-requested",
+                        );
+                    }
                     let partition = partition_address as *mut c_void;
                     unsafe {
                         cancel_run_virtual_processor(partition, 0, 0);
-                    }
-                }
-            });
-        }
-        if let Some(request_interrupt) = request_interrupt {
-            let watchdog_done = std::sync::Arc::clone(&watchdog_done);
-            let timer_interrupt_requests = std::sync::Arc::clone(&timer_interrupt_requests);
-            let partition_address = partition as usize;
-            std::thread::spawn(move || {
-                let interrupt = WhvInterruptControl {
-                    control: 0,
-                    destination: 0,
-                    vector: PIC_TIMER_INTERRUPT_VECTOR,
-                };
-                while !watchdog_done.load(std::sync::atomic::Ordering::SeqCst) {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                    if watchdog_done.load(std::sync::atomic::Ordering::SeqCst) {
-                        break;
-                    }
-                    let partition = partition_address as *mut c_void;
-                    let hresult = unsafe {
-                        request_interrupt(
-                            partition,
-                            &interrupt,
-                            std::mem::size_of::<WhvInterruptControl>() as u32,
-                        )
-                    };
-                    if hresult_succeeded(hresult) {
-                        timer_interrupt_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
             });
@@ -2485,11 +2509,22 @@ mod windows_whp {
         let mut serial_state = Com1SerialState::default();
         let mut block_state = NativeBlockIoPortState::default();
         let mut legacy_io_state = LegacyDeviceIoState::default();
-        let probe_started_at = std::time::Instant::now();
+        let probe_started_at = Instant::now();
+        let mut last_checkpoint_at = probe_started_at;
+        if let Some(path) = checkpoint_path.as_deref() {
+            write_linux_entry_probe_checkpoint(path, report, "started", probe_started_at);
+        }
 
         for exit_index in 0..max_guest_exits {
+            if let Some(path) = checkpoint_path.as_deref() {
+                if last_checkpoint_at.elapsed() >= Duration::from_secs(1) {
+                    write_linux_entry_probe_checkpoint(path, report, "running", probe_started_at);
+                    last_checkpoint_at = Instant::now();
+                }
+            }
+
             if probe_started_at.elapsed()
-                >= std::time::Duration::from_secs(LINUX_ENTRY_PROBE_WALL_CLOCK_BUDGET_SECONDS)
+                >= Duration::from_secs(LINUX_ENTRY_PROBE_WALL_CLOCK_BUDGET_SECONDS)
             {
                 report.calls.push(NativeWhpCallReport {
                     name: "LinuxEntryProbeWallClockBudget",
@@ -2539,7 +2574,7 @@ mod windows_whp {
                     rax,
                 } => {
                     if pane_block_io_port_offset(port).is_some() {
-                        if access_size != 1 {
+                        if !matches!(access_size, 1 | 2 | 4) {
                             break;
                         }
                         if instruction_length == 0 {
@@ -2556,7 +2591,11 @@ mod windows_whp {
 
                         let next_rip = rip + u64::from(instruction_length);
                         if is_write {
-                            if let Some(submission) = block_state.write(port, serial_byte) {
+                            if let Some(submission) = block_state.write_value(
+                                port,
+                                access_size,
+                                (rax & u64::from(pane_block_io_access_mask(access_size))) as u32,
+                            ) {
                                 let outcome = service_native_block_io_command(
                                     &submission.command,
                                     block_io_handler,
@@ -2566,6 +2605,15 @@ mod windows_whp {
                                     outcome.status_code,
                                     outcome.response_bytes,
                                 );
+                                if let Some(path) = checkpoint_path.as_deref() {
+                                    write_linux_entry_probe_checkpoint(
+                                        path,
+                                        report,
+                                        "block-io-serviced",
+                                        probe_started_at,
+                                    );
+                                    last_checkpoint_at = Instant::now();
+                                }
                                 let can_resume =
                                     native_block_io_exit_can_resume(outcome.status_code);
                                 report.calls.push(outcome.report);
@@ -2592,12 +2640,15 @@ mod windows_whp {
                                 break;
                             }
                         } else {
-                            let value = block_state.read(port);
-                            if !set_guest_rax_low_byte_and_rip(
+                            let Some(value) = block_state.read_value(port, access_size) else {
+                                break;
+                            };
+                            if !set_guest_rax_low_value_and_rip(
                                 partition,
                                 set_virtual_processor_registers,
                                 rax,
                                 value,
+                                access_size,
                                 next_rip,
                                 report,
                             ) {
@@ -2869,6 +2920,9 @@ mod windows_whp {
 
         report.serial_io_exit_count = report.serial_bytes.len() as u32;
         report.serial_markers_observed = serial_markers_observed(report);
+        if let Some(path) = checkpoint_path.as_deref() {
+            write_linux_entry_probe_checkpoint(path, report, "finished", probe_started_at);
+        }
         if !report.serial_expected_markers.is_empty() {
             report.calls.push(NativeWhpCallReport {
                 name: "LinuxSerialMilestones",
@@ -2887,17 +2941,6 @@ mod windows_whp {
                 },
             });
         }
-        let timer_interrupts = timer_interrupt_requests.load(std::sync::atomic::Ordering::Relaxed);
-        if request_interrupt.is_some() {
-            report.calls.push(NativeWhpCallReport {
-                name: "LinuxTimerInterruptRequests",
-                hresult: None,
-                ok: timer_interrupts > 0,
-                detail: format!(
-                    "Requested {timer_interrupts} fixed timer interrupts on vector 0x{PIC_TIMER_INTERRUPT_VECTOR:02x} while running the Linux protected-mode probe."
-                ),
-            });
-        }
         compact_linux_entry_probe_calls(report);
         report.calls.push(NativeWhpCallReport {
             name: "LinuxEntryProbeBoundary",
@@ -2914,6 +2957,87 @@ mod windows_whp {
         } else {
             LINUX_ENTRY_PROBE_EXIT_BUDGET
         }
+    }
+
+    fn linux_entry_probe_checkpoint_path() -> Option<PathBuf> {
+        std::env::var_os("PANE_NATIVE_BOOT_TRACE_CHECKPOINT")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    }
+
+    fn write_linux_entry_probe_checkpoint(
+        path: &Path,
+        report: &NativePartitionSmokeReport,
+        reason: &str,
+        probe_started_at: Instant,
+    ) {
+        let serial_text = report.serial_text.as_deref().unwrap_or("");
+        let serial_tail_start = serial_tail_start(serial_text, 8192);
+        let recent_calls = report.calls.iter().rev().take(32).collect::<Vec<_>>();
+        let failed_calls = report
+            .calls
+            .iter()
+            .filter(|call| !call.ok)
+            .rev()
+            .take(32)
+            .collect::<Vec<_>>();
+        let checkpoint = serde_json::json!({
+            "schema_version": 1,
+            "kind": "pane-native-boot-trace-checkpoint",
+            "reason": reason,
+            "elapsed_ms": probe_started_at.elapsed().as_millis(),
+            "status": report.status,
+            "status_label": report.status_label,
+            "blocker": &report.blocker,
+            "entry_mode": &report.entry_mode,
+            "guest_exit_count": report.guest_exit_count,
+            "guest_exit_budget": report.guest_exit_budget,
+            "serial_io_exit_count": report.serial_io_exit_count,
+            "serial_markers_observed": report.serial_markers_observed,
+            "serial_expected_markers": &report.serial_expected_markers,
+            "exit_reason_label": &report.exit_reason_label,
+            "serial_text_bytes": serial_text.len(),
+            "serial_text_tail": &serial_text[serial_tail_start..],
+            "recent_calls": recent_calls,
+            "recent_failed_calls": failed_calls,
+        });
+
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(serialized) = serde_json::to_string_pretty(&checkpoint) {
+            let _ = fs::write(path, serialized);
+        }
+    }
+
+    fn write_linux_entry_probe_watchdog_checkpoint(path: &Path, reason: &str) {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            let _ = fs::create_dir_all(parent);
+        }
+        let checkpoint = serde_json::json!({
+            "schema_version": 1,
+            "kind": "pane-native-boot-trace-checkpoint",
+            "reason": reason,
+            "watchdog_seconds": LINUX_ENTRY_PROBE_WATCHDOG_SECONDS,
+            "detail": "WHP did not return control to Pane before the native boot watchdog fired; Pane requested vCPU cancellation.",
+        });
+        if let Ok(serialized) = serde_json::to_string_pretty(&checkpoint) {
+            let _ = fs::write(path, serialized);
+        }
+    }
+
+    fn serial_tail_start(text: &str, max_bytes: usize) -> usize {
+        let mut start = text.len().saturating_sub(max_bytes);
+        while start < text.len() && !text.is_char_boundary(start) {
+            start += 1;
+        }
+        start
     }
 
     fn compact_linux_entry_probe_calls(report: &mut NativePartitionSmokeReport) {
@@ -4559,6 +4683,44 @@ mod windows_whp {
             assert_eq!(submission.command.device, NativeBlockDeviceId::UserDisk);
             assert_eq!(submission.command.operation, NativeBlockOperation::Write);
             assert_eq!(submission.write_payload, Some(vec![0xde, 0xad, 0xbe]));
+        }
+
+        #[test]
+        fn native_block_io_port_state_supports_wide_index_and_data_transfers() {
+            let mut state = NativeBlockIoPortState::default();
+
+            assert!(state.write(PANE_BLOCK_IO_BASE_PORT, 1).is_none());
+            assert!(state.write(PANE_BLOCK_IO_BASE_PORT + 1, 1).is_none());
+            assert!(state
+                .write_value(PANE_BLOCK_IO_BASE_PORT + 4, 4, 0x0506_0708)
+                .is_none());
+            assert!(state
+                .write_value(PANE_BLOCK_IO_BASE_PORT + 8, 4, 0x0102_0304)
+                .is_none());
+            assert!(state
+                .write_value(PANE_BLOCK_IO_BASE_PORT + 12, 4, 0xddcc_bbaa)
+                .is_none());
+
+            let submission = state
+                .write(PANE_BLOCK_IO_BASE_PORT + 2, 1)
+                .expect("submit creates command");
+
+            assert_eq!(submission.command.block_index, 0x0102_0304_0506_0708);
+            assert_eq!(submission.write_payload, Some(vec![0xaa, 0xbb, 0xcc, 0xdd]));
+
+            state.set_service_result(
+                PANE_BLOCK_IO_STATUS_SERVICED,
+                vec![0x11, 0x22, 0x33, 0x44, 0x55],
+            );
+
+            assert_eq!(
+                state.read_value(PANE_BLOCK_IO_BASE_PORT + 12, 4),
+                Some(0x4433_2211)
+            );
+            assert_eq!(
+                state.read_value(PANE_BLOCK_IO_BASE_PORT + 12, 4),
+                Some(0x0000_0055)
+            );
         }
 
         #[test]

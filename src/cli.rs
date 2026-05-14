@@ -375,6 +375,9 @@ pub struct NativeBootSpikeArgs {
     /// Map guest memory and run the materialized kernel-layout artifact under the serial/HALT contract.
     #[arg(long, conflicts_with_all = ["run_fixture", "run_boot_loader"])]
     pub run_kernel_layout: bool,
+    /// Write incremental native boot diagnostics to this JSON file while the WHP guest is running.
+    #[arg(long)]
+    pub trace_checkpoint: Option<PathBuf>,
     /// Emit structured JSON instead of a human-readable summary.
     #[arg(long)]
     pub json: bool,
@@ -568,6 +571,8 @@ pub struct BundleArgs {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use clap::Parser;
 
     use super::{Cli, Commands};
@@ -681,6 +686,8 @@ mod tests {
             "--prepare-runtime",
             "--execute",
             "--run-kernel-layout",
+            "--trace-checkpoint",
+            "trace.json",
         ])
         .unwrap();
 
@@ -689,6 +696,7 @@ mod tests {
                 assert!(args.prepare_runtime);
                 assert!(args.execute);
                 assert!(args.run_kernel_layout);
+                assert_eq!(args.trace_checkpoint, Some(PathBuf::from("trace.json")));
             }
             _ => panic!("expected native-boot-spike command"),
         }

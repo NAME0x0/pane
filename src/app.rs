@@ -1,6 +1,7 @@
 #![allow(clippy::uninlined_format_args)]
 
 use std::{
+    env,
     fs::{self, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
@@ -2170,6 +2171,18 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
         } else {
             None
         };
+    let previous_trace_checkpoint = env::var_os("PANE_NATIVE_BOOT_TRACE_CHECKPOINT");
+    if let Some(path) = &args.trace_checkpoint {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
+        env::set_var("PANE_NATIVE_BOOT_TRACE_CHECKPOINT", path);
+    } else {
+        env::remove_var("PANE_NATIVE_BOOT_TRACE_CHECKPOINT");
+    }
     let partition_smoke = crate::native::run_partition_smoke(
         args.execute,
         run_guest_image,
@@ -2177,6 +2190,11 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
         &host,
         block_io_handler,
     );
+    if let Some(previous) = previous_trace_checkpoint {
+        env::set_var("PANE_NATIVE_BOOT_TRACE_CHECKPOINT", previous);
+    } else {
+        env::remove_var("PANE_NATIVE_BOOT_TRACE_CHECKPOINT");
+    }
     let protected_linux_entry_requested =
         partition_smoke.entry_mode.as_deref() == Some("linux-protected-mode-32");
     let ready_for_arch_boot_attempt = runtime.native_runtime.ready_for_arch_boot_attempt;
@@ -5134,11 +5152,10 @@ static const struct block_device_operations pane_block_fops = {
 
 static void pane_block_write_index(u64 block_index)
 {
-    int index;
-
-    for (index = 0; index < 8; index++)
-        outb((block_index >> (index * 8)) & 0xff,
-             PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_BLOCK_INDEX_OFFSET + index);
+    outl((u32)(block_index & 0xffffffff),
+         PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_BLOCK_INDEX_OFFSET);
+    outl((u32)(block_index >> 32),
+         PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_BLOCK_INDEX_OFFSET + 4);
 }
 
 static int pane_block_wait_serviced(void)
@@ -5162,7 +5179,7 @@ static int pane_block_wait_serviced(void)
 
 static int pane_block_transfer(int device_id, int operation, u64 block_index, void *buffer)
 {
-    unsigned int byte_index;
+    unsigned int word_index;
     unsigned char *bytes = buffer;
 
     outb(device_id, PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_DEVICE_OFFSET);
@@ -5170,8 +5187,14 @@ static int pane_block_transfer(int device_id, int operation, u64 block_index, vo
     pane_block_write_index(block_index);
 
     if (operation == PANE_BLOCK_OPERATION_WRITE) {
-        for (byte_index = 0; byte_index < PANE_BLOCK_IO_BLOCK_SIZE_BYTES; byte_index++)
-            outb(bytes[byte_index], PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_DATA_OFFSET);
+        for (word_index = 0;
+             word_index < PANE_BLOCK_IO_BLOCK_SIZE_BYTES / sizeof(u32);
+             word_index++) {
+            u32 word;
+
+            memcpy(&word, bytes + word_index * sizeof(word), sizeof(word));
+            outl(word, PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_DATA_OFFSET);
+        }
     }
 
     outb(1, PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_STATUS_OFFSET);
@@ -5179,8 +5202,13 @@ static int pane_block_transfer(int device_id, int operation, u64 block_index, vo
         return -EIO;
 
     if (operation == PANE_BLOCK_OPERATION_READ) {
-        for (byte_index = 0; byte_index < PANE_BLOCK_IO_BLOCK_SIZE_BYTES; byte_index++)
-            bytes[byte_index] = inb(PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_DATA_OFFSET);
+        for (word_index = 0;
+             word_index < PANE_BLOCK_IO_BLOCK_SIZE_BYTES / sizeof(u32);
+             word_index++) {
+            u32 word = inl(PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_DATA_OFFSET);
+
+            memcpy(bytes + word_index * sizeof(word), &word, sizeof(word));
+        }
     }
 
     return 0;
@@ -13991,6 +14019,11 @@ mod tests {
         assert!(block_driver.contains("PANE_BLOCK_OPERATION_WRITE"));
         assert!(block_driver.contains("PANE_BLOCK_IO_BASE_PORT"));
         assert!(block_driver.contains("PANE_BLOCK_STATUS_SERVICED"));
+        assert!(block_driver.contains("outl((u32)(block_index & 0xffffffff)"));
+        assert!(block_driver
+            .contains("outl(word, PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_DATA_OFFSET)"));
+        assert!(block_driver
+            .contains("u32 word = inl(PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_DATA_OFFSET)"));
         assert!(block_driver.contains("REQ_OP_FLUSH"));
         assert!(block_driver.contains("REQ_OP_DISCARD"));
         assert!(block_driver.contains("blk_mq"));

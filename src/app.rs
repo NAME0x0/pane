@@ -190,6 +190,7 @@ struct NativeBootSpikeReport {
     runtime: RuntimeReport,
     partition_smoke: crate::native::NativePartitionSmokeReport,
     ready_for_serial_kernel_spike: bool,
+    ready_for_arch_boot_attempt: bool,
     blockers: Vec<String>,
     next_steps: Vec<String>,
 }
@@ -2137,6 +2138,9 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
         prepare_native_runtime_boundary(&session_name, DEFAULT_RUNTIME_CAPACITY_GIB)?;
     }
     let mut runtime = build_runtime_report(&session_name, DEFAULT_RUNTIME_CAPACITY_GIB, false)?;
+    let arch_boot_attempt_requested = args.execute && args.run_kernel_layout;
+    let arch_boot_attempt_ready =
+        !arch_boot_attempt_requested || runtime.native_runtime.ready_for_arch_boot_attempt;
     let boot_image = if args.execute && args.run_fixture {
         prepare_runtime_paths(&runtime_paths)?;
         write_runtime_config(&runtime_paths, &session_name, &runtime_budget)?;
@@ -2149,7 +2153,7 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
         Some(image)
     } else if args.execute && args.run_boot_loader && runtime.artifacts.boot_loader_image_verified {
         Some(load_boot_loader_image_artifact(&runtime_paths)?)
-    } else if args.execute && args.run_kernel_layout && runtime.artifacts.kernel_boot_layout_ready {
+    } else if arch_boot_attempt_requested && arch_boot_attempt_ready {
         Some(load_kernel_layout_boot_image_artifact(&runtime_paths)?)
     } else {
         None
@@ -2161,7 +2165,7 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
                 .map_err(|error| error.to_string())
         };
     let block_io_handler: Option<&crate::native::NativeBlockIoHandler<'_>> =
-        if args.execute && args.run_kernel_layout {
+        if arch_boot_attempt_requested && arch_boot_attempt_ready {
             Some(&runtime_block_io_handler)
         } else {
             None
@@ -2175,6 +2179,7 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
     );
     let protected_linux_entry_requested =
         partition_smoke.entry_mode.as_deref() == Some("linux-protected-mode-32");
+    let ready_for_arch_boot_attempt = runtime.native_runtime.ready_for_arch_boot_attempt;
     let ready_for_serial_kernel_spike = args.execute
         && run_guest_image
         && partition_smoke.status == crate::native::NativePartitionSmokeStatus::Pass
@@ -2184,7 +2189,7 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
         && runtime.artifacts.native_manifest_exists
         && (!args.run_fixture || runtime.artifacts.serial_boot_image_ready)
         && (!args.run_boot_loader || runtime.artifacts.boot_loader_image_verified)
-        && (!args.run_kernel_layout || runtime.artifacts.kernel_boot_layout_ready)
+        && (!args.run_kernel_layout || runtime.native_runtime.ready_for_arch_boot_attempt)
         && (!protected_linux_entry_requested
             || if partition_smoke.serial_expected_markers.is_empty() {
                 partition_smoke.serial_text.is_some()
@@ -2228,6 +2233,9 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
             "No materialized Pane kernel boot layout exists. Run `pane native-kernel-plan --prepare-runtime --materialize` after registering a verified kernel plan."
                 .to_string(),
         );
+    }
+    if arch_boot_attempt_requested && !runtime.native_runtime.ready_for_arch_boot_attempt {
+        blockers.extend(runtime.native_runtime.blockers.clone());
     }
     if run_guest_image {
         if !runtime.prepared {
@@ -2297,6 +2305,7 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
         runtime,
         partition_smoke,
         ready_for_serial_kernel_spike,
+        ready_for_arch_boot_attempt,
         blockers,
         next_steps: native_boot_spike_next_steps(
             args.execute,
@@ -11494,6 +11503,10 @@ fn print_native_boot_spike_report(report: &NativeBootSpikeReport) {
         "  Serial Ready   {}",
         yes_no(report.ready_for_serial_kernel_spike)
     );
+    println!(
+        "  Arch Boot Try  {}",
+        yes_no(report.ready_for_arch_boot_attempt)
+    );
     println!("Host");
     println!("  OS             {}", report.host.host_os);
     println!("  Arch           {}", report.host.host_arch);
@@ -11505,6 +11518,10 @@ fn print_native_boot_spike_report(report: &NativeBootSpikeReport) {
     println!(
         "  Artifacts Ready {}",
         yes_no(report.runtime.native_runtime.ready_for_boot_spike)
+    );
+    println!(
+        "  Arch Ready     {}",
+        yes_no(report.runtime.native_runtime.ready_for_arch_boot_attempt)
     );
     println!(
         "  Base Verified  {}",

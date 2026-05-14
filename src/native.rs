@@ -1701,8 +1701,10 @@ mod windows_whp {
         report.status_label = report.status.display_name();
         if !passed && report.blocker.is_none() {
             report.blocker = Some(
-                "WHP partition/vCPU lifecycle did not complete; inspect the HRESULT call list."
-                    .to_string(),
+                guest_contract_failure_blocker(&report, selected_entry_mode).unwrap_or_else(|| {
+                    "WHP partition/vCPU lifecycle did not complete; inspect the HRESULT call list."
+                        .to_string()
+                }),
             );
         }
         report
@@ -3450,6 +3452,30 @@ mod windows_whp {
             && report.serial_text == report.serial_expected_text
     }
 
+    fn guest_contract_failure_blocker(
+        report: &NativePartitionSmokeReport,
+        entry_mode: NativeGuestEntryMode,
+    ) -> Option<String> {
+        if guest_contract_passed(report, entry_mode) {
+            return None;
+        }
+
+        match entry_mode {
+            NativeGuestEntryMode::LinuxProtectedMode32 if report.virtual_processor_ran => {
+                Some(linux_entry_probe_detail(report))
+            }
+            NativeGuestEntryMode::RealModeSerial
+                if report.fixture_requested && report.virtual_processor_ran =>
+            {
+                Some(format!(
+                    "Serial boot contract failed: expected {:?}, observed {:?}, halt_observed={}.",
+                    report.serial_expected_text, report.serial_text, report.halt_observed
+                ))
+            }
+            _ => None,
+        }
+    }
+
     fn serial_markers_observed(report: &NativePartitionSmokeReport) -> bool {
         let Some(text) = report.serial_text.as_deref() else {
             return report.serial_expected_markers.is_empty();
@@ -3814,8 +3840,8 @@ mod windows_whp {
     mod tests {
         use super::{
             decode_exit_context, default_linux_msr_state, framebuffer_snapshot_report,
-            guest_contract_passed, input_queue_snapshot_report, linux_entry_probe_detail,
-            linux_entry_probe_exit_budget, linux_entry_probe_passed,
+            guest_contract_failure_blocker, guest_contract_passed, input_queue_snapshot_report,
+            linux_entry_probe_detail, linux_entry_probe_exit_budget, linux_entry_probe_passed,
             linux_protected_mode_registers, serial_contract_passed, serial_markers_observed,
             Com1SerialState, DecodedExit, LegacyDeviceIoState, ACPI_PM1_CONTROL_PORT,
             ACPI_PM1_ENABLE_PORT, ACPI_PM1_STATUS_PORT, ACPI_PM_TIMER_PORT, ALT_DELAY_PORT,
@@ -4499,6 +4525,44 @@ mod windows_whp {
 
             assert!(!linux_entry_probe_passed(&report));
             assert!(linux_entry_probe_detail(&report).contains("unsupported I/O port"));
+        }
+
+        #[test]
+        fn guest_contract_failure_blocker_preserves_linux_probe_detail() {
+            let mut report = base_report();
+            report.exit_reason = Some(WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS);
+            report.exit_reason_label = Some("x64-io-port-access".to_string());
+            report.calls.push(crate::native::NativeWhpCallReport {
+                name: "UnsupportedIoPort",
+                hresult: None,
+                ok: false,
+                detail: "No Pane device model currently handles I/O port 0x1234.".to_string(),
+            });
+
+            let blocker = guest_contract_failure_blocker(
+                &report,
+                crate::native::NativeGuestEntryMode::LinuxProtectedMode32,
+            )
+            .expect("linux blocker");
+
+            assert!(blocker.contains("failing WHP exit `x64-io-port-access`"));
+            assert!(blocker.contains("unsupported I/O port"));
+        }
+
+        #[test]
+        fn guest_contract_failure_blocker_preserves_serial_contract_detail() {
+            let mut report = base_report();
+            report.serial_expected_text = Some(SERIAL_BOOT_BANNER_TEXT.to_string());
+            report.serial_text = Some("PANE_BOOT_PARTIAL\n".to_string());
+
+            let blocker = guest_contract_failure_blocker(
+                &report,
+                crate::native::NativeGuestEntryMode::RealModeSerial,
+            )
+            .expect("serial blocker");
+
+            assert!(blocker.contains("Serial boot contract failed"));
+            assert!(blocker.contains("PANE_BOOT_PARTIAL"));
         }
 
         #[test]

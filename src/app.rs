@@ -4681,7 +4681,11 @@ fn pane_port_block_header_source() -> String {
         r#"#ifndef PANE_PORT_BLOCK_H
 #define PANE_PORT_BLOCK_H
 
+#ifdef __KERNEL__
+#include <linux/types.h>
+#else
 #include <stdint.h>
+#endif
 
 #define PANE_BLOCK_IO_PROTOCOL "{}"
 #define PANE_BLOCK_IO_BASE_PORT {}
@@ -5290,7 +5294,12 @@ static int pane_block_create_disk(int index, int pane_device_id, const char *nam
     struct pane_block_disk *pane_disk = &pane_disks[index];
     sector_t capacity_sectors = device_blocks[index] *
                                 (PANE_BLOCK_IO_BLOCK_SIZE_BYTES / PANE_BLOCK_SECTOR_SIZE);
+    struct queue_limits limits;
     int ret;
+
+    memset(&limits, 0, sizeof(limits));
+    limits.logical_block_size = PANE_BLOCK_IO_BLOCK_SIZE_BYTES;
+    limits.physical_block_size = PANE_BLOCK_IO_BLOCK_SIZE_BYTES;
 
     pane_disk->pane_device_id = pane_device_id;
     strscpy(pane_disk->name, name, sizeof(pane_disk->name));
@@ -5299,7 +5308,6 @@ static int pane_block_create_disk(int index, int pane_device_id, const char *nam
     pane_disk->tag_set.queue_depth = 64;
     pane_disk->tag_set.numa_node = NUMA_NO_NODE;
     pane_disk->tag_set.cmd_size = 0;
-    pane_disk->tag_set.flags = BLK_MQ_F_SHOULD_MERGE;
     pane_disk->tag_set.driver_data = pane_disk;
 
     ret = blk_mq_alloc_tag_set(&pane_disk->tag_set);
@@ -5313,7 +5321,7 @@ static int pane_block_create_disk(int index, int pane_device_id, const char *nam
         return ret;
     }
 
-    pane_disk->disk = blk_mq_alloc_disk(&pane_disk->tag_set, pane_disk);
+    pane_disk->disk = blk_mq_alloc_disk(&pane_disk->tag_set, &limits, pane_disk);
     if (IS_ERR(pane_disk->disk)) {
         ret = PTR_ERR(pane_disk->disk);
         pane_disk->disk = NULL;
@@ -5326,11 +5334,16 @@ static int pane_block_create_disk(int index, int pane_device_id, const char *nam
     pane_disk->disk->first_minor = 0;
     pane_disk->disk->fops = &pane_block_fops;
     pane_disk->disk->private_data = pane_disk;
-    pane_disk->disk->queue->queuedata = pane_disk;
-    blk_queue_logical_block_size(pane_disk->disk->queue, PANE_BLOCK_IO_BLOCK_SIZE_BYTES);
     snprintf(pane_disk->disk->disk_name, DISK_NAME_LEN, "%s", name);
     set_capacity(pane_disk->disk, capacity_sectors);
-    add_disk(pane_disk->disk);
+    ret = add_disk(pane_disk->disk);
+    if (ret) {
+        put_disk(pane_disk->disk);
+        pane_disk->disk = NULL;
+        unregister_blkdev(pane_disk->major, name);
+        blk_mq_free_tag_set(&pane_disk->tag_set);
+        return ret;
+    }
     return 0;
 }
 
@@ -5418,6 +5431,10 @@ set -eu
 #   sh build-pane-initramfs.sh ./pane-storage-discovery.cpio
 
 output="${1:-pane-storage-discovery.cpio}"
+case "$output" in
+    /*) output_path="$output" ;;
+    *) output_path="$OLDPWD/$output" ;;
+esac
 workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
 
@@ -5430,8 +5447,8 @@ if [ -f pane-block.ko ]; then
 fi
 chmod +x "$workdir/init" "$workdir/bin/pane-initramfs-hook" "$workdir/bin/pane-port-probe"
 
-(cd "$workdir" && find . -print | cpio -o -H newc > "$OLDPWD/$output")
-printf 'wrote %s\n' "$output"
+(cd "$workdir" && find . -print | cpio -o -H newc > "$output_path")
+printf 'wrote %s\n' "$output_path"
 "#
     .to_string()
 }
@@ -6460,17 +6477,51 @@ fn kernel_layout_execution_image(
         ));
     }
 
+    let setup_region_size = layout
+        .guest_memory_map
+        .iter()
+        .find(|range| range.label == "bzimage-setup")
+        .map(|range| range.size_bytes)
+        .unwrap_or(setup_bytes as u64)
+        .try_into()
+        .map_err(|_| {
+            AppError::message("Linux bzImage setup region is too large to map on this host.")
+        })?;
+    if setup_region_size < setup_bytes {
+        return Err(AppError::message(
+            "Linux bzImage setup region is smaller than the setup payload.",
+        ));
+    }
+    let mut setup_region_bytes = vec![0_u8; setup_region_size];
+    setup_region_bytes[..setup_bytes].copy_from_slice(&kernel_bytes[..setup_bytes]);
     let setup_region = crate::native::NativeGuestMemoryRegion {
         label: "linux-bzimage-setup".to_string(),
         guest_gpa: 0x0009_0000,
-        bytes: kernel_bytes[..setup_bytes].to_vec(),
+        bytes: setup_region_bytes,
         writable: true,
         executable: false,
     };
     let protected_mode_payload =
-        kernel_bytes[protected_mode_offset..protected_mode_offset + protected_mode_bytes].to_vec();
+        &kernel_bytes[protected_mode_offset..protected_mode_offset + protected_mode_bytes];
+    let protected_mode_region_size = layout
+        .guest_memory_map
+        .iter()
+        .find(|range| range.label == "kernel-payload")
+        .map(|range| range.size_bytes)
+        .unwrap_or(protected_mode_bytes as u64)
+        .try_into()
+        .map_err(|_| {
+            AppError::message("Linux kernel payload region is too large to map on this host.")
+        })?;
+    if protected_mode_region_size < protected_mode_payload.len() {
+        return Err(AppError::message(
+            "Linux kernel payload region is smaller than the protected-mode payload.",
+        ));
+    }
+    let mut protected_mode_region = vec![0_u8; protected_mode_region_size];
+    protected_mode_region[..protected_mode_payload.len()].copy_from_slice(protected_mode_payload);
 
-    Ok((protected_mode_payload, kernel_load_gpa, vec![setup_region]))
+    Ok((protected_mode_region, kernel_load_gpa, vec![setup_region]))
 }
 
 fn linux_guest_mapped_regions(
@@ -6486,7 +6537,14 @@ fn linux_guest_mapped_regions(
         .filter(|range| {
             matches!(
                 range.region_type.as_str(),
-                "usable" | "mmio-stub" | "storage-contract" | "framebuffer" | "input-queue"
+                "usable"
+                    | "bios-data"
+                    | "bios-rom"
+                    | "legacy-rom"
+                    | "mmio-stub"
+                    | "storage-contract"
+                    | "framebuffer"
+                    | "input-queue"
             )
         })
         .map(|range| {
@@ -6498,10 +6556,13 @@ fn linux_guest_mapped_regions(
             })?;
             let label = match range.region_type.as_str() {
                 "usable" => format!("linux-ram-{}", range.label),
+                "bios-data" | "bios-rom" | "legacy-rom" => format!("linux-{}", range.label),
                 "storage-contract" | "framebuffer" | "input-queue" => range.label.clone(),
                 _ => format!("linux-{}", range.label),
             };
             let bytes = match range.region_type.as_str() {
+                "bios-data" => linux_bios_data_area_page_bytes(size),
+                "bios-rom" | "legacy-rom" => vec![0_u8; size],
                 "storage-contract" => layout
                     .storage
                     .as_ref()
@@ -6529,6 +6590,16 @@ fn linux_guest_mapped_regions(
             })
         })
         .collect()
+}
+
+fn linux_bios_data_area_page_bytes(size: usize) -> Vec<u8> {
+    let mut page = vec![0_u8; size];
+    if size >= 0x415 {
+        page[0x400..0x402].copy_from_slice(&0x03f8_u16.to_le_bytes());
+        page[0x40e..0x410].copy_from_slice(&0_u16.to_le_bytes());
+        page[0x413..0x415].copy_from_slice(&640_u16.to_le_bytes());
+    }
+    page
 }
 
 fn storage_contract_page_bytes(storage: &KernelStorageAttachment) -> AppResult<Vec<u8>> {
@@ -6883,7 +6954,8 @@ fn write_linux_e820_table(
         let start = parse_guest_physical_address(&range.start_gpa)?;
         let region_type = match range.region_type.as_str() {
             "usable" => 1,
-            "reserved" | "mmio-stub" | "storage-contract" | "framebuffer" | "input-queue" => 2,
+            "reserved" | "bios-data" | "bios-rom" | "legacy-rom" | "mmio-stub"
+            | "storage-contract" | "framebuffer" | "input-queue" => 2,
             other => {
                 return Err(AppError::message(format!(
                     "Unsupported Linux E820 range type `{other}` for `{}`.",
@@ -7083,7 +7155,7 @@ fn register_kernel_boot_plan(
         cmdline,
         expected_serial_device: "ttyS0".to_string(),
         kernel_load_gpa: "0x00100000".to_string(),
-        initramfs_load_gpa: initramfs_record.as_ref().map(|_| "0x04000000".to_string()),
+        initramfs_load_gpa: initramfs_record.as_ref().map(|_| "0x0c000000".to_string()),
         registered_at_epoch_seconds: current_epoch_seconds(),
         notes: {
             let mut notes = vec![
@@ -7439,7 +7511,16 @@ fn validate_guest_memory_ranges_do_not_overlap(ranges: &[KernelGuestMemoryRange]
 }
 
 fn default_linux_guest_memory_map(initramfs_bytes: u64) -> Vec<KernelGuestMemoryRange> {
+    const INITRAMFS_GPA: u64 = 0x0c00_0000;
+    const HIGH_RAM_GPA: u64 = 0x0800_0000;
+
     let mut ranges = vec![
+        KernelGuestMemoryRange {
+            label: "bios-data-area".to_string(),
+            start_gpa: "0x00000000".to_string(),
+            size_bytes: 0x00001000,
+            region_type: "bios-data".to_string(),
+        },
         KernelGuestMemoryRange {
             label: "boot-params".to_string(),
             start_gpa: "0x00007000".to_string(),
@@ -7471,10 +7552,16 @@ fn default_linux_guest_memory_map(initramfs_bytes: u64) -> Vec<KernelGuestMemory
             region_type: "reserved".to_string(),
         },
         KernelGuestMemoryRange {
-            label: "bios-reserved".to_string(),
-            start_gpa: "0x000f0000".to_string(),
-            size_bytes: 0x00010000,
-            region_type: "reserved".to_string(),
+            label: "legacy-rom".to_string(),
+            start_gpa: "0x000a0000".to_string(),
+            size_bytes: 0x00040000,
+            region_type: "legacy-rom".to_string(),
+        },
+        KernelGuestMemoryRange {
+            label: "bios-rom".to_string(),
+            start_gpa: "0x000e0000".to_string(),
+            size_bytes: 0x00020000,
+            region_type: "bios-rom".to_string(),
         },
         KernelGuestMemoryRange {
             label: "kernel-payload".to_string(),
@@ -7482,21 +7569,37 @@ fn default_linux_guest_memory_map(initramfs_bytes: u64) -> Vec<KernelGuestMemory
             size_bytes: 0x02000000,
             region_type: "reserved".to_string(),
         },
+        KernelGuestMemoryRange {
+            label: "kernel-work-ram".to_string(),
+            start_gpa: "0x02100000".to_string(),
+            size_bytes: 0x05f00000,
+            region_type: "usable".to_string(),
+        },
     ];
 
     if initramfs_bytes > 0 {
+        let initramfs_size = page_align_guest_range(initramfs_bytes);
         ranges.push(KernelGuestMemoryRange {
             label: "initramfs".to_string(),
-            start_gpa: "0x04000000".to_string(),
-            size_bytes: page_align_guest_range(initramfs_bytes),
+            start_gpa: format_guest_physical_address(INITRAMFS_GPA),
+            size_bytes: initramfs_size,
             region_type: "reserved".to_string(),
         });
+        let initramfs_end_gpa = INITRAMFS_GPA.saturating_add(initramfs_size);
+        if initramfs_end_gpa < HIGH_RAM_GPA {
+            ranges.push(KernelGuestMemoryRange {
+                label: "mid-ram".to_string(),
+                start_gpa: format_guest_physical_address(initramfs_end_gpa),
+                size_bytes: HIGH_RAM_GPA - initramfs_end_gpa,
+                region_type: "usable".to_string(),
+            });
+        }
     }
 
     ranges.extend([
         KernelGuestMemoryRange {
             label: "high-ram".to_string(),
-            start_gpa: "0x08000000".to_string(),
+            start_gpa: format_guest_physical_address(HIGH_RAM_GPA),
             size_bytes: 0x04000000,
             region_type: "usable".to_string(),
         },
@@ -12707,7 +12810,13 @@ mod tests {
         assert_eq!(layout.boot_params_gpa, "0x00007000");
         assert_eq!(layout.cmdline_gpa, "0x00020000");
         assert_eq!(layout.kernel_load_gpa, "0x00100000");
-        assert_eq!(layout.initramfs_load_gpa.as_deref(), Some("0x04000000"));
+        assert_eq!(layout.initramfs_load_gpa.as_deref(), Some("0x0c000000"));
+        assert!(layout.guest_memory_map.iter().any(|range| {
+            range.label == "bios-data-area"
+                && range.start_gpa == "0x00000000"
+                && range.size_bytes == 0x00001000
+                && range.region_type == "bios-data"
+        }));
         assert!(layout.guest_memory_map.iter().any(|range| {
             range.label == "high-ram"
                 && range.start_gpa == "0x08000000"
@@ -12717,6 +12826,24 @@ mod tests {
             range.label == "boot-gdt"
                 && range.start_gpa == "0x00008000"
                 && range.region_type == "reserved"
+        }));
+        assert!(layout.guest_memory_map.iter().any(|range| {
+            range.label == "bios-rom"
+                && range.start_gpa == "0x000e0000"
+                && range.size_bytes == 0x00020000
+                && range.region_type == "bios-rom"
+        }));
+        assert!(layout.guest_memory_map.iter().any(|range| {
+            range.label == "legacy-rom"
+                && range.start_gpa == "0x000a0000"
+                && range.size_bytes == 0x00040000
+                && range.region_type == "legacy-rom"
+        }));
+        assert!(layout.guest_memory_map.iter().any(|range| {
+            range.label == "kernel-work-ram"
+                && range.start_gpa == "0x02100000"
+                && range.size_bytes == 0x05f00000
+                && range.region_type == "usable"
         }));
         assert!(layout.guest_memory_map.iter().any(|range| {
             range.label == "io-apic-mmio"
@@ -12730,7 +12857,7 @@ mod tests {
         }));
         assert!(layout.guest_memory_map.iter().any(|range| {
             range.label == "initramfs"
-                && range.start_gpa == "0x04000000"
+                && range.start_gpa == "0x0c000000"
                 && range.size_bytes == 0x00001000
                 && range.region_type == "reserved"
         }));
@@ -12797,7 +12924,7 @@ mod tests {
         }));
         assert!(image.extra_regions.iter().any(|region| {
             region.label == "linux-initramfs"
-                && region.guest_gpa == 0x0400_0000
+                && region.guest_gpa == 0x0c00_0000
                 && region.bytes == b"pane initramfs"
         }));
 
@@ -12813,7 +12940,7 @@ mod tests {
             boot_params_gpa: "0x00007000".to_string(),
             cmdline_gpa: "0x00020000".to_string(),
             kernel_load_gpa: "0x00100000".to_string(),
-            initramfs_load_gpa: Some("0x04000000".to_string()),
+            initramfs_load_gpa: Some("0x0c000000".to_string()),
             kernel_path: "kernel".to_string(),
             kernel_bytes: 4096,
             kernel_sha256: "0".repeat(64),
@@ -12868,12 +12995,21 @@ mod tests {
         assert_eq!(page[0x2c], 8);
         assert_eq!(page[0x2d], 24);
         assert_eq!(&page[0x228..0x22c], &0x0002_0000_u32.to_le_bytes());
-        assert_eq!(&page[0x218..0x21c], &0x0400_0000_u32.to_le_bytes());
+        assert_eq!(&page[0x218..0x21c], &0x0c00_0000_u32.to_le_bytes());
         assert_eq!(&page[0x21c..0x220], &1234_u32.to_le_bytes());
-        assert_eq!(page[0x1e8], 11);
-        assert_eq!(&page[0x2d0..0x2d8], &0x0000_7000_u64.to_le_bytes());
+        assert_eq!(page[0x1e8], 14);
+        assert_eq!(&page[0x2d0..0x2d8], &0_u64.to_le_bytes());
         assert_eq!(&page[0x2d0 + 16..0x2d0 + 20], &2_u32.to_le_bytes());
-        let boot_gdt_offset = 0x2d0 + 1 * 20;
+        let boot_params_offset = 0x2d0 + 1 * 20;
+        assert_eq!(
+            &page[boot_params_offset..boot_params_offset + 8],
+            &0x0000_7000_u64.to_le_bytes()
+        );
+        assert_eq!(
+            &page[boot_params_offset + 16..boot_params_offset + 20],
+            &2_u32.to_le_bytes()
+        );
+        let boot_gdt_offset = 0x2d0 + 2 * 20;
         assert_eq!(
             &page[boot_gdt_offset..boot_gdt_offset + 8],
             &0x0000_8000_u64.to_le_bytes()
@@ -12882,10 +13018,19 @@ mod tests {
             &page[boot_gdt_offset + 16..boot_gdt_offset + 20],
             &2_u32.to_le_bytes()
         );
-        let initramfs_offset = 0x2d0 + 7 * 20;
+        let work_ram_offset = 0x2d0 + 9 * 20;
+        assert_eq!(
+            &page[work_ram_offset..work_ram_offset + 8],
+            &0x0210_0000_u64.to_le_bytes()
+        );
+        assert_eq!(
+            &page[work_ram_offset + 16..work_ram_offset + 20],
+            &1_u32.to_le_bytes()
+        );
+        let initramfs_offset = 0x2d0 + 10 * 20;
         assert_eq!(
             &page[initramfs_offset..initramfs_offset + 8],
-            &0x0400_0000_u64.to_le_bytes()
+            &0x0c00_0000_u64.to_le_bytes()
         );
         assert_eq!(
             &page[initramfs_offset + 8..initramfs_offset + 16],
@@ -12895,7 +13040,7 @@ mod tests {
             &page[initramfs_offset + 16..initramfs_offset + 20],
             &2_u32.to_le_bytes()
         );
-        let high_ram_offset = 0x2d0 + 8 * 20;
+        let high_ram_offset = 0x2d0 + 11 * 20;
         assert_eq!(
             &page[high_ram_offset..high_ram_offset + 8],
             &0x0800_0000_u64.to_le_bytes()
@@ -12904,7 +13049,7 @@ mod tests {
             &page[high_ram_offset + 16..high_ram_offset + 20],
             &1_u32.to_le_bytes()
         );
-        let local_apic_offset = 0x2d0 + 10 * 20;
+        let local_apic_offset = 0x2d0 + 13 * 20;
         assert_eq!(
             &page[local_apic_offset..local_apic_offset + 8],
             &0xfee0_0000_u64.to_le_bytes()
@@ -13006,11 +13151,15 @@ mod tests {
         let (payload, entry_gpa, extra_regions) =
             kernel_layout_execution_image(&layout, &kernel).unwrap();
         assert_eq!(entry_gpa, 0x0010_0000);
-        assert_eq!(payload, kernel[2560..].to_vec());
+        assert_eq!(payload.len(), 0x0200_0000);
+        assert_eq!(&payload[..kernel.len() - 2560], &kernel[2560..]);
+        assert!(payload[kernel.len() - 2560..].iter().all(|byte| *byte == 0));
         assert!(extra_regions.iter().any(|region| {
             region.label == "linux-bzimage-setup"
                 && region.guest_gpa == 0x0009_0000
-                && region.bytes == kernel[..2560]
+                && region.bytes.len() == 0x0001_0000
+                && region.bytes[..2560] == kernel[..2560]
+                && region.bytes[2560..].iter().all(|byte| *byte == 0)
         }));
 
         layout.kernel_format = "controlled-serial-candidate".to_string();
@@ -13025,7 +13174,7 @@ mod tests {
     fn linux_guest_mapped_regions_include_ram_and_apic_stubs() {
         let framebuffer = default_framebuffer_contract();
         let input = default_input_contract();
-        let mut guest_memory_map = default_linux_guest_memory_map(0);
+        let mut guest_memory_map = default_linux_guest_memory_map(1234);
         guest_memory_map
             .extend(runtime_contract_guest_memory_ranges(&framebuffer, &input).unwrap());
         let layout = KernelBootLayout {
@@ -13066,6 +13215,37 @@ mod tests {
         };
 
         let regions = linux_guest_mapped_regions(&layout).unwrap();
+        let bios_data = regions
+            .iter()
+            .find(|region| region.label == "linux-bios-data-area")
+            .expect("bios data area mapping");
+        assert_eq!(bios_data.guest_gpa, 0x0000_0000);
+        assert_eq!(&bios_data.bytes[0x400..0x402], &0x03f8_u16.to_le_bytes());
+        assert_eq!(&bios_data.bytes[0x40e..0x410], &0_u16.to_le_bytes());
+        assert_eq!(&bios_data.bytes[0x413..0x415], &640_u16.to_le_bytes());
+        assert!(bios_data.writable);
+        assert!(!bios_data.executable);
+        assert!(regions.iter().any(|region| {
+            region.label == "linux-bios-rom"
+                && region.guest_gpa == 0x000e_0000
+                && region.bytes.len() == 0x0002_0000
+                && region.writable
+                && !region.executable
+        }));
+        assert!(regions.iter().any(|region| {
+            region.label == "linux-legacy-rom"
+                && region.guest_gpa == 0x000a_0000
+                && region.bytes.len() == 0x0004_0000
+                && region.writable
+                && !region.executable
+        }));
+        assert!(regions.iter().any(|region| {
+            region.label == "linux-ram-kernel-work-ram"
+                && region.guest_gpa == 0x0210_0000
+                && region.bytes.len() == 0x05f0_0000
+                && region.writable
+                && region.executable
+        }));
         assert!(regions.iter().any(|region| {
             region.label == "linux-ram-high-ram"
                 && region.guest_gpa == 0x0800_0000
@@ -13760,6 +13940,8 @@ mod tests {
         assert!(hook.contains("pane.input_queue"));
         let header =
             std::fs::read_to_string(paths.initramfs_driver_dir.join("pane-port-block.h")).unwrap();
+        assert!(header.contains("#ifdef __KERNEL__"));
+        assert!(header.contains("#include <linux/types.h>"));
         assert!(header.contains("#define PANE_BLOCK_IO_BASE_PORT 3328"));
         assert!(header.contains("#define PANE_BLOCK_IO_DATA_OFFSET 12"));
         let init_source =
@@ -13784,6 +13966,8 @@ mod tests {
         assert!(build_script.contains("cpio -o -H newc"));
         assert!(build_script.contains("$workdir/newroot"));
         assert!(build_script.contains("$workdir/lib/modules"));
+        assert!(build_script.contains("output_path="));
+        assert!(build_script.contains("/*) output_path=\"$output\""));
         assert!(build_script.contains("-o \"$workdir/init\" pane-init.c"));
         assert!(build_script.contains("pane-port-probe"));
         assert!(build_script.contains("pane-block.ko"));
@@ -13799,6 +13983,8 @@ mod tests {
         assert!(block_driver.contains("REQ_OP_FLUSH"));
         assert!(block_driver.contains("REQ_OP_DISCARD"));
         assert!(block_driver.contains("blk_mq"));
+        assert!(block_driver.contains("struct queue_limits limits"));
+        assert!(block_driver.contains("blk_mq_alloc_disk(&pane_disk->tag_set, &limits, pane_disk)"));
         assert!(block_driver.contains("vmalloc(PANE_BLOCK_IO_BLOCK_SIZE_BYTES)"));
         assert!(block_driver.contains("absolute_byte"));
         assert!(block_driver.contains("partial filesystem writes"));

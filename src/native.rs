@@ -1101,7 +1101,7 @@ mod windows_whp {
     const WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS: u32 = 0x0000_1000;
     const WHV_RUN_VP_EXIT_REASON_X64_CPUID: u32 = 0x0000_1001;
     const GUEST_PAGE_SIZE: usize = SERIAL_BOOT_TEST_IMAGE_SIZE;
-    const LINUX_ENTRY_PROBE_EXIT_BUDGET: usize = 4096;
+    const LINUX_ENTRY_PROBE_EXIT_BUDGET: usize = 32768;
     const LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET: usize = 256;
     const SERIAL_COM1_PORT: u16 = 0x03f8;
     const SERIAL_COM1_LAST_PORT: u16 = SERIAL_COM1_PORT + 7;
@@ -3056,9 +3056,9 @@ mod windows_whp {
                 PIC1_COMMAND_PORT | PIC2_COMMAND_PORT => Some(0),
                 PIC1_DATA_PORT => Some(self.pic1_mask),
                 PIC2_DATA_PORT => Some(self.pic2_mask),
-                PIT_CHANNEL0_PORT => Some(self.pit_latch[0]),
-                PIT_CHANNEL1_PORT => Some(self.pit_latch[1]),
-                PIT_CHANNEL2_PORT => Some(self.pit_latch[2]),
+                PIT_CHANNEL0_PORT => Some(self.read_pit_channel(0)),
+                PIT_CHANNEL1_PORT => Some(self.read_pit_channel(1)),
+                PIT_CHANNEL2_PORT => Some(self.read_pit_channel(2)),
                 PIT_COMMAND_PORT => Some(self.pit_command),
                 PS2_DATA_PORT => Some(self.ps2_response.pop_front().unwrap_or(0)),
                 PS2_STATUS_COMMAND_PORT => Some(u8::from(!self.ps2_response.is_empty())),
@@ -3117,6 +3117,12 @@ mod windows_whp {
                 ELCR2_PORT => Some(self.elcr2),
                 _ => None,
             }
+        }
+
+        fn read_pit_channel(&mut self, channel: usize) -> u8 {
+            let value = self.pit_latch[channel];
+            self.pit_latch[channel] = self.pit_latch[channel].wrapping_sub(1);
+            value
         }
 
         fn cmos_value(&self) -> u8 {

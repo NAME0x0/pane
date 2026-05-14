@@ -6471,6 +6471,15 @@ fn augment_kernel_cmdline_for_runtime_contracts(
     input: &InputContract,
 ) -> AppResult<String> {
     let mut cmdline = base_cmdline.trim().to_string();
+    append_kernel_arg(
+        &mut cmdline,
+        "earlycon=uart8250,io,0x3f8,115200n8".to_string(),
+    );
+    append_kernel_arg(&mut cmdline, "earlyprintk=serial,ttyS0,115200".to_string());
+    append_kernel_arg(&mut cmdline, "loglevel=7".to_string());
+    append_kernel_arg(&mut cmdline, "ignore_loglevel".to_string());
+    append_kernel_arg(&mut cmdline, "panic=-1".to_string());
+    append_kernel_arg(&mut cmdline, "nomodeset".to_string());
     if let Some(storage) = storage {
         append_kernel_arg(
             &mut cmdline,
@@ -13889,6 +13898,21 @@ mod tests {
         assert_eq!(storage.block_io_status_port_offset, 2);
         assert_eq!(storage.block_io_data_port_offset, 12);
         assert_eq!(storage.block_io_block_size_bytes, 4096);
+        assert!(layout
+            .cmdline
+            .contains("earlycon=uart8250,io,0x3f8,115200n8"));
+        assert!(layout.cmdline.contains("earlyprintk=serial,ttyS0,115200"));
+        assert!(layout.cmdline.contains("loglevel=7"));
+        assert!(layout.cmdline.contains("ignore_loglevel"));
+        assert!(layout.cmdline.contains("nomodeset"));
+        assert_eq!(
+            layout
+                .cmdline
+                .split_whitespace()
+                .filter(|arg| *arg == "panic=-1")
+                .count(),
+            1
+        );
         assert!(layout.cmdline.contains("pane.storage_contract=0x0dfe0000"));
         assert!(layout.cmdline.contains("pane.root=/dev/pane0p1"));
         assert!(layout.cmdline.contains("pane.root_mode=base-partition"));

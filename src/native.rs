@@ -10,6 +10,8 @@ const REQUIRED_WHP_EXPORTS: &[&str] = &[
     "WHvDeleteVirtualProcessor",
     "WHvSetVirtualProcessorRegisters",
     "WHvRunVirtualProcessor",
+    "WHvCancelRunVirtualProcessor",
+    "WHvRequestInterrupt",
     "WHvMapGpaRange",
     "WHvUnmapGpaRange",
 ];
@@ -1101,8 +1103,12 @@ mod windows_whp {
     const WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS: u32 = 0x0000_1000;
     const WHV_RUN_VP_EXIT_REASON_X64_CPUID: u32 = 0x0000_1001;
     const GUEST_PAGE_SIZE: usize = SERIAL_BOOT_TEST_IMAGE_SIZE;
-    const LINUX_ENTRY_PROBE_EXIT_BUDGET: usize = 32768;
+    const LINUX_ENTRY_PROBE_EXIT_BUDGET: usize = 131072;
     const LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET: usize = 256;
+    const LINUX_ENTRY_PROBE_WATCHDOG_SECONDS: u64 = 120;
+    const LINUX_ENTRY_PROBE_WALL_CLOCK_BUDGET_SECONDS: u64 = 90;
+    const LINUX_ENTRY_PROBE_TRACE_HEAD: usize = 384;
+    const LINUX_ENTRY_PROBE_TRACE_TAIL: usize = 384;
     const SERIAL_COM1_PORT: u16 = 0x03f8;
     const SERIAL_COM1_LAST_PORT: u16 = SERIAL_COM1_PORT + 7;
     const SERIAL_LINE_STATUS_PORT: u16 = SERIAL_COM1_PORT + 5;
@@ -1110,6 +1116,7 @@ mod windows_whp {
     const SERIAL_MODEM_STATUS_PORT: u16 = SERIAL_COM1_PORT + 6;
     const PIC1_COMMAND_PORT: u16 = 0x0020;
     const PIC1_DATA_PORT: u16 = 0x0021;
+    const PIC_TIMER_INTERRUPT_VECTOR: u32 = 0x30;
     const PIT_CHANNEL0_PORT: u16 = 0x0040;
     const PIT_CHANNEL1_PORT: u16 = 0x0041;
     const PIT_CHANNEL2_PORT: u16 = 0x0042;
@@ -1125,6 +1132,8 @@ mod windows_whp {
     const PIC2_DATA_PORT: u16 = 0x00a1;
     const ALT_POST_DELAY_PORT: u16 = 0x00eb;
     const ALT_DELAY_PORT: u16 = 0x00ed;
+    const DMA_PAGE_REGISTER_START_PORT: u16 = 0x0081;
+    const DMA_PAGE_REGISTER_END_PORT: u16 = 0x008f;
     const VGA_ATTRIBUTE_PORT: u16 = 0x03c0;
     const VGA_ATTRIBUTE_DATA_READ_PORT: u16 = 0x03c1;
     const VGA_MISC_OUTPUT_WRITE_PORT: u16 = 0x03c2;
@@ -1215,6 +1224,9 @@ mod windows_whp {
     ) -> i32;
     type WhvRunVirtualProcessor =
         unsafe extern "system" fn(*mut c_void, u32, *mut c_void, u32) -> i32;
+    type WhvCancelRunVirtualProcessor = unsafe extern "system" fn(*mut c_void, u32, u32) -> i32;
+    type WhvRequestInterrupt =
+        unsafe extern "system" fn(*mut c_void, *const WhvInterruptControl, u32) -> i32;
     type WhvMapGpaRange = unsafe extern "system" fn(*mut c_void, *mut c_void, u64, u64, u32) -> i32;
     type WhvUnmapGpaRange = unsafe extern "system" fn(*mut c_void, u64, u64) -> i32;
 
@@ -1241,6 +1253,14 @@ mod windows_whp {
         reg64: u64,
         segment: WhvX64SegmentRegister,
         table: WhvX64TableRegister,
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct WhvInterruptControl {
+        control: u64,
+        destination: u32,
+        vector: u32,
     }
 
     #[link(name = "kernel32")]
@@ -1483,6 +1503,36 @@ mod windows_whp {
             } else {
                 None
             };
+            let cancel_run_virtual_processor = if run_fixture {
+                match resolve_whp_function::<WhvCancelRunVirtualProcessor>(
+                    module,
+                    "WHvCancelRunVirtualProcessor",
+                    &mut report,
+                ) {
+                    Some(function) => Some(function),
+                    None => {
+                        FreeLibrary(module);
+                        return report;
+                    }
+                }
+            } else {
+                None
+            };
+            let request_interrupt = if run_fixture {
+                match resolve_whp_function::<WhvRequestInterrupt>(
+                    module,
+                    "WHvRequestInterrupt",
+                    &mut report,
+                ) {
+                    Some(function) => Some(function),
+                    None => {
+                        FreeLibrary(module);
+                        return report;
+                    }
+                }
+            } else {
+                None
+            };
             let map_gpa_range = if run_fixture {
                 match resolve_whp_function::<WhvMapGpaRange>(module, "WHvMapGpaRange", &mut report)
                 {
@@ -1615,6 +1665,8 @@ mod windows_whp {
                         run_guest_image_until_boundary(
                             partition,
                             run_virtual_processor,
+                            cancel_run_virtual_processor,
+                            request_interrupt,
                             set_virtual_processor_registers,
                             boot_image,
                             block_io_handler,
@@ -2205,6 +2257,8 @@ mod windows_whp {
     fn run_guest_image_until_boundary(
         partition: *mut c_void,
         run_virtual_processor: WhvRunVirtualProcessor,
+        cancel_run_virtual_processor: Option<WhvCancelRunVirtualProcessor>,
+        request_interrupt: Option<WhvRequestInterrupt>,
         set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
         boot_image: &NativeSerialBootImage,
         block_io_handler: Option<&NativeBlockIoHandler<'_>>,
@@ -2221,6 +2275,8 @@ mod windows_whp {
             NativeGuestEntryMode::LinuxProtectedMode32 => run_linux_entry_probe(
                 partition,
                 run_virtual_processor,
+                cancel_run_virtual_processor,
+                request_interrupt,
                 set_virtual_processor_registers,
                 block_io_handler,
                 report,
@@ -2370,6 +2426,8 @@ mod windows_whp {
     fn run_linux_entry_probe(
         partition: *mut c_void,
         run_virtual_processor: WhvRunVirtualProcessor,
+        cancel_run_virtual_processor: Option<WhvCancelRunVirtualProcessor>,
+        request_interrupt: Option<WhvRequestInterrupt>,
         set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
         block_io_handler: Option<&NativeBlockIoHandler<'_>>,
         report: &mut NativePartitionSmokeReport,
@@ -2377,12 +2435,73 @@ mod windows_whp {
         report.serial_expected_text = None;
         let max_guest_exits = linux_entry_probe_exit_budget(report);
         report.guest_exit_budget = max_guest_exits as u32;
+        let watchdog_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let timer_interrupt_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        if let Some(cancel_run_virtual_processor) = cancel_run_virtual_processor {
+            let watchdog_done = std::sync::Arc::clone(&watchdog_done);
+            let partition_address = partition as usize;
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(
+                    LINUX_ENTRY_PROBE_WATCHDOG_SECONDS,
+                ));
+                if !watchdog_done.load(std::sync::atomic::Ordering::SeqCst) {
+                    let partition = partition_address as *mut c_void;
+                    unsafe {
+                        cancel_run_virtual_processor(partition, 0, 0);
+                    }
+                }
+            });
+        }
+        if let Some(request_interrupt) = request_interrupt {
+            let watchdog_done = std::sync::Arc::clone(&watchdog_done);
+            let timer_interrupt_requests = std::sync::Arc::clone(&timer_interrupt_requests);
+            let partition_address = partition as usize;
+            std::thread::spawn(move || {
+                let interrupt = WhvInterruptControl {
+                    control: 0,
+                    destination: 0,
+                    vector: PIC_TIMER_INTERRUPT_VECTOR,
+                };
+                while !watchdog_done.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    if watchdog_done.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    let partition = partition_address as *mut c_void;
+                    let hresult = unsafe {
+                        request_interrupt(
+                            partition,
+                            &interrupt,
+                            std::mem::size_of::<WhvInterruptControl>() as u32,
+                        )
+                    };
+                    if hresult_succeeded(hresult) {
+                        timer_interrupt_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            });
+        }
         let mut msr_state = default_linux_msr_state();
         let mut serial_state = Com1SerialState::default();
         let mut block_state = NativeBlockIoPortState::default();
         let mut legacy_io_state = LegacyDeviceIoState::default();
+        let probe_started_at = std::time::Instant::now();
 
         for exit_index in 0..max_guest_exits {
+            if probe_started_at.elapsed()
+                >= std::time::Duration::from_secs(LINUX_ENTRY_PROBE_WALL_CLOCK_BUDGET_SECONDS)
+            {
+                report.calls.push(NativeWhpCallReport {
+                    name: "LinuxEntryProbeWallClockBudget",
+                    hresult: None,
+                    ok: false,
+                    detail: format!(
+                        "Linux protected-mode entry probe exceeded {LINUX_ENTRY_PROBE_WALL_CLOCK_BUDGET_SECONDS}s before reaching all expected serial milestones."
+                    ),
+                });
+                break;
+            }
+
             report.guest_exit_count = (exit_index + 1) as u32;
             let mut exit_context = [0_u8; 1024];
             let hresult = unsafe {
@@ -2722,6 +2841,20 @@ mod windows_whp {
                 DecodedExit::Other => break,
             }
 
+            if !report.serial_expected_markers.is_empty() && serial_markers_observed(report) {
+                report.serial_markers_observed = true;
+                report.calls.push(NativeWhpCallReport {
+                    name: "LinuxSerialMilestoneBoundary",
+                    hresult: None,
+                    ok: true,
+                    detail: format!(
+                        "Stopped the Linux protected-mode probe after observing all expected serial milestones: {}.",
+                        report.serial_expected_markers.join(", ")
+                    ),
+                });
+                break;
+            }
+
             if exit_index + 1 == max_guest_exits {
                 report.calls.push(NativeWhpCallReport {
                     name: "LinuxEntryProbeExitBudget",
@@ -2754,12 +2887,25 @@ mod windows_whp {
                 },
             });
         }
+        let timer_interrupts = timer_interrupt_requests.load(std::sync::atomic::Ordering::Relaxed);
+        if request_interrupt.is_some() {
+            report.calls.push(NativeWhpCallReport {
+                name: "LinuxTimerInterruptRequests",
+                hresult: None,
+                ok: timer_interrupts > 0,
+                detail: format!(
+                    "Requested {timer_interrupts} fixed timer interrupts on vector 0x{PIC_TIMER_INTERRUPT_VECTOR:02x} while running the Linux protected-mode probe."
+                ),
+            });
+        }
+        compact_linux_entry_probe_calls(report);
         report.calls.push(NativeWhpCallReport {
             name: "LinuxEntryProbeBoundary",
             hresult: None,
             ok: linux_entry_probe_passed(report),
             detail: linux_entry_probe_detail(report),
         });
+        watchdog_done.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn linux_entry_probe_exit_budget(report: &NativePartitionSmokeReport) -> usize {
@@ -2768,6 +2914,78 @@ mod windows_whp {
         } else {
             LINUX_ENTRY_PROBE_EXIT_BUDGET
         }
+    }
+
+    fn compact_linux_entry_probe_calls(report: &mut NativePartitionSmokeReport) {
+        let noisy_count = report
+            .calls
+            .iter()
+            .filter(|call| linux_entry_probe_call_is_noisy(call))
+            .count();
+        if noisy_count <= LINUX_ENTRY_PROBE_TRACE_HEAD + LINUX_ENTRY_PROBE_TRACE_TAIL {
+            return;
+        }
+
+        let mut noisy_seen = 0_usize;
+        let noisy_tail_start = noisy_count.saturating_sub(LINUX_ENTRY_PROBE_TRACE_TAIL);
+        let original = std::mem::take(&mut report.calls);
+        let mut compacted = Vec::with_capacity(original.len().min(
+            original.len() - noisy_count
+                + LINUX_ENTRY_PROBE_TRACE_HEAD
+                + LINUX_ENTRY_PROBE_TRACE_TAIL
+                + 1,
+        ));
+        let mut dropped = 0_usize;
+        let mut summary_inserted = false;
+
+        for call in original {
+            if linux_entry_probe_call_is_noisy(&call) {
+                let keep = noisy_seen < LINUX_ENTRY_PROBE_TRACE_HEAD
+                    || noisy_seen >= noisy_tail_start
+                    || !call.ok;
+                noisy_seen += 1;
+                if keep {
+                    compacted.push(call);
+                } else {
+                    dropped += 1;
+                    if !summary_inserted && noisy_seen >= LINUX_ENTRY_PROBE_TRACE_HEAD {
+                        compacted.push(NativeWhpCallReport {
+                            name: "LinuxEntryProbeTraceCompacted",
+                            hresult: None,
+                            ok: true,
+                            detail: "Compacted repetitive successful WHP run, serial I/O, and RIP advancement records; failure records and the diagnostic head/tail are retained.".to_string(),
+                        });
+                        summary_inserted = true;
+                    }
+                }
+            } else {
+                compacted.push(call);
+            }
+        }
+
+        if dropped > 0 {
+            if let Some(summary) = compacted
+                .iter_mut()
+                .find(|call| call.name == "LinuxEntryProbeTraceCompacted")
+            {
+                summary.detail = format!(
+                    "Compacted {dropped} repetitive successful WHP run, serial I/O, and RIP advancement records; failure records and the diagnostic head/tail are retained."
+                );
+            }
+        }
+        report.calls = compacted;
+    }
+
+    fn linux_entry_probe_call_is_noisy(call: &NativeWhpCallReport) -> bool {
+        call.ok
+            && matches!(
+                call.name,
+                "WHvRunVirtualProcessor(linux-entry-probe)"
+                    | "DecodeX64IoPortAccess"
+                    | "WHvSetVirtualProcessorRegisters(RIP)"
+                    | "WHvSetVirtualProcessorRegisters(RAX,RIP)"
+                    | "LegacyDeviceIo"
+            )
     }
 
     fn set_guest_rip(
@@ -2876,6 +3094,7 @@ mod windows_whp {
         acpi_pm1_enable: u16,
         acpi_pm1_control: u16,
         acpi_pm_timer: u32,
+        dma_page_registers: [u8; 0x10],
         elcr1: u8,
         elcr2: u8,
     }
@@ -2913,6 +3132,7 @@ mod windows_whp {
                     self.pic2_mask = value;
                     true
                 }
+                port if Self::legacy_serial_port_offset(port).is_some() => true,
                 PIT_CHANNEL0_PORT => {
                     self.pit_latch[0] = value;
                     true
@@ -2953,6 +3173,12 @@ mod windows_whp {
                 }
                 CMOS_DATA_PORT => true,
                 POST_DELAY_PORT | ALT_POST_DELAY_PORT | ALT_DELAY_PORT => true,
+                DMA_PAGE_REGISTER_START_PORT..=DMA_PAGE_REGISTER_END_PORT
+                    if Self::is_dma_page_register_port(port) =>
+                {
+                    self.dma_page_registers[usize::from(port & 0x0f)] = value;
+                    true
+                }
                 SYSTEM_CONTROL_PORT_A => {
                     self.system_control_a = value;
                     true
@@ -3056,6 +3282,15 @@ mod windows_whp {
                 PIC1_COMMAND_PORT | PIC2_COMMAND_PORT => Some(0),
                 PIC1_DATA_PORT => Some(self.pic1_mask),
                 PIC2_DATA_PORT => Some(self.pic2_mask),
+                port if Self::legacy_serial_port_offset(port).is_some() => {
+                    let offset = Self::legacy_serial_port_offset(port).unwrap_or(0);
+                    Some(match offset {
+                        2 => 0x01,
+                        5 => 0x60,
+                        6 => 0x30,
+                        _ => 0,
+                    })
+                }
                 PIT_CHANNEL0_PORT => Some(self.read_pit_channel(0)),
                 PIT_CHANNEL1_PORT => Some(self.read_pit_channel(1)),
                 PIT_CHANNEL2_PORT => Some(self.read_pit_channel(2)),
@@ -3063,9 +3298,14 @@ mod windows_whp {
                 PS2_DATA_PORT => Some(self.ps2_response.pop_front().unwrap_or(0)),
                 PS2_STATUS_COMMAND_PORT => Some(u8::from(!self.ps2_response.is_empty())),
                 SYSTEM_CONTROL_PORT_A => Some(self.system_control_a),
-                SYSTEM_CONTROL_PORT_B => Some(self.system_control_b),
+                SYSTEM_CONTROL_PORT_B => Some(self.read_system_control_b()),
                 CMOS_DATA_PORT => Some(self.cmos_value()),
                 POST_DELAY_PORT | ALT_POST_DELAY_PORT | ALT_DELAY_PORT => Some(0),
+                DMA_PAGE_REGISTER_START_PORT..=DMA_PAGE_REGISTER_END_PORT
+                    if Self::is_dma_page_register_port(port) =>
+                {
+                    Some(self.dma_page_registers[usize::from(port & 0x0f)])
+                }
                 PCI_CONFIG_ADDRESS_PORT..=PCI_CONFIG_ADDRESS_END_PORT
                 | PCI_CONFIG_DATA_START_PORT..=PCI_CONFIG_DATA_END_PORT => {
                     Some(self.read_pci_config_port(port))
@@ -3119,10 +3359,28 @@ mod windows_whp {
             }
         }
 
+        fn is_dma_page_register_port(port: u16) -> bool {
+            matches!(
+                port,
+                0x0081 | 0x0082 | 0x0083 | 0x0087 | 0x0089 | 0x008a | 0x008b | 0x008f
+            )
+        }
+
+        fn legacy_serial_port_offset(port: u16) -> Option<u16> {
+            [0x02f8, 0x03e8, 0x02e8]
+                .into_iter()
+                .find_map(|base| (base..=base + 7).contains(&port).then(|| port - base))
+        }
+
         fn read_pit_channel(&mut self, channel: usize) -> u8 {
             let value = self.pit_latch[channel];
             self.pit_latch[channel] = self.pit_latch[channel].wrapping_sub(1);
             value
+        }
+
+        fn read_system_control_b(&mut self) -> u8 {
+            self.system_control_b ^= 0x20;
+            self.system_control_b
         }
 
         fn cmos_value(&self) -> u8 {
@@ -3503,7 +3761,10 @@ mod windows_whp {
             && !report.calls.iter().any(|call| {
                 matches!(
                     call.name,
-                    "LinuxEntryProbeExitBudget" | "AdvanceGuestRip" | "UnsupportedIoPort"
+                    "LinuxEntryProbeExitBudget"
+                        | "AdvanceGuestRip"
+                        | "UnsupportedIoPort"
+                        | "LinuxEntryProbeWallClockBudget"
                 ) && !call.ok
             })
             && !matches!(
@@ -3556,6 +3817,16 @@ mod windows_whp {
         } else if !report.virtual_processor_ran {
             "Linux protected-mode entry did not run far enough to produce a WHP exit context."
                 .to_string()
+        } else if report
+            .calls
+            .iter()
+            .any(|call| call.name == "LinuxEntryProbeWallClockBudget" && !call.ok)
+        {
+            format!(
+                "Linux protected-mode entry exceeded the {}s wall-clock probe budget before emitting the required serial milestones: {}.",
+                LINUX_ENTRY_PROBE_WALL_CLOCK_BUDGET_SECONDS,
+                report.serial_expected_markers.join(", ")
+            )
         } else if !report.serial_expected_markers.is_empty() && !report.serial_markers_observed {
             format!(
                 "Linux protected-mode entry has not yet emitted the required serial milestones: {}.",
@@ -3685,7 +3956,7 @@ mod windows_whp {
             report.calls.push(NativeWhpCallReport {
                 name: "DecodeX64IoPortAccess",
                 hresult: None,
-                ok: access_size == 1 && (SERIAL_COM1_PORT..=SERIAL_COM1_LAST_PORT).contains(&port),
+                ok: true,
                 detail: format!(
                     "I/O exit write={is_write} size={access_size} port=0x{port:04x} byte=0x{serial_byte:02x} rip=0x{rip:016x} instruction_length={instruction_length}."
                 ),
@@ -3845,17 +4116,19 @@ mod windows_whp {
     #[cfg(test)]
     mod tests {
         use super::{
-            decode_exit_context, default_linux_msr_state, framebuffer_snapshot_report,
-            guest_contract_failure_blocker, guest_contract_passed, input_queue_snapshot_report,
-            linux_entry_probe_detail, linux_entry_probe_exit_budget, linux_entry_probe_passed,
-            linux_protected_mode_registers, serial_contract_passed, serial_markers_observed,
-            Com1SerialState, DecodedExit, LegacyDeviceIoState, ACPI_PM1_CONTROL_PORT,
-            ACPI_PM1_ENABLE_PORT, ACPI_PM1_STATUS_PORT, ACPI_PM_TIMER_PORT, ALT_DELAY_PORT,
-            ALT_POST_DELAY_PORT, CMOS_ADDRESS_PORT, CMOS_DATA_PORT, CPUID_DEFAULT_RAX_OFFSET,
-            CPUID_DEFAULT_RBX_OFFSET, CPUID_DEFAULT_RCX_OFFSET, CPUID_DEFAULT_RDX_OFFSET,
-            CPUID_RAX_OFFSET, CPUID_RCX_OFFSET, ELCR1_PORT, ELCR2_PORT, IO_ACCESS_INFO_OFFSET,
+            compact_linux_entry_probe_calls, decode_exit_context, default_linux_msr_state,
+            framebuffer_snapshot_report, guest_contract_failure_blocker, guest_contract_passed,
+            input_queue_snapshot_report, linux_entry_probe_detail, linux_entry_probe_exit_budget,
+            linux_entry_probe_passed, linux_protected_mode_registers, serial_contract_passed,
+            serial_markers_observed, Com1SerialState, DecodedExit, LegacyDeviceIoState,
+            ACPI_PM1_CONTROL_PORT, ACPI_PM1_ENABLE_PORT, ACPI_PM1_STATUS_PORT, ACPI_PM_TIMER_PORT,
+            ALT_DELAY_PORT, ALT_POST_DELAY_PORT, CMOS_ADDRESS_PORT, CMOS_DATA_PORT,
+            CPUID_DEFAULT_RAX_OFFSET, CPUID_DEFAULT_RBX_OFFSET, CPUID_DEFAULT_RCX_OFFSET,
+            CPUID_DEFAULT_RDX_OFFSET, CPUID_RAX_OFFSET, CPUID_RCX_OFFSET,
+            DMA_PAGE_REGISTER_START_PORT, ELCR1_PORT, ELCR2_PORT, IO_ACCESS_INFO_OFFSET,
             IO_PORT_OFFSET, IO_RAX_OFFSET, LINUX_ENTRY_PROBE_EXIT_BUDGET,
-            LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET, MEMORY_ACCESS_INFO_OFFSET, MEMORY_GPA_OFFSET,
+            LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET, LINUX_ENTRY_PROBE_TRACE_HEAD,
+            LINUX_ENTRY_PROBE_TRACE_TAIL, MEMORY_ACCESS_INFO_OFFSET, MEMORY_GPA_OFFSET,
             MEMORY_GVA_OFFSET, MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET, MSR_RAX_OFFSET,
             MSR_RDX_OFFSET, PCI_CONFIG_ADDRESS_PORT, PCI_CONFIG_DATA_START_PORT, PIC1_DATA_PORT,
             PIC2_DATA_PORT, PIT_CHANNEL0_PORT, PIT_COMMAND_PORT, POST_DELAY_PORT, PS2_DATA_PORT,
@@ -3988,6 +4261,7 @@ mod windows_whp {
             assert_eq!(io.access(SYSTEM_CONTROL_PORT_A, true, 1, 0x02), Some(0x02));
             assert_eq!(io.access(SYSTEM_CONTROL_PORT_A, false, 1, 0), Some(0x02));
             assert_eq!(io.access(SYSTEM_CONTROL_PORT_B, true, 1, 0x03), Some(0x03));
+            assert_eq!(io.access(SYSTEM_CONTROL_PORT_B, false, 1, 0), Some(0x23));
             assert_eq!(io.access(SYSTEM_CONTROL_PORT_B, false, 1, 0), Some(0x03));
             assert_eq!(io.access(CMOS_ADDRESS_PORT, true, 1, 0x0d), Some(0x0d));
             assert_eq!(io.access(CMOS_DATA_PORT, false, 1, 0), Some(0x80));
@@ -3996,6 +4270,21 @@ mod windows_whp {
             assert_eq!(io.access(ELCR2_PORT, true, 1, 0x0e), Some(0x0e));
             assert_eq!(io.access(ELCR2_PORT, false, 1, 0), Some(0x0e));
             assert_eq!(io.access(POST_DELAY_PORT, true, 1, 0), Some(0));
+            assert_eq!(
+                io.access(DMA_PAGE_REGISTER_START_PORT + 6, false, 1, 0),
+                Some(0)
+            );
+            assert_eq!(
+                io.access(DMA_PAGE_REGISTER_START_PORT + 6, true, 1, 0x5a),
+                Some(0x5a)
+            );
+            assert_eq!(
+                io.access(DMA_PAGE_REGISTER_START_PORT + 6, false, 1, 0),
+                Some(0x5a)
+            );
+            assert_eq!(io.access(0x02f9, false, 1, 0), Some(0));
+            assert_eq!(io.access(0x02fd, false, 1, 0), Some(0x60));
+            assert_eq!(io.access(0x02f9, true, 1, 0x01), Some(0x01));
             assert_eq!(io.access(ALT_POST_DELAY_PORT, true, 1, 0), Some(0));
             assert_eq!(io.access(ALT_DELAY_PORT, true, 1, 0), Some(0));
             assert_eq!(io.access(0x1234, false, 1, 0), None);
@@ -4618,6 +4907,40 @@ mod windows_whp {
                 LINUX_ENTRY_PROBE_EXIT_BUDGET
             );
             assert!(LINUX_ENTRY_PROBE_EXIT_BUDGET > LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET);
+        }
+
+        #[test]
+        fn linux_entry_probe_compacts_noisy_success_calls_but_keeps_failures() {
+            let mut report = base_report();
+            for index in 0..(LINUX_ENTRY_PROBE_TRACE_HEAD + LINUX_ENTRY_PROBE_TRACE_TAIL + 8) {
+                report.calls.push(crate::native::NativeWhpCallReport {
+                    name: "DecodeX64IoPortAccess",
+                    hresult: None,
+                    ok: true,
+                    detail: format!("noisy {index}"),
+                });
+            }
+            report.calls.push(crate::native::NativeWhpCallReport {
+                name: "UnsupportedIoPort",
+                hresult: None,
+                ok: false,
+                detail: "unsupported".to_string(),
+            });
+
+            compact_linux_entry_probe_calls(&mut report);
+
+            assert!(report
+                .calls
+                .iter()
+                .any(|call| call.name == "LinuxEntryProbeTraceCompacted"));
+            assert!(report
+                .calls
+                .iter()
+                .any(|call| call.name == "UnsupportedIoPort" && !call.ok));
+            assert!(
+                report.calls.len()
+                    < LINUX_ENTRY_PROBE_TRACE_HEAD + LINUX_ENTRY_PROBE_TRACE_TAIL + 8
+            );
         }
 
         #[test]

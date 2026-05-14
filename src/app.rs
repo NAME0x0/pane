@@ -5332,6 +5332,7 @@ static int pane_block_create_disk(int index, int pane_device_id, const char *nam
 
     pane_disk->disk->major = pane_disk->major;
     pane_disk->disk->first_minor = 0;
+    pane_disk->disk->minors = 16;
     pane_disk->disk->fops = &pane_block_fops;
     pane_disk->disk->private_data = pane_disk;
     snprintf(pane_disk->disk->disk_name, DISK_NAME_LEN, "%s", name);
@@ -5433,7 +5434,7 @@ set -eu
 output="${1:-pane-storage-discovery.cpio}"
 case "$output" in
     /*) output_path="$output" ;;
-    *) output_path="$OLDPWD/$output" ;;
+    *) output_path="$PWD/$output" ;;
 esac
 workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
@@ -6679,6 +6680,15 @@ fn augment_kernel_cmdline_for_runtime_contracts(
     append_kernel_arg(&mut cmdline, "ignore_loglevel".to_string());
     append_kernel_arg(&mut cmdline, "panic=-1".to_string());
     append_kernel_arg(&mut cmdline, "nomodeset".to_string());
+    append_kernel_arg(&mut cmdline, "lpj=1000000".to_string());
+    append_kernel_arg(&mut cmdline, "tsc=reliable".to_string());
+    append_kernel_arg(&mut cmdline, "clocksource=tsc".to_string());
+    append_kernel_arg(&mut cmdline, "no_timer_check".to_string());
+    append_kernel_arg(&mut cmdline, "i8042.noaux".to_string());
+    append_kernel_arg(&mut cmdline, "acpi=off".to_string());
+    append_kernel_arg(&mut cmdline, "pci=off".to_string());
+    append_kernel_arg(&mut cmdline, "noapic".to_string());
+    append_kernel_arg(&mut cmdline, "nolapic".to_string());
     if let Some(storage) = storage {
         append_kernel_arg(
             &mut cmdline,
@@ -13968,6 +13978,7 @@ mod tests {
         assert!(build_script.contains("$workdir/lib/modules"));
         assert!(build_script.contains("output_path="));
         assert!(build_script.contains("/*) output_path=\"$output\""));
+        assert!(build_script.contains("*) output_path=\"$PWD/$output\""));
         assert!(build_script.contains("-o \"$workdir/init\" pane-init.c"));
         assert!(build_script.contains("pane-port-probe"));
         assert!(build_script.contains("pane-block.ko"));
@@ -13988,6 +13999,7 @@ mod tests {
         assert!(block_driver.contains("vmalloc(PANE_BLOCK_IO_BLOCK_SIZE_BYTES)"));
         assert!(block_driver.contains("absolute_byte"));
         assert!(block_driver.contains("partial filesystem writes"));
+        assert!(block_driver.contains("pane_disk->disk->minors = 16"));
         assert!(block_driver.contains("add_disk"));
         assert!(block_driver.contains("/dev/pane0"));
         assert!(block_driver.contains("/dev/pane1"));
@@ -14426,6 +14438,15 @@ mod tests {
         assert!(layout.cmdline.contains("loglevel=7"));
         assert!(layout.cmdline.contains("ignore_loglevel"));
         assert!(layout.cmdline.contains("nomodeset"));
+        assert!(layout.cmdline.contains("lpj=1000000"));
+        assert!(layout.cmdline.contains("tsc=reliable"));
+        assert!(layout.cmdline.contains("clocksource=tsc"));
+        assert!(layout.cmdline.contains("no_timer_check"));
+        assert!(layout.cmdline.contains("i8042.noaux"));
+        assert!(layout.cmdline.contains("acpi=off"));
+        assert!(layout.cmdline.contains("pci=off"));
+        assert!(layout.cmdline.contains("noapic"));
+        assert!(layout.cmdline.contains("nolapic"));
         assert_eq!(
             layout
                 .cmdline

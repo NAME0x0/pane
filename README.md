@@ -234,7 +234,7 @@ What exists today:
 - width-aware legacy PIC/PIT/ELCR/CMOS RTC/system-control A/B/delay/PCI-config/i8042/VGA/ACPI PM probe port handling with explicit unsupported-I/O blockers for the next device-model gap,
 - deterministic i8042 command-byte, controller self-test, interface-test, and output-port responses for Linux PS/2 controller probing,
 - milestone-aware Linux probe exit budgeting and reporting so storage-backed Arch boot gets enough WHP exits to reach initramfs/root-handoff markers,
-- separate readiness reporting for the first WHP boot spike versus a stricter native Arch boot attempt, including explicit blockers for missing kernel plans, initramfs driver bundles, pane-block modules, discovery initramfs artifacts, and materialized kernel layouts,
+- separate `pane runtime` and `pane native-preflight` readiness reporting for the first WHP boot spike versus a stricter native Arch boot attempt, including explicit blockers for missing kernel plans, initramfs driver bundles, pane-block modules, discovery initramfs artifacts, and materialized kernel layouts,
 - minimal COM1 UART behavior for early serial setup,
 - guarded WHP partition/vCPU execution with deterministic fixture validation.
 

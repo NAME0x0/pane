@@ -173,6 +173,7 @@ struct NativePreflightReport {
     host: crate::native::NativeHostPreflightReport,
     runtime: RuntimeReport,
     ready_for_boot_spike: bool,
+    ready_for_arch_boot_attempt: bool,
     blockers: Vec<String>,
     next_steps: Vec<String>,
 }
@@ -2101,6 +2102,7 @@ fn native_preflight(args: NativePreflightArgs) -> AppResult<()> {
     let runtime = build_runtime_report(&session_name, DEFAULT_RUNTIME_CAPACITY_GIB, false)?;
     let host = runtime.native_host.clone();
     let ready_for_boot_spike = runtime.native_runtime.ready_for_boot_spike;
+    let ready_for_arch_boot_attempt = runtime.native_runtime.ready_for_arch_boot_attempt;
     let blockers = runtime.native_runtime.blockers.clone();
     let mut next_steps = host.next_steps.clone();
     next_steps.extend(runtime.next_steps.clone());
@@ -2112,6 +2114,7 @@ fn native_preflight(args: NativePreflightArgs) -> AppResult<()> {
         host,
         runtime,
         ready_for_boot_spike,
+        ready_for_arch_boot_attempt,
         blockers,
         next_steps,
     };
@@ -11298,7 +11301,11 @@ fn print_runtime_report(report: &RuntimeReport) {
 fn print_native_preflight_report(report: &NativePreflightReport) {
     println!("Pane Native Runtime Preflight");
     println!("  Session        {}", report.session_name);
-    println!("  Ready          {}", yes_no(report.ready_for_boot_spike));
+    println!("  Boot Spike     {}", yes_no(report.ready_for_boot_spike));
+    println!(
+        "  Arch Boot Try  {}",
+        yes_no(report.ready_for_arch_boot_attempt)
+    );
     println!("Host");
     println!("  OS             {}", report.host.host_os);
     println!("  Arch           {}", report.host.host_arch);

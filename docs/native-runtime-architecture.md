@@ -30,6 +30,7 @@ Pane currently owns:
 - a first Pane-owned `x8r8g8b8` framebuffer contract and initialized input queue mapped into guest memory for the future app-rendered display boundary, plus Linux `boot_params.screen_info` population and host-side framebuffer/input snapshot reporting after guarded WHP runs,
 - a first keyboard/pointer input queue contract mapped into guest memory for the future app-owned input path, including a `PANEINQ1` ABI header with queue size, event-record size, producer/consumer indexes, and capacity metadata,
 - Pane runtime contract discovery arguments added to the Linux kernel command line for early boot consumers,
+- separate readiness reporting for the guarded WHP boot spike and the stricter native Arch boot attempt path, so missing kernel plans, initramfs driver bundles, pane-block modules, discovery initramfs artifacts, or materialized kernel layouts are surfaced before execution,
 - native host preflight through `pane native-preflight`,
 - a guarded WHP partition/vCPU lifecycle smoke through `pane native-boot-spike --execute`,
 - a guarded WHP guest-memory/register/vCPU execution test image through `pane native-boot-spike --prepare-runtime --execute --run-fixture`,

@@ -750,6 +750,7 @@ struct NativeRuntimeReport {
     bootable: bool,
     host_ready: bool,
     ready_for_boot_spike: bool,
+    ready_for_arch_boot_attempt: bool,
     requires_wsl: bool,
     requires_mstsc: bool,
     requires_xrdp: bool,
@@ -1649,6 +1650,10 @@ fn launch_pane_owned_runtime(args: LaunchArgs) -> AppResult<()> {
     println!(
         "  Boot Spike     {}",
         yes_no(report.native_runtime.ready_for_boot_spike)
+    );
+    println!(
+        "  Arch Boot Try  {}",
+        yes_no(report.native_runtime.ready_for_arch_boot_attempt)
     );
     println!(
         "  Bootable       {}",
@@ -8503,17 +8508,23 @@ fn build_native_runtime_report(
                     .to_string(),
             );
         }
-        if artifacts.base_os_image_verified
-            && artifacts.user_disk_ready
-            && !artifacts.initramfs_driver_bundle_ready
-        {
+        let native_storage_ready = artifacts.base_os_image_verified
+            && artifacts.base_os_bootable_disk_hint == Some(true)
+            && artifacts.base_os_root_partition_hint == Some(true)
+            && artifacts.user_disk_ready;
+        if native_storage_ready && !artifacts.kernel_boot_plan_ready {
+            blockers.push(
+                "No verified Linux kernel boot plan exists for the native Arch boot path. Register a complete boot set with `pane runtime --register-native-boot-set-manifest <pane-native-boot-set.json>`."
+                    .to_string(),
+            );
+        }
+        if native_storage_ready && !artifacts.initramfs_driver_bundle_ready {
             blockers.push(
                 "No valid Pane initramfs driver source bundle exists for native root storage discovery. Run `pane runtime --write-initramfs-driver`."
                     .to_string(),
             );
         }
-        if artifacts.base_os_image_verified
-            && artifacts.user_disk_ready
+        if native_storage_ready
             && artifacts.initramfs_driver_bundle_ready
             && !artifacts.pane_block_module_verified
         {
@@ -8522,14 +8533,25 @@ fn build_native_runtime_report(
                     .to_string(),
             );
         }
-        if artifacts.base_os_image_verified
-            && artifacts.user_disk_ready
+        if native_storage_ready
             && artifacts.initramfs_driver_bundle_ready
             && artifacts.pane_block_module_verified
             && !artifacts.initramfs_image_verified
         {
             blockers.push(
                 "No verified Pane discovery initramfs artifact exists for native root storage discovery. Run `pane runtime --build-discovery-initramfs`, or register an externally built initramfs with `pane runtime --register-initramfs <path> --initramfs-expected-sha256 <sha256>`."
+                    .to_string(),
+            );
+        }
+        if native_storage_ready
+            && artifacts.kernel_boot_plan_ready
+            && artifacts.initramfs_driver_bundle_ready
+            && artifacts.pane_block_module_verified
+            && artifacts.initramfs_image_verified
+            && !artifacts.kernel_boot_layout_ready
+        {
+            blockers.push(
+                "No materialized native kernel boot layout exists. Run `pane native-kernel-plan --prepare-runtime --materialize` after registering the verified boot artifacts."
                     .to_string(),
             );
         }
@@ -8581,6 +8603,21 @@ fn build_native_runtime_report(
         && artifacts.framebuffer_contract_ready
         && artifacts.input_contract_ready
         && native_host.ready_for_boot_spike;
+    let ready_for_arch_boot_attempt = prepared
+        && artifacts.base_os_image_verified
+        && artifacts.base_os_bootable_disk_hint == Some(true)
+        && artifacts.base_os_root_partition_hint == Some(true)
+        && artifacts.user_disk_ready
+        && artifacts.runtime_config_exists
+        && artifacts.native_manifest_exists
+        && artifacts.framebuffer_contract_ready
+        && artifacts.input_contract_ready
+        && native_host.ready_for_boot_spike
+        && artifacts.kernel_boot_plan_ready
+        && artifacts.initramfs_driver_bundle_ready
+        && artifacts.pane_block_module_verified
+        && artifacts.initramfs_image_verified
+        && artifacts.kernel_boot_layout_ready;
 
     NativeRuntimeReport {
         state,
@@ -8588,6 +8625,7 @@ fn build_native_runtime_report(
         bootable: false,
         host_ready: native_host.ready_for_boot_spike,
         ready_for_boot_spike,
+        ready_for_arch_boot_attempt,
         requires_wsl: false,
         requires_mstsc: false,
         requires_xrdp: false,
@@ -13161,6 +13199,11 @@ mod tests {
         let native = build_native_runtime_report(true, &artifacts, &native_host);
         assert_eq!(native.state, NativeRuntimeState::EngineNotImplemented);
         assert!(native.ready_for_boot_spike);
+        assert!(!native.ready_for_arch_boot_attempt);
+        assert!(native
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("No verified Linux kernel boot plan")));
         assert!(!native
             .blockers
             .iter()
@@ -14111,6 +14154,10 @@ mod tests {
     fn kernel_boot_layout_attaches_verified_storage_and_display_contracts() {
         let paths = temp_runtime_paths("kernel-layout-storage-display");
         super::prepare_runtime_paths(&paths).unwrap();
+        super::write_runtime_config(&paths, "pane", &runtime_storage_budget(8)).unwrap();
+        super::write_native_runtime_manifest(&paths, "pane").unwrap();
+        super::write_framebuffer_contract(&paths).unwrap();
+        super::write_input_contract(&paths).unwrap();
         let base = paths.downloads.join("arch-base.img");
         let kernel = paths.downloads.join("vmlinuz-linux");
         let mut base_image = vec![0_u8; 4 * 1024 * 1024];
@@ -14245,6 +14292,9 @@ mod tests {
 
         let artifacts = build_runtime_artifact_report(&paths);
         assert!(artifacts.kernel_boot_layout_ready);
+        let native_runtime =
+            build_native_runtime_report(true, &artifacts, &test_native_host_report(true));
+        assert!(native_runtime.ready_for_arch_boot_attempt);
 
         let _ = std::fs::remove_dir_all(&paths.root);
     }

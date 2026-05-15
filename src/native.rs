@@ -1389,6 +1389,19 @@ mod windows_whp {
         irr_vectors: Vec<u8>,
     }
 
+    #[derive(Copy, Clone, Debug)]
+    struct TimerInterruptReadiness {
+        rflags: u64,
+        interrupt_state: u64,
+        pending_interruption: u64,
+        deliverability: u64,
+        interrupts_enabled: bool,
+        interrupt_shadow: bool,
+        irq0_unmasked: bool,
+        ready: bool,
+        blocker: &'static str,
+    }
+
     #[link(name = "kernel32")]
     extern "system" {
         fn LoadLibraryA(lp_lib_file_name: *const c_char) -> *mut c_void;
@@ -3134,6 +3147,57 @@ mod windows_whp {
                         break;
                     }
 
+                    if let Some(get_virtual_processor_registers) = get_virtual_processor_registers {
+                        match capture_timer_interrupt_readiness(
+                            partition,
+                            get_virtual_processor_registers,
+                            legacy_io_state.timer_interrupt_vector(),
+                            legacy_io_state.timer_interrupt_unmasked(),
+                            report,
+                        ) {
+                            Some(readiness) if !readiness.ready => {
+                                report.calls.push(NativeWhpCallReport {
+                                    name: "LinuxEntryProbeTimerInterruptDeferred",
+                                    hresult: None,
+                                    ok: true,
+                                    detail: format!(
+                                        "Deferred native timer interrupt vector 0x{:02x}; guest is not ready for maskable interrupt delivery yet: {}.",
+                                        legacy_io_state.timer_interrupt_vector(),
+                                        readiness.blocker
+                                    ),
+                                });
+                                if let Some(path) = checkpoint_path.as_deref() {
+                                    write_linux_entry_probe_checkpoint(
+                                        path,
+                                        report,
+                                        "timer-interrupt-deferred",
+                                        probe_started_at,
+                                    );
+                                    last_checkpoint_at = Instant::now();
+                                }
+                                continue;
+                            }
+                            Some(_) => {}
+                            None => {
+                                report.calls.push(NativeWhpCallReport {
+                                    name: "LinuxEntryProbeTimesliceBoundary",
+                                    hresult: None,
+                                    ok: false,
+                                    detail: "Pane regained control at a WHP time-slice boundary but could not verify guest interrupt readiness, so it refused to request the native timer interrupt.".to_string(),
+                                });
+                                if let Some(path) = checkpoint_path.as_deref() {
+                                    write_linux_entry_probe_checkpoint(
+                                        path,
+                                        report,
+                                        "timer-readiness-unavailable",
+                                        probe_started_at,
+                                    );
+                                }
+                                break;
+                            }
+                        }
+                    }
+
                     let timer_request_ok = if let Some(request_interrupt) = request_interrupt {
                         request_native_timer_interrupt(
                             partition,
@@ -3306,6 +3370,117 @@ mod windows_whp {
             ),
         });
         ok
+    }
+
+    fn capture_timer_interrupt_readiness(
+        partition: *mut c_void,
+        get_virtual_processor_registers: WhvGetVirtualProcessorRegisters,
+        timer_vector: u8,
+        irq0_unmasked: bool,
+        report: &mut NativePartitionSmokeReport,
+    ) -> Option<TimerInterruptReadiness> {
+        let register_names = [
+            WHV_REGISTER_RFLAGS,
+            WHV_REGISTER_INTERRUPT_STATE,
+            WHV_REGISTER_PENDING_INTERRUPTION,
+            WHV_REGISTER_DELIVERABILITY_NOTIFICATIONS,
+        ];
+        let values = read_virtual_processor_registers_resilient(
+            partition,
+            get_virtual_processor_registers,
+            &register_names,
+            "timer-readiness",
+            report,
+        );
+        let [Some(rflags), Some(interrupt_state), Some(pending_interruption), Some(deliverability)] =
+            values.as_slice()
+        else {
+            report.calls.push(NativeWhpCallReport {
+                name: "LinuxEntryProbeTimerInterruptReadiness",
+                hresult: None,
+                ok: false,
+                detail: format!(
+                    "Could not read the full guest interrupt-readiness register set before requesting timer vector 0x{timer_vector:02x}."
+                ),
+            });
+            return None;
+        };
+        let readiness = timer_interrupt_readiness(
+            *rflags,
+            *interrupt_state,
+            *pending_interruption,
+            *deliverability,
+            irq0_unmasked,
+        );
+        report.calls.push(NativeWhpCallReport {
+            name: "LinuxEntryProbeTimerInterruptReadiness",
+            hresult: None,
+            ok: readiness.ready,
+            detail: format!(
+                "timer_vector=0x{timer_vector:02x}, irq0_unmasked={}, rflags=0x{:016x}, interrupts_enabled={}, interrupt_state=0x{:016x}, interrupt_shadow={}, pending_interruption=0x{:016x}, deliverability=0x{:016x}, ready={}, blocker={}.",
+                readiness.irq0_unmasked,
+                readiness.rflags,
+                readiness.interrupts_enabled,
+                readiness.interrupt_state,
+                readiness.interrupt_shadow,
+                readiness.pending_interruption,
+                readiness.deliverability,
+                readiness.ready,
+                readiness.blocker,
+            ),
+        });
+        Some(readiness)
+    }
+
+    fn timer_interrupt_readiness(
+        rflags: u64,
+        interrupt_state: u64,
+        pending_interruption: u64,
+        deliverability: u64,
+        irq0_unmasked: bool,
+    ) -> TimerInterruptReadiness {
+        let interrupts_enabled = rflags & 0x0200 != 0;
+        let interrupt_shadow = interrupt_state & 0x1 != 0;
+        let blocker = timer_interrupt_readiness_blocker(
+            interrupts_enabled,
+            interrupt_shadow,
+            irq0_unmasked,
+            pending_interruption,
+            deliverability,
+        );
+        TimerInterruptReadiness {
+            rflags,
+            interrupt_state,
+            pending_interruption,
+            deliverability,
+            interrupts_enabled,
+            interrupt_shadow,
+            irq0_unmasked,
+            ready: blocker == "ready",
+            blocker,
+        }
+    }
+
+    fn timer_interrupt_readiness_blocker(
+        interrupts_enabled: bool,
+        interrupt_shadow: bool,
+        irq0_unmasked: bool,
+        pending_interruption: u64,
+        deliverability: u64,
+    ) -> &'static str {
+        if !irq0_unmasked {
+            "pic-irq0-masked"
+        } else if !interrupts_enabled {
+            "guest-interrupts-disabled"
+        } else if interrupt_shadow {
+            "guest-interrupt-shadow"
+        } else if pending_interruption != 0 {
+            "pending-interruption-not-delivered"
+        } else if deliverability != 0 {
+            "deliverability-notification-set"
+        } else {
+            "ready"
+        }
     }
 
     fn capture_interrupt_delivery_snapshot(
@@ -3639,7 +3814,7 @@ mod windows_whp {
             "WHvGetVirtualProcessorRegisters(interrupt-group)",
             hresult,
             if ok {
-                "Captured a guest interrupt/APIC register group after the guarded post-timer resume."
+                "Captured a guest interrupt/APIC register group for native interrupt diagnostics."
             } else {
                 "Could not capture a guest interrupt/APIC register group; falling back to per-register reads."
             },
@@ -4877,11 +5052,18 @@ mod windows_whp {
             .iter()
             .any(|call| call.name == "LinuxEntryProbeWallClockBudget" && !call.ok)
         {
-            format!(
-                "Linux protected-mode entry exceeded the {}s wall-clock probe budget before emitting the required serial milestones: {}.",
-                LINUX_ENTRY_PROBE_WALL_CLOCK_BUDGET_SECONDS,
-                report.serial_expected_markers.join(", ")
-            )
+            if let Some(blocker) = timer_interrupt_readiness_report_blocker(report) {
+                format!(
+                    "Linux protected-mode entry exceeded the {}s wall-clock probe budget before emitting the required serial milestones; Pane deferred native timer injection because guest interrupt readiness remained blocked by {blocker}.",
+                    LINUX_ENTRY_PROBE_WALL_CLOCK_BUDGET_SECONDS,
+                )
+            } else {
+                format!(
+                    "Linux protected-mode entry exceeded the {}s wall-clock probe budget before emitting the required serial milestones: {}.",
+                    LINUX_ENTRY_PROBE_WALL_CLOCK_BUDGET_SECONDS,
+                    report.serial_expected_markers.join(", ")
+                )
+            }
         } else if report
             .calls
             .iter()
@@ -4952,6 +5134,24 @@ mod windows_whp {
                     .nth(1)
                     .and_then(|tail| tail.split('.').next())
                     .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            })
+    }
+
+    fn timer_interrupt_readiness_report_blocker(
+        report: &NativePartitionSmokeReport,
+    ) -> Option<String> {
+        report
+            .calls
+            .iter()
+            .rev()
+            .find(|call| call.name == "LinuxEntryProbeTimerInterruptReadiness")
+            .and_then(|call| {
+                call.detail
+                    .split("blocker=")
+                    .nth(1)
+                    .and_then(|tail| tail.split('.').next())
+                    .filter(|value| !value.is_empty() && *value != "ready")
                     .map(str::to_string)
             })
     }
@@ -5220,11 +5420,13 @@ mod windows_whp {
             interrupt_delivery_blocker, interrupt_delivery_snapshot_blocker,
             linux_entry_probe_detail, linux_entry_probe_exit_budget, linux_entry_probe_passed,
             linux_protected_mode_registers, parse_xapic_interrupt_controller_state,
-            serial_contract_passed, serial_markers_observed, xapic_state_vectors, Com1SerialState,
-            DecodedExit, LegacyDeviceIoState, ACPI_PM1_CONTROL_PORT, ACPI_PM1_ENABLE_PORT,
-            ACPI_PM1_STATUS_PORT, ACPI_PM_TIMER_PORT, ALT_DELAY_PORT, ALT_POST_DELAY_PORT,
-            CMOS_ADDRESS_PORT, CMOS_DATA_PORT, CPUID_DEFAULT_RAX_OFFSET, CPUID_DEFAULT_RBX_OFFSET,
-            CPUID_DEFAULT_RCX_OFFSET, CPUID_DEFAULT_RDX_OFFSET, CPUID_RAX_OFFSET, CPUID_RCX_OFFSET,
+            serial_contract_passed, serial_markers_observed, timer_interrupt_readiness,
+            timer_interrupt_readiness_blocker, timer_interrupt_readiness_report_blocker,
+            xapic_state_vectors, Com1SerialState, DecodedExit, LegacyDeviceIoState,
+            ACPI_PM1_CONTROL_PORT, ACPI_PM1_ENABLE_PORT, ACPI_PM1_STATUS_PORT, ACPI_PM_TIMER_PORT,
+            ALT_DELAY_PORT, ALT_POST_DELAY_PORT, CMOS_ADDRESS_PORT, CMOS_DATA_PORT,
+            CPUID_DEFAULT_RAX_OFFSET, CPUID_DEFAULT_RBX_OFFSET, CPUID_DEFAULT_RCX_OFFSET,
+            CPUID_DEFAULT_RDX_OFFSET, CPUID_RAX_OFFSET, CPUID_RCX_OFFSET,
             DMA_PAGE_REGISTER_START_PORT, ELCR1_PORT, ELCR2_PORT, IO_ACCESS_INFO_OFFSET,
             IO_PORT_OFFSET, IO_RAX_OFFSET, LINUX_ENTRY_PROBE_EXIT_BUDGET,
             LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET, LINUX_ENTRY_PROBE_TRACE_HEAD,
@@ -6202,6 +6404,34 @@ mod windows_whp {
         }
 
         #[test]
+        fn linux_entry_probe_reports_deferred_timer_readiness_blocker() {
+            let mut report = base_report();
+            report.virtual_processor_ran = true;
+            report.exit_reason = Some(WHV_RUN_VP_EXIT_REASON_CANCELED);
+            report.exit_reason_label = Some("canceled".to_string());
+            report.calls.push(crate::native::NativeWhpCallReport {
+                name: "LinuxEntryProbeTimerInterruptReadiness",
+                hresult: None,
+                ok: false,
+                detail: "timer_vector=0x20, ready=false, blocker=guest-interrupts-disabled."
+                    .to_string(),
+            });
+            report.calls.push(crate::native::NativeWhpCallReport {
+                name: "LinuxEntryProbeWallClockBudget",
+                hresult: None,
+                ok: false,
+                detail: "budget".to_string(),
+            });
+
+            assert_eq!(
+                timer_interrupt_readiness_report_blocker(&report).as_deref(),
+                Some("guest-interrupts-disabled")
+            );
+            assert!(linux_entry_probe_detail(&report).contains("deferred native timer injection"));
+            assert!(linux_entry_probe_detail(&report).contains("guest-interrupts-disabled"));
+        }
+
+        #[test]
         fn interrupt_delivery_snapshot_helpers_classify_apic_state() {
             let mut words = vec![0_u64; 8];
             words[1] = 1;
@@ -6222,6 +6452,42 @@ mod windows_whp {
                 interrupt_delivery_blocker(true, false, true, false, true, 0, 0),
                 "timer-in-service-without-eoi"
             );
+        }
+
+        #[test]
+        fn timer_interrupt_readiness_requires_guest_interrupt_delivery_window() {
+            assert_eq!(
+                timer_interrupt_readiness_blocker(false, false, true, 0, 0),
+                "guest-interrupts-disabled"
+            );
+            assert_eq!(
+                timer_interrupt_readiness_blocker(true, true, true, 0, 0),
+                "guest-interrupt-shadow"
+            );
+            assert_eq!(
+                timer_interrupt_readiness_blocker(true, false, false, 0, 0),
+                "pic-irq0-masked"
+            );
+            assert_eq!(
+                timer_interrupt_readiness_blocker(true, false, true, 1, 0),
+                "pending-interruption-not-delivered"
+            );
+            assert_eq!(
+                timer_interrupt_readiness_blocker(true, false, true, 0, 1),
+                "deliverability-notification-set"
+            );
+            assert_eq!(
+                timer_interrupt_readiness_blocker(true, false, true, 0, 0),
+                "ready"
+            );
+
+            let blocked = timer_interrupt_readiness(0x0002, 0, 0, 0, true);
+            assert!(!blocked.ready);
+            assert_eq!(blocked.blocker, "guest-interrupts-disabled");
+
+            let ready = timer_interrupt_readiness(0x0202, 0, 0, 0, true);
+            assert!(ready.ready);
+            assert_eq!(ready.blocker, "ready");
         }
 
         #[test]

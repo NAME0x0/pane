@@ -1321,10 +1321,23 @@ mod windows_whp {
     type WhvRunVirtualProcessor =
         unsafe extern "system" fn(*mut c_void, u32, *mut c_void, u32) -> i32;
     type WhvCancelRunVirtualProcessor = unsafe extern "system" fn(*mut c_void, u32, u32) -> i32;
+    type WhvGetVirtualProcessorState =
+        unsafe extern "system" fn(*mut c_void, u32, u32, *mut c_void, u32, *mut u32) -> i32;
+    type WhvGetVirtualProcessorInterruptControllerState2 =
+        unsafe extern "system" fn(*mut c_void, u32, *mut c_void, u32, *mut u32) -> i32;
+    type WhvGetVirtualProcessorInterruptControllerState =
+        unsafe extern "system" fn(*mut c_void, u32, *mut c_void, u32, *mut u32) -> i32;
     type WhvRequestInterrupt =
         unsafe extern "system" fn(*mut c_void, *const WhvInterruptControl, u32) -> i32;
     type WhvMapGpaRange = unsafe extern "system" fn(*mut c_void, *mut c_void, u64, u64, u32) -> i32;
     type WhvUnmapGpaRange = unsafe extern "system" fn(*mut c_void, u64, u64) -> i32;
+    const WHV_VIRTUAL_PROCESSOR_STATE_TYPE_INTERRUPT_CONTROLLER_STATE2: u32 = 0x0000_1000;
+    const XAPIC_STATE_BYTES: usize = 4096;
+    const XAPIC_TPR_OFFSET: usize = 0x080;
+    const XAPIC_PPR_OFFSET: usize = 0x0a0;
+    const XAPIC_ISR_BASE_OFFSET: usize = 0x100;
+    const XAPIC_IRR_BASE_OFFSET: usize = 0x200;
+    const XAPIC_REGISTER_STRIDE: usize = 0x10;
 
     #[repr(C)]
     #[derive(Copy, Clone)]
@@ -1357,6 +1370,23 @@ mod windows_whp {
         control: u64,
         destination: u32,
         vector: u32,
+    }
+
+    #[derive(Copy, Clone, Default)]
+    struct WhpInterruptControllerStateReaders {
+        get_virtual_processor_state: Option<WhvGetVirtualProcessorState>,
+        get_interrupt_controller_state2: Option<WhvGetVirtualProcessorInterruptControllerState2>,
+        get_interrupt_controller_state: Option<WhvGetVirtualProcessorInterruptControllerState>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct XapicInterruptControllerSnapshot {
+        source: &'static str,
+        bytes_written: u32,
+        tpr: u32,
+        ppr: u32,
+        isr_vectors: Vec<u8>,
+        irr_vectors: Vec<u8>,
     }
 
     #[link(name = "kernel32")]
@@ -1629,6 +1659,33 @@ mod windows_whp {
             } else {
                 None
             };
+            let interrupt_controller_state_readers = if run_fixture {
+                WhpInterruptControllerStateReaders {
+                    get_virtual_processor_state: resolve_optional_whp_function::<
+                        WhvGetVirtualProcessorState,
+                    >(
+                        module,
+                        "WHvGetVirtualProcessorState",
+                        &mut report,
+                    ),
+                    get_interrupt_controller_state2: resolve_optional_whp_function::<
+                        WhvGetVirtualProcessorInterruptControllerState2,
+                    >(
+                        module,
+                        "WHvGetVirtualProcessorInterruptControllerState2",
+                        &mut report,
+                    ),
+                    get_interrupt_controller_state: resolve_optional_whp_function::<
+                        WhvGetVirtualProcessorInterruptControllerState,
+                    >(
+                        module,
+                        "WHvGetVirtualProcessorInterruptControllerState",
+                        &mut report,
+                    ),
+                }
+            } else {
+                WhpInterruptControllerStateReaders::default()
+            };
             let request_interrupt = if run_fixture {
                 match resolve_whp_function::<WhvRequestInterrupt>(
                     module,
@@ -1802,6 +1859,7 @@ mod windows_whp {
                             run_virtual_processor,
                             cancel_run_virtual_processor,
                             get_virtual_processor_registers,
+                            interrupt_controller_state_readers,
                             request_interrupt,
                             set_virtual_processor_registers,
                             boot_image,
@@ -1935,6 +1993,26 @@ mod windows_whp {
             report.blocker = Some(format!("Missing required WHP export `{symbol}`."));
             None
         }
+    }
+
+    unsafe fn resolve_optional_whp_function<T>(
+        module: *mut c_void,
+        symbol: &'static str,
+        report: &mut NativePartitionSmokeReport,
+    ) -> Option<T> {
+        let pointer = get_proc_address(module, symbol);
+        report.calls.push(NativeWhpCallReport {
+            name: symbol,
+            hresult: None,
+            ok: pointer.is_some(),
+            detail: if pointer.is_some() {
+                "Resolved optional WHP export.".to_string()
+            } else {
+                "Optional WHP export is unavailable on this host.".to_string()
+            },
+        });
+
+        pointer.map(|pointer| mem::transmute_copy::<*mut c_void, T>(&pointer))
     }
 
     fn hresult_succeeded(value: i32) -> bool {
@@ -2395,6 +2473,7 @@ mod windows_whp {
         run_virtual_processor: WhvRunVirtualProcessor,
         cancel_run_virtual_processor: Option<WhvCancelRunVirtualProcessor>,
         get_virtual_processor_registers: Option<WhvGetVirtualProcessorRegisters>,
+        interrupt_controller_state_readers: WhpInterruptControllerStateReaders,
         request_interrupt: Option<WhvRequestInterrupt>,
         set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
         boot_image: &NativeSerialBootImage,
@@ -2414,6 +2493,7 @@ mod windows_whp {
                 run_virtual_processor,
                 cancel_run_virtual_processor,
                 get_virtual_processor_registers,
+                interrupt_controller_state_readers,
                 request_interrupt,
                 set_virtual_processor_registers,
                 block_io_handler,
@@ -2567,6 +2647,7 @@ mod windows_whp {
         run_virtual_processor: WhvRunVirtualProcessor,
         cancel_run_virtual_processor: Option<WhvCancelRunVirtualProcessor>,
         get_virtual_processor_registers: Option<WhvGetVirtualProcessorRegisters>,
+        interrupt_controller_state_readers: WhpInterruptControllerStateReaders,
         request_interrupt: Option<WhvRequestInterrupt>,
         set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
         block_io_handler: Option<&NativeBlockIoHandler<'_>>,
@@ -3030,6 +3111,7 @@ mod windows_whp {
                             capture_interrupt_delivery_snapshot(
                                 partition,
                                 get_virtual_processor_registers,
+                                interrupt_controller_state_readers,
                                 legacy_io_state.timer_interrupt_vector(),
                                 legacy_io_state.timer_interrupt_unmasked(),
                                 report,
@@ -3229,6 +3311,7 @@ mod windows_whp {
     fn capture_interrupt_delivery_snapshot(
         partition: *mut c_void,
         get_virtual_processor_registers: WhvGetVirtualProcessorRegisters,
+        interrupt_controller_state_readers: WhpInterruptControllerStateReaders,
         timer_vector: u8,
         irq0_unmasked: bool,
         report: &mut NativePartitionSmokeReport,
@@ -3270,6 +3353,11 @@ mod windows_whp {
             "apic-irr",
             report,
         );
+        let controller_snapshot = capture_xapic_interrupt_controller_state(
+            partition,
+            interrupt_controller_state_readers,
+            report,
+        );
 
         let rflags = core_values[0].unwrap_or(0);
         let interrupt_state = core_values[1].unwrap_or(0);
@@ -3289,10 +3377,22 @@ mod windows_whp {
             .into_iter()
             .map(|value| value.unwrap_or(0))
             .collect::<Vec<_>>();
-        let isr_vectors = apic_bitmap_vectors(&isr_words);
-        let irr_vectors = apic_bitmap_vectors(&irr_words);
-        let timer_in_irr = irr_vectors.contains(&timer_vector);
-        let timer_in_isr = isr_vectors.contains(&timer_vector);
+        let register_isr_vectors = apic_bitmap_vectors(&isr_words);
+        let register_irr_vectors = apic_bitmap_vectors(&irr_words);
+        let controller_isr_vectors = controller_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.isr_vectors.clone())
+            .unwrap_or_default();
+        let controller_irr_vectors = controller_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.irr_vectors.clone())
+            .unwrap_or_default();
+        let timer_in_register_irr = register_irr_vectors.contains(&timer_vector);
+        let timer_in_register_isr = register_isr_vectors.contains(&timer_vector);
+        let timer_in_controller_irr = controller_irr_vectors.contains(&timer_vector);
+        let timer_in_controller_isr = controller_isr_vectors.contains(&timer_vector);
+        let timer_in_irr = timer_in_register_irr || timer_in_controller_irr;
+        let timer_in_isr = timer_in_register_isr || timer_in_controller_isr;
         let interrupts_enabled = rflags & 0x0200 != 0;
         let interrupt_shadow = interrupt_state & 0x1 != 0;
         let blocked_reason = interrupt_delivery_blocker(
@@ -3304,18 +3404,217 @@ mod windows_whp {
             pending_interruption,
             deliverability,
         );
+        let controller_source = controller_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.source)
+            .unwrap_or("unavailable");
+        let controller_bytes = controller_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.bytes_written)
+            .unwrap_or(0);
+        let controller_tpr = controller_snapshot
+            .as_ref()
+            .map(|snapshot| u64::from(snapshot.tpr))
+            .unwrap_or(0);
+        let controller_ppr = controller_snapshot
+            .as_ref()
+            .map(|snapshot| u64::from(snapshot.ppr))
+            .unwrap_or(0);
 
         report.calls.push(NativeWhpCallReport {
             name: "LinuxEntryProbeInterruptDeliverySnapshot",
             hresult: None,
             ok: false,
             detail: format!(
-                "timer_vector=0x{timer_vector:02x}, irq0_unmasked={irq0_unmasked}, rflags=0x{rflags:016x}, interrupts_enabled={interrupts_enabled}, interrupt_shadow={interrupt_shadow}, pending_interruption=0x{pending_interruption:016x}, pending_event=0x{pending_event:016x}, deliverability=0x{deliverability:016x}, internal_activity=0x{internal_activity:016x}, apic_tpr=0x{apic_tpr:016x}, apic_ppr=0x{apic_ppr:016x}, isr_available={isr_available}, irr_available={irr_available}, timer_in_irr={timer_in_irr}, timer_in_isr={timer_in_isr}, isr_vectors={}, irr_vectors={}, blocker={blocked_reason}.",
+                "timer_vector=0x{timer_vector:02x}, irq0_unmasked={irq0_unmasked}, rflags=0x{rflags:016x}, interrupts_enabled={interrupts_enabled}, interrupt_shadow={interrupt_shadow}, pending_interruption=0x{pending_interruption:016x}, pending_event=0x{pending_event:016x}, deliverability=0x{deliverability:016x}, internal_activity=0x{internal_activity:016x}, apic_tpr=0x{apic_tpr:016x}, apic_ppr=0x{apic_ppr:016x}, register_isr_available={isr_available}, register_irr_available={irr_available}, register_timer_in_irr={timer_in_register_irr}, register_timer_in_isr={timer_in_register_isr}, register_isr_vectors={}, register_irr_vectors={}, controller_source={controller_source}, controller_bytes={controller_bytes}, controller_apic_tpr=0x{controller_tpr:08x}, controller_apic_ppr=0x{controller_ppr:08x}, controller_timer_in_irr={timer_in_controller_irr}, controller_timer_in_isr={timer_in_controller_isr}, controller_isr_vectors={}, controller_irr_vectors={}, timer_in_irr={timer_in_irr}, timer_in_isr={timer_in_isr}, blocker={blocked_reason}.",
+                format_vector_list(&register_isr_vectors),
+                format_vector_list(&register_irr_vectors),
+                format_vector_list(&controller_isr_vectors),
+                format_vector_list(&controller_irr_vectors),
+            ),
+        });
+        true
+    }
+
+    fn capture_xapic_interrupt_controller_state(
+        partition: *mut c_void,
+        readers: WhpInterruptControllerStateReaders,
+        report: &mut NativePartitionSmokeReport,
+    ) -> Option<XapicInterruptControllerSnapshot> {
+        if let Some(get_virtual_processor_state) = readers.get_virtual_processor_state {
+            let mut state = vec![0_u8; XAPIC_STATE_BYTES];
+            let mut bytes_written = 0_u32;
+            let hresult = unsafe {
+                get_virtual_processor_state(
+                    partition,
+                    0,
+                    WHV_VIRTUAL_PROCESSOR_STATE_TYPE_INTERRUPT_CONTROLLER_STATE2,
+                    state.as_mut_ptr().cast::<c_void>(),
+                    state.len() as u32,
+                    &mut bytes_written,
+                )
+            };
+            let ok = hresult_succeeded(hresult);
+            report.calls.push(hresult_call(
+                "WHvGetVirtualProcessorState(InterruptControllerState2)",
+                hresult,
+                if ok {
+                    "Captured the WHP interrupt-controller state through the current VP state API."
+                } else {
+                    "Could not capture interrupt-controller state through the current VP state API."
+                },
+            ));
+            if ok {
+                return parse_xapic_interrupt_controller_state(
+                    "WHvGetVirtualProcessorState",
+                    &state,
+                    bytes_written,
+                    report,
+                );
+            }
+        }
+
+        if let Some(get_interrupt_controller_state2) = readers.get_interrupt_controller_state2 {
+            let mut state = vec![0_u8; XAPIC_STATE_BYTES];
+            let mut bytes_written = 0_u32;
+            let hresult = unsafe {
+                get_interrupt_controller_state2(
+                    partition,
+                    0,
+                    state.as_mut_ptr().cast::<c_void>(),
+                    state.len() as u32,
+                    &mut bytes_written,
+                )
+            };
+            let ok = hresult_succeeded(hresult);
+            report.calls.push(hresult_call(
+                "WHvGetVirtualProcessorInterruptControllerState2",
+                hresult,
+                if ok {
+                    "Captured the WHP interrupt-controller state through the State2 compatibility API."
+                } else {
+                    "Could not capture interrupt-controller state through the State2 compatibility API."
+                },
+            ));
+            if ok {
+                return parse_xapic_interrupt_controller_state(
+                    "WHvGetVirtualProcessorInterruptControllerState2",
+                    &state,
+                    bytes_written,
+                    report,
+                );
+            }
+        }
+
+        if let Some(get_interrupt_controller_state) = readers.get_interrupt_controller_state {
+            let mut state = vec![0_u8; XAPIC_STATE_BYTES];
+            let mut bytes_written = 0_u32;
+            let hresult = unsafe {
+                get_interrupt_controller_state(
+                    partition,
+                    0,
+                    state.as_mut_ptr().cast::<c_void>(),
+                    state.len() as u32,
+                    &mut bytes_written,
+                )
+            };
+            let ok = hresult_succeeded(hresult);
+            report.calls.push(hresult_call(
+                "WHvGetVirtualProcessorInterruptControllerState",
+                hresult,
+                if ok {
+                    "Captured the WHP interrupt-controller state through the legacy compatibility API."
+                } else {
+                    "Could not capture interrupt-controller state through the legacy compatibility API."
+                },
+            ));
+            if ok {
+                return parse_xapic_interrupt_controller_state(
+                    "WHvGetVirtualProcessorInterruptControllerState",
+                    &state,
+                    bytes_written,
+                    report,
+                );
+            }
+        }
+
+        report.calls.push(NativeWhpCallReport {
+            name: "LinuxEntryProbeInterruptControllerStateUnavailable",
+            hresult: None,
+            ok: false,
+            detail: "No WHP interrupt-controller state reader is available on this host; falling back to register-only interrupt diagnostics.".to_string(),
+        });
+        None
+    }
+
+    fn parse_xapic_interrupt_controller_state(
+        source: &'static str,
+        state: &[u8],
+        bytes_written: u32,
+        report: &mut NativePartitionSmokeReport,
+    ) -> Option<XapicInterruptControllerSnapshot> {
+        let available = if bytes_written == 0 {
+            state.len()
+        } else {
+            (bytes_written as usize).min(state.len())
+        };
+        let state = &state[..available];
+        let Some(tpr) = read_xapic_u32(state, XAPIC_TPR_OFFSET) else {
+            report.calls.push(NativeWhpCallReport {
+                name: "LinuxEntryProbeInterruptControllerState",
+                hresult: None,
+                ok: false,
+                detail: format!(
+                    "{source} returned {available} bytes, which is too small for xAPIC TPR/PPR/ISR/IRR parsing."
+                ),
+            });
+            return None;
+        };
+        let Some(ppr) = read_xapic_u32(state, XAPIC_PPR_OFFSET) else {
+            report.calls.push(NativeWhpCallReport {
+                name: "LinuxEntryProbeInterruptControllerState",
+                hresult: None,
+                ok: false,
+                detail: format!(
+                    "{source} returned {available} bytes, which is too small for xAPIC PPR parsing."
+                ),
+            });
+            return None;
+        };
+        let isr_vectors = xapic_state_vectors(state, XAPIC_ISR_BASE_OFFSET).unwrap_or_default();
+        let irr_vectors = xapic_state_vectors(state, XAPIC_IRR_BASE_OFFSET).unwrap_or_default();
+        report.calls.push(NativeWhpCallReport {
+            name: "LinuxEntryProbeInterruptControllerState",
+            hresult: None,
+            ok: true,
+            detail: format!(
+                "source={source}, bytes_written={bytes_written}, parsed_bytes={available}, tpr=0x{tpr:08x}, ppr=0x{ppr:08x}, isr_vectors={}, irr_vectors={}.",
                 format_vector_list(&isr_vectors),
                 format_vector_list(&irr_vectors),
             ),
         });
-        true
+        Some(XapicInterruptControllerSnapshot {
+            source,
+            bytes_written,
+            tpr,
+            ppr,
+            isr_vectors,
+            irr_vectors,
+        })
+    }
+
+    fn read_xapic_u32(state: &[u8], offset: usize) -> Option<u32> {
+        let bytes = state.get(offset..offset + mem::size_of::<u32>())?;
+        Some(u32::from_le_bytes(bytes.try_into().ok()?))
+    }
+
+    fn xapic_state_vectors(state: &[u8], base_offset: usize) -> Option<Vec<u8>> {
+        let mut words = Vec::with_capacity(8);
+        for register_index in 0..8 {
+            let offset = base_offset + register_index * XAPIC_REGISTER_STRIDE;
+            words.push(u64::from(read_xapic_u32(state, offset)?));
+        }
+        Some(apic_bitmap_vectors(&words))
     }
 
     fn read_virtual_processor_registers_resilient(
@@ -3380,9 +3679,9 @@ mod windows_whp {
     fn apic_bitmap_vectors(words: &[u64]) -> Vec<u8> {
         let mut vectors = Vec::new();
         for (word_index, word) in words.iter().enumerate() {
-            for bit_index in 0..64 {
+            for bit_index in 0..32 {
                 if (word >> bit_index) & 1 == 1 {
-                    let vector = word_index * 64 + bit_index;
+                    let vector = word_index * 32 + bit_index;
                     if vector <= u8::MAX as usize {
                         vectors.push(vector as u8);
                     }
@@ -4920,33 +5219,35 @@ mod windows_whp {
             guest_contract_failure_blocker, guest_contract_passed, input_queue_snapshot_report,
             interrupt_delivery_blocker, interrupt_delivery_snapshot_blocker,
             linux_entry_probe_detail, linux_entry_probe_exit_budget, linux_entry_probe_passed,
-            linux_protected_mode_registers, serial_contract_passed, serial_markers_observed,
-            Com1SerialState, DecodedExit, LegacyDeviceIoState, ACPI_PM1_CONTROL_PORT,
-            ACPI_PM1_ENABLE_PORT, ACPI_PM1_STATUS_PORT, ACPI_PM_TIMER_PORT, ALT_DELAY_PORT,
-            ALT_POST_DELAY_PORT, CMOS_ADDRESS_PORT, CMOS_DATA_PORT, CPUID_DEFAULT_RAX_OFFSET,
-            CPUID_DEFAULT_RBX_OFFSET, CPUID_DEFAULT_RCX_OFFSET, CPUID_DEFAULT_RDX_OFFSET,
-            CPUID_RAX_OFFSET, CPUID_RCX_OFFSET, DMA_PAGE_REGISTER_START_PORT, ELCR1_PORT,
-            ELCR2_PORT, IO_ACCESS_INFO_OFFSET, IO_PORT_OFFSET, IO_RAX_OFFSET,
-            LINUX_ENTRY_PROBE_EXIT_BUDGET, LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET,
-            LINUX_ENTRY_PROBE_TRACE_HEAD, LINUX_ENTRY_PROBE_TRACE_TAIL, MEMORY_ACCESS_INFO_OFFSET,
-            MEMORY_GPA_OFFSET, MEMORY_GVA_OFFSET, MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET,
-            MSR_RAX_OFFSET, MSR_RDX_OFFSET, PCI_CONFIG_ADDRESS_PORT, PCI_CONFIG_DATA_START_PORT,
-            PIC1_COMMAND_PORT, PIC1_DATA_PORT, PIC2_COMMAND_PORT, PIC2_DATA_PORT,
-            PIT_CHANNEL0_PORT, PIT_COMMAND_PORT, POST_DELAY_PORT, PS2_DATA_PORT,
-            PS2_STATUS_COMMAND_PORT, SERIAL_COM1_PORT, SYSTEM_CONTROL_PORT_A,
-            SYSTEM_CONTROL_PORT_B, VGA_ATTRIBUTE_DATA_READ_PORT, VGA_ATTRIBUTE_PORT,
-            VGA_CRTC_COLOR_DATA_PORT, VGA_CRTC_COLOR_INDEX_PORT, VGA_GRAPHICS_DATA_PORT,
-            VGA_GRAPHICS_INDEX_PORT, VGA_INPUT_STATUS_COLOR_PORT, VGA_MISC_OUTPUT_READ_PORT,
-            VGA_MISC_OUTPUT_WRITE_PORT, VGA_SEQUENCER_DATA_PORT, VGA_SEQUENCER_INDEX_PORT,
-            VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET, VP_CONTEXT_RIP_OFFSET, WHV_REGISTER_CR0,
-            WHV_REGISTER_CR3, WHV_REGISTER_CR4, WHV_REGISTER_CS, WHV_REGISTER_DS, WHV_REGISTER_ES,
-            WHV_REGISTER_GDTR, WHV_REGISTER_IDTR, WHV_REGISTER_RBP, WHV_REGISTER_RBX,
-            WHV_REGISTER_RDI, WHV_REGISTER_RFLAGS, WHV_REGISTER_RIP, WHV_REGISTER_RSI,
-            WHV_REGISTER_RSP, WHV_REGISTER_SS, WHV_RUN_VP_EXIT_REASON_CANCELED,
+            linux_protected_mode_registers, parse_xapic_interrupt_controller_state,
+            serial_contract_passed, serial_markers_observed, xapic_state_vectors, Com1SerialState,
+            DecodedExit, LegacyDeviceIoState, ACPI_PM1_CONTROL_PORT, ACPI_PM1_ENABLE_PORT,
+            ACPI_PM1_STATUS_PORT, ACPI_PM_TIMER_PORT, ALT_DELAY_PORT, ALT_POST_DELAY_PORT,
+            CMOS_ADDRESS_PORT, CMOS_DATA_PORT, CPUID_DEFAULT_RAX_OFFSET, CPUID_DEFAULT_RBX_OFFSET,
+            CPUID_DEFAULT_RCX_OFFSET, CPUID_DEFAULT_RDX_OFFSET, CPUID_RAX_OFFSET, CPUID_RCX_OFFSET,
+            DMA_PAGE_REGISTER_START_PORT, ELCR1_PORT, ELCR2_PORT, IO_ACCESS_INFO_OFFSET,
+            IO_PORT_OFFSET, IO_RAX_OFFSET, LINUX_ENTRY_PROBE_EXIT_BUDGET,
+            LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET, LINUX_ENTRY_PROBE_TRACE_HEAD,
+            LINUX_ENTRY_PROBE_TRACE_TAIL, MEMORY_ACCESS_INFO_OFFSET, MEMORY_GPA_OFFSET,
+            MEMORY_GVA_OFFSET, MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET, MSR_RAX_OFFSET,
+            MSR_RDX_OFFSET, PCI_CONFIG_ADDRESS_PORT, PCI_CONFIG_DATA_START_PORT, PIC1_COMMAND_PORT,
+            PIC1_DATA_PORT, PIC2_COMMAND_PORT, PIC2_DATA_PORT, PIT_CHANNEL0_PORT, PIT_COMMAND_PORT,
+            POST_DELAY_PORT, PS2_DATA_PORT, PS2_STATUS_COMMAND_PORT, SERIAL_COM1_PORT,
+            SYSTEM_CONTROL_PORT_A, SYSTEM_CONTROL_PORT_B, VGA_ATTRIBUTE_DATA_READ_PORT,
+            VGA_ATTRIBUTE_PORT, VGA_CRTC_COLOR_DATA_PORT, VGA_CRTC_COLOR_INDEX_PORT,
+            VGA_GRAPHICS_DATA_PORT, VGA_GRAPHICS_INDEX_PORT, VGA_INPUT_STATUS_COLOR_PORT,
+            VGA_MISC_OUTPUT_READ_PORT, VGA_MISC_OUTPUT_WRITE_PORT, VGA_SEQUENCER_DATA_PORT,
+            VGA_SEQUENCER_INDEX_PORT, VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET, VP_CONTEXT_RIP_OFFSET,
+            WHV_REGISTER_CR0, WHV_REGISTER_CR3, WHV_REGISTER_CR4, WHV_REGISTER_CS, WHV_REGISTER_DS,
+            WHV_REGISTER_ES, WHV_REGISTER_GDTR, WHV_REGISTER_IDTR, WHV_REGISTER_RBP,
+            WHV_REGISTER_RBX, WHV_REGISTER_RDI, WHV_REGISTER_RFLAGS, WHV_REGISTER_RIP,
+            WHV_REGISTER_RSI, WHV_REGISTER_RSP, WHV_REGISTER_SS, WHV_RUN_VP_EXIT_REASON_CANCELED,
             WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE, WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS,
             WHV_RUN_VP_EXIT_REASON_X64_APIC_EOI, WHV_RUN_VP_EXIT_REASON_X64_CPUID,
             WHV_RUN_VP_EXIT_REASON_X64_HALT, WHV_RUN_VP_EXIT_REASON_X64_INTERRUPT_WINDOW,
             WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS, WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS,
+            XAPIC_IRR_BASE_OFFSET, XAPIC_ISR_BASE_OFFSET, XAPIC_PPR_OFFSET, XAPIC_REGISTER_STRIDE,
+            XAPIC_STATE_BYTES, XAPIC_TPR_OFFSET,
         };
         use crate::native::{
             evaluate_native_block_io, linux_boot_gdt_page_bytes, native_block_io_exit_can_resume,
@@ -5903,8 +6204,8 @@ mod windows_whp {
         #[test]
         fn interrupt_delivery_snapshot_helpers_classify_apic_state() {
             let mut words = vec![0_u64; 8];
-            words[0] = 1_u64 << 0x20;
-            words[2] = 1_u64 << 1;
+            words[1] = 1;
+            words[4] = 1_u64 << 1;
 
             assert_eq!(apic_bitmap_vectors(&words), vec![0x20, 0x81]);
             assert_eq!(format_vector_list(&[0x20, 0x81]), "[0x20,0x81]");
@@ -5921,6 +6222,48 @@ mod windows_whp {
                 interrupt_delivery_blocker(true, false, true, false, true, 0, 0),
                 "timer-in-service-without-eoi"
             );
+        }
+
+        #[test]
+        fn xapic_interrupt_controller_state_parser_reads_isr_and_irr_vectors() {
+            let mut state = vec![0_u8; XAPIC_STATE_BYTES];
+            state[XAPIC_TPR_OFFSET..XAPIC_TPR_OFFSET + 4].copy_from_slice(&0x10_u32.to_le_bytes());
+            state[XAPIC_PPR_OFFSET..XAPIC_PPR_OFFSET + 4].copy_from_slice(&0x20_u32.to_le_bytes());
+            let isr_vector = 0x30_usize;
+            let isr_offset = XAPIC_ISR_BASE_OFFSET + (isr_vector / 32) * XAPIC_REGISTER_STRIDE;
+            state[isr_offset..isr_offset + 4]
+                .copy_from_slice(&(1_u32 << (isr_vector % 32)).to_le_bytes());
+            let irr_vector = 0x81_usize;
+            let irr_offset = XAPIC_IRR_BASE_OFFSET + (irr_vector / 32) * XAPIC_REGISTER_STRIDE;
+            state[irr_offset..irr_offset + 4]
+                .copy_from_slice(&(1_u32 << (irr_vector % 32)).to_le_bytes());
+
+            assert_eq!(
+                xapic_state_vectors(&state, XAPIC_ISR_BASE_OFFSET),
+                Some(vec![0x30])
+            );
+            assert_eq!(
+                xapic_state_vectors(&state, XAPIC_IRR_BASE_OFFSET),
+                Some(vec![0x81])
+            );
+
+            let mut report = base_report();
+            let snapshot = parse_xapic_interrupt_controller_state(
+                "test-xapic-state",
+                &state,
+                XAPIC_STATE_BYTES as u32,
+                &mut report,
+            )
+            .expect("xAPIC state parses");
+
+            assert_eq!(snapshot.tpr, 0x10);
+            assert_eq!(snapshot.ppr, 0x20);
+            assert_eq!(snapshot.isr_vectors, vec![0x30]);
+            assert_eq!(snapshot.irr_vectors, vec![0x81]);
+            assert!(report
+                .calls
+                .iter()
+                .any(|call| call.name == "LinuxEntryProbeInterruptControllerState" && call.ok));
         }
 
         #[test]

@@ -26,7 +26,7 @@ pub(crate) const PANE_BLOCK_IO_BASE_PORT: u16 = 0x0d00;
 pub(crate) const PANE_BLOCK_IO_PORT_COUNT: u16 = 0x0010;
 pub(crate) const PANE_BLOCK_IO_LAST_PORT: u16 =
     PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_PORT_COUNT - 1;
-pub(crate) const PANE_BLOCK_IO_BLOCK_SIZE_BYTES: u32 = 4096;
+pub(crate) const PANE_BLOCK_IO_BLOCK_SIZE_BYTES: u32 = 512;
 pub(crate) const PANE_BLOCK_IO_STATUS_SUBMITTED: u8 = 0x01;
 pub(crate) const PANE_BLOCK_IO_STATUS_SERVICED: u8 = 0x02;
 pub(crate) const PANE_BLOCK_IO_STATUS_DENIED: u8 = 0xfc;
@@ -5949,7 +5949,7 @@ mod windows_whp {
                 device: NativeBlockDeviceId::UserDisk,
                 operation: NativeBlockOperation::Read,
                 block_index: 9,
-                block_size_bytes: 512,
+                block_size_bytes: 4096,
             });
             assert!(!bad_block_size.allowed);
             assert_eq!(bad_block_size.status, "unsupported-block-size");
@@ -5961,7 +5961,10 @@ mod windows_whp {
 
             assert_eq!(state.read(PANE_BLOCK_IO_BASE_PORT), 0);
             assert_eq!(state.read(PANE_BLOCK_IO_BASE_PORT + 1), 0);
-            assert_eq!(state.read(PANE_BLOCK_IO_BASE_PORT + 3), 8);
+            assert_eq!(
+                state.read(PANE_BLOCK_IO_BASE_PORT + 3),
+                (PANE_BLOCK_IO_BLOCK_SIZE_BYTES / 512) as u8
+            );
             assert!(state.write(PANE_BLOCK_IO_BASE_PORT, 1).is_none());
             assert!(state.write(PANE_BLOCK_IO_BASE_PORT + 1, 1).is_none());
             for (index, byte) in 0x0102_0304_0506_0708_u64

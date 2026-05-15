@@ -4021,6 +4021,19 @@ fn read_u32_le_slice(bytes: &[u8]) -> Option<u32> {
 
 #[allow(dead_code)] // Covered by tests; used by the upcoming WHP read-only base block-device handler.
 fn read_base_os_block(paths: &RuntimePaths, block_index: u64) -> AppResult<Vec<u8>> {
+    read_base_os_io_block(paths, block_index, PANE_BASE_OS_BLOCK_SIZE_BYTES)
+}
+
+fn read_base_os_io_block(
+    paths: &RuntimePaths,
+    block_index: u64,
+    block_size_bytes: u64,
+) -> AppResult<Vec<u8>> {
+    if block_size_bytes == 0 {
+        return Err(AppError::message(
+            "Pane base OS block I/O requires a non-zero block size.",
+        ));
+    }
     let metadata = read_json_file::<BaseOsImageMetadata>(&paths.base_os_metadata)?;
     if !metadata.verified {
         return Err(AppError::message(
@@ -4039,11 +4052,11 @@ fn read_base_os_block(paths: &RuntimePaths, block_index: u64) -> AppResult<Vec<u
         ));
     }
 
-    let block_size: usize = PANE_BASE_OS_BLOCK_SIZE_BYTES
+    let block_size: usize = block_size_bytes
         .try_into()
         .map_err(|_| AppError::message("Pane base OS block size is too large for this host."))?;
     let offset = block_index
-        .checked_mul(PANE_BASE_OS_BLOCK_SIZE_BYTES)
+        .checked_mul(block_size_bytes)
         .ok_or_else(|| AppError::message("Pane base OS block offset overflowed."))?;
     let mut block = vec![0_u8; block_size];
     if offset >= metadata.bytes {
@@ -4053,7 +4066,7 @@ fn read_base_os_block(paths: &RuntimePaths, block_index: u64) -> AppResult<Vec<u
     let mut file = OpenOptions::new().read(true).open(&paths.base_os_image)?;
     file.seek(SeekFrom::Start(offset))?;
     let remaining = metadata.bytes - offset;
-    let to_read = remaining.min(PANE_BASE_OS_BLOCK_SIZE_BYTES) as usize;
+    let to_read = remaining.min(block_size_bytes) as usize;
     file.read_exact(&mut block[..to_read])?;
     Ok(block)
 }
@@ -4208,17 +4221,48 @@ fn read_user_disk_block(
     metadata: &UserDiskMetadata,
     block_index: u64,
 ) -> AppResult<Vec<u8>> {
+    read_user_disk_io_block(paths, metadata, block_index, metadata.block_size_bytes)
+}
+
+fn user_disk_io_block_offset(
+    metadata: &UserDiskMetadata,
+    block_index: u64,
+    block_size_bytes: u64,
+) -> AppResult<u64> {
+    if block_size_bytes == 0 {
+        return Err(AppError::message(
+            "Pane user disk block I/O requires a non-zero block size.",
+        ));
+    }
+    let byte_offset = block_index
+        .checked_mul(block_size_bytes)
+        .ok_or_else(|| AppError::message("Pane user disk I/O block offset overflowed."))?;
+    if byte_offset >= metadata.logical_size_bytes {
+        return Err(AppError::message(format!(
+            "Pane user disk I/O block {block_index} is outside the logical disk size."
+        )));
+    }
+    user_disk_data_offset(metadata)
+        .checked_add(byte_offset)
+        .ok_or_else(|| AppError::message("Pane user disk I/O block data offset overflowed."))
+}
+
+fn read_user_disk_io_block(
+    paths: &RuntimePaths,
+    metadata: &UserDiskMetadata,
+    block_index: u64,
+    block_size_bytes: u64,
+) -> AppResult<Vec<u8>> {
     if !user_disk_artifact_ready(paths, &Some(metadata.clone())) {
         return Err(AppError::message(
             "Pane sparse user disk is not ready for block I/O.",
         ));
     }
 
-    let block_size: usize = metadata
-        .block_size_bytes
+    let block_size: usize = block_size_bytes
         .try_into()
         .map_err(|_| AppError::message("Pane user disk block size is too large for this host."))?;
-    let offset = user_disk_block_offset(metadata, block_index)?;
+    let offset = user_disk_io_block_offset(metadata, block_index, block_size_bytes)?;
     let mut block = vec![0_u8; block_size];
     let mut file = OpenOptions::new().read(true).open(&paths.user_disk)?;
     let file_len = file.metadata()?.len();
@@ -4241,23 +4285,29 @@ fn write_user_disk_block(
     block_index: u64,
     block: &[u8],
 ) -> AppResult<()> {
+    write_user_disk_io_block(paths, metadata, block_index, block)
+}
+
+fn write_user_disk_io_block(
+    paths: &RuntimePaths,
+    metadata: &UserDiskMetadata,
+    block_index: u64,
+    block: &[u8],
+) -> AppResult<()> {
     if !user_disk_artifact_ready(paths, &Some(metadata.clone())) {
         return Err(AppError::message(
             "Pane sparse user disk is not ready for block I/O.",
         ));
     }
 
-    let block_size: usize = metadata
-        .block_size_bytes
-        .try_into()
-        .map_err(|_| AppError::message("Pane user disk block size is too large for this host."))?;
-    if block.len() != block_size {
-        return Err(AppError::message(format!(
-            "Pane user disk writes must be exactly {block_size} bytes."
-        )));
+    if block.is_empty() {
+        return Err(AppError::message(
+            "Pane user disk writes must contain at least one byte.",
+        ));
     }
 
-    let offset = user_disk_block_offset(metadata, block_index)?;
+    let block_size_bytes = block.len() as u64;
+    let offset = user_disk_io_block_offset(metadata, block_index, block_size_bytes)?;
     let mut file = OpenOptions::new().write(true).open(&paths.user_disk)?;
     file.seek(SeekFrom::Start(offset))?;
     file.write_all(block)?;
@@ -4284,14 +4334,23 @@ fn execute_native_block_io_command(
 
     let bytes = match (command.device, command.operation) {
         (crate::native::NativeBlockDeviceId::BaseOs, crate::native::NativeBlockOperation::Read) => {
-            read_base_os_block(paths, command.block_index)?
+            read_base_os_io_block(
+                paths,
+                command.block_index,
+                u64::from(command.block_size_bytes),
+            )?
         }
         (
             crate::native::NativeBlockDeviceId::UserDisk,
             crate::native::NativeBlockOperation::Read,
         ) => {
             let metadata = read_json_file::<UserDiskMetadata>(&paths.user_disk_metadata)?;
-            read_user_disk_block(paths, &metadata, command.block_index)?
+            read_user_disk_io_block(
+                paths,
+                &metadata,
+                command.block_index,
+                u64::from(command.block_size_bytes),
+            )?
         }
         (
             crate::native::NativeBlockDeviceId::UserDisk,
@@ -4306,7 +4365,7 @@ fn execute_native_block_io_command(
                 )));
             }
             let metadata = read_json_file::<UserDiskMetadata>(&paths.user_disk_metadata)?;
-            write_user_disk_block(paths, &metadata, command.block_index, payload)?;
+            write_user_disk_io_block(paths, &metadata, command.block_index, payload)?;
             Vec::new()
         }
         (
@@ -5166,7 +5225,7 @@ static unsigned long device_blocks[PANE_BLOCK_DEVICE_COUNT] = {
     PANE_BLOCK_DEFAULT_BLOCKS,
 };
 module_param_array(device_blocks, ulong, NULL, 0444);
-MODULE_PARM_DESC(device_blocks, "Logical 4096-byte Pane blocks for /dev/pane0 and /dev/pane1");
+MODULE_PARM_DESC(device_blocks, "Logical Pane I/O blocks for /dev/pane0 and /dev/pane1");
 
 struct pane_block_disk {
     int pane_device_id;
@@ -13898,6 +13957,7 @@ mod tests {
         let base = paths.downloads.join("arch-base.img");
         let mut image = vec![0_u8; 5000];
         image[..16].copy_from_slice(b"PANE_BASE_ADAPT_");
+        image[512..528].copy_from_slice(b"PANE_BASE_512___");
         std::fs::write(&base, image).unwrap();
         let base_sha = sha256_file(&base).unwrap();
         register_base_os_image(&paths, &base, Some(&base_sha), false, false).unwrap();
@@ -13917,6 +13977,19 @@ mod tests {
         assert!(base_read.decision.allowed);
         assert_eq!(&base_read.bytes[..16], b"PANE_BASE_ADAPT_");
 
+        let base_second_sector = execute_native_block_io_command(
+            &paths,
+            &crate::native::NativeBlockIoCommand {
+                device: crate::native::NativeBlockDeviceId::BaseOs,
+                operation: crate::native::NativeBlockOperation::Read,
+                block_index: 1,
+                block_size_bytes: crate::native::PANE_BLOCK_IO_BLOCK_SIZE_BYTES,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(&base_second_sector.bytes[..16], b"PANE_BASE_512___");
+
         let denied_base_write = execute_native_block_io_command(
             &paths,
             &crate::native::NativeBlockIoCommand {
@@ -13925,13 +13998,16 @@ mod tests {
                 block_index: 0,
                 block_size_bytes: crate::native::PANE_BLOCK_IO_BLOCK_SIZE_BYTES,
             },
-            Some(&vec![1_u8; 4096]),
+            Some(&vec![
+                1_u8;
+                crate::native::PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize
+            ]),
         )
         .unwrap();
         assert!(!denied_base_write.decision.allowed);
         assert_eq!(denied_base_write.decision.status, "readonly-device");
 
-        let payload = vec![0x5a_u8; 4096];
+        let payload = vec![0x5a_u8; crate::native::PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize];
         let user_write = execute_native_block_io_command(
             &paths,
             &crate::native::NativeBlockIoCommand {
@@ -13983,7 +14059,10 @@ mod tests {
         assert_eq!(metadata.block_io_protocol, "pane-port-block-v1");
         assert_eq!(metadata.block_io_port_base, "0x0d00");
         assert_eq!(metadata.block_io_port_count, 16);
-        assert_eq!(metadata.block_io_block_size_bytes, 4096);
+        assert_eq!(
+            metadata.block_io_block_size_bytes,
+            u64::from(crate::native::PANE_BLOCK_IO_BLOCK_SIZE_BYTES)
+        );
         assert!(paths
             .initramfs_driver_dir
             .join("pane-initramfs-hook.sh")
@@ -14506,7 +14585,10 @@ mod tests {
         assert_eq!(storage.block_io_port_count, 16);
         assert_eq!(storage.block_io_status_port_offset, 2);
         assert_eq!(storage.block_io_data_port_offset, 12);
-        assert_eq!(storage.block_io_block_size_bytes, 4096);
+        assert_eq!(
+            storage.block_io_block_size_bytes,
+            u64::from(crate::native::PANE_BLOCK_IO_BLOCK_SIZE_BYTES)
+        );
         assert!(layout
             .cmdline
             .contains("earlycon=uart8250,io,0x3f8,115200n8"));
@@ -14536,8 +14618,8 @@ mod tests {
         assert!(layout.cmdline.contains("pane.root_mode=base-partition"));
         assert!(layout.cmdline.contains("pane.root_partition=1"));
         assert!(layout.cmdline.contains("pane.user=/dev/pane1"));
-        assert!(layout.cmdline.contains("pane.block_io=0x0d00,16,4096"));
-        assert!(layout.cmdline.contains("pane.block_devices=1024,786432"));
+        assert!(layout.cmdline.contains("pane.block_io=0x0d00,16,512"));
+        assert!(layout.cmdline.contains("pane.block_devices=8192,6291456"));
         assert!(layout
             .cmdline
             .contains("pane.framebuffer=0x0e000000,1024,768,32,x8r8g8b8"));

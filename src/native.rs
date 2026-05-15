@@ -3236,17 +3236,14 @@ mod windows_whp {
                                 }
                                 continue;
                             }
-                            Some(_)
-                                if interrupt_window_notification_armed
-                                    && interrupt_window_ready_waits < 4 =>
-                            {
+                            Some(_) if interrupt_window_notification_armed => {
                                 interrupt_window_ready_waits += 1;
                                 report.calls.push(NativeWhpCallReport {
                                     name: "LinuxEntryProbeAwaitingInterruptWindow",
                                     hresult: None,
                                     ok: true,
                                     detail: format!(
-                                        "Guest interrupt readiness is open; waiting for WHP interrupt-window exit before requesting native timer interrupt (attempt {interrupt_window_ready_waits}/4)."
+                                        "Guest interrupt readiness is open; waiting for WHP interrupt-window exit before requesting native timer interrupt (ready sample {interrupt_window_ready_waits})."
                                     ),
                                 });
                                 if let Some(path) = checkpoint_path.as_deref() {
@@ -3260,16 +3257,7 @@ mod windows_whp {
                                 }
                                 continue;
                             }
-                            Some(_) => {
-                                if interrupt_window_notification_armed {
-                                    report.calls.push(NativeWhpCallReport {
-                                        name: "LinuxEntryProbeInterruptWindowFallback",
-                                        hresult: None,
-                                        ok: true,
-                                        detail: "WHP did not return an interrupt-window exit after repeated ready samples; falling back to direct WHvRequestInterrupt at the ready time-slice boundary.".to_string(),
-                                    });
-                                }
-                            }
+                            Some(_) => {}
                             None => {
                                 report.calls.push(NativeWhpCallReport {
                                     name: "LinuxEntryProbeTimesliceBoundary",

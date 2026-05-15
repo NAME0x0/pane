@@ -4751,6 +4751,7 @@ fn pane_init_source() -> String {
 #include <string.h>
 #include <sys/io.h>
 #include <sys/mount.h>
+#include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
@@ -4932,24 +4933,55 @@ static int load_pane_block_module(const char *device_blocks) {
         snprintf(params, sizeof(params), "device_blocks=%s", device_blocks);
     }
 #ifdef SYS_finit_module
-    if (syscall(SYS_finit_module, fd, params, 0) == 0) {
-        close(fd);
-        log_line("PANE_BLOCK_MODULE_LOAD_OK");
-        return 0;
+    pid_t child = fork();
+    if (child == 0) {
+        int child_rc = syscall(SYS_finit_module, fd, params, 0);
+        _exit(child_rc == 0 ? 0 : (errno == EEXIST ? 17 : 1));
     }
-    if (errno == EEXIST) {
+    if (child < 0) {
+        char line[160];
+        snprintf(line, sizeof(line), "PANE_BLOCK_MODULE_FORK_FAILED errno=%d", errno);
+        log_line(line);
         close(fd);
-        log_line("PANE_BLOCK_MODULE_ALREADY_LOADED");
-        return 0;
+        return -1;
     }
+    for (unsigned int attempt = 0; attempt < 50000000; attempt++) {
+        int status = 0;
+        pid_t waited = waitpid(child, &status, WNOHANG);
+        if (waited == child) {
+            close(fd);
+            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+                log_line("PANE_BLOCK_MODULE_LOAD_OK");
+                return 0;
+            }
+            if (WIFEXITED(status) && WEXITSTATUS(status) == 17) {
+                log_line("PANE_BLOCK_MODULE_ALREADY_LOADED");
+                return 0;
+            }
+            char line[160];
+            snprintf(line, sizeof(line), "PANE_BLOCK_MODULE_LOAD_FAILED status=%d", status);
+            log_line(line);
+            return -1;
+        }
+        if (waited < 0) {
+            char line[160];
+            snprintf(line, sizeof(line), "PANE_BLOCK_MODULE_WAIT_FAILED errno=%d", errno);
+            log_line(line);
+            close(fd);
+            return -1;
+        }
+    }
+    log_line("PANE_BLOCK_MODULE_LOAD_TIMEOUT");
+    close(fd);
+    return -1;
 #else
     errno = ENOSYS;
-#endif
     char line[160];
     snprintf(line, sizeof(line), "PANE_BLOCK_MODULE_LOAD_FAILED errno=%d", errno);
     log_line(line);
     close(fd);
     return -1;
+#endif
 }
 
 static int try_mount_root(const char *root_device) {
@@ -5476,7 +5508,14 @@ if [ -f pane-block.ko ]; then
 fi
 chmod +x "$workdir/init" "$workdir/bin/pane-initramfs-hook" "$workdir/bin/pane-port-probe"
 
-(cd "$workdir" && find . -print | cpio -o -H newc > "$output_path")
+if command -v cpio >/dev/null 2>&1; then
+    (cd "$workdir" && find . -print | cpio -o -H newc > "$output_path")
+elif command -v bsdtar >/dev/null 2>&1; then
+    (cd "$workdir" && bsdtar --format newc -cf "$output_path" .)
+else
+    echo "build-pane-initramfs: need cpio or bsdtar to write a newc initramfs" >&2
+    exit 127
+fi
 printf 'wrote %s\n' "$output_path"
 "#
     .to_string()
@@ -13988,7 +14027,10 @@ mod tests {
         assert!(init_source.contains("PANE_BLOCK_IO_PROBE_OK"));
         assert!(init_source.contains("PANE_BLOCK_MODULE_LOAD_ATTEMPT"));
         assert!(init_source.contains("PANE_BLOCK_MODULE_LOAD_OK"));
+        assert!(init_source.contains("PANE_BLOCK_MODULE_LOAD_TIMEOUT"));
         assert!(init_source.contains("PANE_BLOCK_MODULE_NOT_PRESENT"));
+        assert!(init_source.contains("waitpid(child, &status, WNOHANG)"));
+        assert!(init_source.contains("attempt < 50000000"));
         assert!(init_source.contains("device_blocks=%s"));
         assert!(init_source.contains("pane.block_devices"));
         assert!(init_source.contains("PANE_DISPLAY_CONTRACT_DISCOVERED"));
@@ -14002,6 +14044,7 @@ mod tests {
             std::fs::read_to_string(paths.initramfs_driver_dir.join("build-pane-initramfs.sh"))
                 .unwrap();
         assert!(build_script.contains("cpio -o -H newc"));
+        assert!(build_script.contains("bsdtar --format newc"));
         assert!(build_script.contains("$workdir/newroot"));
         assert!(build_script.contains("$workdir/lib/modules"));
         assert!(build_script.contains("output_path="));

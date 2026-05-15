@@ -1297,6 +1297,7 @@ mod windows_whp {
     const WHV_REGISTER_PENDING_EVENT: u32 = 0x8000_0002;
     const WHV_REGISTER_DELIVERABILITY_NOTIFICATIONS: u32 = 0x8000_0004;
     const WHV_REGISTER_INTERNAL_ACTIVITY_STATE: u32 = 0x8000_0005;
+    const WHV_DELIVERABILITY_NOTIFICATION_INTERRUPT: u64 = 1 << 1;
     const WHV_X64_REGISTER_APIC_TPR: u32 = 0x0000_3008;
     const WHV_X64_REGISTER_APIC_PPR: u32 = 0x0000_300a;
     const WHV_X64_REGISTER_APIC_ISR0: u32 = 0x0000_3010;
@@ -2679,6 +2680,12 @@ mod windows_whp {
         let mut timer_interrupt_requested = false;
         let mut timer_interrupt_acknowledged = false;
         let mut post_timer_resume_attempted = false;
+        let mut interrupt_window_notification_armed = arm_timer_interrupt_window_notification(
+            partition,
+            set_virtual_processor_registers,
+            report,
+        );
+        let mut interrupt_window_ready_waits = 0_u32;
         let probe_started_at = Instant::now();
         let mut last_checkpoint_at = probe_started_at;
         if let Some(path) = checkpoint_path.as_deref() {
@@ -3077,20 +3084,64 @@ mod windows_whp {
                     }
                 }
                 DecodedExit::InterruptWindow => {
-                    report.calls.push(NativeWhpCallReport {
-                        name: "InterruptWindowResumed",
-                        hresult: None,
-                        ok: true,
-                        detail:
-                            "Guest reached an interrupt-window exit; Pane has no pending interrupt to inject and will resume the vCPU."
-                                .to_string(),
-                    });
                     if timer_interrupt_requested {
                         report.calls.push(NativeWhpCallReport {
                             name: "LinuxEntryProbeTimerInterruptWindow",
                             hresult: None,
                             ok: true,
                             detail: "Guest reached an interrupt-window exit after Pane requested the native timer interrupt.".to_string(),
+                        });
+                        report.calls.push(NativeWhpCallReport {
+                            name: "InterruptWindowResumed",
+                            hresult: None,
+                            ok: true,
+                            detail:
+                                "Guest reached an interrupt-window exit after timer injection; Pane will resume the vCPU."
+                                    .to_string(),
+                        });
+                    } else if let Some(request_interrupt) = request_interrupt {
+                        let timer_request_ok = request_native_timer_interrupt(
+                            partition,
+                            request_interrupt,
+                            legacy_io_state.timer_interrupt_vector(),
+                            legacy_io_state.timer_interrupt_unmasked(),
+                            report,
+                        );
+                        if timer_request_ok {
+                            timer_interrupt_requested = true;
+                            post_timer_resume_attempted = true;
+                            report.calls.push(NativeWhpCallReport {
+                                name: "LinuxEntryProbeInterruptWindowTimerRequest",
+                                hresult: None,
+                                ok: true,
+                                detail: "WHP reported a maskable interrupt delivery window, so Pane requested the native timer interrupt there.".to_string(),
+                            });
+                            if let Some(path) = checkpoint_path.as_deref() {
+                                write_linux_entry_probe_checkpoint(
+                                    path,
+                                    report,
+                                    "timer-interrupt-window-requested",
+                                    probe_started_at,
+                                );
+                                last_checkpoint_at = Instant::now();
+                            }
+                        } else {
+                            report.calls.push(NativeWhpCallReport {
+                                name: "LinuxEntryProbeInterruptWindowTimerRequest",
+                                hresult: None,
+                                ok: false,
+                                detail: "WHP reported a maskable interrupt delivery window, but Pane could not request the native timer interrupt.".to_string(),
+                            });
+                            break;
+                        }
+                    } else {
+                        report.calls.push(NativeWhpCallReport {
+                            name: "InterruptWindowResumed",
+                            hresult: None,
+                            ok: true,
+                            detail:
+                                "Guest reached an interrupt-window exit, but WHvRequestInterrupt is unavailable; Pane will resume the vCPU."
+                                    .to_string(),
                         });
                     }
                 }
@@ -3156,6 +3207,14 @@ mod windows_whp {
                             report,
                         ) {
                             Some(readiness) if !readiness.ready => {
+                                if !interrupt_window_notification_armed {
+                                    interrupt_window_notification_armed =
+                                        arm_timer_interrupt_window_notification(
+                                            partition,
+                                            set_virtual_processor_registers,
+                                            report,
+                                        );
+                                }
                                 report.calls.push(NativeWhpCallReport {
                                     name: "LinuxEntryProbeTimerInterruptDeferred",
                                     hresult: None,
@@ -3177,7 +3236,40 @@ mod windows_whp {
                                 }
                                 continue;
                             }
-                            Some(_) => {}
+                            Some(_)
+                                if interrupt_window_notification_armed
+                                    && interrupt_window_ready_waits < 4 =>
+                            {
+                                interrupt_window_ready_waits += 1;
+                                report.calls.push(NativeWhpCallReport {
+                                    name: "LinuxEntryProbeAwaitingInterruptWindow",
+                                    hresult: None,
+                                    ok: true,
+                                    detail: format!(
+                                        "Guest interrupt readiness is open; waiting for WHP interrupt-window exit before requesting native timer interrupt (attempt {interrupt_window_ready_waits}/4)."
+                                    ),
+                                });
+                                if let Some(path) = checkpoint_path.as_deref() {
+                                    write_linux_entry_probe_checkpoint(
+                                        path,
+                                        report,
+                                        "awaiting-interrupt-window",
+                                        probe_started_at,
+                                    );
+                                    last_checkpoint_at = Instant::now();
+                                }
+                                continue;
+                            }
+                            Some(_) => {
+                                if interrupt_window_notification_armed {
+                                    report.calls.push(NativeWhpCallReport {
+                                        name: "LinuxEntryProbeInterruptWindowFallback",
+                                        hresult: None,
+                                        ok: true,
+                                        detail: "WHP did not return an interrupt-window exit after repeated ready samples; falling back to direct WHvRequestInterrupt at the ready time-slice boundary.".to_string(),
+                                    });
+                                }
+                            }
                             None => {
                                 report.calls.push(NativeWhpCallReport {
                                     name: "LinuxEntryProbeTimesliceBoundary",
@@ -3372,6 +3464,46 @@ mod windows_whp {
         ok
     }
 
+    fn arm_timer_interrupt_window_notification(
+        partition: *mut c_void,
+        set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
+        report: &mut NativePartitionSmokeReport,
+    ) -> bool {
+        let register_names = [WHV_REGISTER_DELIVERABILITY_NOTIFICATIONS];
+        let register_values = [WhvRegisterValue {
+            reg64: WHV_DELIVERABILITY_NOTIFICATION_INTERRUPT,
+        }];
+        let hresult = unsafe {
+            set_virtual_processor_registers(
+                partition,
+                0,
+                register_names.as_ptr(),
+                register_names.len() as u32,
+                register_values.as_ptr(),
+            )
+        };
+        let ok = hresult_succeeded(hresult);
+        report.calls.push(hresult_call(
+            "WHvSetVirtualProcessorRegisters(DeliverabilityNotifications)",
+            hresult,
+            if ok {
+                "Armed WHP interrupt-window exits so Pane can request the timer only when a maskable interrupt is deliverable."
+            } else {
+                "Could not arm WHP interrupt-window exits; Pane will fall back to readiness polling."
+            },
+        ));
+        report.calls.push(NativeWhpCallReport {
+            name: "LinuxEntryProbeInterruptWindowNotification",
+            hresult: Some(format_hresult(hresult)),
+            ok,
+            detail: format!(
+                "interrupt_notification={}, value=0x{WHV_DELIVERABILITY_NOTIFICATION_INTERRUPT:016x}.",
+                ok
+            ),
+        });
+        ok
+    }
+
     fn capture_timer_interrupt_readiness(
         partition: *mut c_void,
         get_virtual_processor_registers: WhvGetVirtualProcessorRegisters,
@@ -3441,12 +3573,13 @@ mod windows_whp {
     ) -> TimerInterruptReadiness {
         let interrupts_enabled = rflags & 0x0200 != 0;
         let interrupt_shadow = interrupt_state & 0x1 != 0;
+        let blocking_deliverability = deliverability & !WHV_DELIVERABILITY_NOTIFICATION_INTERRUPT;
         let blocker = timer_interrupt_readiness_blocker(
             interrupts_enabled,
             interrupt_shadow,
             irq0_unmasked,
             pending_interruption,
-            deliverability,
+            blocking_deliverability,
         );
         TimerInterruptReadiness {
             rflags,
@@ -5440,10 +5573,11 @@ mod windows_whp {
             VGA_GRAPHICS_DATA_PORT, VGA_GRAPHICS_INDEX_PORT, VGA_INPUT_STATUS_COLOR_PORT,
             VGA_MISC_OUTPUT_READ_PORT, VGA_MISC_OUTPUT_WRITE_PORT, VGA_SEQUENCER_DATA_PORT,
             VGA_SEQUENCER_INDEX_PORT, VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET, VP_CONTEXT_RIP_OFFSET,
-            WHV_REGISTER_CR0, WHV_REGISTER_CR3, WHV_REGISTER_CR4, WHV_REGISTER_CS, WHV_REGISTER_DS,
-            WHV_REGISTER_ES, WHV_REGISTER_GDTR, WHV_REGISTER_IDTR, WHV_REGISTER_RBP,
-            WHV_REGISTER_RBX, WHV_REGISTER_RDI, WHV_REGISTER_RFLAGS, WHV_REGISTER_RIP,
-            WHV_REGISTER_RSI, WHV_REGISTER_RSP, WHV_REGISTER_SS, WHV_RUN_VP_EXIT_REASON_CANCELED,
+            WHV_DELIVERABILITY_NOTIFICATION_INTERRUPT, WHV_REGISTER_CR0, WHV_REGISTER_CR3,
+            WHV_REGISTER_CR4, WHV_REGISTER_CS, WHV_REGISTER_DS, WHV_REGISTER_ES, WHV_REGISTER_GDTR,
+            WHV_REGISTER_IDTR, WHV_REGISTER_RBP, WHV_REGISTER_RBX, WHV_REGISTER_RDI,
+            WHV_REGISTER_RFLAGS, WHV_REGISTER_RIP, WHV_REGISTER_RSI, WHV_REGISTER_RSP,
+            WHV_REGISTER_SS, WHV_RUN_VP_EXIT_REASON_CANCELED,
             WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE, WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS,
             WHV_RUN_VP_EXIT_REASON_X64_APIC_EOI, WHV_RUN_VP_EXIT_REASON_X64_CPUID,
             WHV_RUN_VP_EXIT_REASON_X64_HALT, WHV_RUN_VP_EXIT_REASON_X64_INTERRUPT_WINDOW,
@@ -6488,6 +6622,16 @@ mod windows_whp {
             let ready = timer_interrupt_readiness(0x0202, 0, 0, 0, true);
             assert!(ready.ready);
             assert_eq!(ready.blocker, "ready");
+
+            let ready_with_pane_notification = timer_interrupt_readiness(
+                0x0202,
+                0,
+                0,
+                WHV_DELIVERABILITY_NOTIFICATION_INTERRUPT,
+                true,
+            );
+            assert!(ready_with_pane_notification.ready);
+            assert_eq!(ready_with_pane_notification.blocker, "ready");
         }
 
         #[test]

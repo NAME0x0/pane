@@ -4808,6 +4808,7 @@ fn pane_init_source() -> String {
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sched.h>
 #include <sys/io.h>
 #include <sys/mount.h>
 #include <sys/wait.h>
@@ -4972,9 +4973,10 @@ static int wait_for_device(const char *path) {
     return -1;
 }
 
-static int load_pane_block_module(const char *device_blocks) {
+static int load_pane_block_module(const char *device_blocks, const char *root_offset) {
     const char *module_path = "/lib/modules/pane-block.ko";
     char params[128] = {0};
+    unsigned long long base_block_offset = 0;
     int fd = open(module_path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         if (errno == ENOENT) {
@@ -4988,8 +4990,14 @@ static int load_pane_block_module(const char *device_blocks) {
     }
 
     log_line("PANE_BLOCK_MODULE_LOAD_ATTEMPT");
+    if (root_offset && root_offset[0] != '\0') {
+        base_block_offset = strtoull(root_offset, NULL, 10) / PANE_BLOCK_IO_BLOCK_SIZE_BYTES;
+    }
     if (device_blocks && device_blocks[0] != '\0') {
-        snprintf(params, sizeof(params), "device_blocks=%s", device_blocks);
+        snprintf(params, sizeof(params), "device_blocks=%s base_block_offset=%llu",
+                 device_blocks, base_block_offset);
+    } else {
+        snprintf(params, sizeof(params), "base_block_offset=%llu", base_block_offset);
     }
 #ifdef SYS_finit_module
     pid_t child = fork();
@@ -5029,6 +5037,10 @@ static int load_pane_block_module(const char *device_blocks) {
             close(fd);
             return -1;
         }
+        if ((attempt % 1000000U) == 999999U) {
+            log_line("PANE_BLOCK_MODULE_LOAD_WAITING");
+        }
+        sched_yield();
     }
     log_line("PANE_BLOCK_MODULE_LOAD_TIMEOUT");
     close(fd);
@@ -5087,6 +5099,7 @@ int main(void) {
     char block_io[128] = {0};
     char root_device[128] = {0};
     char user_device[128] = {0};
+    char root_offset[128] = {0};
     char block_devices[128] = {0};
     char framebuffer[128] = {0};
     char input_queue[128] = {0};
@@ -5103,6 +5116,7 @@ int main(void) {
     find_arg(cmdline, "pane.block_io", block_io, sizeof(block_io));
     find_arg(cmdline, "pane.root", root_device, sizeof(root_device));
     find_arg(cmdline, "pane.user", user_device, sizeof(user_device));
+    find_arg(cmdline, "pane.root_offset", root_offset, sizeof(root_offset));
     find_arg(cmdline, "pane.block_devices", block_devices, sizeof(block_devices));
     find_arg(cmdline, "pane.framebuffer", framebuffer, sizeof(framebuffer));
     find_arg(cmdline, "pane.input_queue", input_queue, sizeof(input_queue));
@@ -5111,6 +5125,7 @@ int main(void) {
     log_key_value("pane.block_io", block_io);
     log_key_value("pane.root", root_device);
     log_key_value("pane.user", user_device);
+    log_key_value("pane.root_offset", root_offset);
     log_key_value("pane.block_devices", block_devices);
     log_key_value("pane.framebuffer", framebuffer);
     log_key_value("pane.input_queue", input_queue);
@@ -5137,7 +5152,7 @@ int main(void) {
     }
 
     log_line("PANE_BLOCK_IO_PROBE_OK");
-    load_pane_block_module(block_devices);
+    load_pane_block_module(block_devices, root_offset);
     log_line("PANE_INITRAMFS_DISCOVERY_DONE");
     if (framebuffer[0] != '\0' && input_queue[0] != '\0') {
         log_line("PANE_DISPLAY_CONTRACT_DISCOVERED");
@@ -5216,26 +5231,34 @@ fn pane_block_driver_source() -> String {
 
 #define PANE_BLOCK_DRIVER_NAME "pane_block"
 #define PANE_BLOCK_DEVICE_COUNT 2
+#define PANE_BLOCK_MINORS_PER_DISK 16
 #define PANE_BLOCK_DEFAULT_BLOCKS 2097152UL
 #define PANE_BLOCK_SECTOR_SIZE 512U
-#define PANE_BLOCK_TIMEOUT_POLLS 1000000U
 
 static unsigned long device_blocks[PANE_BLOCK_DEVICE_COUNT] = {
     PANE_BLOCK_DEFAULT_BLOCKS,
     PANE_BLOCK_DEFAULT_BLOCKS,
 };
+static unsigned long base_block_offset;
 module_param_array(device_blocks, ulong, NULL, 0444);
 MODULE_PARM_DESC(device_blocks, "Logical Pane I/O blocks for /dev/pane0 and /dev/pane1");
+module_param(base_block_offset, ulong, 0444);
+MODULE_PARM_DESC(base_block_offset, "Pane I/O block offset where /dev/pane0 starts inside the base OS image");
 
 struct pane_block_disk {
     int pane_device_id;
-    int major;
+    u64 block_offset;
     char name[DISK_NAME_LEN];
     struct gendisk *disk;
     struct blk_mq_tag_set tag_set;
 };
 
 static struct pane_block_disk pane_disks[PANE_BLOCK_DEVICE_COUNT];
+static int pane_block_major;
+static bool pane_block_initializing = true;
+static unsigned int pane_block_transfer_log_count;
+static unsigned int pane_block_request_log_count;
+static unsigned int pane_block_init_read_log_count;
 
 static const struct block_device_operations pane_block_fops = {
     .owner = THIS_MODULE,
@@ -5251,27 +5274,31 @@ static void pane_block_write_index(u64 block_index)
 
 static int pane_block_wait_serviced(void)
 {
-    unsigned int poll;
+    u8 status = inb(PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_STATUS_OFFSET);
 
-    for (poll = 0; poll < PANE_BLOCK_TIMEOUT_POLLS; poll++) {
-        u8 status = inb(PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_STATUS_OFFSET);
-
-        if (status == PANE_BLOCK_STATUS_SERVICED)
-            return 0;
-        if (status == PANE_BLOCK_STATUS_DENIED ||
-            status == PANE_BLOCK_STATUS_FAILED ||
-            status == PANE_BLOCK_STATUS_INVALID)
-            return -EIO;
-        cpu_relax();
-    }
-
-    return -ETIMEDOUT;
+    pr_info(PANE_BLOCK_DRIVER_NAME
+            ": PANE_BLOCK_STATUS_READ status=0x%02x\n", status);
+    if (status == PANE_BLOCK_STATUS_SERVICED)
+        return 0;
+    if (status == PANE_BLOCK_STATUS_DENIED ||
+        status == PANE_BLOCK_STATUS_FAILED ||
+        status == PANE_BLOCK_STATUS_INVALID)
+        return -EIO;
+    return -EAGAIN;
 }
 
 static int pane_block_transfer(int device_id, int operation, u64 block_index, void *buffer)
 {
     unsigned int word_index;
     unsigned char *bytes = buffer;
+    bool log_transfer = pane_block_transfer_log_count < 16;
+
+    if (log_transfer) {
+        pane_block_transfer_log_count++;
+        pr_info(PANE_BLOCK_DRIVER_NAME
+                ": PANE_BLOCK_TRANSFER_START device=%d op=%d block=%llu\n",
+                device_id, operation, block_index);
+    }
 
     outb(device_id, PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_DEVICE_OFFSET);
     outb(operation, PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_OPERATION_OFFSET);
@@ -5289,8 +5316,17 @@ static int pane_block_transfer(int device_id, int operation, u64 block_index, vo
     }
 
     outb(1, PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_STATUS_OFFSET);
-    if (pane_block_wait_serviced() != 0)
+    if (log_transfer)
+        pr_info(PANE_BLOCK_DRIVER_NAME
+                ": PANE_BLOCK_SUBMIT_DONE device=%d op=%d block=%llu\n",
+                device_id, operation, block_index);
+    if (pane_block_wait_serviced() != 0) {
+        if (log_transfer)
+            pr_err(PANE_BLOCK_DRIVER_NAME
+                   ": PANE_BLOCK_TRANSFER_WAIT_FAILED device=%d op=%d block=%llu\n",
+                   device_id, operation, block_index);
         return -EIO;
+    }
 
     if (operation == PANE_BLOCK_OPERATION_READ) {
         for (word_index = 0;
@@ -5302,6 +5338,11 @@ static int pane_block_transfer(int device_id, int operation, u64 block_index, vo
         }
     }
 
+    if (log_transfer) {
+        pr_info(PANE_BLOCK_DRIVER_NAME
+                ": PANE_BLOCK_TRANSFER_DONE device=%d op=%d block=%llu\n",
+                device_id, operation, block_index);
+    }
     return 0;
 }
 
@@ -5330,7 +5371,31 @@ static blk_status_t pane_block_queue_rq(struct blk_mq_hw_ctx *hctx,
         return BLK_STS_IOERR;
     }
 
+    if (pane_block_request_log_count < 16) {
+        pane_block_request_log_count++;
+        pr_info(PANE_BLOCK_DRIVER_NAME
+                ": PANE_BLOCK_REQUEST_START disk=%s op=%d sector=%llu bytes=%u offset=%llu\n",
+                pane_disk->name, operation, (u64)blk_rq_pos(rq), blk_rq_bytes(rq),
+                pane_disk->block_offset);
+    }
+
     blk_mq_start_request(rq);
+    if (pane_block_initializing && operation == PANE_BLOCK_OPERATION_READ) {
+        if (pane_block_init_read_log_count < 16) {
+            pane_block_init_read_log_count++;
+            pr_info(PANE_BLOCK_DRIVER_NAME
+                    ": PANE_BLOCK_INIT_READ_ZERO_FILL disk=%s sector=%llu bytes=%u\n",
+                    pane_disk->name, (u64)blk_rq_pos(rq), blk_rq_bytes(rq));
+        }
+        rq_for_each_segment(bvec, rq, iter) {
+            unsigned char *mapped = kmap_local_page(bvec.bv_page);
+            memset(mapped + bvec.bv_offset, 0, bvec.bv_len);
+            kunmap_local(mapped);
+        }
+        blk_mq_end_request(rq, BLK_STS_OK);
+        return BLK_STS_OK;
+    }
+
     bounce = vmalloc(PANE_BLOCK_IO_BLOCK_SIZE_BYTES);
     if (!bounce) {
         blk_mq_end_request(rq, BLK_STS_RESOURCE);
@@ -5356,7 +5421,7 @@ static blk_status_t pane_block_queue_rq(struct blk_mq_hw_ctx *hctx,
             if (operation == PANE_BLOCK_OPERATION_READ) {
                 if (pane_block_transfer(pane_disk->pane_device_id,
                                         PANE_BLOCK_OPERATION_READ,
-                                        block_index,
+                                        block_index + pane_disk->block_offset,
                                         bounce) != 0) {
                     status = BLK_STS_IOERR;
                     break;
@@ -5365,7 +5430,7 @@ static blk_status_t pane_block_queue_rq(struct blk_mq_hw_ctx *hctx,
             } else if (block_offset == 0 && chunk == PANE_BLOCK_IO_BLOCK_SIZE_BYTES) {
                 if (pane_block_transfer(pane_disk->pane_device_id,
                                         PANE_BLOCK_OPERATION_WRITE,
-                                        block_index,
+                                        block_index + pane_disk->block_offset,
                                         segment + segment_offset) != 0) {
                     status = BLK_STS_IOERR;
                     break;
@@ -5374,7 +5439,7 @@ static blk_status_t pane_block_queue_rq(struct blk_mq_hw_ctx *hctx,
                 /* Preserve untouched bytes for partial filesystem writes. */
                 if (pane_block_transfer(pane_disk->pane_device_id,
                                         PANE_BLOCK_OPERATION_READ,
-                                        block_index,
+                                        block_index + pane_disk->block_offset,
                                         bounce) != 0) {
                     status = BLK_STS_IOERR;
                     break;
@@ -5382,7 +5447,7 @@ static blk_status_t pane_block_queue_rq(struct blk_mq_hw_ctx *hctx,
                 memcpy(bounce + block_offset, segment + segment_offset, chunk);
                 if (pane_block_transfer(pane_disk->pane_device_id,
                                         PANE_BLOCK_OPERATION_WRITE,
-                                        block_index,
+                                        block_index + pane_disk->block_offset,
                                         bounce) != 0) {
                     status = BLK_STS_IOERR;
                     break;
@@ -5419,8 +5484,13 @@ static int pane_block_create_disk(int index, int pane_device_id, const char *nam
     memset(&limits, 0, sizeof(limits));
     limits.logical_block_size = PANE_BLOCK_IO_BLOCK_SIZE_BYTES;
     limits.physical_block_size = PANE_BLOCK_IO_BLOCK_SIZE_BYTES;
+    pr_info(PANE_BLOCK_DRIVER_NAME
+            ": PANE_BLOCK_CREATE_DISK_START name=%s device=%d blocks=%lu sectors=%llu base_offset=%lu\n",
+            name, pane_device_id, device_blocks[index], (u64)capacity_sectors,
+            index == 0 ? base_block_offset : 0);
 
     pane_disk->pane_device_id = pane_device_id;
+    pane_disk->block_offset = index == 0 ? base_block_offset : 0;
     strscpy(pane_disk->name, name, sizeof(pane_disk->name));
     pane_disk->tag_set.ops = &pane_block_mq_ops;
     pane_disk->tag_set.nr_hw_queues = 1;
@@ -5430,40 +5500,52 @@ static int pane_block_create_disk(int index, int pane_device_id, const char *nam
     pane_disk->tag_set.driver_data = pane_disk;
 
     ret = blk_mq_alloc_tag_set(&pane_disk->tag_set);
-    if (ret)
-        return ret;
-
-    pane_disk->major = register_blkdev(0, name);
-    if (pane_disk->major <= 0) {
-        ret = -EBUSY;
-        blk_mq_free_tag_set(&pane_disk->tag_set);
+    if (ret) {
+        pr_err(PANE_BLOCK_DRIVER_NAME
+               ": PANE_BLOCK_ALLOC_TAG_SET_FAILED name=%s ret=%d\n",
+               name, ret);
         return ret;
     }
+    pr_info(PANE_BLOCK_DRIVER_NAME
+            ": PANE_BLOCK_ALLOC_TAG_SET_OK name=%s\n", name);
 
     pane_disk->disk = blk_mq_alloc_disk(&pane_disk->tag_set, &limits, pane_disk);
     if (IS_ERR(pane_disk->disk)) {
         ret = PTR_ERR(pane_disk->disk);
+        pr_err(PANE_BLOCK_DRIVER_NAME
+               ": PANE_BLOCK_ALLOC_DISK_FAILED name=%s ret=%d\n",
+               name, ret);
         pane_disk->disk = NULL;
-        unregister_blkdev(pane_disk->major, name);
         blk_mq_free_tag_set(&pane_disk->tag_set);
         return ret;
     }
+    pr_info(PANE_BLOCK_DRIVER_NAME
+            ": PANE_BLOCK_ALLOC_DISK_OK name=%s\n", name);
 
-    pane_disk->disk->major = pane_disk->major;
-    pane_disk->disk->first_minor = 0;
-    pane_disk->disk->minors = 16;
+    pane_disk->disk->major = pane_block_major;
+    pane_disk->disk->first_minor = index * PANE_BLOCK_MINORS_PER_DISK;
+    pane_disk->disk->minors = PANE_BLOCK_MINORS_PER_DISK;
     pane_disk->disk->fops = &pane_block_fops;
     pane_disk->disk->private_data = pane_disk;
+#ifdef GENHD_FL_NO_PART
+    pane_disk->disk->flags |= GENHD_FL_NO_PART;
+#endif
     snprintf(pane_disk->disk->disk_name, DISK_NAME_LEN, "%s", name);
     set_capacity(pane_disk->disk, capacity_sectors);
+    pr_info(PANE_BLOCK_DRIVER_NAME
+            ": PANE_BLOCK_ADD_DISK_START name=%s\n", name);
     ret = add_disk(pane_disk->disk);
     if (ret) {
+        pr_err(PANE_BLOCK_DRIVER_NAME
+               ": PANE_BLOCK_ADD_DISK_FAILED name=%s ret=%d\n",
+               name, ret);
         put_disk(pane_disk->disk);
         pane_disk->disk = NULL;
-        unregister_blkdev(pane_disk->major, name);
         blk_mq_free_tag_set(&pane_disk->tag_set);
         return ret;
     }
+    pr_info(PANE_BLOCK_DRIVER_NAME
+            ": PANE_BLOCK_ADD_DISK_OK name=%s\n", name);
     return 0;
 }
 
@@ -5475,8 +5557,6 @@ static void pane_block_destroy_disk(int index)
         del_gendisk(pane_disk->disk);
         put_disk(pane_disk->disk);
     }
-    if (pane_disk->major > 0)
-        unregister_blkdev(pane_disk->major, pane_disk->name);
     blk_mq_free_tag_set(&pane_disk->tag_set);
 }
 
@@ -5484,17 +5564,41 @@ static int __init pane_block_init(void)
 {
     int ret;
 
-    ret = pane_block_create_disk(0, PANE_BLOCK_DEVICE_BASE_OS, "pane0");
-    if (ret)
-        return ret;
+    pr_info(PANE_BLOCK_DRIVER_NAME
+            ": PANE_BLOCK_INIT_START protocol=%s io_block=%u device_blocks=%lu,%lu base_block_offset=%lu\n",
+            PANE_BLOCK_IO_PROTOCOL, PANE_BLOCK_IO_BLOCK_SIZE_BYTES,
+            device_blocks[0], device_blocks[1], base_block_offset);
 
-    ret = pane_block_create_disk(1, PANE_BLOCK_DEVICE_USER_DISK, "pane1");
+    pane_block_major = register_blkdev(0, PANE_BLOCK_DRIVER_NAME);
+    if (pane_block_major <= 0) {
+        pr_err(PANE_BLOCK_DRIVER_NAME
+               ": PANE_BLOCK_REGISTER_BLKDEV_FAILED ret=%d\n",
+               pane_block_major);
+        return -EBUSY;
+    }
+    pr_info(PANE_BLOCK_DRIVER_NAME
+            ": PANE_BLOCK_REGISTER_BLKDEV_OK major=%d\n",
+            pane_block_major);
+
+    ret = pane_block_create_disk(0, PANE_BLOCK_DEVICE_BASE_OS, "pane0");
     if (ret) {
-        pane_block_destroy_disk(0);
+        pr_err(PANE_BLOCK_DRIVER_NAME
+               ": PANE_BLOCK_INIT_BASE_DISK_FAILED ret=%d\n", ret);
+        unregister_blkdev(pane_block_major, PANE_BLOCK_DRIVER_NAME);
         return ret;
     }
 
-    pr_info(PANE_BLOCK_DRIVER_NAME ": registered /dev/pane0 and /dev/pane1 for %s\n",
+    ret = pane_block_create_disk(1, PANE_BLOCK_DEVICE_USER_DISK, "pane1");
+    if (ret) {
+        pr_err(PANE_BLOCK_DRIVER_NAME
+               ": PANE_BLOCK_INIT_USER_DISK_FAILED ret=%d\n", ret);
+        pane_block_destroy_disk(0);
+        unregister_blkdev(pane_block_major, PANE_BLOCK_DRIVER_NAME);
+        return ret;
+    }
+
+    pane_block_initializing = false;
+    pr_info(PANE_BLOCK_DRIVER_NAME ": PANE_BLOCK_INIT_OK registered /dev/pane0 and /dev/pane1 for %s\n",
             PANE_BLOCK_IO_PROTOCOL);
     return 0;
 }
@@ -5503,6 +5607,8 @@ static void __exit pane_block_exit(void)
 {
     pane_block_destroy_disk(1);
     pane_block_destroy_disk(0);
+    if (pane_block_major > 0)
+        unregister_blkdev(pane_block_major, PANE_BLOCK_DRIVER_NAME);
 }
 
 module_init(pane_block_init);
@@ -6851,7 +6957,13 @@ fn augment_kernel_cmdline_for_runtime_contracts(
             &mut cmdline,
             format!(
                 "pane.block_devices={},{}",
-                pane_block_device_blocks(storage.base_os_bytes, storage.block_io_block_size_bytes)?,
+                pane_block_device_blocks(
+                    storage
+                        .root_handoff
+                        .partition_byte_length
+                        .unwrap_or(storage.base_os_bytes),
+                    storage.block_io_block_size_bytes
+                )?,
                 pane_block_device_blocks(
                     storage.user_disk_logical_size_bytes,
                     storage.block_io_block_size_bytes
@@ -7537,8 +7649,8 @@ fn build_kernel_root_handoff(base_metadata: &BaseOsImageMetadata) -> KernelRootH
     if let Some(root) = &base_metadata.root_partition_hint {
         return KernelRootHandoff {
             schema_version: 1,
-            mode: "base-partition".to_string(),
-            root_device: format!("{BASE_DEVICE}p{}", root.index),
+            mode: "base-partition-direct".to_string(),
+            root_device: BASE_DEVICE.to_string(),
             base_device: BASE_DEVICE.to_string(),
             partition_index: Some(root.index),
             partition_byte_offset: Some(root.byte_offset),
@@ -7546,9 +7658,9 @@ fn build_kernel_root_handoff(base_metadata: &BaseOsImageMetadata) -> KernelRootH
             filesystem_hint: Some(root.partition_type.clone()),
             requires_initramfs_driver: true,
             notes: vec![
-                "Pane found a likely Linux root partition and will hand it to the guest as the root target."
+                "Pane found a likely Linux root partition and exposes that partition directly as /dev/pane0 to avoid guest partition-scan I/O during native boot."
                     .to_string(),
-                "A Pane-aware initramfs or block driver is still required before Linux can mount this device natively."
+                "The Pane block driver applies the partition byte offset internally so the guest mounts a root device, not the outer raw disk."
                     .to_string(),
             ],
         };
@@ -14108,9 +14220,12 @@ mod tests {
         assert!(init_source.contains("PANE_BLOCK_MODULE_LOAD_OK"));
         assert!(init_source.contains("PANE_BLOCK_MODULE_LOAD_TIMEOUT"));
         assert!(init_source.contains("PANE_BLOCK_MODULE_NOT_PRESENT"));
+        assert!(init_source.contains("PANE_BLOCK_MODULE_LOAD_WAITING"));
         assert!(init_source.contains("waitpid(child, &status, WNOHANG)"));
+        assert!(init_source.contains("sched_yield();"));
         assert!(init_source.contains("attempt < 50000000"));
-        assert!(init_source.contains("device_blocks=%s"));
+        assert!(init_source.contains("device_blocks=%s base_block_offset=%llu"));
+        assert!(init_source.contains("pane.root_offset"));
         assert!(init_source.contains("pane.block_devices"));
         assert!(init_source.contains("PANE_DISPLAY_CONTRACT_DISCOVERED"));
         assert!(init_source.contains("PANE_FRAMEBUFFER"));
@@ -14153,9 +14268,23 @@ mod tests {
         assert!(block_driver.contains("blk_mq_alloc_disk(&pane_disk->tag_set, &limits, pane_disk)"));
         assert!(block_driver.contains("vmalloc(PANE_BLOCK_IO_BLOCK_SIZE_BYTES)"));
         assert!(block_driver.contains("absolute_byte"));
+        assert!(block_driver.contains("base_block_offset"));
+        assert!(block_driver.contains("GENHD_FL_NO_PART"));
+        assert!(block_driver.contains("block_index + pane_disk->block_offset"));
+        assert!(block_driver.contains("PANE_BLOCK_INIT_READ_ZERO_FILL"));
+        assert!(block_driver.contains("pane_block_initializing = false"));
         assert!(block_driver.contains("partial filesystem writes"));
-        assert!(block_driver.contains("pane_disk->disk->minors = 16"));
+        assert!(block_driver.contains("PANE_BLOCK_MINORS_PER_DISK 16"));
+        assert!(block_driver.contains("index * PANE_BLOCK_MINORS_PER_DISK"));
         assert!(block_driver.contains("add_disk"));
+        assert!(block_driver.contains("PANE_BLOCK_INIT_START"));
+        assert!(block_driver.contains("PANE_BLOCK_REGISTER_BLKDEV_OK"));
+        assert!(block_driver.contains("PANE_BLOCK_CREATE_DISK_START"));
+        assert!(block_driver.contains("PANE_BLOCK_ADD_DISK_START"));
+        assert!(block_driver.contains("PANE_BLOCK_TRANSFER_START"));
+        assert!(block_driver.contains("PANE_BLOCK_SUBMIT_DONE"));
+        assert!(block_driver.contains("PANE_BLOCK_STATUS_READ"));
+        assert!(block_driver.contains("PANE_BLOCK_TRANSFER_DONE"));
         assert!(block_driver.contains("/dev/pane0"));
         assert!(block_driver.contains("/dev/pane1"));
         let block_build_script = std::fs::read_to_string(
@@ -14576,7 +14705,7 @@ mod tests {
             layout.expected_serial_milestones,
             pane_initramfs_expected_serial_milestones()
         );
-        assert_eq!(storage.root_device, "/dev/pane0p1");
+        assert_eq!(storage.root_device, "/dev/pane0");
         assert_eq!(storage.user_device, "/dev/pane1");
         assert_eq!(storage.contract_gpa, "0x0dfe0000");
         assert_eq!(storage.base_os_block_size_bytes, 4096);
@@ -14614,12 +14743,14 @@ mod tests {
             1
         );
         assert!(layout.cmdline.contains("pane.storage_contract=0x0dfe0000"));
-        assert!(layout.cmdline.contains("pane.root=/dev/pane0p1"));
-        assert!(layout.cmdline.contains("pane.root_mode=base-partition"));
+        assert!(layout.cmdline.contains("pane.root=/dev/pane0"));
+        assert!(layout
+            .cmdline
+            .contains("pane.root_mode=base-partition-direct"));
         assert!(layout.cmdline.contains("pane.root_partition=1"));
         assert!(layout.cmdline.contains("pane.user=/dev/pane1"));
         assert!(layout.cmdline.contains("pane.block_io=0x0d00,16,512"));
-        assert!(layout.cmdline.contains("pane.block_devices=8192,6291456"));
+        assert!(layout.cmdline.contains("pane.block_devices=4096,6291456"));
         assert!(layout
             .cmdline
             .contains("pane.framebuffer=0x0e000000,1024,768,32,x8r8g8b8"));
@@ -14628,8 +14759,8 @@ mod tests {
             .contains("pane.input_queue=0x0dff0000,4096,32,64"));
         assert!(storage.readonly_base);
         assert!(storage.writable_user_disk);
-        assert_eq!(storage.root_handoff.mode, "base-partition");
-        assert_eq!(storage.root_handoff.root_device, "/dev/pane0p1");
+        assert_eq!(storage.root_handoff.mode, "base-partition-direct");
+        assert_eq!(storage.root_handoff.root_device, "/dev/pane0");
         assert_eq!(storage.root_handoff.partition_index, Some(1));
         assert_eq!(
             storage.root_handoff.filesystem_hint.as_deref(),
@@ -14827,9 +14958,9 @@ mod tests {
         let layout = build_kernel_boot_layout(&paths, "pane", true).unwrap();
         let storage = layout.storage.as_ref().expect("storage attachment");
 
-        assert_eq!(storage.root_device, "/dev/pane0p1");
-        assert_eq!(storage.root_handoff.mode, "base-partition");
-        assert_eq!(storage.root_handoff.root_device, "/dev/pane0p1");
+        assert_eq!(storage.root_device, "/dev/pane0");
+        assert_eq!(storage.root_handoff.mode, "base-partition-direct");
+        assert_eq!(storage.root_handoff.root_device, "/dev/pane0");
         assert_eq!(storage.root_handoff.partition_index, Some(1));
         assert_eq!(storage.root_handoff.partition_byte_offset, Some(2048 * 512));
         assert_eq!(storage.root_handoff.partition_byte_length, Some(4096 * 512));
@@ -14842,8 +14973,10 @@ mod tests {
             layout.expected_serial_milestones,
             pane_initramfs_expected_serial_milestones()
         );
-        assert!(layout.cmdline.contains("pane.root=/dev/pane0p1"));
-        assert!(layout.cmdline.contains("pane.root_mode=base-partition"));
+        assert!(layout.cmdline.contains("pane.root=/dev/pane0"));
+        assert!(layout
+            .cmdline
+            .contains("pane.root_mode=base-partition-direct"));
         assert!(layout.cmdline.contains("pane.root_partition=1"));
         assert!(layout.cmdline.contains("pane.root_offset=1048576"));
         assert!(layout.cmdline.contains("pane.root_length=2097152"));
@@ -14855,8 +14988,8 @@ mod tests {
             .expect("storage contract region");
         assert!(storage_contract
             .bytes
-            .windows("base-partition".len())
-            .any(|window| window == b"base-partition"));
+            .windows("base-partition-direct".len())
+            .any(|window| window == b"base-partition-direct"));
 
         let _ = std::fs::remove_dir_all(&paths.root);
     }

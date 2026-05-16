@@ -4258,9 +4258,9 @@ mod windows_whp {
             "WHvSetVirtualProcessorRegisters(RIP)",
             hresult,
             if ok {
-                "Advanced guest RIP past the emulated serial I/O instruction."
+                "Advanced guest RIP past the emulated I/O instruction."
             } else {
-                "Could not advance guest RIP after serial I/O exit."
+                "Could not advance guest RIP after I/O exit."
             },
         ));
         ok

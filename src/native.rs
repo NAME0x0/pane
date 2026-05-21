@@ -26,7 +26,7 @@ pub(crate) const PANE_BLOCK_IO_BASE_PORT: u16 = 0x0d00;
 pub(crate) const PANE_BLOCK_IO_PORT_COUNT: u16 = 0x0010;
 pub(crate) const PANE_BLOCK_IO_LAST_PORT: u16 =
     PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_PORT_COUNT - 1;
-pub(crate) const PANE_BLOCK_IO_BLOCK_SIZE_BYTES: u32 = 512;
+pub(crate) const PANE_BLOCK_IO_BLOCK_SIZE_BYTES: u32 = 4096;
 pub(crate) const PANE_BLOCK_IO_STATUS_SUBMITTED: u8 = 0x01;
 pub(crate) const PANE_BLOCK_IO_STATUS_SERVICED: u8 = 0x02;
 pub(crate) const PANE_BLOCK_IO_STATUS_DENIED: u8 = 0xfc;
@@ -1163,7 +1163,8 @@ mod windows_whp {
     };
     use crate::native::{
         native_block_io_exit_can_resume, pane_block_io_access_mask, pane_block_io_port_offset,
-        service_native_block_io_command, NativeBlockIoPortState,
+        service_native_block_io_command, NativeBlockIoPortState, NativeBlockOperation,
+        PANE_BLOCK_IO_BLOCK_SIZE_BYTES, PANE_BLOCK_IO_STATUS_SERVICED,
     };
 
     const WHV_CAPABILITY_CODE_HYPERVISOR_PRESENT: u32 = 0;
@@ -1830,7 +1831,7 @@ mod windows_whp {
                 ));
             }
 
-            let guest_regions = if run_fixture && report.virtual_processor_created {
+            let mut guest_regions = if run_fixture && report.virtual_processor_created {
                 if let Some(map_gpa_range) = map_gpa_range {
                     map_boot_image_regions(partition, map_gpa_range, boot_image, &mut report)
                 } else {
@@ -1880,6 +1881,7 @@ mod windows_whp {
                             set_virtual_processor_registers,
                             boot_image,
                             block_io_handler,
+                            &mut guest_regions,
                             &mut report,
                         );
                     }
@@ -2064,6 +2066,13 @@ mod windows_whp {
         guest_gpa: u64,
         size: u64,
         _memory: GuestMemory,
+    }
+
+    fn pane_block_dma_window(mapped_regions: &mut [MappedGuestRegion]) -> Option<&mut [u8]> {
+        mapped_regions
+            .iter_mut()
+            .find(|region| region.label == "pane-block-dma")
+            .map(|region| region._memory.as_mut_slice())
     }
 
     struct GuestMemory {
@@ -2509,6 +2518,7 @@ mod windows_whp {
         set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
         boot_image: &NativeSerialBootImage,
         block_io_handler: Option<&NativeBlockIoHandler<'_>>,
+        mapped_regions: &mut [MappedGuestRegion],
         report: &mut NativePartitionSmokeReport,
     ) {
         match boot_image.entry_mode {
@@ -2528,6 +2538,7 @@ mod windows_whp {
                 request_interrupt,
                 set_virtual_processor_registers,
                 block_io_handler,
+                pane_block_dma_window(mapped_regions),
                 report,
             ),
         }
@@ -2682,6 +2693,7 @@ mod windows_whp {
         request_interrupt: Option<WhvRequestInterrupt>,
         set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
         block_io_handler: Option<&NativeBlockIoHandler<'_>>,
+        mut block_dma_window: Option<&mut [u8]>,
         report: &mut NativePartitionSmokeReport,
     ) {
         report.serial_expected_text = None;
@@ -2859,15 +2871,53 @@ mod windows_whp {
                                 access_size,
                                 (rax & u64::from(pane_block_io_access_mask(access_size))) as u32,
                             ) {
+                                let dma_ready = block_dma_window.as_ref().is_some_and(|window| {
+                                    window.len() >= PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize
+                                });
+                                let dma_write_payload = if dma_ready
+                                    && submission.command.operation == NativeBlockOperation::Write
+                                {
+                                    block_dma_window.as_deref().map(|window| {
+                                        window[..PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize].to_vec()
+                                    })
+                                } else {
+                                    None
+                                };
                                 let outcome = service_native_block_io_command(
                                     &submission.command,
                                     block_io_handler,
-                                    submission.write_payload.as_deref(),
+                                    dma_write_payload
+                                        .as_deref()
+                                        .or(submission.write_payload.as_deref()),
                                 );
-                                block_state.set_service_result(
-                                    outcome.status_code,
-                                    outcome.response_bytes,
-                                );
+                                let status_code = outcome.status_code;
+                                let mut response_bytes = outcome.response_bytes;
+                                if dma_ready
+                                    && status_code == PANE_BLOCK_IO_STATUS_SERVICED
+                                    && submission.command.operation == NativeBlockOperation::Read
+                                {
+                                    if let Some(window) = block_dma_window.as_deref_mut() {
+                                        let transfer_len = response_bytes
+                                            .len()
+                                            .min(PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize);
+                                        window[..PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize].fill(0);
+                                        window[..transfer_len]
+                                            .copy_from_slice(&response_bytes[..transfer_len]);
+                                        report.calls.push(NativeWhpCallReport {
+                                            name: "PaneBlockDmaServiced",
+                                            hresult: None,
+                                            ok: transfer_len
+                                                == PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize,
+                                            detail: format!(
+                                                "Pane copied {transfer_len} bytes for {} block {} through the shared block DMA window.",
+                                                submission.command.device.label(),
+                                                submission.command.block_index
+                                            ),
+                                        });
+                                        response_bytes.clear();
+                                    }
+                                }
+                                block_state.set_service_result(status_code, response_bytes);
                                 last_progress_at = Instant::now();
                                 if let Some(path) = checkpoint_path.as_deref() {
                                     write_linux_entry_probe_checkpoint(
@@ -2878,8 +2928,7 @@ mod windows_whp {
                                     );
                                     last_checkpoint_at = Instant::now();
                                 }
-                                let can_resume =
-                                    native_block_io_exit_can_resume(outcome.status_code);
+                                let can_resume = native_block_io_exit_can_resume(status_code);
                                 report.calls.push(outcome.report);
                                 if can_resume {
                                     if !set_guest_rip(
@@ -6097,7 +6146,7 @@ mod windows_whp {
                 device: NativeBlockDeviceId::UserDisk,
                 operation: NativeBlockOperation::Read,
                 block_index: 9,
-                block_size_bytes: 4096,
+                block_size_bytes: 512,
             });
             assert!(!bad_block_size.allowed);
             assert_eq!(bad_block_size.status, "unsupported-block-size");

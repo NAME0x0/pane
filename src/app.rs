@@ -566,6 +566,10 @@ struct KernelStorageAttachment {
     block_io_data_port_offset: u16,
     #[serde(default = "default_pane_block_io_block_size_bytes")]
     block_io_block_size_bytes: u64,
+    #[serde(default = "default_pane_block_dma_gpa")]
+    block_dma_gpa: String,
+    #[serde(default = "default_pane_block_dma_size_bytes")]
+    block_dma_size_bytes: u64,
     base_os_image_format: String,
     base_os_bootable_disk_hint: bool,
     base_os_partitions: Vec<BaseOsPartition>,
@@ -744,6 +748,14 @@ fn default_pane_block_io_data_port_offset() -> u16 {
 
 fn default_pane_block_io_block_size_bytes() -> u64 {
     u64::from(crate::native::PANE_BLOCK_IO_BLOCK_SIZE_BYTES)
+}
+
+fn default_pane_block_dma_gpa() -> String {
+    "0x0dfd0000".to_string()
+}
+
+fn default_pane_block_dma_size_bytes() -> u64 {
+    0x00001000
 }
 
 #[derive(Debug, Serialize)]
@@ -4720,6 +4732,7 @@ pane_cmdline_value() {{
 
 pane_storage_contract="$(pane_cmdline_value pane.storage_contract || true)"
 pane_block_io="$(pane_cmdline_value pane.block_io || true)"
+pane_block_dma="$(pane_cmdline_value pane.block_dma || true)"
 pane_root="$(pane_cmdline_value pane.root || true)"
 pane_user="$(pane_cmdline_value pane.user || true)"
 pane_block_devices="$(pane_cmdline_value pane.block_devices || true)"
@@ -4730,6 +4743,7 @@ mkdir -p /run/pane
 cat > /run/pane/native-storage.env <<EOF
 PANE_STORAGE_CONTRACT=$pane_storage_contract
 PANE_BLOCK_IO=$pane_block_io
+PANE_BLOCK_DMA=$pane_block_dma
 PANE_ROOT=$pane_root
 PANE_USER=$pane_user
 PANE_BLOCK_DEVICES=$pane_block_devices
@@ -4881,6 +4895,7 @@ static void mkdir_if_missing(const char *path, mode_t mode) {
 static void write_native_storage_env(
     const char *storage_contract,
     const char *block_io,
+    const char *block_dma,
     const char *root_device,
     const char *user_device,
     const char *framebuffer,
@@ -4895,6 +4910,7 @@ static void write_native_storage_env(
     }
     dprintf(fd, "PANE_STORAGE_CONTRACT=%s\n", storage_contract);
     dprintf(fd, "PANE_BLOCK_IO=%s\n", block_io);
+    dprintf(fd, "PANE_BLOCK_DMA=%s\n", block_dma);
     dprintf(fd, "PANE_ROOT=%s\n", root_device);
     dprintf(fd, "PANE_USER=%s\n", user_device);
     dprintf(fd, "PANE_FRAMEBUFFER=%s\n", framebuffer);
@@ -4973,10 +4989,12 @@ static int wait_for_device(const char *path) {
     return -1;
 }
 
-static int load_pane_block_module(const char *device_blocks, const char *root_offset) {
+static int load_pane_block_module(const char *device_blocks, const char *root_offset, const char *block_dma) {
     const char *module_path = "/lib/modules/pane-block.ko";
-    char params[128] = {0};
+    char params[256] = {0};
     unsigned long long base_block_offset = 0;
+    unsigned long long shared_buffer_gpa = 0;
+    unsigned long long shared_buffer_bytes = 0;
     int fd = open(module_path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         if (errno == ENOENT) {
@@ -4993,11 +5011,20 @@ static int load_pane_block_module(const char *device_blocks, const char *root_of
     if (root_offset && root_offset[0] != '\0') {
         base_block_offset = strtoull(root_offset, NULL, 10) / PANE_BLOCK_IO_BLOCK_SIZE_BYTES;
     }
+    if (block_dma && block_dma[0] != '\0') {
+        shared_buffer_gpa = strtoull(block_dma, NULL, 0);
+        const char *comma = strchr(block_dma, ',');
+        if (comma && comma[1] != '\0')
+            shared_buffer_bytes = strtoull(comma + 1, NULL, 10);
+    }
     if (device_blocks && device_blocks[0] != '\0') {
-        snprintf(params, sizeof(params), "device_blocks=%s base_block_offset=%llu",
-                 device_blocks, base_block_offset);
+        snprintf(params, sizeof(params),
+                 "device_blocks=%s base_block_offset=%llu shared_buffer_gpa=%llu shared_buffer_bytes=%llu",
+                 device_blocks, base_block_offset, shared_buffer_gpa, shared_buffer_bytes);
     } else {
-        snprintf(params, sizeof(params), "base_block_offset=%llu", base_block_offset);
+        snprintf(params, sizeof(params),
+                 "base_block_offset=%llu shared_buffer_gpa=%llu shared_buffer_bytes=%llu",
+                 base_block_offset, shared_buffer_gpa, shared_buffer_bytes);
     }
 #ifdef SYS_finit_module
     pid_t child = fork();
@@ -5097,6 +5124,7 @@ int main(void) {
     char cmdline[4096];
     char storage_contract[128] = {0};
     char block_io[128] = {0};
+    char block_dma[128] = {0};
     char root_device[128] = {0};
     char user_device[128] = {0};
     char root_offset[128] = {0};
@@ -5114,6 +5142,7 @@ int main(void) {
     }
     find_arg(cmdline, "pane.storage_contract", storage_contract, sizeof(storage_contract));
     find_arg(cmdline, "pane.block_io", block_io, sizeof(block_io));
+    find_arg(cmdline, "pane.block_dma", block_dma, sizeof(block_dma));
     find_arg(cmdline, "pane.root", root_device, sizeof(root_device));
     find_arg(cmdline, "pane.user", user_device, sizeof(user_device));
     find_arg(cmdline, "pane.root_offset", root_offset, sizeof(root_offset));
@@ -5123,6 +5152,7 @@ int main(void) {
 
     log_key_value("pane.storage_contract", storage_contract);
     log_key_value("pane.block_io", block_io);
+    log_key_value("pane.block_dma", block_dma);
     log_key_value("pane.root", root_device);
     log_key_value("pane.user", user_device);
     log_key_value("pane.root_offset", root_offset);
@@ -5152,14 +5182,14 @@ int main(void) {
     }
 
     log_line("PANE_BLOCK_IO_PROBE_OK");
-    load_pane_block_module(block_devices, root_offset);
+    load_pane_block_module(block_devices, root_offset, block_dma);
     log_line("PANE_INITRAMFS_DISCOVERY_DONE");
     if (framebuffer[0] != '\0' && input_queue[0] != '\0') {
         log_line("PANE_DISPLAY_CONTRACT_DISCOVERED");
     } else {
         log_line("PANE_DISPLAY_CONTRACT_MISSING");
     }
-    write_native_storage_env(storage_contract, block_io, root_device, user_device, framebuffer, input_queue);
+    write_native_storage_env(storage_contract, block_io, block_dma, root_device, user_device, framebuffer, input_queue);
 
     log_line("PANE_ROOT_MOUNT_ATTEMPT");
     if (wait_for_device(root_device) != 0) {
@@ -5240,10 +5270,16 @@ static unsigned long device_blocks[PANE_BLOCK_DEVICE_COUNT] = {
     PANE_BLOCK_DEFAULT_BLOCKS,
 };
 static unsigned long base_block_offset;
+static unsigned long shared_buffer_gpa;
+static unsigned long shared_buffer_bytes;
 module_param_array(device_blocks, ulong, NULL, 0444);
 MODULE_PARM_DESC(device_blocks, "Logical Pane I/O blocks for /dev/pane0 and /dev/pane1");
 module_param(base_block_offset, ulong, 0444);
 MODULE_PARM_DESC(base_block_offset, "Pane I/O block offset where /dev/pane0 starts inside the base OS image");
+module_param(shared_buffer_gpa, ulong, 0444);
+MODULE_PARM_DESC(shared_buffer_gpa, "Guest physical address of the Pane shared block transfer buffer");
+module_param(shared_buffer_bytes, ulong, 0444);
+MODULE_PARM_DESC(shared_buffer_bytes, "Bytes available in the Pane shared block transfer buffer");
 
 struct pane_block_disk {
     int pane_device_id;
@@ -5256,6 +5292,7 @@ struct pane_block_disk {
 static struct pane_block_disk pane_disks[PANE_BLOCK_DEVICE_COUNT];
 static int pane_block_major;
 static bool pane_block_initializing = true;
+static void *pane_block_shared_buffer;
 static unsigned int pane_block_transfer_log_count;
 static unsigned int pane_block_request_log_count;
 static unsigned int pane_block_init_read_log_count;
@@ -5304,7 +5341,9 @@ static int pane_block_transfer(int device_id, int operation, u64 block_index, vo
     outb(operation, PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_OPERATION_OFFSET);
     pane_block_write_index(block_index);
 
-    if (operation == PANE_BLOCK_OPERATION_WRITE) {
+    if (operation == PANE_BLOCK_OPERATION_WRITE && pane_block_shared_buffer) {
+        memcpy(pane_block_shared_buffer, bytes, PANE_BLOCK_IO_BLOCK_SIZE_BYTES);
+    } else if (operation == PANE_BLOCK_OPERATION_WRITE) {
         for (word_index = 0;
              word_index < PANE_BLOCK_IO_BLOCK_SIZE_BYTES / sizeof(u32);
              word_index++) {
@@ -5329,12 +5368,16 @@ static int pane_block_transfer(int device_id, int operation, u64 block_index, vo
     }
 
     if (operation == PANE_BLOCK_OPERATION_READ) {
-        for (word_index = 0;
-             word_index < PANE_BLOCK_IO_BLOCK_SIZE_BYTES / sizeof(u32);
-             word_index++) {
-            u32 word = inl(PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_DATA_OFFSET);
+        if (pane_block_shared_buffer) {
+            memcpy(bytes, pane_block_shared_buffer, PANE_BLOCK_IO_BLOCK_SIZE_BYTES);
+        } else {
+            for (word_index = 0;
+                 word_index < PANE_BLOCK_IO_BLOCK_SIZE_BYTES / sizeof(u32);
+                 word_index++) {
+                u32 word = inl(PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_DATA_OFFSET);
 
-            memcpy(bytes + word_index * sizeof(word), &word, sizeof(word));
+                memcpy(bytes + word_index * sizeof(word), &word, sizeof(word));
+            }
         }
     }
 
@@ -5565,15 +5608,35 @@ static int __init pane_block_init(void)
     int ret;
 
     pr_info(PANE_BLOCK_DRIVER_NAME
-            ": PANE_BLOCK_INIT_START protocol=%s io_block=%u device_blocks=%lu,%lu base_block_offset=%lu\n",
+            ": PANE_BLOCK_INIT_START protocol=%s io_block=%u device_blocks=%lu,%lu base_block_offset=%lu shared_buffer_gpa=%lu shared_buffer_bytes=%lu\n",
             PANE_BLOCK_IO_PROTOCOL, PANE_BLOCK_IO_BLOCK_SIZE_BYTES,
-            device_blocks[0], device_blocks[1], base_block_offset);
+            device_blocks[0], device_blocks[1], base_block_offset,
+            shared_buffer_gpa, shared_buffer_bytes);
+
+    if (shared_buffer_gpa != 0 &&
+        shared_buffer_bytes >= PANE_BLOCK_IO_BLOCK_SIZE_BYTES) {
+        pane_block_shared_buffer = memremap((phys_addr_t)shared_buffer_gpa,
+                                            shared_buffer_bytes,
+                                            MEMREMAP_WB);
+        if (pane_block_shared_buffer) {
+            pr_info(PANE_BLOCK_DRIVER_NAME
+                    ": PANE_BLOCK_SHARED_BUFFER_OK gpa=%lu bytes=%lu\n",
+                    shared_buffer_gpa, shared_buffer_bytes);
+        } else {
+            pr_warn(PANE_BLOCK_DRIVER_NAME
+                    ": PANE_BLOCK_SHARED_BUFFER_UNAVAILABLE gpa=%lu bytes=%lu\n",
+                    shared_buffer_gpa, shared_buffer_bytes);
+        }
+    }
 
     pane_block_major = register_blkdev(0, PANE_BLOCK_DRIVER_NAME);
     if (pane_block_major <= 0) {
         pr_err(PANE_BLOCK_DRIVER_NAME
                ": PANE_BLOCK_REGISTER_BLKDEV_FAILED ret=%d\n",
                pane_block_major);
+        if (pane_block_shared_buffer)
+            memunmap(pane_block_shared_buffer);
+        pane_block_shared_buffer = NULL;
         return -EBUSY;
     }
     pr_info(PANE_BLOCK_DRIVER_NAME
@@ -5585,6 +5648,9 @@ static int __init pane_block_init(void)
         pr_err(PANE_BLOCK_DRIVER_NAME
                ": PANE_BLOCK_INIT_BASE_DISK_FAILED ret=%d\n", ret);
         unregister_blkdev(pane_block_major, PANE_BLOCK_DRIVER_NAME);
+        if (pane_block_shared_buffer)
+            memunmap(pane_block_shared_buffer);
+        pane_block_shared_buffer = NULL;
         return ret;
     }
 
@@ -5594,6 +5660,9 @@ static int __init pane_block_init(void)
                ": PANE_BLOCK_INIT_USER_DISK_FAILED ret=%d\n", ret);
         pane_block_destroy_disk(0);
         unregister_blkdev(pane_block_major, PANE_BLOCK_DRIVER_NAME);
+        if (pane_block_shared_buffer)
+            memunmap(pane_block_shared_buffer);
+        pane_block_shared_buffer = NULL;
         return ret;
     }
 
@@ -5609,6 +5678,9 @@ static void __exit pane_block_exit(void)
     pane_block_destroy_disk(0);
     if (pane_block_major > 0)
         unregister_blkdev(pane_block_major, PANE_BLOCK_DRIVER_NAME);
+    if (pane_block_shared_buffer)
+        memunmap(pane_block_shared_buffer);
+    pane_block_shared_buffer = NULL;
 }
 
 module_init(pane_block_init);
@@ -5693,7 +5765,7 @@ This bundle is generated by `pane runtime --write-initramfs-driver`.
 
 It defines the guest-side discovery hook, C probe source, self-contained C
 `/init` source, and Linux block-driver source contract for Pane's native
-block-port ABI. The generated `/init` discovers the Pane storage contract,
+block-port ABI plus its shared-memory block transfer window. The generated `/init` discovers the Pane storage contract,
 writes `/run/pane/native-storage.env`, waits for the declared root device,
 attempts to mount it at `/newroot`, moves proc/sys/dev into the new root, and
 executes the real Linux init once `/dev/pane0` exists. If `pane-block.ko` is
@@ -5706,6 +5778,7 @@ Expected kernel arguments:
 
 - `pane.storage_contract=<guest-physical-address>`
 - `pane.block_io=<base-port>,<port-count>,<block-size-bytes>`
+- `pane.block_dma=<guest-physical-address>,<bytes>`
 - `pane.root=<root-device>`
 - `pane.user=<user-device>`
 
@@ -6776,6 +6849,7 @@ fn linux_guest_mapped_regions(
                     | "legacy-rom"
                     | "mmio-stub"
                     | "storage-contract"
+                    | "block-dma"
                     | "framebuffer"
                     | "input-queue"
             )
@@ -6790,7 +6864,9 @@ fn linux_guest_mapped_regions(
             let label = match range.region_type.as_str() {
                 "usable" => format!("linux-ram-{}", range.label),
                 "bios-data" | "bios-rom" | "legacy-rom" => format!("linux-{}", range.label),
-                "storage-contract" | "framebuffer" | "input-queue" => range.label.clone(),
+                "storage-contract" | "block-dma" | "framebuffer" | "input-queue" => {
+                    range.label.clone()
+                }
                 _ => format!("linux-{}", range.label),
             };
             let bytes = match range.region_type.as_str() {
@@ -6968,6 +7044,13 @@ fn augment_kernel_cmdline_for_runtime_contracts(
                     storage.user_disk_logical_size_bytes,
                     storage.block_io_block_size_bytes
                 )?
+            ),
+        );
+        append_kernel_arg(
+            &mut cmdline,
+            format!(
+                "pane.block_dma={},{}",
+                storage.block_dma_gpa, storage.block_dma_size_bytes
             ),
         );
     }
@@ -7203,7 +7286,7 @@ fn write_linux_e820_table(
         let region_type = match range.region_type.as_str() {
             "usable" => 1,
             "reserved" | "bios-data" | "bios-rom" | "legacy-rom" | "mmio-stub"
-            | "storage-contract" | "framebuffer" | "input-queue" => 2,
+            | "storage-contract" | "block-dma" | "framebuffer" | "input-queue" => 2,
             other => {
                 return Err(AppError::message(format!(
                     "Unsupported Linux E820 range type `{other}` for `{}`.",
@@ -7521,6 +7604,7 @@ fn build_kernel_boot_layout(
     if is_linux_bzimage {
         if let Some(storage) = &storage {
             guest_memory_map.push(storage_contract_guest_memory_range(storage)?);
+            guest_memory_map.push(block_dma_guest_memory_range(storage)?);
         }
         guest_memory_map.extend(runtime_contract_guest_memory_ranges(&framebuffer, &input)?);
         validate_guest_memory_ranges_do_not_overlap(&guest_memory_map)?;
@@ -7623,6 +7707,8 @@ fn build_kernel_storage_attachment(
         block_io_status_port_offset: default_pane_block_io_status_port_offset(),
         block_io_data_port_offset: default_pane_block_io_data_port_offset(),
         block_io_block_size_bytes: default_pane_block_io_block_size_bytes(),
+        block_dma_gpa: default_pane_block_dma_gpa(),
+        block_dma_size_bytes: default_pane_block_dma_size_bytes(),
         base_os_image_format: base_metadata.image_format,
         base_os_bootable_disk_hint: base_metadata.bootable_disk_hint,
         base_os_partitions: base_metadata.partitions,
@@ -7706,6 +7792,18 @@ fn storage_contract_guest_memory_range(
         start_gpa: format_guest_physical_address(storage_gpa),
         size_bytes: 0x00001000,
         region_type: "storage-contract".to_string(),
+    })
+}
+
+fn block_dma_guest_memory_range(
+    storage: &KernelStorageAttachment,
+) -> AppResult<KernelGuestMemoryRange> {
+    let block_dma_gpa = parse_guest_physical_address(&storage.block_dma_gpa)?;
+    Ok(KernelGuestMemoryRange {
+        label: "pane-block-dma".to_string(),
+        start_gpa: format_guest_physical_address(block_dma_gpa),
+        size_bytes: page_align_guest_range(storage.block_dma_size_bytes),
+        region_type: "block-dma".to_string(),
     })
 }
 
@@ -8620,6 +8718,7 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
                             default_linux_guest_memory_map(metadata.initramfs_bytes.unwrap_or(0));
                         if let Some(storage) = &layout.storage {
                             ranges.push(storage_contract_guest_memory_range(storage).ok()?);
+                            ranges.push(block_dma_guest_memory_range(storage).ok()?);
                         }
                         ranges
                             .extend(runtime_contract_guest_memory_ranges(framebuffer, input).ok()?);
@@ -14069,7 +14168,7 @@ mod tests {
         let base = paths.downloads.join("arch-base.img");
         let mut image = vec![0_u8; 5000];
         image[..16].copy_from_slice(b"PANE_BASE_ADAPT_");
-        image[512..528].copy_from_slice(b"PANE_BASE_512___");
+        image[4096..4112].copy_from_slice(b"PANE_BASE_4096__");
         std::fs::write(&base, image).unwrap();
         let base_sha = sha256_file(&base).unwrap();
         register_base_os_image(&paths, &base, Some(&base_sha), false, false).unwrap();
@@ -14100,7 +14199,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(&base_second_sector.bytes[..16], b"PANE_BASE_512___");
+        assert_eq!(&base_second_sector.bytes[..16], b"PANE_BASE_4096__");
 
         let denied_base_write = execute_native_block_io_command(
             &paths,
@@ -14203,6 +14302,7 @@ mod tests {
                 .unwrap();
         assert!(hook.contains("pane.storage_contract"));
         assert!(hook.contains("pane.block_io"));
+        assert!(hook.contains("pane.block_dma"));
         assert!(hook.contains("pane.block_devices"));
         assert!(hook.contains("pane.framebuffer"));
         assert!(hook.contains("pane.input_queue"));
@@ -14224,9 +14324,10 @@ mod tests {
         assert!(init_source.contains("waitpid(child, &status, WNOHANG)"));
         assert!(init_source.contains("sched_yield();"));
         assert!(init_source.contains("attempt < 50000000"));
-        assert!(init_source.contains("device_blocks=%s base_block_offset=%llu"));
+        assert!(init_source.contains("shared_buffer_gpa=%llu shared_buffer_bytes=%llu"));
         assert!(init_source.contains("pane.root_offset"));
         assert!(init_source.contains("pane.block_devices"));
+        assert!(init_source.contains("pane.block_dma"));
         assert!(init_source.contains("PANE_DISPLAY_CONTRACT_DISCOVERED"));
         assert!(init_source.contains("PANE_FRAMEBUFFER"));
         assert!(init_source.contains("PANE_INPUT_QUEUE"));
@@ -14256,6 +14357,10 @@ mod tests {
         assert!(block_driver.contains("PANE_BLOCK_OPERATION_WRITE"));
         assert!(block_driver.contains("PANE_BLOCK_IO_BASE_PORT"));
         assert!(block_driver.contains("PANE_BLOCK_STATUS_SERVICED"));
+        assert!(block_driver.contains("shared_buffer_gpa"));
+        assert!(block_driver.contains("pane_block_shared_buffer"));
+        assert!(block_driver.contains("PANE_BLOCK_SHARED_BUFFER_OK"));
+        assert!(block_driver.contains("memremap((phys_addr_t)shared_buffer_gpa"));
         assert!(block_driver.contains("outl((u32)(block_index & 0xffffffff)"));
         assert!(block_driver
             .contains("outl(word, PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_DATA_OFFSET)"));
@@ -14718,6 +14823,8 @@ mod tests {
             storage.block_io_block_size_bytes,
             u64::from(crate::native::PANE_BLOCK_IO_BLOCK_SIZE_BYTES)
         );
+        assert_eq!(storage.block_dma_gpa, "0x0dfd0000");
+        assert_eq!(storage.block_dma_size_bytes, 4096);
         assert!(layout
             .cmdline
             .contains("earlycon=uart8250,io,0x3f8,115200n8"));
@@ -14749,8 +14856,9 @@ mod tests {
             .contains("pane.root_mode=base-partition-direct"));
         assert!(layout.cmdline.contains("pane.root_partition=1"));
         assert!(layout.cmdline.contains("pane.user=/dev/pane1"));
-        assert!(layout.cmdline.contains("pane.block_io=0x0d00,16,512"));
-        assert!(layout.cmdline.contains("pane.block_devices=4096,6291456"));
+        assert!(layout.cmdline.contains("pane.block_io=0x0d00,16,4096"));
+        assert!(layout.cmdline.contains("pane.block_devices=512,786432"));
+        assert!(layout.cmdline.contains("pane.block_dma=0x0dfd0000,4096"));
         assert!(layout
             .cmdline
             .contains("pane.framebuffer=0x0e000000,1024,768,32,x8r8g8b8"));
@@ -14779,7 +14887,16 @@ mod tests {
                 && range.start_gpa == "0x0dfe0000"
                 && range.region_type == "storage-contract"
         }));
+        assert!(layout.guest_memory_map.iter().any(|range| {
+            range.label == "pane-block-dma"
+                && range.start_gpa == "0x0dfd0000"
+                && range.size_bytes == 4096
+                && range.region_type == "block-dma"
+        }));
         let mapped_regions = linux_guest_mapped_regions(&layout).unwrap();
+        assert!(mapped_regions
+            .iter()
+            .any(|region| region.label == "pane-block-dma" && region.guest_gpa == 0x0dfd_0000));
         let storage_contract = mapped_regions
             .iter()
             .find(|region| region.label == "pane-storage-contract")

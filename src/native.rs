@@ -1187,7 +1187,9 @@ mod windows_whp {
     const LINUX_ENTRY_PROBE_EXIT_BUDGET: usize = 131072;
     const LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET: usize = 256;
     const LINUX_ENTRY_PROBE_TIMESLICE_MILLIS: u64 = 250;
+    const LINUX_ENTRY_PROBE_CANCEL_GRACE_SECONDS: u64 = 5;
     const LINUX_ENTRY_PROBE_WALL_CLOCK_BUDGET_SECONDS: u64 = 90;
+    const LINUX_ENTRY_PROBE_TOTAL_BUDGET_SECONDS: u64 = 300;
     const LINUX_ENTRY_PROBE_TRACE_HEAD: usize = 384;
     const LINUX_ENTRY_PROBE_TRACE_TAIL: usize = 384;
     const SERIAL_COM1_PORT: u16 = 0x03f8;
@@ -1888,7 +1890,20 @@ mod windows_whp {
                 capture_runtime_surface_snapshots(&guest_regions, &mut report);
             }
 
-            if run_fixture && report.memory_mapped {
+            let skip_whp_cleanup = report
+                .calls
+                .iter()
+                .any(|call| call.name == "LinuxEntryProbeRunCancelTimeout" && !call.ok);
+            if skip_whp_cleanup {
+                report.calls.push(NativeWhpCallReport {
+                    name: "WHPPartitionCleanupSkipped",
+                    hresult: None,
+                    ok: true,
+                    detail: "Skipped WHP unmap/delete calls after a non-returning vCPU run; the process will let Windows reclaim the partition at exit instead of racing cleanup against the guarded run worker.".to_string(),
+                });
+            }
+
+            if !skip_whp_cleanup && run_fixture && report.memory_mapped {
                 if let Some(unmap_gpa_range) = unmap_gpa_range {
                     let mut unmapped_all = true;
                     for region in guest_regions.iter().rev() {
@@ -1911,7 +1926,7 @@ mod windows_whp {
 
             drop(guest_regions);
 
-            if report.partition_created && report.virtual_processor_created {
+            if !skip_whp_cleanup && report.partition_created && report.virtual_processor_created {
                 let hresult = delete_virtual_processor(partition, 0);
                 report.virtual_processor_deleted = hresult_succeeded(hresult);
                 report.calls.push(hresult_call(
@@ -1925,7 +1940,7 @@ mod windows_whp {
                 ));
             }
 
-            if report.partition_created {
+            if !skip_whp_cleanup && report.partition_created {
                 let hresult = delete_partition(partition);
                 report.partition_deleted = hresult_succeeded(hresult);
                 report.calls.push(hresult_call(
@@ -1939,7 +1954,9 @@ mod windows_whp {
                 ));
             }
 
-            FreeLibrary(module);
+            if !skip_whp_cleanup {
+                FreeLibrary(module);
+            }
         }
 
         let selected_entry_mode = boot_image
@@ -2671,8 +2688,22 @@ mod windows_whp {
         let max_guest_exits = linux_entry_probe_exit_budget(report);
         report.guest_exit_budget = max_guest_exits as u32;
         let checkpoint_path = linux_entry_probe_checkpoint_path();
-        let run_controller = cancel_run_virtual_processor
-            .map(|cancel| LinuxEntryProbeRunController::start(partition, cancel));
+        let Some(cancel_run_virtual_processor) = cancel_run_virtual_processor else {
+            report.calls.push(NativeWhpCallReport {
+                name: "WHvCancelRunVirtualProcessor",
+                hresult: None,
+                ok: false,
+                detail:
+                    "WHvCancelRunVirtualProcessor is unavailable, so Pane refuses to run the Linux probe without a host-side escape hatch."
+                        .to_string(),
+            });
+            return;
+        };
+        let mut guarded_runner = LinuxEntryProbeGuardedRunner::start(
+            partition,
+            run_virtual_processor,
+            cancel_run_virtual_processor,
+        );
         let mut msr_state = default_linux_msr_state();
         let mut serial_state = Com1SerialState::default();
         let mut block_state = NativeBlockIoPortState::default();
@@ -2688,6 +2719,7 @@ mod windows_whp {
         let mut interrupt_window_ready_waits = 0_u32;
         let probe_started_at = Instant::now();
         let mut last_checkpoint_at = probe_started_at;
+        let mut last_progress_at = probe_started_at;
         if let Some(path) = checkpoint_path.as_deref() {
             write_linux_entry_probe_checkpoint(path, report, "started", probe_started_at);
         }
@@ -2700,7 +2732,7 @@ mod windows_whp {
                 }
             }
 
-            if probe_started_at.elapsed()
+            if last_progress_at.elapsed()
                 >= Duration::from_secs(LINUX_ENTRY_PROBE_WALL_CLOCK_BUDGET_SECONDS)
             {
                 report.calls.push(NativeWhpCallReport {
@@ -2708,37 +2740,54 @@ mod windows_whp {
                     hresult: None,
                     ok: false,
                     detail: format!(
-                        "Linux protected-mode entry probe exceeded {LINUX_ENTRY_PROBE_WALL_CLOCK_BUDGET_SECONDS}s before reaching all expected serial milestones."
+                        "Linux protected-mode entry probe made no meaningful guest progress for {LINUX_ENTRY_PROBE_WALL_CLOCK_BUDGET_SECONDS}s before reaching all expected serial milestones; total elapsed={}s.",
+                        probe_started_at.elapsed().as_secs()
+                    ),
+                });
+                break;
+            }
+
+            if probe_started_at.elapsed()
+                >= Duration::from_secs(LINUX_ENTRY_PROBE_TOTAL_BUDGET_SECONDS)
+            {
+                report.calls.push(NativeWhpCallReport {
+                    name: "LinuxEntryProbeTotalWallClockBudget",
+                    hresult: None,
+                    ok: false,
+                    detail: format!(
+                        "Linux protected-mode entry probe exceeded the {LINUX_ENTRY_PROBE_TOTAL_BUDGET_SECONDS}s total live-run budget while still making only partial progress; latest serial milestones observed={} of {}.",
+                        report
+                            .serial_expected_markers
+                            .iter()
+                            .filter(|marker| report
+                                .serial_text
+                                .as_deref()
+                                .map(|text| text.contains(marker.as_str()))
+                                .unwrap_or(false))
+                            .count(),
+                        report.serial_expected_markers.len()
                     ),
                 });
                 break;
             }
 
             report.guest_exit_count = (exit_index + 1) as u32;
-            let mut exit_context = [0_u8; 1024];
-            let cancel_count_before = run_controller
-                .as_ref()
-                .map(LinuxEntryProbeRunController::cancel_request_count)
-                .unwrap_or(0);
-            if let Some(controller) = &run_controller {
-                controller.begin_run();
-            }
-            let hresult = unsafe {
-                run_virtual_processor(
-                    partition,
-                    0,
-                    exit_context.as_mut_ptr().cast::<c_void>(),
-                    exit_context.len() as u32,
-                )
+            let cancel_count_before = guarded_runner.cancel_request_count();
+            let Some(run_result) = guarded_runner.run(report) else {
+                if let Some(path) = checkpoint_path.as_deref() {
+                    write_linux_entry_probe_checkpoint(
+                        path,
+                        report,
+                        "run-cancel-timeout",
+                        probe_started_at,
+                    );
+                }
+                break;
             };
-            if let Some(controller) = &run_controller {
-                controller.end_run();
-            }
+            let hresult = run_result.hresult;
+            let exit_context = run_result.exit_context;
             let run_ok = hresult_succeeded(hresult);
-            let cancel_count_after = run_controller
-                .as_ref()
-                .map(LinuxEntryProbeRunController::cancel_request_count)
-                .unwrap_or(cancel_count_before);
+            let cancel_count_after = guarded_runner.cancel_request_count();
             let timeslice_cancelled = !run_ok && cancel_count_after > cancel_count_before;
             if timeslice_cancelled {
                 report.virtual_processor_ran = true;
@@ -2819,6 +2868,7 @@ mod windows_whp {
                                     outcome.status_code,
                                     outcome.response_bytes,
                                 );
+                                last_progress_at = Instant::now();
                                 if let Some(path) = checkpoint_path.as_deref() {
                                     write_linux_entry_probe_checkpoint(
                                         path,
@@ -2840,6 +2890,15 @@ mod windows_whp {
                                     ) {
                                         break;
                                     }
+                                    if let Some(path) = checkpoint_path.as_deref() {
+                                        write_linux_entry_probe_checkpoint(
+                                            path,
+                                            report,
+                                            "block-io-rip-advanced",
+                                            probe_started_at,
+                                        );
+                                        last_checkpoint_at = Instant::now();
+                                    }
                                     continue;
                                 }
                                 break;
@@ -2857,6 +2916,7 @@ mod windows_whp {
                             let Some(value) = block_state.read_value(port, access_size) else {
                                 break;
                             };
+                            last_progress_at = Instant::now();
                             if !set_guest_rax_low_value_and_rip(
                                 partition,
                                 set_virtual_processor_registers,
@@ -2957,6 +3017,7 @@ mod windows_whp {
                             report.serial_byte = Some(serial_byte);
                             report.serial_text =
                                 Some(String::from_utf8_lossy(&report.serial_bytes).into_owned());
+                            last_progress_at = Instant::now();
                         }
 
                         if !set_guest_rip(
@@ -3407,9 +3468,6 @@ mod windows_whp {
             ok: linux_entry_probe_passed(report),
             detail: linux_entry_probe_detail(report),
         });
-        if let Some(controller) = &run_controller {
-            controller.stop();
-        }
     }
 
     fn request_native_timer_interrupt(
@@ -4029,64 +4087,132 @@ mod windows_whp {
         }
     }
 
-    struct LinuxEntryProbeRunController {
-        done: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        running: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        cancel_requests: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    struct LinuxEntryProbeRunResult {
+        hresult: i32,
+        exit_context: [u8; 1024],
     }
 
-    impl LinuxEntryProbeRunController {
+    struct LinuxEntryProbeGuardedRunner {
+        partition_address: usize,
+        cancel_run_virtual_processor: WhvCancelRunVirtualProcessor,
+        request_tx: std::sync::mpsc::Sender<()>,
+        result_rx: std::sync::mpsc::Receiver<LinuxEntryProbeRunResult>,
+        cancel_requests: u64,
+    }
+
+    impl LinuxEntryProbeGuardedRunner {
         fn start(
             partition: *mut c_void,
+            run_virtual_processor: WhvRunVirtualProcessor,
             cancel_run_virtual_processor: WhvCancelRunVirtualProcessor,
         ) -> Self {
-            let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let cancel_requests = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-            let thread_done = std::sync::Arc::clone(&done);
-            let thread_running = std::sync::Arc::clone(&running);
-            let thread_cancel_requests = std::sync::Arc::clone(&cancel_requests);
+            let (request_tx, request_rx) = std::sync::mpsc::channel::<()>();
+            let (result_tx, result_rx) = std::sync::mpsc::channel::<LinuxEntryProbeRunResult>();
             let partition_address = partition as usize;
             std::thread::spawn(move || {
-                while !thread_done.load(std::sync::atomic::Ordering::SeqCst) {
-                    std::thread::sleep(Duration::from_millis(LINUX_ENTRY_PROBE_TIMESLICE_MILLIS));
-                    if thread_done.load(std::sync::atomic::Ordering::SeqCst) {
+                while request_rx.recv().is_ok() {
+                    let mut exit_context = [0_u8; 1024];
+                    let hresult = unsafe {
+                        run_virtual_processor(
+                            partition_address as *mut c_void,
+                            0,
+                            exit_context.as_mut_ptr().cast::<c_void>(),
+                            exit_context.len() as u32,
+                        )
+                    };
+                    if result_tx
+                        .send(LinuxEntryProbeRunResult {
+                            hresult,
+                            exit_context,
+                        })
+                        .is_err()
+                    {
                         break;
-                    }
-                    if thread_running.load(std::sync::atomic::Ordering::SeqCst) {
-                        thread_cancel_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        let partition = partition_address as *mut c_void;
-                        unsafe {
-                            cancel_run_virtual_processor(partition, 0, 0);
-                        }
                     }
                 }
             });
             Self {
-                done,
-                running,
-                cancel_requests,
+                partition_address,
+                cancel_run_virtual_processor,
+                request_tx,
+                result_rx,
+                cancel_requests: 0,
             }
         }
 
-        fn begin_run(&self) {
-            self.running
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-        }
+        fn run(
+            &mut self,
+            report: &mut NativePartitionSmokeReport,
+        ) -> Option<LinuxEntryProbeRunResult> {
+            if self.request_tx.send(()).is_err() {
+                report.calls.push(NativeWhpCallReport {
+                    name: "LinuxEntryProbeRunWorker",
+                    hresult: None,
+                    ok: false,
+                    detail:
+                        "Pane could not request a guarded WHP run because the run worker stopped."
+                            .to_string(),
+                });
+                return None;
+            }
 
-        fn end_run(&self) {
-            self.running
-                .store(false, std::sync::atomic::Ordering::SeqCst);
+            let run_started_at = Instant::now();
+            let mut next_cancel_at = Duration::from_millis(LINUX_ENTRY_PROBE_TIMESLICE_MILLIS);
+            let mut first_cancel_at = None;
+
+            loop {
+                match self.result_rx.recv_timeout(Duration::from_millis(25)) {
+                    Ok(result) => return Some(result),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        let elapsed = run_started_at.elapsed();
+                        if elapsed < next_cancel_at {
+                            continue;
+                        }
+
+                        let cancel_run_virtual_processor = self.cancel_run_virtual_processor;
+                        let partition_address = self.partition_address;
+                        std::thread::spawn(move || unsafe {
+                            cancel_run_virtual_processor(partition_address as *mut c_void, 0, 0);
+                        });
+                        self.cancel_requests = self.cancel_requests.saturating_add(1);
+                        first_cancel_at.get_or_insert_with(Instant::now);
+                        next_cancel_at += Duration::from_millis(LINUX_ENTRY_PROBE_TIMESLICE_MILLIS);
+
+                        if first_cancel_at
+                            .map(|first| {
+                                first.elapsed()
+                                    >= Duration::from_secs(LINUX_ENTRY_PROBE_CANCEL_GRACE_SECONDS)
+                            })
+                            .unwrap_or(false)
+                        {
+                            report.calls.push(NativeWhpCallReport {
+                                name: "LinuxEntryProbeRunCancelTimeout",
+                                hresult: None,
+                                ok: false,
+                                detail: format!(
+                                    "WHvRunVirtualProcessor did not return after {}s of asynchronous WHvCancelRunVirtualProcessor requests; Pane stopped the native probe instead of leaving the app hung.",
+                                    LINUX_ENTRY_PROBE_CANCEL_GRACE_SECONDS
+                                ),
+                            });
+                            return None;
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        report.calls.push(NativeWhpCallReport {
+                            name: "LinuxEntryProbeRunWorker",
+                            hresult: None,
+                            ok: false,
+                            detail: "Pane's guarded WHP run worker stopped before returning an exit context."
+                                .to_string(),
+                        });
+                        return None;
+                    }
+                }
+            }
         }
 
         fn cancel_request_count(&self) -> u64 {
             self.cancel_requests
-                .load(std::sync::atomic::Ordering::SeqCst)
-        }
-
-        fn stop(&self) {
-            self.done.store(true, std::sync::atomic::Ordering::SeqCst);
-            self.end_run();
         }
     }
 
@@ -5115,6 +5241,8 @@ mod windows_whp {
                         | "AdvanceGuestRip"
                         | "UnsupportedIoPort"
                         | "LinuxEntryProbeWallClockBudget"
+                        | "LinuxEntryProbeTotalWallClockBudget"
+                        | "LinuxEntryProbeRunCancelTimeout"
                         | "LinuxEntryProbePostTimerResumeBoundary"
                 ) && !call.ok
             })
@@ -5175,16 +5303,36 @@ mod windows_whp {
         {
             if let Some(blocker) = timer_interrupt_readiness_report_blocker(report) {
                 format!(
-                    "Linux protected-mode entry exceeded the {}s wall-clock probe budget before emitting the required serial milestones; Pane deferred native timer injection because guest interrupt readiness remained blocked by {blocker}.",
+                    "Linux protected-mode entry made no meaningful guest progress for {}s before emitting the required serial milestones; Pane deferred native timer injection because guest interrupt readiness remained blocked by {blocker}.",
                     LINUX_ENTRY_PROBE_WALL_CLOCK_BUDGET_SECONDS,
                 )
             } else {
                 format!(
-                    "Linux protected-mode entry exceeded the {}s wall-clock probe budget before emitting the required serial milestones: {}.",
+                    "Linux protected-mode entry made no meaningful guest progress for {}s before emitting the required serial milestones: {}.",
                     LINUX_ENTRY_PROBE_WALL_CLOCK_BUDGET_SECONDS,
                     report.serial_expected_markers.join(", ")
                 )
             }
+        } else if let Some(call) = report
+            .calls
+            .iter()
+            .rev()
+            .find(|call| call.name == "LinuxEntryProbeTotalWallClockBudget" && !call.ok)
+        {
+            format!(
+                "Linux protected-mode entry exceeded Pane's total live-run budget while still making only partial progress: {}",
+                call.detail
+            )
+        } else if let Some(call) = report
+            .calls
+            .iter()
+            .rev()
+            .find(|call| call.name == "LinuxEntryProbeRunCancelTimeout" && !call.ok)
+        {
+            format!(
+                "Linux protected-mode entry stopped because the host could not regain control from WHvRunVirtualProcessor after repeated cancellation requests: {}",
+                call.detail
+            )
         } else if report
             .calls
             .iter()
@@ -6309,6 +6457,38 @@ mod windows_whp {
 
             assert!(!linux_entry_probe_passed(&report));
             assert!(linux_entry_probe_detail(&report).contains("unsupported I/O port"));
+        }
+
+        #[test]
+        fn linux_entry_probe_rejects_non_returning_guarded_run() {
+            let mut report = base_report();
+            report.exit_reason = Some(WHV_RUN_VP_EXIT_REASON_CANCELED);
+            report.exit_reason_label = Some("canceled".to_string());
+            report.calls.push(crate::native::NativeWhpCallReport {
+                name: "LinuxEntryProbeRunCancelTimeout",
+                hresult: Some("0x00000000".to_string()),
+                ok: false,
+                detail: "cancel timeout".to_string(),
+            });
+
+            assert!(!linux_entry_probe_passed(&report));
+            assert!(linux_entry_probe_detail(&report).contains("could not regain control"));
+        }
+
+        #[test]
+        fn linux_entry_probe_rejects_total_live_run_budget() {
+            let mut report = base_report();
+            report.exit_reason = Some(WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS);
+            report.exit_reason_label = Some("x64-io-port-access".to_string());
+            report.calls.push(crate::native::NativeWhpCallReport {
+                name: "LinuxEntryProbeTotalWallClockBudget",
+                hresult: None,
+                ok: false,
+                detail: "partial progress".to_string(),
+            });
+
+            assert!(!linux_entry_probe_passed(&report));
+            assert!(linux_entry_probe_detail(&report).contains("total live-run budget"));
         }
 
         #[test]

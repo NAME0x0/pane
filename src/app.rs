@@ -337,6 +337,8 @@ struct BaseOsImageMetadata {
     partitions: Vec<BaseOsPartition>,
     #[serde(default)]
     root_partition_hint: Option<BaseOsPartition>,
+    #[serde(default)]
+    root_filesystem_hint: Option<String>,
     verified: bool,
     registered_at_epoch_seconds: u64,
     #[serde(default)]
@@ -353,6 +355,7 @@ struct BaseOsImageInspection {
     bootable_disk_hint: bool,
     partitions: Vec<BaseOsPartition>,
     root_partition_hint: Option<BaseOsPartition>,
+    root_filesystem_hint: Option<String>,
     notes: Vec<String>,
 }
 
@@ -3848,6 +3851,7 @@ fn register_base_os_image(
         bootable_disk_hint: inspection.bootable_disk_hint,
         partitions: inspection.partitions,
         root_partition_hint: inspection.root_partition_hint,
+        root_filesystem_hint: inspection.root_filesystem_hint,
         verified,
         registered_at_epoch_seconds: current_epoch_seconds(),
         notes: inspection.notes,
@@ -3908,6 +3912,11 @@ fn inspect_base_os_image_artifact(path: &Path) -> AppResult<BaseOsImageInspectio
         .iter()
         .find(|partition| partition.root_candidate)
         .cloned();
+    let root_filesystem_hint = root_partition_hint.as_ref().and_then(|root| {
+        detect_partition_filesystem(path, root.byte_offset)
+            .ok()
+            .flatten()
+    });
 
     let (image_format, bootable_disk_hint) = if has_gpt_header {
         ("raw-gpt-disk", true)
@@ -3931,6 +3940,11 @@ fn inspect_base_os_image_artifact(path: &Path) -> AppResult<BaseOsImageInspectio
                 "Pane found a likely Linux root partition at index {} offset {} bytes.",
                 root.index, root.byte_offset
             ));
+            if let Some(filesystem) = &root_filesystem_hint {
+                notes.push(format!(
+                    "Pane detected the likely root filesystem as {filesystem}."
+                ));
+            }
         } else {
             notes.push(
                 "Pane did not find an obvious Linux root partition; native boot may need an explicit root handoff."
@@ -3952,8 +3966,32 @@ fn inspect_base_os_image_artifact(path: &Path) -> AppResult<BaseOsImageInspectio
         bootable_disk_hint,
         partitions,
         root_partition_hint,
+        root_filesystem_hint,
         notes,
     })
+}
+
+fn detect_partition_filesystem(path: &Path, partition_offset: u64) -> AppResult<Option<String>> {
+    let mut file = OpenOptions::new().read(true).open(path)?;
+    let mut probe = vec![0_u8; 128 * 1024];
+    file.seek(SeekFrom::Start(partition_offset))?;
+    let bytes_read = file.read(&mut probe)?;
+    probe.truncate(bytes_read);
+
+    if probe.get(0x438..0x43a) == Some(&[0x53, 0xef]) {
+        return Ok(Some("ext4".to_string()));
+    }
+    if probe.get(0x1_0000 + 0x40..0x1_0000 + 0x48) == Some(b"_BHRfS_M") {
+        return Ok(Some("btrfs".to_string()));
+    }
+    if probe.get(0..4) == Some(b"XFSB") {
+        return Ok(Some("xfs".to_string()));
+    }
+    if probe.get(0x400..0x404) == Some(&[0x10, 0x20, 0xf5, 0xf2]) {
+        return Ok(Some("f2fs".to_string()));
+    }
+
+    Ok(None)
 }
 
 fn inspect_mbr_partitions(header: &[u8]) -> Vec<BaseOsPartition> {
@@ -4950,6 +4988,7 @@ static void write_native_storage_env(
     const char *root_device,
     const char *user_device,
     const char *root_readonly,
+    const char *root_fs,
     const char *framebuffer,
     const char *input_queue
 ) {
@@ -4966,6 +5005,7 @@ static void write_native_storage_env(
     dprintf(fd, "PANE_ROOT=%s\n", root_device);
     dprintf(fd, "PANE_USER=%s\n", user_device);
     dprintf(fd, "PANE_ROOT_READONLY=%s\n", root_readonly);
+    dprintf(fd, "PANE_ROOT_FS=%s\n", root_fs);
     dprintf(fd, "PANE_FRAMEBUFFER=%s\n", framebuffer);
     dprintf(fd, "PANE_INPUT_QUEUE=%s\n", input_queue);
     dprintf(fd, "PANE_BLOCK_IO_PROTOCOL=%s\n", PANE_BLOCK_IO_PROTOCOL);
@@ -5135,14 +5175,40 @@ static int load_pane_block_module(const char *device_blocks, const char *root_of
 #endif
 }
 
-static int try_mount_root(const char *root_device, int root_readonly) {
+static int supported_root_fs(const char *value) {
+    return strcmp(value, "ext4") == 0 ||
+           strcmp(value, "btrfs") == 0 ||
+           strcmp(value, "xfs") == 0 ||
+           strcmp(value, "f2fs") == 0;
+}
+
+static int mount_root_with_fs(const char *root_device, const char *filesystem, int root_readonly) {
+    unsigned long flags = MS_RELATIME | (root_readonly ? MS_RDONLY : 0);
+    if (mount(root_device, "/newroot", filesystem, flags, "") == 0) {
+        char line[160];
+        if (root_readonly) {
+            snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_OK fs=%s readonly=true", filesystem);
+        } else {
+            snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_OK fs=%s", filesystem);
+        }
+        log_line(line);
+        return 0;
+    }
+    return -1;
+}
+
+static int try_mount_root(const char *root_device, int root_readonly, const char *root_fs) {
     const char *filesystems[] = {"ext4", "btrfs", "xfs", "f2fs", NULL};
+    if (supported_root_fs(root_fs) && mount_root_with_fs(root_device, root_fs, root_readonly) == 0) {
+        return 0;
+    }
+
     if (root_readonly) {
         for (unsigned int index = 0; filesystems[index] != NULL; index++) {
-            if (mount(root_device, "/newroot", filesystems[index], MS_RDONLY | MS_RELATIME, "") == 0) {
-                char line[160];
-                snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_OK fs=%s readonly=true", filesystems[index]);
-                log_line(line);
+            if (root_fs[0] != '\0' && strcmp(root_fs, filesystems[index]) == 0) {
+                continue;
+            }
+            if (mount_root_with_fs(root_device, filesystems[index], 1) == 0) {
                 return 0;
             }
         }
@@ -5150,10 +5216,10 @@ static int try_mount_root(const char *root_device, int root_readonly) {
     }
 
     for (unsigned int index = 0; filesystems[index] != NULL; index++) {
-        if (mount(root_device, "/newroot", filesystems[index], MS_RELATIME, "") == 0) {
-            char line[128];
-            snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_OK fs=%s", filesystems[index]);
-            log_line(line);
+        if (root_fs[0] != '\0' && strcmp(root_fs, filesystems[index]) == 0) {
+            continue;
+        }
+        if (mount_root_with_fs(root_device, filesystems[index], 0) == 0) {
             return 0;
         }
     }
@@ -5193,6 +5259,7 @@ int main(void) {
     char root_device[128] = {0};
     char user_device[128] = {0};
     char root_readonly[32] = {0};
+    char root_fs[32] = {0};
     char root_offset[128] = {0};
     char block_devices[128] = {0};
     char framebuffer[128] = {0};
@@ -5212,6 +5279,7 @@ int main(void) {
     find_arg(cmdline, "pane.root", root_device, sizeof(root_device));
     find_arg(cmdline, "pane.user", user_device, sizeof(user_device));
     find_arg(cmdline, "pane.root_readonly", root_readonly, sizeof(root_readonly));
+    find_arg(cmdline, "pane.root_fs", root_fs, sizeof(root_fs));
     find_arg(cmdline, "pane.root_offset", root_offset, sizeof(root_offset));
     find_arg(cmdline, "pane.block_devices", block_devices, sizeof(block_devices));
     find_arg(cmdline, "pane.framebuffer", framebuffer, sizeof(framebuffer));
@@ -5223,6 +5291,7 @@ int main(void) {
     log_key_value("pane.root", root_device);
     log_key_value("pane.user", user_device);
     log_key_value("pane.root_readonly", root_readonly);
+    log_key_value("pane.root_fs", root_fs);
     log_key_value("pane.root_offset", root_offset);
     log_key_value("pane.block_devices", block_devices);
     log_key_value("pane.framebuffer", framebuffer);
@@ -5257,14 +5326,14 @@ int main(void) {
     } else {
         log_line("PANE_DISPLAY_CONTRACT_MISSING");
     }
-    write_native_storage_env(storage_contract, block_io, block_dma, root_device, user_device, root_readonly, framebuffer, input_queue);
+    write_native_storage_env(storage_contract, block_io, block_dma, root_device, user_device, root_readonly, root_fs, framebuffer, input_queue);
 
     log_line("PANE_ROOT_MOUNT_ATTEMPT");
     if (wait_for_device(root_device) != 0) {
         log_line("PANE_ROOT_DEVICE_WAIT_TIMEOUT");
         wait_forever();
     }
-    if (try_mount_root(root_device, truthy_arg(root_readonly)) != 0) {
+    if (try_mount_root(root_device, truthy_arg(root_readonly), root_fs) != 0) {
         log_line("PANE_ROOT_MOUNT_FAILED");
         wait_forever();
     }
@@ -7087,6 +7156,14 @@ fn augment_kernel_cmdline_for_runtime_contracts(
                 if storage.readonly_base { 1 } else { 0 }
             ),
         );
+        if let Some(filesystem) = storage
+            .root_handoff
+            .filesystem_hint
+            .as_deref()
+            .and_then(supported_root_filesystem_hint)
+        {
+            append_kernel_arg(&mut cmdline, format!("pane.root_fs={filesystem}"));
+        }
         if let Some(index) = storage.root_handoff.partition_index {
             append_kernel_arg(&mut cmdline, format!("pane.root_partition={index}"));
         }
@@ -7154,6 +7231,20 @@ fn augment_kernel_cmdline_for_runtime_contracts(
     );
     validate_kernel_cmdline(&cmdline)?;
     Ok(cmdline)
+}
+
+fn supported_root_filesystem_hint(value: &str) -> Option<&'static str> {
+    if value.eq_ignore_ascii_case("ext4") {
+        Some("ext4")
+    } else if value.eq_ignore_ascii_case("btrfs") {
+        Some("btrfs")
+    } else if value.eq_ignore_ascii_case("xfs") {
+        Some("xfs")
+    } else if value.eq_ignore_ascii_case("f2fs") {
+        Some("f2fs")
+    } else {
+        None
+    }
 }
 
 fn pane_block_device_blocks(bytes: u64, block_size_bytes: u64) -> AppResult<u64> {
@@ -7818,7 +7909,10 @@ fn build_kernel_root_handoff(base_metadata: &BaseOsImageMetadata) -> KernelRootH
             partition_index: Some(root.index),
             partition_byte_offset: Some(root.byte_offset),
             partition_byte_length: Some(root.byte_length),
-            filesystem_hint: Some(root.partition_type.clone()),
+            filesystem_hint: base_metadata
+                .root_filesystem_hint
+                .clone()
+                .or_else(|| Some(root.partition_type.clone())),
             requires_initramfs_driver: true,
             notes: vec![
                 "Pane found a likely Linux root partition and exposes that partition directly as /dev/pane0 to avoid guest partition-scan I/O during native boot."
@@ -7854,7 +7948,10 @@ fn build_kernel_root_handoff(base_metadata: &BaseOsImageMetadata) -> KernelRootH
         partition_index: None,
         partition_byte_offset: None,
         partition_byte_length: None,
-        filesystem_hint: Some(base_metadata.image_format.clone()),
+        filesystem_hint: base_metadata
+            .root_filesystem_hint
+            .clone()
+            .or_else(|| Some(base_metadata.image_format.clone())),
         requires_initramfs_driver: true,
         notes: vec![note.to_string()],
     }
@@ -12856,6 +12953,8 @@ mod tests {
         image[454..458].copy_from_slice(&2048_u32.to_le_bytes());
         image[458..462].copy_from_slice(&4096_u32.to_le_bytes());
         image[510..512].copy_from_slice(&[0x55, 0xaa]);
+        let root_offset = 2048 * 512;
+        image[root_offset + 0x438..root_offset + 0x43a].copy_from_slice(&[0x53, 0xef]);
         image
     }
 
@@ -13890,6 +13989,7 @@ mod tests {
         assert_eq!(root.byte_offset, 2048 * 512);
         assert_eq!(root.byte_length, 4096 * 512);
         assert!(root.root_candidate);
+        assert_eq!(metadata.root_filesystem_hint.as_deref(), Some("ext4"));
 
         let _ = std::fs::remove_dir_all(&paths.root);
     }
@@ -14412,7 +14512,10 @@ mod tests {
         assert!(init_source.contains("shared_buffer_gpa=%llu shared_buffer_bytes=%llu"));
         assert!(init_source.contains("pane.root_offset"));
         assert!(init_source.contains("pane.root_readonly"));
+        assert!(init_source.contains("pane.root_fs"));
         assert!(init_source.contains("PANE_ROOT_READONLY"));
+        assert!(init_source.contains("PANE_ROOT_FS"));
+        assert!(init_source.contains("supported_root_fs"));
         assert!(init_source.contains("MS_RDONLY | MS_RELATIME"));
         assert!(init_source.contains("pane.block_devices"));
         assert!(init_source.contains("pane.block_dma"));
@@ -14879,13 +14982,7 @@ mod tests {
         super::write_input_contract(&paths).unwrap();
         let base = paths.downloads.join("arch-base.img");
         let kernel = paths.downloads.join("vmlinuz-linux");
-        let mut base_image = vec![0_u8; 4 * 1024 * 1024];
-        base_image[446] = 0x80;
-        base_image[450] = 0x83;
-        base_image[454..458].copy_from_slice(&2048_u32.to_le_bytes());
-        base_image[458..462].copy_from_slice(&4096_u32.to_le_bytes());
-        base_image[510..512].copy_from_slice(&[0x55, 0xaa]);
-        std::fs::write(&base, base_image).unwrap();
+        std::fs::write(&base, fake_mbr_linux_root_disk_image()).unwrap();
         std::fs::write(&kernel, fake_linux_bzimage()).unwrap();
         let base_sha = sha256_file(&base).unwrap();
         let kernel_sha = sha256_file(&kernel).unwrap();
@@ -14964,6 +15061,7 @@ mod tests {
             .cmdline
             .contains("pane.root_mode=base-partition-direct"));
         assert!(layout.cmdline.contains("pane.root_readonly=1"));
+        assert!(layout.cmdline.contains("pane.root_fs=ext4"));
         assert!(layout.cmdline.contains("pane.root_partition=1"));
         assert!(layout.cmdline.contains("pane.user=/dev/pane1"));
         assert!(layout.cmdline.contains("pane.block_io=0x0d00,16,4096"));
@@ -14982,7 +15080,7 @@ mod tests {
         assert_eq!(storage.root_handoff.partition_index, Some(1));
         assert_eq!(
             storage.root_handoff.filesystem_hint.as_deref(),
-            Some("0x83")
+            Some("ext4")
         );
         assert!(storage.root_handoff.requires_initramfs_driver);
         assert_eq!(storage.base_os_sha256, base_sha);
@@ -15155,13 +15253,7 @@ mod tests {
         super::prepare_runtime_paths(&paths).unwrap();
         let base = paths.downloads.join("arch-root-partition.img");
         let kernel = paths.downloads.join("vmlinuz-linux");
-        let mut image = vec![0_u8; 4096];
-        image[446] = 0x80;
-        image[450] = 0x83;
-        image[454..458].copy_from_slice(&2048_u32.to_le_bytes());
-        image[458..462].copy_from_slice(&4096_u32.to_le_bytes());
-        image[510..512].copy_from_slice(&[0x55, 0xaa]);
-        std::fs::write(&base, image).unwrap();
+        std::fs::write(&base, fake_mbr_linux_root_disk_image()).unwrap();
         std::fs::write(&kernel, fake_linux_bzimage()).unwrap();
         let base_sha = sha256_file(&base).unwrap();
         let kernel_sha = sha256_file(&kernel).unwrap();
@@ -15193,7 +15285,7 @@ mod tests {
         assert_eq!(storage.root_handoff.partition_byte_length, Some(4096 * 512));
         assert_eq!(
             storage.root_handoff.filesystem_hint.as_deref(),
-            Some("0x83")
+            Some("ext4")
         );
         assert!(storage.root_handoff.requires_initramfs_driver);
         assert_eq!(
@@ -15204,6 +15296,7 @@ mod tests {
         assert!(layout
             .cmdline
             .contains("pane.root_mode=base-partition-direct"));
+        assert!(layout.cmdline.contains("pane.root_fs=ext4"));
         assert!(layout.cmdline.contains("pane.root_partition=1"));
         assert!(layout.cmdline.contains("pane.root_offset=1048576"));
         assert!(layout.cmdline.contains("pane.root_length=2097152"));

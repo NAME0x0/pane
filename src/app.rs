@@ -462,6 +462,8 @@ struct PaneInitramfsDriverMetadata {
     init_source_sha256: String,
     probe_source_sha256: String,
     block_driver_source_sha256: String,
+    #[serde(default = "pane_block_driver_abi_sha256")]
+    block_driver_abi_sha256: String,
     block_driver_build_script_sha256: String,
     build_script_sha256: String,
     readme_sha256: String,
@@ -495,6 +497,8 @@ struct PaneBlockModuleMetadata {
     target_kernel_format: Option<String>,
     #[serde(default)]
     block_driver_source_sha256: Option<String>,
+    #[serde(default)]
+    block_driver_abi_sha256: Option<String>,
     registered_at_epoch_seconds: u64,
     notes: Vec<String>,
 }
@@ -748,6 +752,44 @@ fn default_pane_block_io_data_port_offset() -> u16 {
 
 fn default_pane_block_io_block_size_bytes() -> u64 {
     u64::from(crate::native::PANE_BLOCK_IO_BLOCK_SIZE_BYTES)
+}
+
+const COMPATIBLE_PANE_BLOCK_DRIVER_SOURCE_SHA256_BY_ABI: &[&str] = &[
+    // Shared-DMA, 4096-byte block ABI before successful status logging was capped.
+    "dc1a49843850c2122003f0cbd467285f2a469a266a7209c214f4e5bc7053381f",
+];
+
+fn pane_block_driver_abi_sha256() -> String {
+    sha256_bytes(pane_block_driver_abi_contract().as_bytes())
+}
+
+fn pane_block_driver_abi_contract() -> String {
+    format!(
+        "pane-linux-block-module-abi-v1\nprotocol={}\nbase_port={}\nport_count={}\nstatus_offset={}\ndata_offset={}\nblock_size_bytes={}\nsector_size_bytes=512\ndevice_count=2\nminors_per_disk=16\nbase_device=pane0\nuser_device=pane1\noperations=read,write,flush,discard\nshared_buffer=optional-memremap\n",
+        default_pane_block_io_protocol(),
+        default_pane_block_io_port_base(),
+        default_pane_block_io_port_count(),
+        default_pane_block_io_status_port_offset(),
+        default_pane_block_io_data_port_offset(),
+        default_pane_block_io_block_size_bytes(),
+    )
+}
+
+fn pane_block_module_matches_current_driver_abi(
+    module_metadata: &PaneBlockModuleMetadata,
+    initramfs_driver_metadata: &PaneInitramfsDriverMetadata,
+) -> bool {
+    let expected_abi_sha256 = pane_block_driver_abi_sha256();
+    if module_metadata.block_driver_abi_sha256.as_deref() == Some(expected_abi_sha256.as_str()) {
+        return true;
+    }
+
+    let Some(source_sha256) = module_metadata.block_driver_source_sha256.as_deref() else {
+        return false;
+    };
+
+    source_sha256 == initramfs_driver_metadata.block_driver_source_sha256
+        || COMPATIBLE_PANE_BLOCK_DRIVER_SOURCE_SHA256_BY_ABI.contains(&source_sha256)
 }
 
 fn default_pane_block_dma_gpa() -> String {
@@ -4434,6 +4476,7 @@ fn write_pane_initramfs_driver_bundle(
         init_source_sha256: sha256_file(&init_source_path)?,
         probe_source_sha256: sha256_file(&probe_source_path)?,
         block_driver_source_sha256: sha256_file(&block_driver_source_path)?,
+        block_driver_abi_sha256: pane_block_driver_abi_sha256(),
         block_driver_build_script_sha256: sha256_file(&block_driver_build_script_path)?,
         build_script_sha256: sha256_file(&build_script_path)?,
         readme_sha256: sha256_file(&readme_path)?,
@@ -4472,6 +4515,7 @@ fn load_verified_pane_initramfs_driver_metadata(
         || metadata.block_io_status_port_offset != default_pane_block_io_status_port_offset()
         || metadata.block_io_data_port_offset != default_pane_block_io_data_port_offset()
         || metadata.block_io_block_size_bytes != default_pane_block_io_block_size_bytes()
+        || metadata.block_driver_abi_sha256 != pane_block_driver_abi_sha256()
     {
         return Err(AppError::message(
             "Pane initramfs driver metadata does not match the native block I/O ABI. Regenerate it with `pane runtime --write-initramfs-driver`.",
@@ -4589,9 +4633,10 @@ fn register_pane_block_module(
         target_kernel_sha256: Some(kernel_metadata.kernel_sha256),
         target_kernel_format: Some(kernel_metadata.kernel_format),
         block_driver_source_sha256: Some(initramfs_driver.block_driver_source_sha256),
+        block_driver_abi_sha256: Some(initramfs_driver.block_driver_abi_sha256),
         registered_at_epoch_seconds: current_epoch_seconds(),
         notes: vec![
-            "This kernel module is bound to the currently registered target kernel artifact and generated pane-block.c source hash.".to_string(),
+            "This kernel module is bound to the currently registered target kernel artifact and Pane block-driver ABI hash.".to_string(),
             "Pane copies this module into the discovery initramfs as /lib/modules/pane-block.ko so /init can load it before waiting for /dev/pane0.".to_string(),
         ],
     };
@@ -4641,11 +4686,10 @@ fn load_verified_pane_block_module_metadata(
         || metadata.target_kernel_bytes != Some(kernel_metadata.kernel_bytes)
         || metadata.target_kernel_sha256.as_deref() != Some(kernel_metadata.kernel_sha256.as_str())
         || metadata.target_kernel_format.as_deref() != Some(kernel_metadata.kernel_format.as_str())
-        || metadata.block_driver_source_sha256.as_deref()
-            != Some(initramfs_driver.block_driver_source_sha256.as_str())
+        || !pane_block_module_matches_current_driver_abi(&metadata, &initramfs_driver)
     {
         return Err(AppError::message(
-            "Registered Pane block module was not built for the current verified kernel and generated pane-block.c contract. Rebuild and re-register pane-block.ko.",
+            "Registered Pane block module was not built for the current verified kernel and Pane block-driver ABI. Rebuild and re-register pane-block.ko.",
         ));
     }
     Ok(metadata)
@@ -8599,6 +8643,7 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
                     == default_pane_block_io_status_port_offset()
                 && metadata.block_io_data_port_offset == default_pane_block_io_data_port_offset()
                 && metadata.block_io_block_size_bytes == default_pane_block_io_block_size_bytes()
+                && metadata.block_driver_abi_sha256 == pane_block_driver_abi_sha256()
                 && sha256_file(Path::new(&metadata.hook_path)).ok().as_deref()
                     == Some(metadata.hook_sha256.as_str())
                 && sha256_file(Path::new(&metadata.header_path))
@@ -8664,10 +8709,11 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
                     == kernel_boot_metadata
                         .as_ref()
                         .map(|metadata| metadata.kernel_format.as_str())
-                && metadata.block_driver_source_sha256.as_deref()
-                    == initramfs_driver_metadata
-                        .as_ref()
-                        .map(|metadata| metadata.block_driver_source_sha256.as_str())
+                && initramfs_driver_metadata
+                    .as_ref()
+                    .is_some_and(|initramfs_driver| {
+                        pane_block_module_matches_current_driver_abi(metadata, initramfs_driver)
+                    })
         })
         .unwrap_or(false);
 
@@ -12637,23 +12683,25 @@ mod tests {
         inspect_kernel_image_artifact, inspect_workspace, inventory_contains_distro,
         kernel_layout_execution_image, linux_guest_mapped_regions,
         load_kernel_layout_boot_image_artifact, load_verified_pane_block_module_metadata,
-        pane_block_device_blocks, pane_initramfs_expected_serial_milestones,
-        parse_guest_physical_address, preferred_transport, read_base_os_block, read_json_file,
-        read_user_disk_block, register_base_os_image, register_boot_loader_image,
-        register_kernel_boot_plan, register_native_boot_set_artifacts,
-        register_native_boot_set_from_manifest, register_pane_block_module,
-        register_pane_discovery_initramfs_artifact, repair_user_disk_metadata, resize_user_disk,
-        resolve_bundle_output_path, resolve_init_source, resolve_launch_target,
-        resolve_managed_environment_for_reset, resolve_saved_launch, resolve_session_context,
-        resolve_status_distro, restore_user_disk_snapshot, runtime_contract_guest_memory_ranges,
-        runtime_storage_budget, sha256_file, status_port_for, user_disk_artifact_ready,
-        validate_setup_password, validate_setup_username, windows_transport_check, write_json_file,
+        pane_block_device_blocks, pane_block_driver_abi_sha256,
+        pane_initramfs_expected_serial_milestones, parse_guest_physical_address,
+        preferred_transport, read_base_os_block, read_json_file, read_user_disk_block,
+        register_base_os_image, register_boot_loader_image, register_kernel_boot_plan,
+        register_native_boot_set_artifacts, register_native_boot_set_from_manifest,
+        register_pane_block_module, register_pane_discovery_initramfs_artifact,
+        repair_user_disk_metadata, resize_user_disk, resolve_bundle_output_path,
+        resolve_init_source, resolve_launch_target, resolve_managed_environment_for_reset,
+        resolve_saved_launch, resolve_session_context, resolve_status_distro,
+        restore_user_disk_snapshot, runtime_contract_guest_memory_ranges, runtime_storage_budget,
+        sha256_file, status_port_for, user_disk_artifact_ready, validate_setup_password,
+        validate_setup_username, windows_transport_check, write_json_file,
         write_native_boot_set_manifest_template, write_pane_initramfs_driver_bundle,
         write_user_disk_block, AppLifecyclePhase, AppNextAction, BaseOsImageMetadata, CheckStatus,
         DistroHealth, DoctorCheck, DoctorReport, FramebufferContract, InitSource, KernelBootLayout,
         KernelBootMetadata, NativeRuntimeState, PaneBlockModuleMetadata,
         PaneInitramfsDriverMetadata, StatusReport, UserDiskExportManifest, UserDiskMetadata,
-        UserDiskSnapshotMetadata, WorkspaceHealth, WslInventory, EMBEDDED_APP_ASSETS,
+        UserDiskSnapshotMetadata, WorkspaceHealth, WslInventory,
+        COMPATIBLE_PANE_BLOCK_DRIVER_SOURCE_SHA256_BY_ABI, EMBEDDED_APP_ASSETS,
         PANE_USER_DISK_EXPORT_DISK_FILENAME, PANE_USER_DISK_EXPORT_MANIFEST_FILENAME,
         PANE_USER_DISK_EXPORT_METADATA_FILENAME,
     };
@@ -14276,6 +14324,10 @@ mod tests {
             metadata.block_io_block_size_bytes,
             u64::from(crate::native::PANE_BLOCK_IO_BLOCK_SIZE_BYTES)
         );
+        assert_eq!(
+            metadata.block_driver_abi_sha256,
+            pane_block_driver_abi_sha256()
+        );
         assert!(paths
             .initramfs_driver_dir
             .join("pane-initramfs-hook.sh")
@@ -14470,6 +14522,24 @@ mod tests {
                     .as_str()
             )
         );
+        assert_eq!(
+            metadata.block_driver_abi_sha256.as_deref(),
+            Some(pane_block_driver_abi_sha256().as_str())
+        );
+
+        let mut legacy_metadata = metadata.clone();
+        legacy_metadata.block_driver_abi_sha256 = None;
+        legacy_metadata.block_driver_source_sha256 =
+            Some(COMPATIBLE_PANE_BLOCK_DRIVER_SOURCE_SHA256_BY_ABI[0].to_string());
+        write_json_file(
+            &paths.state.join("pane-block-module.json"),
+            &legacy_metadata,
+        )
+        .unwrap();
+        let artifacts = build_runtime_artifact_report(&paths);
+        assert!(artifacts.pane_block_module_verified);
+        assert!(load_verified_pane_block_module_metadata(&paths).is_ok());
+
         let replacement_kernel = paths.downloads.join("vmlinuz-linux-replacement");
         let mut replacement_bytes = fake_linux_bzimage();
         replacement_bytes[3000] = 0x7f;

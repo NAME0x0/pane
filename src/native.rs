@@ -1191,6 +1191,7 @@ mod windows_whp {
     const LINUX_ENTRY_PROBE_CANCEL_GRACE_SECONDS: u64 = 5;
     const LINUX_ENTRY_PROBE_WALL_CLOCK_BUDGET_SECONDS: u64 = 90;
     const LINUX_ENTRY_PROBE_TOTAL_BUDGET_SECONDS: u64 = 300;
+    const LINUX_ENTRY_PROBE_STORAGE_TOTAL_BUDGET_SECONDS: u64 = 1200;
     const LINUX_ENTRY_PROBE_TRACE_HEAD: usize = 384;
     const LINUX_ENTRY_PROBE_TRACE_TAIL: usize = 384;
     const SERIAL_COM1_PORT: u16 = 0x03f8;
@@ -2698,6 +2699,7 @@ mod windows_whp {
     ) {
         report.serial_expected_text = None;
         let max_guest_exits = linux_entry_probe_exit_budget(report);
+        let total_budget_seconds = linux_entry_probe_total_budget_seconds(report);
         report.guest_exit_budget = max_guest_exits as u32;
         let checkpoint_path = linux_entry_probe_checkpoint_path();
         let Some(cancel_run_virtual_processor) = cancel_run_virtual_processor else {
@@ -2759,15 +2761,13 @@ mod windows_whp {
                 break;
             }
 
-            if probe_started_at.elapsed()
-                >= Duration::from_secs(LINUX_ENTRY_PROBE_TOTAL_BUDGET_SECONDS)
-            {
+            if probe_started_at.elapsed() >= Duration::from_secs(total_budget_seconds) {
                 report.calls.push(NativeWhpCallReport {
                     name: "LinuxEntryProbeTotalWallClockBudget",
                     hresult: None,
                     ok: false,
                     detail: format!(
-                        "Linux protected-mode entry probe exceeded the {LINUX_ENTRY_PROBE_TOTAL_BUDGET_SECONDS}s total live-run budget while still making only partial progress; latest serial milestones observed={} of {}.",
+                        "Linux protected-mode entry probe exceeded the {total_budget_seconds}s total live-run budget while still making only partial progress; latest serial milestones observed={} of {}.",
                         report
                             .serial_expected_markers
                             .iter()
@@ -4273,6 +4273,18 @@ mod windows_whp {
         }
     }
 
+    fn linux_entry_probe_total_budget_seconds(report: &NativePartitionSmokeReport) -> u64 {
+        if report
+            .serial_expected_markers
+            .iter()
+            .any(|marker| matches!(marker.as_str(), "PANE_ROOT_MOUNT_OK" | "PANE_INIT_EXEC"))
+        {
+            LINUX_ENTRY_PROBE_STORAGE_TOTAL_BUDGET_SECONDS
+        } else {
+            LINUX_ENTRY_PROBE_TOTAL_BUDGET_SECONDS
+        }
+    }
+
     fn linux_entry_probe_checkpoint_path() -> Option<PathBuf> {
         std::env::var_os("PANE_NATIVE_BOOT_TRACE_CHECKPOINT")
             .filter(|value| !value.is_empty())
@@ -4306,6 +4318,7 @@ mod windows_whp {
             "entry_mode": &report.entry_mode,
             "guest_exit_count": report.guest_exit_count,
             "guest_exit_budget": report.guest_exit_budget,
+            "total_budget_seconds": linux_entry_probe_total_budget_seconds(report),
             "serial_io_exit_count": report.serial_io_exit_count,
             "serial_markers_observed": report.serial_markers_observed,
             "serial_expected_markers": &report.serial_expected_markers,
@@ -5737,17 +5750,18 @@ mod windows_whp {
             guest_contract_failure_blocker, guest_contract_passed, input_queue_snapshot_report,
             interrupt_delivery_blocker, interrupt_delivery_snapshot_blocker,
             linux_entry_probe_detail, linux_entry_probe_exit_budget, linux_entry_probe_passed,
-            linux_protected_mode_registers, parse_xapic_interrupt_controller_state,
-            serial_contract_passed, serial_markers_observed, timer_interrupt_readiness,
-            timer_interrupt_readiness_blocker, timer_interrupt_readiness_report_blocker,
-            xapic_state_vectors, Com1SerialState, DecodedExit, LegacyDeviceIoState,
-            ACPI_PM1_CONTROL_PORT, ACPI_PM1_ENABLE_PORT, ACPI_PM1_STATUS_PORT, ACPI_PM_TIMER_PORT,
-            ALT_DELAY_PORT, ALT_POST_DELAY_PORT, CMOS_ADDRESS_PORT, CMOS_DATA_PORT,
-            CPUID_DEFAULT_RAX_OFFSET, CPUID_DEFAULT_RBX_OFFSET, CPUID_DEFAULT_RCX_OFFSET,
-            CPUID_DEFAULT_RDX_OFFSET, CPUID_RAX_OFFSET, CPUID_RCX_OFFSET,
+            linux_entry_probe_total_budget_seconds, linux_protected_mode_registers,
+            parse_xapic_interrupt_controller_state, serial_contract_passed,
+            serial_markers_observed, timer_interrupt_readiness, timer_interrupt_readiness_blocker,
+            timer_interrupt_readiness_report_blocker, xapic_state_vectors, Com1SerialState,
+            DecodedExit, LegacyDeviceIoState, ACPI_PM1_CONTROL_PORT, ACPI_PM1_ENABLE_PORT,
+            ACPI_PM1_STATUS_PORT, ACPI_PM_TIMER_PORT, ALT_DELAY_PORT, ALT_POST_DELAY_PORT,
+            CMOS_ADDRESS_PORT, CMOS_DATA_PORT, CPUID_DEFAULT_RAX_OFFSET, CPUID_DEFAULT_RBX_OFFSET,
+            CPUID_DEFAULT_RCX_OFFSET, CPUID_DEFAULT_RDX_OFFSET, CPUID_RAX_OFFSET, CPUID_RCX_OFFSET,
             DMA_PAGE_REGISTER_START_PORT, ELCR1_PORT, ELCR2_PORT, IO_ACCESS_INFO_OFFSET,
             IO_PORT_OFFSET, IO_RAX_OFFSET, LINUX_ENTRY_PROBE_EXIT_BUDGET,
-            LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET, LINUX_ENTRY_PROBE_TRACE_HEAD,
+            LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET, LINUX_ENTRY_PROBE_STORAGE_TOTAL_BUDGET_SECONDS,
+            LINUX_ENTRY_PROBE_TOTAL_BUDGET_SECONDS, LINUX_ENTRY_PROBE_TRACE_HEAD,
             LINUX_ENTRY_PROBE_TRACE_TAIL, MEMORY_ACCESS_INFO_OFFSET, MEMORY_GPA_OFFSET,
             MEMORY_GVA_OFFSET, MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET, MSR_RAX_OFFSET,
             MSR_RDX_OFFSET, PCI_CONFIG_ADDRESS_PORT, PCI_CONFIG_DATA_START_PORT, PIC1_COMMAND_PORT,
@@ -6617,12 +6631,20 @@ mod windows_whp {
                 linux_entry_probe_exit_budget(&report),
                 LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET
             );
+            assert_eq!(
+                linux_entry_probe_total_budget_seconds(&report),
+                LINUX_ENTRY_PROBE_TOTAL_BUDGET_SECONDS
+            );
 
             report.serial_expected_markers = vec!["PANE_INIT_EXEC".to_string()];
 
             assert_eq!(
                 linux_entry_probe_exit_budget(&report),
                 LINUX_ENTRY_PROBE_EXIT_BUDGET
+            );
+            assert_eq!(
+                linux_entry_probe_total_budget_seconds(&report),
+                LINUX_ENTRY_PROBE_STORAGE_TOTAL_BUDGET_SECONDS
             );
             assert!(LINUX_ENTRY_PROBE_EXIT_BUDGET > LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET);
         }

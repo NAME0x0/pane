@@ -5309,12 +5309,14 @@ static void pane_block_write_index(u64 block_index)
          PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_BLOCK_INDEX_OFFSET + 4);
 }
 
-static int pane_block_wait_serviced(void)
+static int pane_block_wait_serviced(bool log_transfer)
 {
     u8 status = inb(PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_STATUS_OFFSET);
 
-    pr_info(PANE_BLOCK_DRIVER_NAME
-            ": PANE_BLOCK_STATUS_READ status=0x%02x\n", status);
+    if (log_transfer || status != PANE_BLOCK_STATUS_SERVICED) {
+        pr_info(PANE_BLOCK_DRIVER_NAME
+                ": PANE_BLOCK_STATUS_READ status=0x%02x\n", status);
+    }
     if (status == PANE_BLOCK_STATUS_SERVICED)
         return 0;
     if (status == PANE_BLOCK_STATUS_DENIED ||
@@ -5359,7 +5361,7 @@ static int pane_block_transfer(int device_id, int operation, u64 block_index, vo
         pr_info(PANE_BLOCK_DRIVER_NAME
                 ": PANE_BLOCK_SUBMIT_DONE device=%d op=%d block=%llu\n",
                 device_id, operation, block_index);
-    if (pane_block_wait_serviced() != 0) {
+    if (pane_block_wait_serviced(log_transfer) != 0) {
         if (log_transfer)
             pr_err(PANE_BLOCK_DRIVER_NAME
                    ": PANE_BLOCK_TRANSFER_WAIT_FAILED device=%d op=%d block=%llu\n",
@@ -14389,6 +14391,8 @@ mod tests {
         assert!(block_driver.contains("PANE_BLOCK_TRANSFER_START"));
         assert!(block_driver.contains("PANE_BLOCK_SUBMIT_DONE"));
         assert!(block_driver.contains("PANE_BLOCK_STATUS_READ"));
+        assert!(block_driver.contains("pane_block_wait_serviced(log_transfer)"));
+        assert!(block_driver.contains("log_transfer || status != PANE_BLOCK_STATUS_SERVICED"));
         assert!(block_driver.contains("PANE_BLOCK_TRANSFER_DONE"));
         assert!(block_driver.contains("/dev/pane0"));
         assert!(block_driver.contains("/dev/pane1"));

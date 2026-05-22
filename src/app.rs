@@ -6986,8 +6986,8 @@ fn augment_kernel_cmdline_for_runtime_contracts(
         "earlycon=uart8250,io,0x3f8,115200n8".to_string(),
     );
     append_kernel_arg(&mut cmdline, "earlyprintk=serial,ttyS0,115200".to_string());
-    append_kernel_arg(&mut cmdline, "loglevel=7".to_string());
-    append_kernel_arg(&mut cmdline, "ignore_loglevel".to_string());
+    append_kernel_arg(&mut cmdline, "quiet".to_string());
+    append_kernel_arg(&mut cmdline, "loglevel=4".to_string());
     append_kernel_arg(&mut cmdline, "panic=-1".to_string());
     append_kernel_arg(&mut cmdline, "nomodeset".to_string());
     append_kernel_arg(&mut cmdline, "lpj=1000000".to_string());
@@ -14833,8 +14833,9 @@ mod tests {
             .cmdline
             .contains("earlycon=uart8250,io,0x3f8,115200n8"));
         assert!(layout.cmdline.contains("earlyprintk=serial,ttyS0,115200"));
-        assert!(layout.cmdline.contains("loglevel=7"));
-        assert!(layout.cmdline.contains("ignore_loglevel"));
+        assert!(layout.cmdline.contains("quiet"));
+        assert!(layout.cmdline.contains("loglevel=4"));
+        assert!(!layout.cmdline.contains("ignore_loglevel"));
         assert!(layout.cmdline.contains("nomodeset"));
         assert!(layout.cmdline.contains("lpj=1000000"));
         assert!(layout.cmdline.contains("tsc=reliable"));

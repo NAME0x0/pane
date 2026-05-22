@@ -4928,6 +4928,13 @@ static void log_key_value(const char *key, const char *value) {
     log_line(line);
 }
 
+static int truthy_arg(const char *value) {
+    return strcmp(value, "1") == 0 ||
+           strcmp(value, "true") == 0 ||
+           strcmp(value, "yes") == 0 ||
+           strcmp(value, "readonly") == 0;
+}
+
 static void mkdir_if_missing(const char *path, mode_t mode) {
     if (mkdir(path, mode) != 0 && errno != EEXIST) {
         char line[256];
@@ -4942,6 +4949,7 @@ static void write_native_storage_env(
     const char *block_dma,
     const char *root_device,
     const char *user_device,
+    const char *root_readonly,
     const char *framebuffer,
     const char *input_queue
 ) {
@@ -4957,6 +4965,7 @@ static void write_native_storage_env(
     dprintf(fd, "PANE_BLOCK_DMA=%s\n", block_dma);
     dprintf(fd, "PANE_ROOT=%s\n", root_device);
     dprintf(fd, "PANE_USER=%s\n", user_device);
+    dprintf(fd, "PANE_ROOT_READONLY=%s\n", root_readonly);
     dprintf(fd, "PANE_FRAMEBUFFER=%s\n", framebuffer);
     dprintf(fd, "PANE_INPUT_QUEUE=%s\n", input_queue);
     dprintf(fd, "PANE_BLOCK_IO_PROTOCOL=%s\n", PANE_BLOCK_IO_PROTOCOL);
@@ -5126,8 +5135,20 @@ static int load_pane_block_module(const char *device_blocks, const char *root_of
 #endif
 }
 
-static int try_mount_root(const char *root_device) {
+static int try_mount_root(const char *root_device, int root_readonly) {
     const char *filesystems[] = {"ext4", "btrfs", "xfs", "f2fs", NULL};
+    if (root_readonly) {
+        for (unsigned int index = 0; filesystems[index] != NULL; index++) {
+            if (mount(root_device, "/newroot", filesystems[index], MS_RDONLY | MS_RELATIME, "") == 0) {
+                char line[160];
+                snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_OK fs=%s readonly=true", filesystems[index]);
+                log_line(line);
+                return 0;
+            }
+        }
+        return -1;
+    }
+
     for (unsigned int index = 0; filesystems[index] != NULL; index++) {
         if (mount(root_device, "/newroot", filesystems[index], MS_RELATIME, "") == 0) {
             char line[128];
@@ -5171,6 +5192,7 @@ int main(void) {
     char block_dma[128] = {0};
     char root_device[128] = {0};
     char user_device[128] = {0};
+    char root_readonly[32] = {0};
     char root_offset[128] = {0};
     char block_devices[128] = {0};
     char framebuffer[128] = {0};
@@ -5189,6 +5211,7 @@ int main(void) {
     find_arg(cmdline, "pane.block_dma", block_dma, sizeof(block_dma));
     find_arg(cmdline, "pane.root", root_device, sizeof(root_device));
     find_arg(cmdline, "pane.user", user_device, sizeof(user_device));
+    find_arg(cmdline, "pane.root_readonly", root_readonly, sizeof(root_readonly));
     find_arg(cmdline, "pane.root_offset", root_offset, sizeof(root_offset));
     find_arg(cmdline, "pane.block_devices", block_devices, sizeof(block_devices));
     find_arg(cmdline, "pane.framebuffer", framebuffer, sizeof(framebuffer));
@@ -5199,6 +5222,7 @@ int main(void) {
     log_key_value("pane.block_dma", block_dma);
     log_key_value("pane.root", root_device);
     log_key_value("pane.user", user_device);
+    log_key_value("pane.root_readonly", root_readonly);
     log_key_value("pane.root_offset", root_offset);
     log_key_value("pane.block_devices", block_devices);
     log_key_value("pane.framebuffer", framebuffer);
@@ -5233,14 +5257,14 @@ int main(void) {
     } else {
         log_line("PANE_DISPLAY_CONTRACT_MISSING");
     }
-    write_native_storage_env(storage_contract, block_io, block_dma, root_device, user_device, framebuffer, input_queue);
+    write_native_storage_env(storage_contract, block_io, block_dma, root_device, user_device, root_readonly, framebuffer, input_queue);
 
     log_line("PANE_ROOT_MOUNT_ATTEMPT");
     if (wait_for_device(root_device) != 0) {
         log_line("PANE_ROOT_DEVICE_WAIT_TIMEOUT");
         wait_forever();
     }
-    if (try_mount_root(root_device) != 0) {
+    if (try_mount_root(root_device, truthy_arg(root_readonly)) != 0) {
         log_line("PANE_ROOT_MOUNT_FAILED");
         wait_forever();
     }
@@ -7055,6 +7079,13 @@ fn augment_kernel_cmdline_for_runtime_contracts(
         append_kernel_arg(
             &mut cmdline,
             format!("pane.root_mode={}", storage.root_handoff.mode),
+        );
+        append_kernel_arg(
+            &mut cmdline,
+            format!(
+                "pane.root_readonly={}",
+                if storage.readonly_base { 1 } else { 0 }
+            ),
         );
         if let Some(index) = storage.root_handoff.partition_index {
             append_kernel_arg(&mut cmdline, format!("pane.root_partition={index}"));
@@ -14380,6 +14411,9 @@ mod tests {
         assert!(init_source.contains("attempt < 50000000"));
         assert!(init_source.contains("shared_buffer_gpa=%llu shared_buffer_bytes=%llu"));
         assert!(init_source.contains("pane.root_offset"));
+        assert!(init_source.contains("pane.root_readonly"));
+        assert!(init_source.contains("PANE_ROOT_READONLY"));
+        assert!(init_source.contains("MS_RDONLY | MS_RELATIME"));
         assert!(init_source.contains("pane.block_devices"));
         assert!(init_source.contains("pane.block_dma"));
         assert!(init_source.contains("PANE_DISPLAY_CONTRACT_DISCOVERED"));
@@ -14929,6 +14963,7 @@ mod tests {
         assert!(layout
             .cmdline
             .contains("pane.root_mode=base-partition-direct"));
+        assert!(layout.cmdline.contains("pane.root_readonly=1"));
         assert!(layout.cmdline.contains("pane.root_partition=1"));
         assert!(layout.cmdline.contains("pane.user=/dev/pane1"));
         assert!(layout.cmdline.contains("pane.block_io=0x0d00,16,4096"));

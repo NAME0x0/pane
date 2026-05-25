@@ -293,6 +293,7 @@ struct RuntimeArtifactReport {
     initramfs_driver_bundle_exists: bool,
     initramfs_driver_metadata_exists: bool,
     initramfs_driver_bundle_ready: bool,
+    discovery_initramfs_matches_driver_bundle: bool,
     pane_block_module_exists: bool,
     pane_block_module_bytes: Option<u64>,
     pane_block_module_sha256: Option<String>,
@@ -470,6 +471,24 @@ struct PaneInitramfsDriverMetadata {
     block_driver_build_script_sha256: String,
     build_script_sha256: String,
     readme_sha256: String,
+    #[serde(default)]
+    packaged_initramfs_path: Option<String>,
+    #[serde(default)]
+    packaged_initramfs_bytes: Option<u64>,
+    #[serde(default)]
+    packaged_initramfs_sha256: Option<String>,
+    #[serde(default)]
+    packaged_hook_sha256: Option<String>,
+    #[serde(default)]
+    packaged_init_source_sha256: Option<String>,
+    #[serde(default)]
+    packaged_probe_source_sha256: Option<String>,
+    #[serde(default)]
+    packaged_block_driver_source_sha256: Option<String>,
+    #[serde(default)]
+    packaged_block_driver_abi_sha256: Option<String>,
+    #[serde(default)]
+    packaged_block_module_sha256: Option<String>,
     block_io_protocol: String,
     block_io_port_base: String,
     block_io_port_count: u16,
@@ -793,6 +812,33 @@ fn pane_block_module_matches_current_driver_abi(
 
     source_sha256 == initramfs_driver_metadata.block_driver_source_sha256
         || COMPATIBLE_PANE_BLOCK_DRIVER_SOURCE_SHA256_BY_ABI.contains(&source_sha256)
+}
+
+fn pane_discovery_initramfs_matches_current_driver_bundle(
+    paths: &RuntimePaths,
+    initramfs_driver_metadata: Option<&PaneInitramfsDriverMetadata>,
+    pane_block_module_metadata: Option<&PaneBlockModuleMetadata>,
+    initramfs_image_bytes: Option<u64>,
+    initramfs_actual_sha256: Option<&String>,
+) -> bool {
+    let Some(metadata) = initramfs_driver_metadata else {
+        return false;
+    };
+    metadata.packaged_initramfs_path.as_deref()
+        == Some(paths.initramfs_image.display().to_string().as_str())
+        && metadata.packaged_initramfs_bytes == initramfs_image_bytes
+        && metadata.packaged_initramfs_sha256.as_ref() == initramfs_actual_sha256
+        && metadata.packaged_hook_sha256.as_deref() == Some(metadata.hook_sha256.as_str())
+        && metadata.packaged_init_source_sha256.as_deref()
+            == Some(metadata.init_source_sha256.as_str())
+        && metadata.packaged_probe_source_sha256.as_deref()
+            == Some(metadata.probe_source_sha256.as_str())
+        && metadata.packaged_block_driver_source_sha256.as_deref()
+            == Some(metadata.block_driver_source_sha256.as_str())
+        && metadata.packaged_block_driver_abi_sha256.as_deref()
+            == Some(metadata.block_driver_abi_sha256.as_str())
+        && metadata.packaged_block_module_sha256.as_deref()
+            == pane_block_module_metadata.map(|metadata| metadata.sha256.as_str())
 }
 
 fn default_pane_block_dma_gpa() -> String {
@@ -2555,6 +2601,17 @@ fn native_kernel_plan(args: NativeKernelPlanArgs) -> AppResult<()> {
     {
         blockers.push(
             "No verified Pane discovery initramfs artifact exists. Run `pane runtime --build-discovery-initramfs`, or register an externally built initramfs with `pane runtime --register-initramfs <path> --initramfs-expected-sha256 <sha256>`."
+                .to_string(),
+        );
+    }
+    if runtime.artifacts.base_os_image_verified
+        && runtime.artifacts.user_disk_ready
+        && runtime.artifacts.initramfs_driver_bundle_ready
+        && runtime.artifacts.initramfs_image_verified
+        && !runtime.artifacts.discovery_initramfs_matches_driver_bundle
+    {
+        blockers.push(
+            "Verified discovery initramfs artifact was not packaged from the current Pane initramfs driver bundle. Rebuild it with `pane runtime --build-discovery-initramfs` before materializing a storage-backed kernel layout."
                 .to_string(),
         );
     }
@@ -4537,6 +4594,15 @@ fn write_pane_initramfs_driver_bundle(
         block_driver_build_script_sha256: sha256_file(&block_driver_build_script_path)?,
         build_script_sha256: sha256_file(&build_script_path)?,
         readme_sha256: sha256_file(&readme_path)?,
+        packaged_initramfs_path: None,
+        packaged_initramfs_bytes: None,
+        packaged_initramfs_sha256: None,
+        packaged_hook_sha256: None,
+        packaged_init_source_sha256: None,
+        packaged_probe_source_sha256: None,
+        packaged_block_driver_source_sha256: None,
+        packaged_block_driver_abi_sha256: None,
+        packaged_block_module_sha256: None,
         block_io_protocol: default_pane_block_io_protocol(),
         block_io_port_base: default_pane_block_io_port_base(),
         block_io_port_count: default_pane_block_io_port_count(),
@@ -6259,7 +6325,8 @@ fn build_and_register_pane_discovery_initramfs(
         prebuilt_probe_binary,
     )?;
 
-    register_pane_discovery_initramfs_artifact(paths, &output, force)
+    register_pane_discovery_initramfs_artifact(paths, &output, force)?;
+    record_pane_discovery_initramfs_package_metadata(paths)
 }
 
 fn register_pane_discovery_initramfs_artifact(
@@ -6269,6 +6336,26 @@ fn register_pane_discovery_initramfs_artifact(
 ) -> AppResult<()> {
     let sha256 = sha256_file(source)?;
     register_kernel_boot_plan(paths, None, None, Some(source), Some(&sha256), None, force)
+}
+
+fn record_pane_discovery_initramfs_package_metadata(paths: &RuntimePaths) -> AppResult<()> {
+    let mut metadata = load_verified_pane_initramfs_driver_metadata(paths)?;
+    let module_metadata = if pane_block_module_path(paths).is_file() {
+        Some(load_verified_pane_block_module_metadata(paths)?)
+    } else {
+        None
+    };
+    metadata.packaged_initramfs_path = Some(paths.initramfs_image.display().to_string());
+    metadata.packaged_initramfs_bytes = Some(fs::metadata(&paths.initramfs_image)?.len());
+    metadata.packaged_initramfs_sha256 = Some(sha256_file(&paths.initramfs_image)?);
+    metadata.packaged_hook_sha256 = Some(metadata.hook_sha256.clone());
+    metadata.packaged_init_source_sha256 = Some(metadata.init_source_sha256.clone());
+    metadata.packaged_probe_source_sha256 = Some(metadata.probe_source_sha256.clone());
+    metadata.packaged_block_driver_source_sha256 =
+        Some(metadata.block_driver_source_sha256.clone());
+    metadata.packaged_block_driver_abi_sha256 = Some(metadata.block_driver_abi_sha256.clone());
+    metadata.packaged_block_module_sha256 = module_metadata.map(|metadata| metadata.sha256);
+    write_json_file(&paths.initramfs_driver_metadata, &metadata)
 }
 
 fn create_user_disk_snapshot(paths: &RuntimePaths) -> AppResult<UserDiskSnapshotMetadata> {
@@ -9095,6 +9182,14 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
                     })
         })
         .unwrap_or(false);
+    let discovery_initramfs_matches_driver_bundle =
+        pane_discovery_initramfs_matches_current_driver_bundle(
+            paths,
+            initramfs_driver_metadata.as_ref(),
+            pane_block_module_metadata.as_ref(),
+            initramfs_image_bytes,
+            initramfs_actual_sha256.as_ref(),
+        );
 
     let kernel_boot_layout = read_json_file::<KernelBootLayout>(&paths.kernel_boot_layout).ok();
     let framebuffer_contract =
@@ -9207,6 +9302,7 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
                 && layout.cmdline.contains("console=ttyS0")
                 && (layout.storage.is_none() || initramfs_image_verified)
                 && (layout.storage.is_none() || initramfs_driver_bundle_ready)
+                && (layout.storage.is_none() || discovery_initramfs_matches_driver_bundle)
                 && (layout.storage.is_none() || pane_block_module_verified)
                 && layout.initramfs_driver
                     == layout
@@ -9303,6 +9399,7 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
         initramfs_driver_bundle_exists,
         initramfs_driver_metadata_exists: paths.initramfs_driver_metadata.is_file(),
         initramfs_driver_bundle_ready,
+        discovery_initramfs_matches_driver_bundle,
         pane_block_module_exists: pane_block_module_path.is_file(),
         pane_block_module_bytes,
         pane_block_module_sha256: pane_block_module_metadata
@@ -9433,10 +9530,22 @@ fn build_native_runtime_report(
             );
         }
         if native_storage_ready
+            && artifacts.initramfs_driver_bundle_ready
+            && artifacts.pane_block_module_verified
+            && artifacts.initramfs_image_verified
+            && !artifacts.discovery_initramfs_matches_driver_bundle
+        {
+            blockers.push(
+                "Verified discovery initramfs artifact was not packaged from the current Pane initramfs driver bundle. Rebuild it with `pane runtime --build-discovery-initramfs` before attempting native Arch boot."
+                    .to_string(),
+            );
+        }
+        if native_storage_ready
             && artifacts.kernel_boot_plan_ready
             && artifacts.initramfs_driver_bundle_ready
             && artifacts.pane_block_module_verified
             && artifacts.initramfs_image_verified
+            && artifacts.discovery_initramfs_matches_driver_bundle
             && !artifacts.kernel_boot_layout_ready
         {
             blockers.push(
@@ -9506,6 +9615,7 @@ fn build_native_runtime_report(
         && artifacts.initramfs_driver_bundle_ready
         && artifacts.pane_block_module_verified
         && artifacts.initramfs_image_verified
+        && artifacts.discovery_initramfs_matches_driver_bundle
         && artifacts.kernel_boot_layout_ready;
 
     NativeRuntimeReport {
@@ -13222,6 +13332,7 @@ mod tests {
         )
         .unwrap();
         register_pane_discovery_initramfs_artifact(paths, &discovery_initramfs, false).unwrap();
+        super::record_pane_discovery_initramfs_package_metadata(paths).unwrap();
     }
 
     fn register_fake_pane_block_module(paths: &RuntimePaths) {
@@ -14947,12 +15058,43 @@ mod tests {
         .unwrap();
         assert!(artifacts.initramfs_image_exists);
         assert!(artifacts.initramfs_image_verified);
+        assert!(artifacts.discovery_initramfs_matches_driver_bundle);
         assert!(archive
             .windows("pane-prebuilt-init".len())
             .any(|window| window == b"pane-prebuilt-init"));
         assert!(archive
             .windows("pane-prebuilt-probe".len())
             .any(|window| window == b"pane-prebuilt-probe"));
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn stale_registered_discovery_initramfs_does_not_match_current_driver_bundle() {
+        let paths = temp_runtime_paths("runtime-stale-discovery-initramfs");
+        super::prepare_runtime_paths(&paths).unwrap();
+        let kernel = paths.downloads.join("vmlinuz-linux");
+        std::fs::write(&kernel, fake_linux_bzimage()).unwrap();
+        let kernel_sha = sha256_file(&kernel).unwrap();
+        register_kernel_boot_plan(
+            &paths,
+            Some(&kernel),
+            Some(&kernel_sha),
+            None,
+            None,
+            Some("console=ttyS0 panic=-1 root=/dev/pane0"),
+            false,
+        )
+        .unwrap();
+        write_pane_initramfs_driver_bundle(&paths).unwrap();
+        let stale_initramfs = paths.downloads.join("stale-discovery.cpio");
+        std::fs::write(&stale_initramfs, b"stale pane initramfs").unwrap();
+
+        register_pane_discovery_initramfs_artifact(&paths, &stale_initramfs, false).unwrap();
+
+        let artifacts = build_runtime_artifact_report(&paths);
+        assert!(artifacts.initramfs_image_verified);
+        assert!(!artifacts.discovery_initramfs_matches_driver_bundle);
 
         let _ = std::fs::remove_dir_all(&paths.root);
     }

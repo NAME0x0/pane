@@ -6017,6 +6017,12 @@ Pane compiles the generated guest `/init` and probe with a Linux-capable static
 archive itself. The archive writer is built into Pane, so the app path does not
 depend on host `cpio` or `bsdtar`.
 
+Compiler selection order for generated guest binaries:
+
+- `PANE_LINUX_CC` plus optional whitespace-separated `PANE_LINUX_CC_ARGS`
+- `cc`
+- `zig cc -target x86_64-linux-musl`
+
 If a reproducible artifact builder already produced the two guest binaries, Pane
 can package them without invoking a compiler:
 
@@ -6168,30 +6174,97 @@ fn write_newc_cpio_archive(output: &Path, entries: &[NewcCpioEntry]) -> AppResul
     Ok(())
 }
 
-fn run_initramfs_cc(source: &Path, output: &Path, label: &str) -> AppResult<()> {
-    let status = Command::new("cc")
+struct InitramfsCompilerCandidate {
+    label: String,
+    program: String,
+    base_args: Vec<String>,
+}
+
+fn initramfs_compiler_candidates() -> Vec<InitramfsCompilerCandidate> {
+    let mut candidates = Vec::new();
+    if let Some(program) = env::var("PANE_LINUX_CC")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        let base_args = env::var("PANE_LINUX_CC_ARGS")
+            .ok()
+            .map(|args| {
+                args.split_whitespace()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        candidates.push(InitramfsCompilerCandidate {
+            label: "PANE_LINUX_CC".to_string(),
+            program,
+            base_args,
+        });
+    }
+    candidates.push(InitramfsCompilerCandidate {
+        label: "cc".to_string(),
+        program: "cc".to_string(),
+        base_args: Vec::new(),
+    });
+    candidates.push(InitramfsCompilerCandidate {
+        label: "zig cc -target x86_64-linux-musl".to_string(),
+        program: "zig".to_string(),
+        base_args: vec![
+            "cc".to_string(),
+            "-target".to_string(),
+            "x86_64-linux-musl".to_string(),
+        ],
+    });
+    candidates
+}
+
+fn run_initramfs_compiler_candidate(
+    candidate: &InitramfsCompilerCandidate,
+    source: &Path,
+    output: &Path,
+    label: &str,
+) -> Result<(), String> {
+    let _ = fs::remove_file(output);
+    let mut command = Command::new(&candidate.program);
+    command.args(&candidate.base_args);
+    command
         .arg("-Os")
         .arg("-static")
         .arg("-o")
         .arg(output)
         .arg(source)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    let status = command
         .output()
-        .map_err(|error| {
-            AppError::message(format!(
-                "Failed to compile {label} with `cc`: {error}. Pane now packages the initramfs archive itself, but the guest `/init` and probe still require a Linux-capable static C compiler. Install a Linux-targeting `cc`, or build the binaries externally and register a verified initramfs with `pane runtime --register-initramfs`."
-            ))
-        })?;
+        .map_err(|error| format!("{} could not start: {error}", candidate.label))?;
 
     if !status.status.success() {
-        return Err(AppError::message(format!(
-            "Failed to compile {label} with `cc -Os -static`.\nstdout:\n{}\nstderr:\n{}\nPane requires static ELF guest binaries for the discovery initramfs. Use a Linux-capable static C toolchain or register an externally built initramfs.",
+        return Err(format!(
+            "{} exited with status {}.\nstdout:\n{}\nstderr:\n{}",
+            candidate.label,
+            status.status,
             String::from_utf8_lossy(&status.stdout),
             String::from_utf8_lossy(&status.stderr)
-        )));
+        ));
     }
+
     verify_elf_binary(output, label)
+        .map_err(|error| format!("{} produced unusable output: {error}", candidate.label))
+}
+
+fn run_initramfs_cc(source: &Path, output: &Path, label: &str) -> AppResult<()> {
+    let mut failures = Vec::new();
+    for candidate in initramfs_compiler_candidates() {
+        match run_initramfs_compiler_candidate(&candidate, source, output, label) {
+            Ok(()) => return Ok(()),
+            Err(error) => failures.push(error),
+        }
+    }
+    Err(AppError::message(format!(
+        "Failed to compile {label} as a static Linux ELF binary. Pane now packages the initramfs archive itself, but the guest `/init` and probe still require a Linux-capable C compiler. Install `cc`, install Zig, set `PANE_LINUX_CC`/`PANE_LINUX_CC_ARGS`, or pass prebuilt ELF binaries with `--discovery-init-binary` and `--discovery-probe-binary`.\nCompiler attempts:\n- {}",
+        failures.join("\n- ")
+    )))
 }
 
 fn verify_elf_binary(path: &Path, label: &str) -> AppResult<()> {
@@ -14960,6 +15033,8 @@ mod tests {
         assert!(block_build_script.contains("make -C"));
         let readme = std::fs::read_to_string(paths.initramfs_driver_dir.join("README.md")).unwrap();
         assert!(readme.contains("Pane compiles the generated guest `/init`"));
+        assert!(readme.contains("PANE_LINUX_CC"));
+        assert!(readme.contains("zig cc -target x86_64-linux-musl"));
         assert!(readme.contains("packages the `newc` initramfs"));
         assert!(readme.contains("depend on host `cpio` or `bsdtar`"));
         assert!(artifacts.initramfs_driver_bundle_exists);
@@ -14999,6 +15074,19 @@ mod tests {
             .any(|window| window == b"pane init"));
 
         let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn initramfs_compiler_candidates_include_portable_fallbacks() {
+        let labels = super::initramfs_compiler_candidates()
+            .into_iter()
+            .map(|candidate| candidate.label)
+            .collect::<Vec<_>>();
+
+        assert!(labels.iter().any(|label| label == "cc"));
+        assert!(labels
+            .iter()
+            .any(|label| label == "zig cc -target x86_64-linux-musl"));
     }
 
     #[test]

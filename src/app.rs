@@ -4986,6 +4986,7 @@ fn pane_init_source() -> String {
 
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -5269,16 +5270,56 @@ static int supported_root_fs(const char *value) {
 
 static int mount_root_with_fs(const char *root_device, const char *filesystem, int root_readonly) {
     unsigned long flags = MS_RELATIME | (root_readonly ? MS_RDONLY : 0);
-    if (mount(root_device, "/newroot", filesystem, flags, "") == 0) {
-        char line[160];
-        if (root_readonly) {
-            snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_OK fs=%s readonly=true", filesystem);
-        } else {
-            snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_OK fs=%s", filesystem);
-        }
-        log_line(line);
-        return 0;
+    char line[192];
+    snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_TRY fs=%s readonly=%s", filesystem, root_readonly ? "true" : "false");
+    log_line(line);
+
+    pid_t child = fork();
+    if (child == 0) {
+        int mount_rc = mount(root_device, "/newroot", filesystem, flags, "");
+        _exit(mount_rc == 0 ? 0 : (errno & 0xff));
     }
+    if (child < 0) {
+        snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_FORK_FAILED fs=%s errno=%d", filesystem, errno);
+        log_line(line);
+        return -1;
+    }
+
+    for (unsigned int attempt = 0; attempt < 5000000; attempt++) {
+        int status = 0;
+        pid_t waited = waitpid(child, &status, WNOHANG);
+        if (waited == child) {
+            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+                if (root_readonly) {
+                    snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_OK fs=%s readonly=true", filesystem);
+                } else {
+                    snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_OK fs=%s", filesystem);
+                }
+                log_line(line);
+                return 0;
+            }
+            if (WIFEXITED(status)) {
+                snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_FAIL fs=%s errno=%d", filesystem, WEXITSTATUS(status));
+            } else {
+                snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_FAIL fs=%s status=%d", filesystem, status);
+            }
+            log_line(line);
+            return -1;
+        }
+        if (waited < 0) {
+            snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_WAIT_FAILED fs=%s errno=%d", filesystem, errno);
+            log_line(line);
+            return -1;
+        }
+        if ((attempt % 1000000U) == 999999U) {
+            snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_WAITING fs=%s", filesystem);
+            log_line(line);
+        }
+        sched_yield();
+    }
+    kill(child, SIGKILL);
+    snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_TIMEOUT fs=%s", filesystem);
+    log_line(line);
     return -1;
 }
 
@@ -5308,8 +5349,7 @@ static int try_mount_root(const char *root_device, int root_readonly, const char
             return 0;
         }
     }
-    if (mount(root_device, "/newroot", "ext4", MS_RDONLY | MS_RELATIME, "") == 0) {
-        log_line("PANE_ROOT_MOUNT_OK fs=ext4 readonly=true");
+    if (mount_root_with_fs(root_device, "ext4", 1) == 0) {
         return 0;
     }
     return -1;
@@ -14953,13 +14993,19 @@ mod tests {
         assert!(init_source.contains("PANE_ROOT_READONLY"));
         assert!(init_source.contains("PANE_ROOT_FS"));
         assert!(init_source.contains("supported_root_fs"));
-        assert!(init_source.contains("MS_RDONLY | MS_RELATIME"));
+        assert!(init_source.contains("MS_RELATIME | (root_readonly ? MS_RDONLY : 0)"));
         assert!(init_source.contains("pane.block_devices"));
         assert!(init_source.contains("pane.block_dma"));
         assert!(init_source.contains("PANE_DISPLAY_CONTRACT_DISCOVERED"));
         assert!(init_source.contains("PANE_FRAMEBUFFER"));
         assert!(init_source.contains("PANE_INPUT_QUEUE"));
         assert!(init_source.contains("PANE_ROOT_MOUNT_ATTEMPT"));
+        assert!(init_source.contains("PANE_ROOT_MOUNT_TRY"));
+        assert!(init_source.contains("PANE_ROOT_MOUNT_FAIL"));
+        assert!(init_source.contains("PANE_ROOT_MOUNT_TIMEOUT"));
+        assert!(init_source.contains("PANE_ROOT_MOUNT_WAITING"));
+        assert!(init_source.contains("kill(child, SIGKILL)"));
+        assert!(init_source.contains("attempt < 5000000"));
         assert!(init_source.contains("PANE_ROOT_MOUNT_OK"));
         assert!(init_source.contains("execl(\"/sbin/init\""));
         assert!(init_source.contains("#define COM1_PORT 0x3f8"));

@@ -487,8 +487,8 @@ impl NativeBlockIoPortState {
         }
         if pane_block_io_port_offset(port)? == 12 {
             let mut bytes = [0_u8; 4];
-            for offset in 0..access_size as usize {
-                bytes[offset] = self.read_data_byte();
+            for byte in bytes.iter_mut().take(access_size as usize) {
+                *byte = self.read_data_byte();
             }
             return Some(u32::from_le_bytes(bytes) & pane_block_io_access_mask(access_size));
         }
@@ -2509,6 +2509,7 @@ mod windows_whp {
         (register_names, register_values)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_guest_image_until_boundary(
         partition: *mut c_void,
         run_virtual_processor: WhvRunVirtualProcessor,
@@ -2685,6 +2686,7 @@ mod windows_whp {
         report.serial_io_exit_count = report.serial_bytes.len() as u32;
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_linux_entry_probe(
         partition: *mut c_void,
         run_virtual_processor: WhvRunVirtualProcessor,
@@ -3591,10 +3593,8 @@ mod windows_whp {
             name: "LinuxEntryProbeInterruptWindowNotification",
             hresult: Some(format_hresult(hresult)),
             ok,
-            detail: format!(
-                "interrupt_notification={}, value=0x{WHV_DELIVERABILITY_NOTIFICATION_INTERRUPT:016x}.",
-                ok
-            ),
+            detail:
+                format!("interrupt_notification={ok}, value=0x{WHV_DELIVERABILITY_NOTIFICATION_INTERRUPT:016x}."),
         });
         ok
     }
@@ -4074,7 +4074,7 @@ mod windows_whp {
                     ok,
                     detail: format!("{label}: register=0x{register_name:08x}."),
                 });
-                ok.then(|| unsafe { value.reg64 })
+                ok.then_some(unsafe { value.reg64 })
             })
             .collect()
     }
@@ -4239,8 +4239,7 @@ mod windows_whp {
                                 hresult: None,
                                 ok: false,
                                 detail: format!(
-                                    "WHvRunVirtualProcessor did not return after {}s of asynchronous WHvCancelRunVirtualProcessor requests; Pane stopped the native probe instead of leaving the app hung.",
-                                    LINUX_ENTRY_PROBE_CANCEL_GRACE_SECONDS
+                                    "WHvRunVirtualProcessor did not return after {LINUX_ENTRY_PROBE_CANCEL_GRACE_SECONDS}s of asynchronous WHvCancelRunVirtualProcessor requests; Pane stopped the native probe instead of leaving the app hung."
                                 ),
                             });
                             return None;
@@ -5365,14 +5364,12 @@ mod windows_whp {
         {
             if let Some(blocker) = timer_interrupt_readiness_report_blocker(report) {
                 format!(
-                    "Linux protected-mode entry made no meaningful guest progress for {}s before emitting the required serial milestones; Pane deferred native timer injection because guest interrupt readiness remained blocked by {blocker}.",
-                    LINUX_ENTRY_PROBE_WALL_CLOCK_BUDGET_SECONDS,
+                    "Linux protected-mode entry made no meaningful guest progress for {LINUX_ENTRY_PROBE_WALL_CLOCK_BUDGET_SECONDS}s before emitting the required serial milestones; Pane deferred native timer injection because guest interrupt readiness remained blocked by {blocker}.",
                 )
             } else {
                 format!(
-                    "Linux protected-mode entry made no meaningful guest progress for {}s before emitting the required serial milestones: {}.",
-                    LINUX_ENTRY_PROBE_WALL_CLOCK_BUDGET_SECONDS,
-                    report.serial_expected_markers.join(", ")
+                    "Linux protected-mode entry made no meaningful guest progress for {LINUX_ENTRY_PROBE_WALL_CLOCK_BUDGET_SECONDS}s before emitting the required serial milestones: {}.",
+                    report.serial_expected_markers.join(", "),
                 )
             }
         } else if let Some(call) = report

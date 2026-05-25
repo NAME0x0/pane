@@ -5921,7 +5921,19 @@ Expected kernel arguments:
 - `pane.root=<root-device>`
 - `pane.user=<user-device>`
 
-To build the discovery initramfs on Linux:
+To build and register the discovery initramfs through Pane:
+
+```sh
+pane runtime --write-initramfs-driver --build-discovery-initramfs
+```
+
+Pane compiles the generated guest `/init` and probe with a Linux-capable static
+`cc`, verifies both outputs are ELF binaries, and packages the `newc` initramfs
+archive itself. The archive writer is built into Pane, so the app path does not
+depend on host `cpio` or `bsdtar`.
+
+For external/manual builders, the generated shell script can still produce an
+equivalent cpio archive:
 
 ```sh
 sh build-pane-initramfs.sh ./pane-storage-discovery.cpio
@@ -5965,6 +5977,208 @@ fn pane_initramfs_expected_serial_milestones() -> Vec<String> {
     ]
 }
 
+struct NewcCpioEntry {
+    name: String,
+    mode: u32,
+    data: Vec<u8>,
+}
+
+impl NewcCpioEntry {
+    fn directory(name: &str) -> Self {
+        Self {
+            name: name.trim_matches('/').to_string(),
+            mode: 0o040755,
+            data: Vec::new(),
+        }
+    }
+
+    fn file(name: &str, mode: u32, data: Vec<u8>) -> Self {
+        Self {
+            name: name.trim_matches('/').to_string(),
+            mode: 0o100000 | mode,
+            data,
+        }
+    }
+}
+
+fn write_newc_padding(file: &mut fs::File, written_len: usize) -> AppResult<()> {
+    let padding = (4 - (written_len % 4)) % 4;
+    if padding > 0 {
+        file.write_all(&vec![0_u8; padding])?;
+    }
+    Ok(())
+}
+
+fn write_newc_cpio_entry(file: &mut fs::File, inode: u32, entry: &NewcCpioEntry) -> AppResult<()> {
+    if entry.name.is_empty() {
+        return Err(AppError::message(
+            "newc cpio entries require a non-empty archive path.",
+        ));
+    }
+    let data_len = u32::try_from(entry.data.len()).map_err(|_| {
+        AppError::message(format!(
+            "newc cpio entry {} is too large for the initramfs format.",
+            entry.name
+        ))
+    })?;
+    let name_size = u32::try_from(entry.name.len() + 1).map_err(|_| {
+        AppError::message(format!(
+            "newc cpio entry path is too long for {}.",
+            entry.name
+        ))
+    })?;
+    let header = format!(
+        "070701{inode:08x}{mode:08x}{uid:08x}{gid:08x}{nlink:08x}{mtime:08x}{filesize:08x}{devmajor:08x}{devminor:08x}{rdevmajor:08x}{rdevminor:08x}{namesize:08x}{check:08x}",
+        inode = inode,
+        mode = entry.mode,
+        uid = 0_u32,
+        gid = 0_u32,
+        nlink = 1_u32,
+        mtime = 0_u32,
+        filesize = data_len,
+        devmajor = 0_u32,
+        devminor = 0_u32,
+        rdevmajor = 0_u32,
+        rdevminor = 0_u32,
+        namesize = name_size,
+        check = 0_u32
+    );
+    file.write_all(header.as_bytes())?;
+    file.write_all(entry.name.as_bytes())?;
+    file.write_all(&[0])?;
+    write_newc_padding(file, header.len() + entry.name.len() + 1)?;
+    file.write_all(&entry.data)?;
+    write_newc_padding(file, entry.data.len())?;
+    Ok(())
+}
+
+fn write_newc_cpio_archive(output: &Path, entries: &[NewcCpioEntry]) -> AppResult<()> {
+    let mut file = fs::File::create(output)?;
+    for (index, entry) in entries.iter().enumerate() {
+        write_newc_cpio_entry(
+            &mut file,
+            u32::try_from(index + 1).unwrap_or(u32::MAX),
+            entry,
+        )?;
+    }
+    write_newc_cpio_entry(
+        &mut file,
+        u32::try_from(entries.len() + 1).unwrap_or(u32::MAX),
+        &NewcCpioEntry {
+            name: "TRAILER!!!".to_string(),
+            mode: 0,
+            data: Vec::new(),
+        },
+    )?;
+    Ok(())
+}
+
+fn run_initramfs_cc(source: &Path, output: &Path, label: &str) -> AppResult<()> {
+    let status = Command::new("cc")
+        .arg("-Os")
+        .arg("-static")
+        .arg("-o")
+        .arg(output)
+        .arg(source)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| {
+            AppError::message(format!(
+                "Failed to compile {label} with `cc`: {error}. Pane now packages the initramfs archive itself, but the guest `/init` and probe still require a Linux-capable static C compiler. Install a Linux-targeting `cc`, or build the binaries externally and register a verified initramfs with `pane runtime --register-initramfs`."
+            ))
+        })?;
+
+    if !status.status.success() {
+        return Err(AppError::message(format!(
+            "Failed to compile {label} with `cc -Os -static`.\nstdout:\n{}\nstderr:\n{}\nPane requires static ELF guest binaries for the discovery initramfs. Use a Linux-capable static C toolchain or register an externally built initramfs.",
+            String::from_utf8_lossy(&status.stdout),
+            String::from_utf8_lossy(&status.stderr)
+        )));
+    }
+    verify_elf_binary(output, label)
+}
+
+fn verify_elf_binary(path: &Path, label: &str) -> AppResult<()> {
+    let mut file = fs::File::open(path)?;
+    let mut magic = [0_u8; 4];
+    file.read_exact(&mut magic).map_err(|error| {
+        AppError::message(format!(
+            "Failed to read compiled {label} at {}: {error}",
+            path.display()
+        ))
+    })?;
+    if magic != *b"\x7fELF" {
+        return Err(AppError::message(format!(
+            "Compiled {label} at {} is not an ELF binary. Pane initramfs artifacts must be built for Linux, not the Windows host ABI.",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn build_pane_discovery_initramfs_with_native_packager(
+    paths: &RuntimePaths,
+    metadata: &PaneInitramfsDriverMetadata,
+    output: &Path,
+) -> AppResult<()> {
+    let staging = paths
+        .initramfs_driver_dir
+        .join("pane-storage-discovery-root");
+    if staging.exists() {
+        fs::remove_dir_all(&staging)?;
+    }
+    fs::create_dir_all(staging.join("bin"))?;
+    fs::create_dir_all(staging.join("dev"))?;
+    fs::create_dir_all(staging.join("lib/modules"))?;
+    fs::create_dir_all(staging.join("newroot"))?;
+    fs::create_dir_all(staging.join("proc"))?;
+    fs::create_dir_all(staging.join("run/pane"))?;
+    fs::create_dir_all(staging.join("sys"))?;
+
+    let init_binary = staging.join("init");
+    let probe_binary = staging.join("bin/pane-port-probe");
+    run_initramfs_cc(
+        Path::new(&metadata.init_source_path),
+        &init_binary,
+        "Pane discovery /init",
+    )?;
+    run_initramfs_cc(
+        Path::new(&metadata.probe_source_path),
+        &probe_binary,
+        "Pane port probe",
+    )?;
+
+    let hook = fs::read(Path::new(&metadata.hook_path))?;
+    let init = fs::read(&init_binary)?;
+    let probe = fs::read(&probe_binary)?;
+    let mut entries = vec![
+        NewcCpioEntry::directory("bin"),
+        NewcCpioEntry::directory("dev"),
+        NewcCpioEntry::directory("lib"),
+        NewcCpioEntry::directory("lib/modules"),
+        NewcCpioEntry::directory("newroot"),
+        NewcCpioEntry::directory("proc"),
+        NewcCpioEntry::directory("run"),
+        NewcCpioEntry::directory("run/pane"),
+        NewcCpioEntry::directory("sys"),
+        NewcCpioEntry::file("init", 0o755, init),
+        NewcCpioEntry::file("bin/pane-port-probe", 0o755, probe),
+        NewcCpioEntry::file("bin/pane-initramfs-hook", 0o755, hook),
+    ];
+
+    let module = pane_block_module_path(paths);
+    if module.is_file() {
+        entries.push(NewcCpioEntry::file(
+            "lib/modules/pane-block.ko",
+            0o644,
+            fs::read(module)?,
+        ));
+    }
+
+    write_newc_cpio_archive(output, &entries)
+}
+
 fn build_and_register_pane_discovery_initramfs(paths: &RuntimePaths, force: bool) -> AppResult<()> {
     let metadata = load_verified_pane_initramfs_driver_metadata(paths)?;
     if !paths.kernel_boot_metadata.is_file() {
@@ -5986,27 +6200,7 @@ fn build_and_register_pane_discovery_initramfs(paths: &RuntimePaths, force: bool
     if pane_block_module_path(paths).exists() {
         load_verified_pane_block_module_metadata(paths)?;
     }
-    let status = Command::new("sh")
-        .arg("./build-pane-initramfs.sh")
-        .arg("pane-storage-discovery.cpio")
-        .current_dir(&paths.initramfs_driver_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|error| {
-            AppError::message(format!(
-                "Failed to run Pane discovery initramfs build script with `sh`: {error}. Install a POSIX shell plus `cc` and `cpio`, or build the cpio externally and register it with `pane runtime --register-initramfs`."
-            ))
-        })?;
-
-    if !status.status.success() {
-        return Err(AppError::message(format!(
-            "Pane discovery initramfs build failed with status {}.\nstdout:\n{}\nstderr:\n{}",
-            status.status,
-            String::from_utf8_lossy(&status.stdout),
-            String::from_utf8_lossy(&status.stderr)
-        )));
-    }
+    build_pane_discovery_initramfs_with_native_packager(paths, &metadata, &output)?;
 
     register_pane_discovery_initramfs_artifact(paths, &output, force)
 }
@@ -14594,9 +14788,45 @@ mod tests {
         assert!(block_build_script.contains("KERNEL_BUILD_DIR"));
         assert!(block_build_script.contains("pane-block.ko"));
         assert!(block_build_script.contains("make -C"));
+        let readme = std::fs::read_to_string(paths.initramfs_driver_dir.join("README.md")).unwrap();
+        assert!(readme.contains("Pane compiles the generated guest `/init`"));
+        assert!(readme.contains("packages the `newc` initramfs"));
+        assert!(readme.contains("depend on host `cpio` or `bsdtar`"));
         assert!(artifacts.initramfs_driver_bundle_exists);
         assert!(artifacts.initramfs_driver_metadata_exists);
         assert!(artifacts.initramfs_driver_bundle_ready);
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn writes_newc_cpio_archive_with_trailer_and_payloads() {
+        let paths = temp_runtime_paths("runtime-newc-cpio");
+        super::prepare_runtime_paths(&paths).unwrap();
+        let output = paths.downloads.join("test-initramfs.cpio");
+
+        super::write_newc_cpio_archive(
+            &output,
+            &[
+                super::NewcCpioEntry::directory("bin"),
+                super::NewcCpioEntry::file("init", 0o755, b"pane init".to_vec()),
+                super::NewcCpioEntry::file("bin/pane-port-probe", 0o755, b"pane probe".to_vec()),
+            ],
+        )
+        .unwrap();
+
+        let archive = std::fs::read(&output).unwrap();
+        assert!(archive.starts_with(b"070701"));
+        assert_eq!(archive.len() % 4, 0);
+        assert!(archive
+            .windows("TRAILER!!!".len())
+            .any(|window| window == b"TRAILER!!!"));
+        assert!(archive
+            .windows("bin/pane-port-probe".len())
+            .any(|window| window == b"bin/pane-port-probe"));
+        assert!(archive
+            .windows("pane init".len())
+            .any(|window| window == b"pane init"));
 
         let _ = std::fs::remove_dir_all(&paths.root);
     }

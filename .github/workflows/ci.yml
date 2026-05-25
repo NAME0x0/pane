@@ -60,6 +60,53 @@ jobs:
       - name: Test non-Windows portable units
         run: cargo test --locked
 
+  guest-discovery-artifacts:
+    name: Guest Discovery Artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: cross-platform-check
+    env:
+      LOCALAPPDATA: ${{ runner.temp }}/pane-localappdata
+      PANE_SESSION: ci-guest-discovery
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Install static C toolchain
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc libc6-dev
+
+      - name: Generate Pane initramfs driver bundle
+        run: cargo run --locked -- runtime --session-name "$PANE_SESSION" --prepare --write-initramfs-driver --json
+
+      - name: Compile guest discovery ELFs
+        run: |
+          set -euo pipefail
+          driver_dir="$LOCALAPPDATA/Pane/runtime/$PANE_SESSION/engines/pane-initramfs-driver"
+          artifact_dir="$RUNNER_TEMP/pane-guest-discovery"
+          mkdir -p "$artifact_dir"
+          cc -Os -static -o "$artifact_dir/init" "$driver_dir/pane-init.c"
+          cc -Os -static -o "$artifact_dir/pane-port-probe" "$driver_dir/pane-port-probe.c"
+          test "$(head -c 4 "$artifact_dir/init")" = "$(printf '\177ELF')"
+          test "$(head -c 4 "$artifact_dir/pane-port-probe")" = "$(printf '\177ELF')"
+          sha256sum "$artifact_dir/init" "$artifact_dir/pane-port-probe" > "$artifact_dir/SHA256SUMS"
+
+      - name: Upload guest discovery ELFs
+        uses: actions/upload-artifact@v4
+        with:
+          name: pane-guest-discovery-elfs
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/pane-guest-discovery/init
+            ${{ runner.temp }}/pane-guest-discovery/pane-port-probe
+            ${{ runner.temp }}/pane-guest-discovery/SHA256SUMS
+
   docs-and-scripts:
     name: Docs and Script Hygiene
     runs-on: windows-latest
@@ -201,6 +248,7 @@ jobs:
       - cross-platform-check
       - docs-and-scripts
       - native-runtime-smoke
+      - guest-discovery-artifacts
       - package-windows
     if: always()
     steps:
@@ -212,6 +260,7 @@ jobs:
             "${{ needs.cross-platform-check.result }}" \
             "${{ needs.docs-and-scripts.result }}" \
             "${{ needs.native-runtime-smoke.result }}" \
+            "${{ needs.guest-discovery-artifacts.result }}" \
             "${{ needs.package-windows.result }}"; do
             if [ "$result" != "success" ]; then
               echo "A required CI job failed or was skipped: $result"

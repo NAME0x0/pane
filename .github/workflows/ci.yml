@@ -66,7 +66,7 @@ jobs:
     timeout-minutes: 15
     needs: cross-platform-check
     env:
-      LOCALAPPDATA: ${{ runner.temp }}/pane-localappdata
+      LOCALAPPDATA: ${{ github.workspace }}/.pane-localappdata
       PANE_SESSION: ci-guest-discovery
     steps:
       - name: Checkout
@@ -88,7 +88,7 @@ jobs:
         run: |
           set -euo pipefail
           driver_dir="$LOCALAPPDATA/Pane/runtime/$PANE_SESSION/engines/pane-initramfs-driver"
-          artifact_dir="$RUNNER_TEMP/pane-guest-discovery"
+          artifact_dir="$GITHUB_WORKSPACE/pane-guest-discovery"
           mkdir -p "$artifact_dir"
           cc -Os -static -o "$artifact_dir/init" "$driver_dir/pane-init.c"
           cc -Os -static -o "$artifact_dir/pane-port-probe" "$driver_dir/pane-port-probe.c"
@@ -103,9 +103,9 @@ jobs:
           retention-days: 14
           if-no-files-found: error
           path: |
-            ${{ runner.temp }}/pane-guest-discovery/init
-            ${{ runner.temp }}/pane-guest-discovery/pane-port-probe
-            ${{ runner.temp }}/pane-guest-discovery/SHA256SUMS
+            pane-guest-discovery/init
+            pane-guest-discovery/pane-port-probe
+            pane-guest-discovery/SHA256SUMS
 
   docs-and-scripts:
     name: Docs and Script Hygiene

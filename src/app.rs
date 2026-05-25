@@ -1974,6 +1974,20 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
     let budget = runtime_storage_budget(args.capacity_gib);
     let registering_native_boot_set =
         args.register_native_boot_set || args.register_native_boot_set_manifest.is_some();
+    if !args.build_discovery_initramfs
+        && (args.discovery_init_binary.is_some() || args.discovery_probe_binary.is_some())
+    {
+        return Err(AppError::message(
+            "--discovery-init-binary and --discovery-probe-binary require --build-discovery-initramfs.",
+        ));
+    }
+    if args.build_discovery_initramfs
+        && (args.discovery_init_binary.is_some() != args.discovery_probe_binary.is_some())
+    {
+        return Err(AppError::message(
+            "--discovery-init-binary and --discovery-probe-binary must be provided together.",
+        ));
+    }
     let has_runtime_mutation = args.register_base_image.is_some()
         || registering_native_boot_set
         || args.write_native_boot_set_manifest_template.is_some()
@@ -2102,7 +2116,12 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
     }
 
     if args.build_discovery_initramfs {
-        build_and_register_pane_discovery_initramfs(&paths, args.force)?;
+        build_and_register_pane_discovery_initramfs(
+            &paths,
+            args.discovery_init_binary.as_deref(),
+            args.discovery_probe_binary.as_deref(),
+            args.force,
+        )?;
     }
 
     if args.create_user_disk {
@@ -5932,6 +5951,16 @@ Pane compiles the generated guest `/init` and probe with a Linux-capable static
 archive itself. The archive writer is built into Pane, so the app path does not
 depend on host `cpio` or `bsdtar`.
 
+If a reproducible artifact builder already produced the two guest binaries, Pane
+can package them without invoking a compiler:
+
+```sh
+pane runtime --build-discovery-initramfs --discovery-init-binary ./init --discovery-probe-binary ./pane-port-probe
+```
+
+Both inputs must be Linux ELF binaries. Pane rejects Windows-host binaries before
+registering the initramfs.
+
 For external/manual builders, the generated shell script can still produce an
 equivalent cpio archive:
 
@@ -6121,7 +6150,15 @@ fn build_pane_discovery_initramfs_with_native_packager(
     paths: &RuntimePaths,
     metadata: &PaneInitramfsDriverMetadata,
     output: &Path,
+    prebuilt_init_binary: Option<&Path>,
+    prebuilt_probe_binary: Option<&Path>,
 ) -> AppResult<()> {
+    if prebuilt_init_binary.is_some() != prebuilt_probe_binary.is_some() {
+        return Err(AppError::message(
+            "--discovery-init-binary and --discovery-probe-binary must be provided together.",
+        ));
+    }
+
     let staging = paths
         .initramfs_driver_dir
         .join("pane-storage-discovery-root");
@@ -6138,16 +6175,25 @@ fn build_pane_discovery_initramfs_with_native_packager(
 
     let init_binary = staging.join("init");
     let probe_binary = staging.join("bin/pane-port-probe");
-    run_initramfs_cc(
-        Path::new(&metadata.init_source_path),
-        &init_binary,
-        "Pane discovery /init",
-    )?;
-    run_initramfs_cc(
-        Path::new(&metadata.probe_source_path),
-        &probe_binary,
-        "Pane port probe",
-    )?;
+    if let (Some(prebuilt_init), Some(prebuilt_probe)) =
+        (prebuilt_init_binary, prebuilt_probe_binary)
+    {
+        verify_elf_binary(prebuilt_init, "prebuilt Pane discovery /init")?;
+        verify_elf_binary(prebuilt_probe, "prebuilt Pane port probe")?;
+        fs::copy(prebuilt_init, &init_binary)?;
+        fs::copy(prebuilt_probe, &probe_binary)?;
+    } else {
+        run_initramfs_cc(
+            Path::new(&metadata.init_source_path),
+            &init_binary,
+            "Pane discovery /init",
+        )?;
+        run_initramfs_cc(
+            Path::new(&metadata.probe_source_path),
+            &probe_binary,
+            "Pane port probe",
+        )?;
+    }
 
     let hook = fs::read(Path::new(&metadata.hook_path))?;
     let init = fs::read(&init_binary)?;
@@ -6179,7 +6225,12 @@ fn build_pane_discovery_initramfs_with_native_packager(
     write_newc_cpio_archive(output, &entries)
 }
 
-fn build_and_register_pane_discovery_initramfs(paths: &RuntimePaths, force: bool) -> AppResult<()> {
+fn build_and_register_pane_discovery_initramfs(
+    paths: &RuntimePaths,
+    prebuilt_init_binary: Option<&Path>,
+    prebuilt_probe_binary: Option<&Path>,
+    force: bool,
+) -> AppResult<()> {
     let metadata = load_verified_pane_initramfs_driver_metadata(paths)?;
     if !paths.kernel_boot_metadata.is_file() {
         return Err(AppError::message(
@@ -6200,7 +6251,13 @@ fn build_and_register_pane_discovery_initramfs(paths: &RuntimePaths, force: bool
     if pane_block_module_path(paths).exists() {
         load_verified_pane_block_module_metadata(paths)?;
     }
-    build_pane_discovery_initramfs_with_native_packager(paths, &metadata, &output)?;
+    build_pane_discovery_initramfs_with_native_packager(
+        paths,
+        &metadata,
+        &output,
+        prebuilt_init_binary,
+        prebuilt_probe_binary,
+    )?;
 
     register_pane_discovery_initramfs_artifact(paths, &output, force)
 }
@@ -13108,6 +13165,8 @@ mod tests {
             kernel_cmdline: None,
             write_initramfs_driver: false,
             build_discovery_initramfs: false,
+            discovery_init_binary: None,
+            discovery_probe_binary: None,
             build_pane_block_module: false,
             kernel_build_dir: None,
             register_pane_block_module: None,
@@ -14827,6 +14886,73 @@ mod tests {
         assert!(archive
             .windows("pane init".len())
             .any(|window| window == b"pane init"));
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn rejects_non_elf_discovery_binary_before_packaging() {
+        let paths = temp_runtime_paths("runtime-non-elf-discovery-binary");
+        super::prepare_runtime_paths(&paths).unwrap();
+        let binary = paths.downloads.join("init.exe");
+        std::fs::write(&binary, b"MZnot-linux").unwrap();
+
+        let error = super::verify_elf_binary(&binary, "prebuilt Pane discovery /init")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("not an ELF binary"));
+        assert!(error.contains("Windows host ABI"));
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn packages_discovery_initramfs_from_prebuilt_elfs_without_compiler() {
+        let paths = temp_runtime_paths("runtime-prebuilt-discovery-elfs");
+        super::prepare_runtime_paths(&paths).unwrap();
+        let kernel = paths.downloads.join("vmlinuz-linux");
+        std::fs::write(&kernel, fake_linux_bzimage()).unwrap();
+        let kernel_sha = sha256_file(&kernel).unwrap();
+        register_kernel_boot_plan(
+            &paths,
+            Some(&kernel),
+            Some(&kernel_sha),
+            None,
+            None,
+            Some("console=ttyS0 panic=-1 root=/dev/pane0"),
+            false,
+        )
+        .unwrap();
+        write_pane_initramfs_driver_bundle(&paths).unwrap();
+        let init = paths.downloads.join("pane-init.elf");
+        let probe = paths.downloads.join("pane-port-probe.elf");
+        std::fs::write(&init, b"\x7fELFpane-prebuilt-init").unwrap();
+        std::fs::write(&probe, b"\x7fELFpane-prebuilt-probe").unwrap();
+
+        super::build_and_register_pane_discovery_initramfs(
+            &paths,
+            Some(&init),
+            Some(&probe),
+            false,
+        )
+        .unwrap();
+
+        let artifacts = build_runtime_artifact_report(&paths);
+        let archive = std::fs::read(
+            paths
+                .initramfs_driver_dir
+                .join("pane-storage-discovery.cpio"),
+        )
+        .unwrap();
+        assert!(artifacts.initramfs_image_exists);
+        assert!(artifacts.initramfs_image_verified);
+        assert!(archive
+            .windows("pane-prebuilt-init".len())
+            .any(|window| window == b"pane-prebuilt-init"));
+        assert!(archive
+            .windows("pane-prebuilt-probe".len())
+            .any(|window| window == b"pane-prebuilt-probe"));
 
         let _ = std::fs::remove_dir_all(&paths.root);
     }

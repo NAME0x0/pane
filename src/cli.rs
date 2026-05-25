@@ -295,6 +295,12 @@ pub struct RuntimeArgs {
     /// Build the generated discovery initramfs cpio and register it into the verified kernel boot plan.
     #[arg(long)]
     pub build_discovery_initramfs: bool,
+    /// Prebuilt Linux ELF /init binary to package instead of compiling pane-init.c locally.
+    #[arg(long)]
+    pub discovery_init_binary: Option<PathBuf>,
+    /// Prebuilt Linux ELF pane-port-probe binary to package instead of compiling pane-port-probe.c locally.
+    #[arg(long)]
+    pub discovery_probe_binary: Option<PathBuf>,
     /// Build pane-block.ko from the generated source, then register it into the initramfs driver bundle.
     #[arg(long)]
     pub build_pane_block_module: bool,

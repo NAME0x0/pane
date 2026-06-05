@@ -4070,6 +4070,40 @@ fn detect_partition_filesystem(path: &Path, partition_offset: u64) -> AppResult<
     Ok(None)
 }
 
+fn refresh_base_os_metadata_inspection(
+    paths: &RuntimePaths,
+    mut metadata: BaseOsImageMetadata,
+) -> AppResult<BaseOsImageMetadata> {
+    if !metadata.verified || metadata.stored_path != paths.base_os_image.display().to_string() {
+        return Ok(metadata);
+    }
+
+    let actual_bytes = fs::metadata(&paths.base_os_image)?.len();
+    if actual_bytes != metadata.bytes || sha256_file(&paths.base_os_image)? != metadata.sha256 {
+        return Ok(metadata);
+    }
+
+    let inspection = inspect_base_os_image_artifact(&paths.base_os_image)?;
+    let changed = metadata.image_format != inspection.image_format
+        || metadata.bootable_disk_hint != inspection.bootable_disk_hint
+        || metadata.partitions != inspection.partitions
+        || metadata.root_partition_hint != inspection.root_partition_hint
+        || metadata.root_filesystem_hint != inspection.root_filesystem_hint
+        || metadata.notes != inspection.notes;
+
+    if changed {
+        metadata.image_format = inspection.image_format;
+        metadata.bootable_disk_hint = inspection.bootable_disk_hint;
+        metadata.partitions = inspection.partitions;
+        metadata.root_partition_hint = inspection.root_partition_hint;
+        metadata.root_filesystem_hint = inspection.root_filesystem_hint;
+        metadata.notes = inspection.notes;
+        write_json_file(&paths.base_os_metadata, &metadata)?;
+    }
+
+    Ok(metadata)
+}
+
 fn inspect_mbr_partitions(header: &[u8]) -> Vec<BaseOsPartition> {
     header
         .get(446..510)
@@ -8297,7 +8331,10 @@ fn build_kernel_storage_attachment(
     let base_bytes = artifacts.base_os_image_bytes.ok_or_else(|| {
         AppError::message("Verified base OS image is missing its recorded byte length.")
     })?;
-    let base_metadata = read_json_file::<BaseOsImageMetadata>(&paths.base_os_metadata)?;
+    let base_metadata = refresh_base_os_metadata_inspection(
+        paths,
+        read_json_file::<BaseOsImageMetadata>(&paths.base_os_metadata)?,
+    )?;
     if !base_metadata.bootable_disk_hint {
         return Err(AppError::message(format!(
             "Pane native storage requires a verified raw disk base image with a Linux root partition hint; `{}` was registered as `{}`. Convert the Arch rootfs to a raw disk image or register a bootable raw Arch image before materializing a storage-backed kernel layout.",
@@ -15772,6 +15809,65 @@ mod tests {
         let native_runtime =
             build_native_runtime_report(true, &artifacts, &test_native_host_report(true));
         assert!(native_runtime.ready_for_arch_boot_attempt);
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn kernel_boot_layout_refreshes_stale_base_os_filesystem_hint() {
+        let paths = temp_runtime_paths("kernel-layout-refreshes-base-fs-hint");
+        super::prepare_runtime_paths(&paths).unwrap();
+        super::write_runtime_config(&paths, "pane", &runtime_storage_budget(8)).unwrap();
+        super::write_native_runtime_manifest(&paths, "pane").unwrap();
+        super::write_framebuffer_contract(&paths).unwrap();
+        super::write_input_contract(&paths).unwrap();
+        let base = paths.downloads.join("arch-base.img");
+        let kernel = paths.downloads.join("vmlinuz-linux");
+        std::fs::write(&base, fake_mbr_linux_root_disk_image()).unwrap();
+        std::fs::write(&kernel, fake_linux_bzimage()).unwrap();
+        let base_sha = sha256_file(&base).unwrap();
+        let kernel_sha = sha256_file(&kernel).unwrap();
+
+        register_base_os_image(&paths, &base, Some(&base_sha), false, false).unwrap();
+        let mut stale_metadata =
+            read_json_file::<BaseOsImageMetadata>(&paths.base_os_metadata).unwrap();
+        stale_metadata.root_filesystem_hint = None;
+        stale_metadata.notes = vec!["stale metadata from older Pane build".to_string()];
+        write_json_file(&paths.base_os_metadata, &stale_metadata).unwrap();
+        create_user_disk_descriptor(&paths, &runtime_storage_budget(8), false).unwrap();
+        write_pane_initramfs_driver_bundle(&paths).unwrap();
+        register_kernel_boot_plan(
+            &paths,
+            Some(&kernel),
+            Some(&kernel_sha),
+            None,
+            None,
+            Some("console=ttyS0 root=/dev/pane0 rw"),
+            false,
+        )
+        .unwrap();
+        register_fake_pane_block_module(&paths);
+        register_fake_discovery_initramfs(&paths);
+
+        let layout = build_kernel_boot_layout(&paths, "pane", true).unwrap();
+        let refreshed = read_json_file::<BaseOsImageMetadata>(&paths.base_os_metadata).unwrap();
+
+        assert!(layout.cmdline.contains("pane.root_fs=ext4"));
+        assert_eq!(
+            layout
+                .storage
+                .as_ref()
+                .unwrap()
+                .root_handoff
+                .filesystem_hint
+                .as_deref(),
+            Some("ext4")
+        );
+        assert_eq!(refreshed.root_filesystem_hint.as_deref(), Some("ext4"));
+        assert!(refreshed
+            .notes
+            .iter()
+            .any(|note| note.contains("root filesystem as ext4")));
 
         let _ = std::fs::remove_dir_all(&paths.root);
     }

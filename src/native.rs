@@ -1192,6 +1192,7 @@ mod windows_whp {
     const LINUX_ENTRY_PROBE_WALL_CLOCK_BUDGET_SECONDS: u64 = 90;
     const LINUX_ENTRY_PROBE_TOTAL_BUDGET_SECONDS: u64 = 300;
     const LINUX_ENTRY_PROBE_STORAGE_TOTAL_BUDGET_SECONDS: u64 = 1200;
+    const LINUX_ENTRY_PROBE_MODULE_LOAD_BUDGET_SECONDS: u64 = 90;
     const LINUX_ENTRY_PROBE_ROOT_MOUNT_BUDGET_SECONDS: u64 = 120;
     const LINUX_ENTRY_PROBE_TRACE_HEAD: usize = 384;
     const LINUX_ENTRY_PROBE_TRACE_TAIL: usize = 384;
@@ -2737,6 +2738,7 @@ mod windows_whp {
         let probe_started_at = Instant::now();
         let mut last_checkpoint_at = probe_started_at;
         let mut last_progress_at = probe_started_at;
+        let mut module_load_started_at: Option<Instant> = None;
         let mut root_mount_started_at: Option<Instant> = None;
         if let Some(path) = checkpoint_path.as_deref() {
             write_linux_entry_probe_checkpoint(path, report, "started", probe_started_at);
@@ -2751,6 +2753,26 @@ mod windows_whp {
             }
 
             if let Some(serial_text) = report.serial_text.as_deref() {
+                if linux_entry_probe_module_load_active(serial_text) {
+                    let module_load_started =
+                        *module_load_started_at.get_or_insert_with(Instant::now);
+                    if module_load_started.elapsed()
+                        >= Duration::from_secs(LINUX_ENTRY_PROBE_MODULE_LOAD_BUDGET_SECONDS)
+                    {
+                        report.calls.push(NativeWhpCallReport {
+                            name: "LinuxEntryProbeModuleLoadBudget",
+                            hresult: None,
+                            ok: false,
+                            detail: format!(
+                                "Pane observed PANE_BLOCK_MODULE_LOAD_ATTEMPT but no module-load terminal marker for {LINUX_ENTRY_PROBE_MODULE_LOAD_BUDGET_SECONDS}s; the guest did not reach PANE_BLOCK_MODULE_LOAD_OK, PANE_BLOCK_MODULE_LOAD_FAILED, or PANE_BLOCK_MODULE_LOAD_TIMEOUT."
+                            ),
+                        });
+                        break;
+                    }
+                } else {
+                    module_load_started_at = None;
+                }
+
                 if linux_entry_probe_root_mount_active(serial_text) {
                     let root_mount_started =
                         *root_mount_started_at.get_or_insert_with(Instant::now);
@@ -5315,6 +5337,23 @@ mod windows_whp {
         true
     }
 
+    fn linux_entry_probe_module_load_active(serial_text: &str) -> bool {
+        let Some(module_load_index) = serial_text.rfind("PANE_BLOCK_MODULE_LOAD_ATTEMPT") else {
+            return false;
+        };
+        let module_load_tail = &serial_text[module_load_index..];
+        ![
+            "PANE_BLOCK_MODULE_LOAD_OK",
+            "PANE_BLOCK_MODULE_LOAD_FAILED",
+            "PANE_BLOCK_MODULE_LOAD_TIMEOUT",
+            "PANE_BLOCK_MODULE_ALREADY_LOADED",
+            "PANE_BLOCK_MODULE_NOT_PRESENT",
+            "PANE_INITRAMFS_DISCOVERY_DONE",
+        ]
+        .iter()
+        .any(|marker| module_load_tail.contains(marker))
+    }
+
     fn linux_entry_probe_root_mount_active(serial_text: &str) -> bool {
         let Some(root_mount_try_index) = serial_text.rfind("PANE_ROOT_MOUNT_TRY") else {
             return false;
@@ -5343,6 +5382,7 @@ mod windows_whp {
                         | "UnsupportedIoPort"
                         | "LinuxEntryProbeWallClockBudget"
                         | "LinuxEntryProbeTotalWallClockBudget"
+                        | "LinuxEntryProbeModuleLoadBudget"
                         | "LinuxEntryProbeRootMountBudget"
                         | "LinuxEntryProbeRunCancelTimeout"
                         | "LinuxEntryProbePostTimerResumeBoundary"
@@ -5413,6 +5453,16 @@ mod windows_whp {
                     report.serial_expected_markers.join(", "),
                 )
             }
+        } else if let Some(call) = report
+            .calls
+            .iter()
+            .rev()
+            .find(|call| call.name == "LinuxEntryProbeModuleLoadBudget" && !call.ok)
+        {
+            format!(
+                "Linux protected-mode entry reached Pane's block-module load phase but did not reach a terminal module-load marker within the phase budget: {}",
+                call.detail
+            )
         } else if let Some(call) = report
             .calls
             .iter()
@@ -5797,7 +5847,8 @@ mod windows_whp {
             default_linux_msr_state, format_vector_list, framebuffer_snapshot_report,
             guest_contract_failure_blocker, guest_contract_passed, input_queue_snapshot_report,
             interrupt_delivery_blocker, interrupt_delivery_snapshot_blocker,
-            linux_entry_probe_detail, linux_entry_probe_exit_budget, linux_entry_probe_passed,
+            linux_entry_probe_detail, linux_entry_probe_exit_budget,
+            linux_entry_probe_module_load_active, linux_entry_probe_passed,
             linux_entry_probe_root_mount_active, linux_entry_probe_total_budget_seconds,
             linux_protected_mode_registers, parse_xapic_interrupt_controller_state,
             serial_contract_passed, serial_markers_observed, timer_interrupt_readiness,
@@ -6601,6 +6652,43 @@ mod windows_whp {
 
             assert!(!linux_entry_probe_passed(&report));
             assert!(linux_entry_probe_detail(&report).contains("total live-run budget"));
+        }
+
+        #[test]
+        fn linux_entry_probe_rejects_module_load_phase_budget() {
+            let mut report = base_report();
+            report.virtual_processor_ran = true;
+            report.exit_reason = Some(WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS);
+            report.exit_reason_label = Some("x64-io-port-access".to_string());
+            report.serial_text = Some("PANE_BLOCK_MODULE_LOAD_ATTEMPT\n".to_string());
+            report.calls.push(crate::native::NativeWhpCallReport {
+                name: "LinuxEntryProbeModuleLoadBudget",
+                hresult: None,
+                ok: false,
+                detail: "module load did not return".to_string(),
+            });
+
+            assert!(linux_entry_probe_module_load_active(
+                report.serial_text.as_deref().unwrap()
+            ));
+            assert!(!linux_entry_probe_passed(&report));
+            assert!(linux_entry_probe_detail(&report).contains("block-module load phase"));
+        }
+
+        #[test]
+        fn linux_entry_probe_module_load_phase_ends_on_terminal_marker() {
+            assert!(linux_entry_probe_module_load_active(
+                "PANE_BLOCK_MODULE_LOAD_ATTEMPT\n"
+            ));
+            assert!(!linux_entry_probe_module_load_active(
+                "PANE_BLOCK_MODULE_LOAD_ATTEMPT\nPANE_BLOCK_MODULE_LOAD_OK\n"
+            ));
+            assert!(!linux_entry_probe_module_load_active(
+                "PANE_BLOCK_MODULE_LOAD_ATTEMPT\nPANE_BLOCK_MODULE_LOAD_TIMEOUT\n"
+            ));
+            assert!(!linux_entry_probe_module_load_active(
+                "PANE_BLOCK_MODULE_LOAD_ATTEMPT\nPANE_INITRAMFS_DISCOVERY_DONE\n"
+            ));
         }
 
         #[test]

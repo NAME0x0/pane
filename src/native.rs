@@ -332,6 +332,9 @@ pub(crate) struct NativeBlockIoPortState {
     response_bytes: Vec<u8>,
     response_cursor: usize,
     write_payload: Vec<u8>,
+    pending_submission: Option<NativeBlockIoSubmission>,
+    pending_status_read_seen: bool,
+    pending_submit_serial_len: Option<usize>,
 }
 
 impl Default for NativeBlockIoPortState {
@@ -344,6 +347,9 @@ impl Default for NativeBlockIoPortState {
             response_bytes: Vec::new(),
             response_cursor: 0,
             write_payload: Vec::new(),
+            pending_submission: None,
+            pending_status_read_seen: false,
+            pending_submit_serial_len: None,
         }
     }
 }
@@ -357,6 +363,9 @@ impl NativeBlockIoPortState {
     fn clear_transfer_buffers(&mut self) {
         self.clear_response();
         self.write_payload.clear();
+        self.pending_submission = None;
+        self.pending_status_read_seen = false;
+        self.pending_submit_serial_len = None;
     }
 
     #[cfg(test)]
@@ -420,18 +429,19 @@ impl NativeBlockIoPortState {
                     return None;
                 }
                 self.status = PANE_BLOCK_IO_STATUS_SUBMITTED;
-                let command = NativeBlockIoCommand {
-                    device: self.device,
-                    operation: self.operation,
-                    block_index: u64::from_le_bytes(self.block_index_bytes),
-                    block_size_bytes: PANE_BLOCK_IO_BLOCK_SIZE_BYTES,
-                };
-                let write_payload = (self.operation == NativeBlockOperation::Write)
-                    .then(|| self.write_payload.clone());
-                Some(NativeBlockIoSubmission {
-                    command,
-                    write_payload,
-                })
+                self.pending_submission = Some(NativeBlockIoSubmission {
+                    command: NativeBlockIoCommand {
+                        device: self.device,
+                        operation: self.operation,
+                        block_index: u64::from_le_bytes(self.block_index_bytes),
+                        block_size_bytes: PANE_BLOCK_IO_BLOCK_SIZE_BYTES,
+                    },
+                    write_payload: (self.operation == NativeBlockOperation::Write)
+                        .then(|| self.write_payload.clone()),
+                });
+                self.pending_status_read_seen = false;
+                self.pending_submit_serial_len = None;
+                None
             }
             4..=11 => {
                 let offset = usize::from(pane_block_io_port_offset(port)? - 4);
@@ -472,6 +482,9 @@ impl NativeBlockIoPortState {
     }
 
     pub(crate) fn set_service_result(&mut self, status: u8, response_bytes: Vec<u8>) {
+        self.pending_submission = None;
+        self.pending_status_read_seen = false;
+        self.pending_submit_serial_len = None;
         self.status = status;
         self.response_cursor = 0;
         self.response_bytes = if status == PANE_BLOCK_IO_STATUS_SERVICED {
@@ -479,6 +492,43 @@ impl NativeBlockIoPortState {
         } else {
             Vec::new()
         };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_pending_submission(&mut self) -> Option<NativeBlockIoSubmission> {
+        self.pending_submission.take()
+    }
+
+    pub(crate) fn note_pending_status_read(&mut self) -> bool {
+        if self.pending_submission.is_some() && !self.pending_status_read_seen {
+            self.pending_status_read_seen = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn note_pending_submit_serial_position(&mut self, serial_len: usize) {
+        if self.pending_submission.is_some() {
+            self.pending_submit_serial_len = Some(serial_len);
+        }
+    }
+
+    pub(crate) fn take_ready_pending_submission(
+        &mut self,
+        serial_text: Option<&str>,
+    ) -> Option<NativeBlockIoSubmission> {
+        let submit_completion_marker_seen = self
+            .pending_submit_serial_len
+            .and_then(|start| serial_text.and_then(|text| text.get(start..)))
+            .is_some_and(|tail| tail.contains("PANE_BLOCK_TRANSFER_SUBMITTED"));
+        if self.pending_status_read_seen || submit_completion_marker_seen {
+            self.pending_status_read_seen = false;
+            self.pending_submit_serial_len = None;
+            self.pending_submission.take()
+        } else {
+            None
+        }
     }
 
     pub(crate) fn read_value(&mut self, port: u16, access_size: u32) -> Option<u32> {
@@ -2770,11 +2820,7 @@ mod windows_whp {
         let mut root_mount_timer_request_count = 0_u32;
         let mut last_root_mount_timer_request_at: Option<Instant> = None;
         let mut post_timer_resume_attempted = false;
-        let mut interrupt_window_notification_armed = arm_timer_interrupt_window_notification(
-            partition,
-            set_virtual_processor_registers,
-            report,
-        );
+        let mut interrupt_window_notification_armed = false;
         let mut interrupt_window_ready_waits = 0_u32;
         let probe_started_at = Instant::now();
         let mut last_checkpoint_at = probe_started_at;
@@ -2789,6 +2835,79 @@ mod windows_whp {
             if let Some(path) = checkpoint_path.as_deref() {
                 if last_checkpoint_at.elapsed() >= Duration::from_secs(1) {
                     write_linux_entry_probe_checkpoint(path, report, "running", probe_started_at);
+                    last_checkpoint_at = Instant::now();
+                }
+            }
+
+            if let Some(submission) =
+                block_state.take_ready_pending_submission(report.serial_text.as_deref())
+            {
+                let dma_ready = block_dma_window
+                    .as_ref()
+                    .is_some_and(|window| window.len() >= PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize);
+                let dma_write_payload =
+                    if dma_ready && submission.command.operation == NativeBlockOperation::Write {
+                        block_dma_window.as_deref().map(|window| {
+                            window[..PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize].to_vec()
+                        })
+                    } else {
+                        None
+                    };
+                let outcome = service_native_block_io_command(
+                    &submission.command,
+                    block_io_handler,
+                    dma_write_payload
+                        .as_deref()
+                        .or(submission.write_payload.as_deref()),
+                );
+                let status_code = outcome.status_code;
+                let mut response_bytes = outcome.response_bytes;
+                let response_len = response_bytes.len();
+                let root_mount_active = report
+                    .serial_text
+                    .as_deref()
+                    .map(linux_entry_probe_root_mount_active)
+                    .unwrap_or(false);
+                block_io_trace.record(
+                    &submission.command,
+                    status_code,
+                    response_len,
+                    root_mount_active,
+                );
+                report.block_io_trace = block_io_trace.report();
+                if dma_ready
+                    && status_code == PANE_BLOCK_IO_STATUS_SERVICED
+                    && submission.command.operation == NativeBlockOperation::Read
+                {
+                    if let Some(window) = block_dma_window.as_deref_mut() {
+                        let transfer_len = response_bytes
+                            .len()
+                            .min(PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize);
+                        window[..PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize].fill(0);
+                        window[..transfer_len].copy_from_slice(&response_bytes[..transfer_len]);
+                        report.calls.push(NativeWhpCallReport {
+                            name: "PaneBlockDmaServiced",
+                            hresult: None,
+                            ok: transfer_len == PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize,
+                            detail: format!(
+                                "Pane copied {transfer_len} bytes for {} block {} through the shared block DMA window after the guest observed SUBMITTED status.",
+                                submission.command.device.label(),
+                                submission.command.block_index
+                            ),
+                        });
+                        response_bytes.clear();
+                    }
+                }
+                block_state.set_service_result(status_code, response_bytes);
+                last_progress_at = Instant::now();
+                report.calls.push(outcome.report);
+                if let Some(path) = checkpoint_path.as_deref() {
+                    write_linux_entry_probe_checkpoint(
+                        path,
+                        report,
+                        "block-io-deferred-status-serviced",
+                        probe_started_at,
+                    );
                     last_checkpoint_at = Instant::now();
                 }
             }
@@ -2848,11 +2967,30 @@ mod windows_whp {
                         root_mount_timer_requested = true;
                         root_mount_timer_request_count += 1;
                         last_root_mount_timer_request_at = Some(Instant::now());
+                        if interrupt_window_notification_armed {
+                            interrupt_window_notification_armed =
+                                !disarm_timer_interrupt_window_notification(
+                                    partition,
+                                    set_virtual_processor_registers,
+                                    "root-mount-timer-primed",
+                                    report,
+                                );
+                        }
                         last_checkpoint_at = Instant::now();
                     }
                     if root_mount_started.elapsed()
                         >= Duration::from_secs(LINUX_ENTRY_PROBE_ROOT_MOUNT_BUDGET_SECONDS)
                     {
+                        if let Some(get_virtual_processor_registers) =
+                            get_virtual_processor_registers
+                        {
+                            capture_linux_execution_snapshot(
+                                partition,
+                                get_virtual_processor_registers,
+                                "root-mount-budget",
+                                report,
+                            );
+                        }
                         report.calls.push(NativeWhpCallReport {
                             name: "LinuxEntryProbeRootMountBudget",
                             hresult: None,
@@ -2871,6 +3009,14 @@ mod windows_whp {
             if last_progress_at.elapsed()
                 >= Duration::from_secs(LINUX_ENTRY_PROBE_WALL_CLOCK_BUDGET_SECONDS)
             {
+                if let Some(get_virtual_processor_registers) = get_virtual_processor_registers {
+                    capture_linux_execution_snapshot(
+                        partition,
+                        get_virtual_processor_registers,
+                        "wall-clock-budget",
+                        report,
+                    );
+                }
                 report.calls.push(NativeWhpCallReport {
                     name: "LinuxEntryProbeWallClockBudget",
                     hresult: None,
@@ -2884,6 +3030,14 @@ mod windows_whp {
             }
 
             if probe_started_at.elapsed() >= Duration::from_secs(total_budget_seconds) {
+                if let Some(get_virtual_processor_registers) = get_virtual_processor_registers {
+                    capture_linux_execution_snapshot(
+                        partition,
+                        get_virtual_processor_registers,
+                        "total-wall-clock-budget",
+                        report,
+                    );
+                }
                 report.calls.push(NativeWhpCallReport {
                     name: "LinuxEntryProbeTotalWallClockBudget",
                     hresult: None,
@@ -2906,6 +3060,11 @@ mod windows_whp {
             }
 
             report.guest_exit_count = (exit_index + 1) as u32;
+            let root_mount_phase_active = report
+                .serial_text
+                .as_deref()
+                .map(linux_entry_probe_root_mount_active)
+                .unwrap_or(false);
             let cancel_count_before = guarded_runner.cancel_request_count();
             let Some(run_result) = guarded_runner.run(report) else {
                 if let Some(path) = checkpoint_path.as_deref() {
@@ -2942,7 +3101,8 @@ mod windows_whp {
                     );
                     last_checkpoint_at = Instant::now();
                 }
-                if !root_mount_timer_requested
+                if root_mount_phase_active
+                    && !root_mount_timer_requested
                     && maybe_prime_root_mount_timer(
                         partition,
                         get_virtual_processor_registers,
@@ -3005,11 +3165,16 @@ mod windows_whp {
 
                         let next_rip = rip + u64::from(instruction_length);
                         if is_write {
-                            if let Some(submission) = block_state.write_value(
+                            let submission = block_state.write_value(
                                 port,
                                 access_size,
                                 (rax & u64::from(pane_block_io_access_mask(access_size))) as u32,
-                            ) {
+                            );
+                            if pane_block_io_port_offset(port) == Some(2) {
+                                block_state
+                                    .note_pending_submit_serial_position(report.serial_bytes.len());
+                            }
+                            if let Some(submission) = submission {
                                 let dma_ready = block_dma_window.as_ref().is_some_and(|window| {
                                     window.len() >= PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize
                                 });
@@ -3114,6 +3279,16 @@ mod windows_whp {
                                 break;
                             }
                         } else {
+                            if pane_block_io_port_offset(port) == Some(2)
+                                && block_state.note_pending_status_read()
+                            {
+                                report.calls.push(NativeWhpCallReport {
+                                    name: "PaneBlockStatusReadObserved",
+                                    hresult: None,
+                                    ok: true,
+                                    detail: "Guest read Pane block status while a command was pending; Pane returned SUBMITTED and will service the request before the next vCPU run.".to_string(),
+                                });
+                            }
                             let Some(value) = block_state.read_value(port, access_size) else {
                                 break;
                             };
@@ -3347,6 +3522,15 @@ mod windows_whp {
                 }
                 DecodedExit::InterruptWindow => {
                     if timer_interrupt_requested {
+                        if interrupt_window_notification_armed {
+                            interrupt_window_notification_armed =
+                                !disarm_timer_interrupt_window_notification(
+                                    partition,
+                                    set_virtual_processor_registers,
+                                    "timer-already-requested",
+                                    report,
+                                );
+                        }
                         report.calls.push(NativeWhpCallReport {
                             name: "LinuxEntryProbeTimerInterruptWindow",
                             hresult: None,
@@ -3361,6 +3545,31 @@ mod windows_whp {
                                 "Guest reached an interrupt-window exit after timer injection; Pane will resume the vCPU."
                                     .to_string(),
                         });
+                    } else if !root_mount_phase_active {
+                        if interrupt_window_notification_armed {
+                            interrupt_window_notification_armed =
+                                !disarm_timer_interrupt_window_notification(
+                                    partition,
+                                    set_virtual_processor_registers,
+                                    "interrupt-window-before-root-mount",
+                                    report,
+                                );
+                        }
+                        report.calls.push(NativeWhpCallReport {
+                            name: "LinuxEntryProbeInterruptWindowSuppressedBeforeRootMount",
+                            hresult: None,
+                            ok: true,
+                            detail: "WHP reported an interrupt-window exit before Pane reached root-mount storage activity; Pane resumed without injecting a timer interrupt.".to_string(),
+                        });
+                        if let Some(path) = checkpoint_path.as_deref() {
+                            write_linux_entry_probe_checkpoint(
+                                path,
+                                report,
+                                "interrupt-window-suppressed-before-root-mount",
+                                probe_started_at,
+                            );
+                            last_checkpoint_at = Instant::now();
+                        }
                     } else if let Some(request_interrupt) = request_interrupt {
                         let timer_request_ok = request_native_timer_interrupt(
                             partition,
@@ -3372,6 +3581,15 @@ mod windows_whp {
                         if timer_request_ok {
                             timer_interrupt_requested = true;
                             post_timer_resume_attempted = true;
+                            if interrupt_window_notification_armed {
+                                interrupt_window_notification_armed =
+                                    !disarm_timer_interrupt_window_notification(
+                                        partition,
+                                        set_virtual_processor_registers,
+                                        "interrupt-window-timer-requested",
+                                        report,
+                                    );
+                            }
                             report.calls.push(NativeWhpCallReport {
                                 name: "LinuxEntryProbeInterruptWindowTimerRequest",
                                 hresult: None,
@@ -3437,6 +3655,12 @@ mod windows_whp {
                         if let Some(get_virtual_processor_registers) =
                             get_virtual_processor_registers
                         {
+                            capture_linux_execution_snapshot(
+                                partition,
+                                get_virtual_processor_registers,
+                                "post-timer-boundary",
+                                report,
+                            );
                             capture_interrupt_delivery_snapshot(
                                 partition,
                                 get_virtual_processor_registers,
@@ -3463,7 +3687,8 @@ mod windows_whp {
                         break;
                     }
 
-                    if !root_mount_timer_requested
+                    if root_mount_phase_active
+                        && !root_mount_timer_requested
                         && maybe_prime_root_mount_timer(
                             partition,
                             get_virtual_processor_registers,
@@ -3478,11 +3703,38 @@ mod windows_whp {
                         root_mount_timer_requested = true;
                         root_mount_timer_request_count += 1;
                         last_root_mount_timer_request_at = Some(Instant::now());
+                        if interrupt_window_notification_armed {
+                            interrupt_window_notification_armed =
+                                !disarm_timer_interrupt_window_notification(
+                                    partition,
+                                    set_virtual_processor_registers,
+                                    "root-mount-timer-primed-after-cancel",
+                                    report,
+                                );
+                        }
                         last_checkpoint_at = Instant::now();
                         continue;
                     }
 
                     if let Some(get_virtual_processor_registers) = get_virtual_processor_registers {
+                        if !root_mount_phase_active {
+                            report.calls.push(NativeWhpCallReport {
+                                name: "LinuxEntryProbeTimerSuppressedBeforeRootMount",
+                                hresult: None,
+                                ok: true,
+                                detail: "Pane regained control before root-mount activity; native timer injection is suppressed until storage/root-mount progress requires it.".to_string(),
+                            });
+                            if let Some(path) = checkpoint_path.as_deref() {
+                                write_linux_entry_probe_checkpoint(
+                                    path,
+                                    report,
+                                    "timer-suppressed-before-root-mount",
+                                    probe_started_at,
+                                );
+                                last_checkpoint_at = Instant::now();
+                            }
+                            continue;
+                        }
                         match capture_timer_interrupt_readiness(
                             partition,
                             get_virtual_processor_registers,
@@ -3583,6 +3835,15 @@ mod windows_whp {
                     if timer_request_ok && !post_timer_resume_attempted {
                         timer_interrupt_requested = true;
                         post_timer_resume_attempted = true;
+                        if interrupt_window_notification_armed {
+                            interrupt_window_notification_armed =
+                                !disarm_timer_interrupt_window_notification(
+                                    partition,
+                                    set_virtual_processor_registers,
+                                    "timeslice-timer-requested",
+                                    report,
+                                );
+                        }
                         report.calls.push(NativeWhpCallReport {
                             name: "LinuxEntryProbePostTimerResume",
                             hresult: None,
@@ -3871,6 +4132,42 @@ mod windows_whp {
         ok
     }
 
+    fn disarm_timer_interrupt_window_notification(
+        partition: *mut c_void,
+        set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
+        reason: &'static str,
+        report: &mut NativePartitionSmokeReport,
+    ) -> bool {
+        let register_names = [WHV_REGISTER_DELIVERABILITY_NOTIFICATIONS];
+        let register_values = [WhvRegisterValue { reg64: 0 }];
+        let hresult = unsafe {
+            set_virtual_processor_registers(
+                partition,
+                0,
+                register_names.as_ptr(),
+                register_names.len() as u32,
+                register_values.as_ptr(),
+            )
+        };
+        let ok = hresult_succeeded(hresult);
+        report.calls.push(hresult_call(
+            "WHvSetVirtualProcessorRegisters(DeliverabilityNotifications=0)",
+            hresult,
+            if ok {
+                "Disarmed WHP interrupt-window exits after queuing a timer interrupt."
+            } else {
+                "Could not disarm WHP interrupt-window exits after queuing a timer interrupt."
+            },
+        ));
+        report.calls.push(NativeWhpCallReport {
+            name: "LinuxEntryProbeInterruptWindowNotificationDisarmed",
+            hresult: Some(format_hresult(hresult)),
+            ok,
+            detail: format!("reason={reason}, interrupt_notification=false."),
+        });
+        ok
+    }
+
     fn capture_timer_interrupt_readiness(
         partition: *mut c_void,
         get_virtual_processor_registers: WhvGetVirtualProcessorRegisters,
@@ -4109,6 +4406,61 @@ mod windows_whp {
             ),
         });
         true
+    }
+
+    fn capture_linux_execution_snapshot(
+        partition: *mut c_void,
+        get_virtual_processor_registers: WhvGetVirtualProcessorRegisters,
+        label: &'static str,
+        report: &mut NativePartitionSmokeReport,
+    ) -> bool {
+        let register_names = [
+            WHV_REGISTER_RAX,
+            WHV_REGISTER_RBX,
+            WHV_REGISTER_RCX,
+            WHV_REGISTER_RDX,
+            WHV_REGISTER_RSI,
+            WHV_REGISTER_RDI,
+            WHV_REGISTER_RSP,
+            WHV_REGISTER_RBP,
+            WHV_REGISTER_RIP,
+            WHV_REGISTER_RFLAGS,
+            WHV_REGISTER_CR0,
+            WHV_REGISTER_CR3,
+            WHV_REGISTER_CR4,
+        ];
+        let values = read_virtual_processor_registers_resilient(
+            partition,
+            get_virtual_processor_registers,
+            &register_names,
+            label,
+            report,
+        );
+        let value = |index: usize| values.get(index).and_then(|value| *value).unwrap_or(0);
+        let rflags = value(9);
+        let interrupts_enabled = rflags & 0x0200 != 0;
+        let ok = values.iter().all(Option::is_some);
+        report.calls.push(NativeWhpCallReport {
+            name: "LinuxEntryProbeExecutionSnapshot",
+            hresult: None,
+            ok,
+            detail: format!(
+                "label={label}, rax=0x{:016x}, rbx=0x{:016x}, rcx=0x{:016x}, rdx=0x{:016x}, rsi=0x{:016x}, rdi=0x{:016x}, rsp=0x{:016x}, rbp=0x{:016x}, rip=0x{:016x}, rflags=0x{rflags:016x}, interrupts_enabled={interrupts_enabled}, cr0=0x{:016x}, cr3=0x{:016x}, cr4=0x{:016x}.",
+                value(0),
+                value(1),
+                value(2),
+                value(3),
+                value(4),
+                value(5),
+                value(6),
+                value(7),
+                value(8),
+                value(10),
+                value(11),
+                value(12),
+            ),
+        });
+        ok
     }
 
     fn capture_xapic_interrupt_controller_state(
@@ -6621,10 +6973,10 @@ mod windows_whp {
                     .is_none());
             }
 
+            assert!(state.write(PANE_BLOCK_IO_BASE_PORT + 2, 1).is_none());
             let submission = state
-                .write(PANE_BLOCK_IO_BASE_PORT + 2, 1)
-                .expect("submit creates command");
-
+                .take_pending_submission()
+                .expect("submit records a pending command");
             let command = submission.command;
             assert_eq!(command.device, NativeBlockDeviceId::UserDisk);
             assert_eq!(command.operation, NativeBlockOperation::Write);
@@ -6647,9 +6999,10 @@ mod windows_whp {
             assert!(state.write(PANE_BLOCK_IO_BASE_PORT + 12, 0xad).is_none());
             assert!(state.write(PANE_BLOCK_IO_BASE_PORT + 12, 0xbe).is_none());
 
+            assert!(state.write(PANE_BLOCK_IO_BASE_PORT + 2, 1).is_none());
             let submission = state
-                .write(PANE_BLOCK_IO_BASE_PORT + 2, 1)
-                .expect("submit creates command");
+                .take_pending_submission()
+                .expect("submit records a pending command");
 
             assert_eq!(submission.command.device, NativeBlockDeviceId::UserDisk);
             assert_eq!(submission.command.operation, NativeBlockOperation::Write);
@@ -6672,9 +7025,10 @@ mod windows_whp {
                 .write_value(PANE_BLOCK_IO_BASE_PORT + 12, 4, 0xddcc_bbaa)
                 .is_none());
 
+            assert!(state.write(PANE_BLOCK_IO_BASE_PORT + 2, 1).is_none());
             let submission = state
-                .write(PANE_BLOCK_IO_BASE_PORT + 2, 1)
-                .expect("submit creates command");
+                .take_pending_submission()
+                .expect("submit records a pending command");
 
             assert_eq!(submission.command.block_index, 0x0102_0304_0506_0708);
             assert_eq!(submission.write_payload, Some(vec![0xaa, 0xbb, 0xcc, 0xdd]));

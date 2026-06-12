@@ -201,6 +201,8 @@ cargo run -- bundle
 
 Pane's long-term runtime target is not WSL, XRDP, `mstsc.exe`, QEMU, VirtualBox, or Hyper-V Manager. The target is a Pane-owned Windows app that creates the guest runtime, owns the storage boundary, boots Linux through Windows Hypervisor Platform, and renders the guest through its own app surface.
 
+The native engine direction is now crosvm/rust-vmm based: crosvm is the reference architecture, `rust-vmm/linux-loader` is the intended Linux boot adapter, and `rust-vmm/vm-virtio`/virtio semantics are the intended replacement for Pane's current custom block-port experiment. Pane remains the app/runtime owner; this is not a pivot to a generic QEMU wrapper.
+
 What exists today:
 
 - runtime storage reservation under `%LOCALAPPDATA%\Pane\runtime\<session>`,
@@ -289,6 +291,12 @@ Run the safe plan-only boot-spike report:
 cargo run -- native-boot-spike --json
 ```
 
+Inspect the native VMM foundation contract:
+
+```powershell
+cargo run -- native-foundation --json
+```
+
 Run the deterministic WHP fixture:
 
 ```powershell
@@ -344,6 +352,7 @@ Storage-backed kernel layouts require the generated Pane initramfs driver bundle
 | `pane runtime` | Manages the future Pane-owned runtime storage and artifact contract. |
 | `pane native-preflight` | Checks WHP host/runtime readiness without side effects. |
 | `pane native-kernel-plan` | Materializes the verified kernel boot layout. |
+| `pane native-foundation` | Shows the crosvm/rust-vmm foundation selected for the Pane-owned runtime. |
 | `pane native-boot-spike` | Runs or previews guarded WHP boot-spike milestones. |
 
 Run any command with `--help` for the current argument list:
@@ -424,6 +433,7 @@ Project docs:
 - [Arch MVP Guide](docs/mvp-arch.md)
 - [Product Contract](docs/product-contract.md)
 - [Native Runtime Architecture](docs/native-runtime-architecture.md)
+- [VMM Foundation](docs/vmm-foundation.md)
 - [Clean Machine Validation](docs/clean-machine-validation.md)
 - [Vision](docs/vision.md)
 - [Phase 1 Audit](docs/phase-1-audit.md)

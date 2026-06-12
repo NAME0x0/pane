@@ -117,3 +117,5 @@ Pane cannot claim the native runtime is real until:
 ## Product Implication
 
 This is slower than shipping a wrapper around an existing VM product, but it is the path that matches Pane's stated vision. The near-term work should bias toward measurable native-runtime milestones instead of adding more distro and desktop options on top of the bridge.
+
+The VMM implementation direction is now explicitly crosvm/rust-vmm based. Pane should use crosvm as the reference architecture and adopt rust-vmm building blocks such as linux-loader and vm-virtio behind narrow Pane-owned adapters instead of expanding the bespoke Pane block-port protocol into a full storage/display stack. See [vmm-foundation.md](vmm-foundation.md).

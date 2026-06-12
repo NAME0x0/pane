@@ -43,6 +43,8 @@ pub enum Commands {
     NativeBootSpike(NativeBootSpikeArgs),
     /// Validate and materialize the native kernel boot layout contract.
     NativeKernelPlan(NativeKernelPlanArgs),
+    /// Show the crosvm/rust-vmm foundation plan for the Pane-owned runtime.
+    NativeFoundation(NativeFoundationArgs),
     /// Show Pane's managed Linux environment catalog and support tiers.
     Environments(EnvironmentsArgs),
     /// Run support-focused diagnostics before launch or reconnect.
@@ -406,6 +408,13 @@ pub struct NativeKernelPlanArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct NativeFoundationArgs {
+    /// Emit structured JSON instead of a human-readable summary.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct EnvironmentsArgs {
     /// Emit structured JSON instead of a human-readable summary.
     #[arg(long)]
@@ -724,6 +733,16 @@ mod tests {
                 assert!(args.materialize);
             }
             _ => panic!("expected native-kernel-plan command"),
+        }
+    }
+
+    #[test]
+    fn native_foundation_accepts_json_flag() {
+        let cli = Cli::try_parse_from(["pane", "native-foundation", "--json"]).unwrap();
+
+        match cli.command {
+            Commands::NativeFoundation(args) => assert!(args.json),
+            _ => panic!("expected native-foundation command"),
         }
     }
 }

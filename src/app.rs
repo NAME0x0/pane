@@ -21,9 +21,9 @@ use crate::{
     bootstrap::{render_bootstrap_script, render_update_script},
     cli::{
         AppStatusArgs, BundleArgs, Cli, Commands, ConnectArgs, DoctorArgs, EnvironmentsArgs,
-        InitArgs, LaunchArgs, LogsArgs, NativeBootSpikeArgs, NativeKernelPlanArgs,
-        NativePreflightArgs, OnboardArgs, RelayArgs, RepairArgs, ResetArgs, RuntimeArgs,
-        SetupUserArgs, ShareArgs, StatusArgs, StopArgs, TerminalArgs, UpdateArgs,
+        InitArgs, LaunchArgs, LogsArgs, NativeBootSpikeArgs, NativeFoundationArgs,
+        NativeKernelPlanArgs, NativePreflightArgs, OnboardArgs, RelayArgs, RepairArgs, ResetArgs,
+        RuntimeArgs, SetupUserArgs, ShareArgs, StatusArgs, StopArgs, TerminalArgs, UpdateArgs,
     },
     error::{AppError, AppResult},
     model::{
@@ -162,6 +162,7 @@ struct RuntimeReport {
     artifacts: RuntimeArtifactReport,
     native_host: crate::native::NativeHostPreflightReport,
     native_runtime: NativeRuntimeReport,
+    vmm_foundation: crate::vmm_foundation::VmmFoundationReport,
     current_limitation: &'static str,
     next_steps: Vec<String>,
     notes: Vec<String>,
@@ -1167,6 +1168,7 @@ pub fn run() -> AppResult<()> {
         Commands::NativePreflight(args) => native_preflight(args),
         Commands::NativeBootSpike(args) => native_boot_spike(args),
         Commands::NativeKernelPlan(args) => native_kernel_plan(args),
+        Commands::NativeFoundation(args) => native_foundation(args),
         Commands::Environments(args) => environments(args),
         Commands::Doctor(args) => doctor(args),
         Commands::Connect(args) => connect(args),
@@ -2689,6 +2691,18 @@ fn native_kernel_plan(args: NativeKernelPlanArgs) -> AppResult<()> {
     Ok(())
 }
 
+fn native_foundation(args: NativeFoundationArgs) -> AppResult<()> {
+    let report = crate::vmm_foundation::build_vmm_foundation_report();
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    print_native_foundation_report(&report);
+    Ok(())
+}
+
 fn environments(args: EnvironmentsArgs) -> AppResult<()> {
     let report = build_environment_catalog_report();
 
@@ -3467,6 +3481,7 @@ fn build_runtime_report(
         artifacts,
         native_host,
         native_runtime,
+        vmm_foundation: crate::vmm_foundation::build_vmm_foundation_report(),
         current_limitation: "Pane owns the runtime storage layout, config, manifests, and host preflight now. It still cannot boot a Pane-owned OS image or draw a Pane-owned desktop window without the current WSL/XRDP bridge.",
         next_steps: vec![
             "Run `pane native-preflight --prepare-runtime --json` to prepare the Pane-owned runtime boundary and prove the host can support the first WHP boot-to-serial spike."
@@ -5256,10 +5271,14 @@ static int load_pane_block_module(const char *device_blocks, const char *root_of
         base_block_offset = strtoull(root_offset, NULL, 10) / PANE_BLOCK_IO_BLOCK_SIZE_BYTES;
     }
     if (block_dma && block_dma[0] != '\0') {
-        shared_buffer_gpa = strtoull(block_dma, NULL, 0);
-        const char *comma = strchr(block_dma, ',');
-        if (comma && comma[1] != '\0')
-            shared_buffer_bytes = strtoull(comma + 1, NULL, 10);
+        /*
+         * Keep the host-side DMA window mapped for the future fast path, but
+         * force the early Arch root-mount spike through the simpler data-port
+         * streaming path until WHP/shared-buffer guest visibility is proven.
+         */
+        log_line("PANE_BLOCK_DMA_DISABLED_FOR_PORT_STREAM");
+        shared_buffer_gpa = 0;
+        shared_buffer_bytes = 0;
     }
     if (device_blocks && device_blocks[0] != '\0') {
         snprintf(params, sizeof(params),
@@ -5605,6 +5624,7 @@ fn pane_block_driver_source() -> String {
 #include <linux/io.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/processor.h>
 #include <linux/string.h>
 #include <linux/types.h>
 #include <linux/vmalloc.h>
@@ -5622,7 +5642,7 @@ static unsigned long device_blocks[PANE_BLOCK_DEVICE_COUNT] = {
 static unsigned long base_block_offset;
 static unsigned long shared_buffer_gpa;
 static unsigned long shared_buffer_bytes;
-static bool trust_submit_completion = true;
+static bool trust_submit_completion;
 module_param_array(device_blocks, ulong, NULL, 0444);
 MODULE_PARM_DESC(device_blocks, "Logical Pane I/O blocks for /dev/pane0 and /dev/pane1");
 module_param(base_block_offset, ulong, 0444);
@@ -5678,18 +5698,31 @@ static void pane_block_write_index(u64 block_index)
 
 static int pane_block_wait_serviced(bool log_transfer)
 {
-    u8 status = inb(PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_STATUS_OFFSET);
+    unsigned int attempt;
+    u8 status = 0;
 
-    if (log_transfer || status != PANE_BLOCK_STATUS_SERVICED) {
-        pr_info(PANE_BLOCK_DRIVER_NAME
-                ": PANE_BLOCK_STATUS_READ status=0x%02x\n", status);
+    for (attempt = 0; attempt < 1024; attempt++) {
+        status = inb(PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_STATUS_OFFSET);
+        if (log_transfer || status != PANE_BLOCK_STATUS_SERVICED) {
+            pr_info(PANE_BLOCK_DRIVER_NAME
+                    ": PANE_BLOCK_STATUS_READ attempt=%u status=0x%02x\n",
+                    attempt, status);
+        }
+        if (status == PANE_BLOCK_STATUS_SERVICED) {
+            if (log_transfer)
+                pane_block_serial_log("PANE_BLOCK_STATUS_SERVICED");
+            return 0;
+        }
+        if (status == PANE_BLOCK_STATUS_DENIED ||
+            status == PANE_BLOCK_STATUS_FAILED ||
+            status == PANE_BLOCK_STATUS_INVALID) {
+            pane_block_serial_log("PANE_BLOCK_STATUS_ERROR");
+            return -EIO;
+        }
+        cpu_relax();
     }
-    if (status == PANE_BLOCK_STATUS_SERVICED)
-        return 0;
-    if (status == PANE_BLOCK_STATUS_DENIED ||
-        status == PANE_BLOCK_STATUS_FAILED ||
-        status == PANE_BLOCK_STATUS_INVALID)
-        return -EIO;
+
+    pane_block_serial_log("PANE_BLOCK_STATUS_WAIT_TIMEOUT");
     return -EAGAIN;
 }
 
@@ -5716,13 +5749,14 @@ static int pane_block_transfer(int device_id, int operation, u64 block_index, vo
         }
     }
 
+    pane_block_serial_log("PANE_BLOCK_SUBMIT_READY");
     outb(1, PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_STATUS_OFFSET);
     pane_block_serial_log("PANE_BLOCK_TRANSFER_SUBMITTED");
     if (!trust_submit_completion) {
         if (pane_block_wait_serviced(log_transfer) != 0) {
             pr_err(PANE_BLOCK_DRIVER_NAME
-                   ": PANE_BLOCK_TRANSFER_WAIT_FAILED device=%d op=%d block=%llu\n",
-                   device_id, operation, block_index);
+                   ": PANE_BLOCK_TRANSFER_WAIT_FAILED device=%d op=%d block=%llu trust_submit_completion=%d\n",
+                   device_id, operation, block_index, trust_submit_completion);
             return -EIO;
         }
     }
@@ -9292,6 +9326,7 @@ fn write_native_runtime_manifest(paths: &RuntimePaths, session_name: &str) -> Ap
         "schema_version": 1,
         "session_name": session_name,
         "engine": "pane-owned-os-runtime",
+        "foundation": crate::vmm_foundation::build_vmm_foundation_report(),
         "bootable": false,
         "external_integrations_required_by_target": {
             "wsl": false,
@@ -12596,6 +12631,17 @@ fn print_runtime_report(report: &RuntimeReport) {
             println!("  - {}", blocker);
         }
     }
+    println!("VMM Foundation");
+    println!(
+        "  Strategy       {}",
+        report.vmm_foundation.selected_strategy
+    );
+    println!(
+        "  Reference      {}",
+        report.vmm_foundation.reference_vmm.name
+    );
+    println!("  Boot Adapter   rust-vmm/linux-loader");
+    println!("  Device Model   rust-vmm/vm-virtio + virtio semantics");
     println!("Native Host");
     println!("  OS             {}", report.native_host.host_os);
     println!("  Arch           {}", report.native_host.host_arch);
@@ -12817,6 +12863,37 @@ fn print_native_kernel_plan_report(report: &NativeKernelPlanReport) {
     }
     println!("Next Steps");
     for step in &report.next_steps {
+        println!("  - {}", step);
+    }
+}
+
+fn print_native_foundation_report(report: &crate::vmm_foundation::VmmFoundationReport) {
+    println!("Pane Native Foundation");
+    println!("  Strategy       {}", report.selected_strategy);
+    println!("  Rule           {}", report.implementation_rule);
+    println!("Reference VMM");
+    println!(
+        "  {} ({})",
+        report.reference_vmm.name, report.reference_vmm.license
+    );
+    println!("  {}", report.reference_vmm.role);
+    println!("Adopted Components");
+    for component in &report.adopted_crates {
+        println!("  - {} ({})", component.name, component.license);
+        println!("    {}", component.role);
+    }
+    println!("Rejected Paths");
+    for path in &report.rejected_paths {
+        println!("  - {}: {}", path.name, path.reason);
+    }
+    println!("Migration Milestones");
+    for milestone in &report.migration_milestones {
+        println!("  - {}: {}", milestone.id, milestone.title);
+        println!("    {}", milestone.objective);
+        println!("    gate: {}", milestone.acceptance_gate);
+    }
+    println!("Immediate Next Steps");
+    for step in &report.immediate_next_steps {
         println!("  - {}", step);
     }
 }
@@ -15240,6 +15317,8 @@ mod tests {
         assert!(init_source.contains("MS_RELATIME | (root_readonly ? MS_RDONLY : 0)"));
         assert!(init_source.contains("pane.block_devices"));
         assert!(init_source.contains("pane.block_dma"));
+        assert!(init_source.contains("PANE_BLOCK_DMA_DISABLED_FOR_PORT_STREAM"));
+        assert!(init_source.contains("force the early Arch root-mount spike"));
         assert!(init_source.contains("PANE_DISPLAY_CONTRACT_DISCOVERED"));
         assert!(init_source.contains("PANE_FRAMEBUFFER"));
         assert!(init_source.contains("PANE_INPUT_QUEUE"));
@@ -15285,7 +15364,11 @@ mod tests {
         assert!(block_driver.contains("PANE_BLOCK_SHARED_BUFFER_OK"));
         assert!(block_driver.contains("trust_submit_completion"));
         assert!(block_driver.contains("module_param(trust_submit_completion, bool, 0444)"));
+        assert!(block_driver.contains("static bool trust_submit_completion;"));
         assert!(block_driver.contains("if (!trust_submit_completion)"));
+        assert!(block_driver.contains("PANE_BLOCK_SUBMIT_READY"));
+        assert!(block_driver.contains("PANE_BLOCK_STATUS_SERVICED"));
+        assert!(block_driver.contains("PANE_BLOCK_STATUS_WAIT_TIMEOUT"));
         assert!(block_driver.contains("pane_block_serial_log"));
         assert!(block_driver.contains("PANE_BLOCK_TRANSFER_SUBMITTED"));
         assert!(block_driver.contains("PANE_BLOCK_READ_DMA_COPIED"));
@@ -15325,6 +15408,8 @@ mod tests {
         assert!(block_driver.contains("PANE_BLOCK_STATUS_READ"));
         assert!(block_driver.contains("pane_block_wait_serviced(log_transfer)"));
         assert!(block_driver.contains("log_transfer || status != PANE_BLOCK_STATUS_SERVICED"));
+        assert!(block_driver.contains("attempt < 1024"));
+        assert!(block_driver.contains("cpu_relax()"));
         assert!(block_driver.contains("bool log_transfer = false"));
         assert!(block_driver.contains("PANE_BLOCK_TRANSFER_WAIT_FAILED"));
         assert!(block_driver.contains("/dev/pane0"));

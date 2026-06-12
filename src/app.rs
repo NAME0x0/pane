@@ -624,6 +624,8 @@ struct KernelStorageAttachment {
     block_dma_gpa: String,
     #[serde(default = "default_pane_block_dma_size_bytes")]
     block_dma_size_bytes: u64,
+    #[serde(default = "legacy_virtio_block_backend_plan")]
+    virtio_block: VirtioBlockBackendPlan,
     base_os_image_format: String,
     base_os_bootable_disk_hint: bool,
     base_os_partitions: Vec<BaseOsPartition>,
@@ -642,6 +644,41 @@ struct KernelStorageAttachment {
     contract_gpa: String,
     readonly_base: bool,
     writable_user_disk: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct VirtioBlockBackendPlan {
+    schema_version: u32,
+    backend_kind: String,
+    source_crate: String,
+    candidate_crate_version: Option<String>,
+    license: String,
+    source_url: String,
+    adoption_state: String,
+    transport: String,
+    queue_model: String,
+    interrupt_model: String,
+    sector_size_bytes: u64,
+    root_device_hint: String,
+    replaces: String,
+    devices: Vec<VirtioBlockDevicePlan>,
+    notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct VirtioBlockDevicePlan {
+    id: String,
+    role: String,
+    guest_device_hint: String,
+    backend_path: String,
+    readonly: bool,
+    sparse_backing: bool,
+    logical_size_bytes: u64,
+    block_size_bytes: u64,
+    root_partition_index: Option<u32>,
+    root_partition_byte_offset: Option<u64>,
+    root_partition_byte_length: Option<u64>,
+    filesystem_hint: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -892,6 +929,89 @@ fn default_pane_block_dma_gpa() -> String {
 
 fn default_pane_block_dma_size_bytes() -> u64 {
     0x00001000
+}
+
+fn virtio_block_backend_plan(storage: &KernelStorageAttachment) -> VirtioBlockBackendPlan {
+    let root_device_hint = storage
+        .root_handoff
+        .partition_index
+        .map(|index| format!("/dev/vda{index}"))
+        .unwrap_or_else(|| "/dev/vda".to_string());
+
+    VirtioBlockBackendPlan {
+        schema_version: 1,
+        backend_kind: "pane-virtio-blk-backend-plan-v1".to_string(),
+        source_crate: "rust-vmm/vm-virtio".to_string(),
+        candidate_crate_version: None,
+        license: "Apache-2.0 OR BSD-3-Clause".to_string(),
+        source_url: "https://github.com/rust-vmm/vm-virtio".to_string(),
+        adoption_state: "contract-ready-not-yet-executed".to_string(),
+        transport: "virtio-mmio-planned".to_string(),
+        queue_model: "split-virtqueue-planned".to_string(),
+        interrupt_model: "WHP interrupt injection through Pane device loop".to_string(),
+        sector_size_bytes: 512,
+        root_device_hint,
+        replaces: "pane-port-block-v1 plus generated pane-block.ko root storage".to_string(),
+        devices: vec![
+            VirtioBlockDevicePlan {
+                id: "vda".to_string(),
+                role: "read-only-arch-base-os".to_string(),
+                guest_device_hint: "/dev/vda".to_string(),
+                backend_path: storage.base_os_path.clone(),
+                readonly: true,
+                sparse_backing: false,
+                logical_size_bytes: storage.base_os_bytes,
+                block_size_bytes: storage.base_os_block_size_bytes,
+                root_partition_index: storage.root_handoff.partition_index,
+                root_partition_byte_offset: storage.root_handoff.partition_byte_offset,
+                root_partition_byte_length: storage.root_handoff.partition_byte_length,
+                filesystem_hint: storage.root_handoff.filesystem_hint.clone(),
+            },
+            VirtioBlockDevicePlan {
+                id: "vdb".to_string(),
+                role: "writable-pane-user-disk".to_string(),
+                guest_device_hint: "/dev/vdb".to_string(),
+                backend_path: storage.user_disk_path.clone(),
+                readonly: false,
+                sparse_backing: storage.user_disk_sparse_backing,
+                logical_size_bytes: storage.user_disk_logical_size_bytes,
+                block_size_bytes: storage.user_disk_block_size_bytes,
+                root_partition_index: None,
+                root_partition_byte_offset: None,
+                root_partition_byte_length: None,
+                filesystem_hint: None,
+            },
+        ],
+        notes: vec![
+            "This is the standard Linux block-device target for Pane-owned Arch boot; it is not yet executed by the WHP runner."
+                .to_string(),
+            "The existing Pane block-port contract remains only as the current diagnostic bridge until the virtio device loop is implemented."
+                .to_string(),
+        ],
+    }
+}
+
+fn legacy_virtio_block_backend_plan() -> VirtioBlockBackendPlan {
+    VirtioBlockBackendPlan {
+        schema_version: 0,
+        backend_kind: "legacy-no-virtio-block-contract".to_string(),
+        source_crate: "none".to_string(),
+        candidate_crate_version: None,
+        license: "not-applicable".to_string(),
+        source_url: String::new(),
+        adoption_state: "legacy-layout-rematerialize-required".to_string(),
+        transport: "none".to_string(),
+        queue_model: "none".to_string(),
+        interrupt_model: "none".to_string(),
+        sector_size_bytes: 0,
+        root_device_hint: String::new(),
+        replaces: "none".to_string(),
+        devices: Vec::new(),
+        notes: vec![
+            "This layout predates the virtio-blk backend contract and must be rematerialized before the native storage path can progress."
+                .to_string(),
+        ],
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -8678,7 +8798,7 @@ fn build_kernel_storage_attachment(
     let root_handoff = build_kernel_root_handoff(&base_metadata);
     let root_device = root_handoff.root_device.clone();
 
-    Ok(Some(KernelStorageAttachment {
+    let mut storage = KernelStorageAttachment {
         schema_version: 1,
         base_os_path: paths.base_os_image.display().to_string(),
         base_os_sha256: base_sha256,
@@ -8692,6 +8812,7 @@ fn build_kernel_storage_attachment(
         block_io_block_size_bytes: default_pane_block_io_block_size_bytes(),
         block_dma_gpa: default_pane_block_dma_gpa(),
         block_dma_size_bytes: default_pane_block_dma_size_bytes(),
+        virtio_block: legacy_virtio_block_backend_plan(),
         base_os_image_format: base_metadata.image_format,
         base_os_bootable_disk_hint: base_metadata.bootable_disk_hint,
         base_os_partitions: base_metadata.partitions,
@@ -8709,7 +8830,9 @@ fn build_kernel_storage_attachment(
         contract_gpa: "0x0dfe0000".to_string(),
         readonly_base: true,
         writable_user_disk: true,
-    }))
+    };
+    storage.virtio_block = virtio_block_backend_plan(&storage);
+    Ok(Some(storage))
 }
 
 fn build_kernel_root_handoff(base_metadata: &BaseOsImageMetadata) -> KernelRootHandoff {
@@ -9787,6 +9910,11 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
                 && (layout.storage.is_none() || initramfs_driver_bundle_ready)
                 && (layout.storage.is_none() || discovery_initramfs_matches_driver_bundle)
                 && (layout.storage.is_none() || pane_block_module_verified)
+                && layout
+                    .storage
+                    .as_ref()
+                    .map(|storage| storage.virtio_block == virtio_block_backend_plan(storage))
+                    .unwrap_or(true)
                 && layout.initramfs_driver
                     == layout
                         .storage
@@ -12941,6 +13069,9 @@ fn print_native_kernel_plan_report(report: &NativeKernelPlanReport) {
                 "  Sparse Backing {}",
                 yes_no(storage.user_disk_sparse_backing)
             );
+            println!("  Virtio Backend {}", storage.virtio_block.backend_kind);
+            println!("  Virtio State   {}", storage.virtio_block.adoption_state);
+            println!("  Virtio Root    {}", storage.virtio_block.root_device_hint);
         }
         if let Some(framebuffer) = &layout.framebuffer {
             println!("Display Contract");
@@ -13698,7 +13829,7 @@ mod tests {
         import_user_disk_package, initialize_managed_arch_environment, input_queue_page_bytes,
         inspect_kernel_image_artifact, inspect_workspace, inventory_contains_distro,
         kernel_layout_execution_image, legacy_linux_loader_adapter_plan,
-        linux_guest_mapped_regions, linux_loader_adapter_plan,
+        legacy_virtio_block_backend_plan, linux_guest_mapped_regions, linux_loader_adapter_plan,
         load_kernel_layout_boot_image_artifact, load_verified_pane_block_module_metadata,
         pane_block_device_blocks, pane_block_driver_abi_sha256,
         pane_initramfs_expected_serial_milestones, parse_guest_physical_address,
@@ -16157,6 +16288,35 @@ mod tests {
         );
         assert_eq!(storage.block_dma_gpa, "0x0dfd0000");
         assert_eq!(storage.block_dma_size_bytes, 4096);
+        assert_eq!(
+            storage.virtio_block.backend_kind,
+            "pane-virtio-blk-backend-plan-v1"
+        );
+        assert_eq!(storage.virtio_block.source_crate, "rust-vmm/vm-virtio");
+        assert_eq!(
+            storage.virtio_block.adoption_state,
+            "contract-ready-not-yet-executed"
+        );
+        assert_eq!(storage.virtio_block.transport, "virtio-mmio-planned");
+        assert_eq!(storage.virtio_block.root_device_hint, "/dev/vda1");
+        assert_eq!(storage.virtio_block.devices.len(), 2);
+        assert_eq!(storage.virtio_block.devices[0].id, "vda");
+        assert_eq!(
+            storage.virtio_block.devices[0].guest_device_hint,
+            "/dev/vda"
+        );
+        assert!(storage.virtio_block.devices[0].readonly);
+        assert_eq!(
+            storage.virtio_block.devices[0].root_partition_byte_offset,
+            Some(2048 * 512)
+        );
+        assert_eq!(storage.virtio_block.devices[1].id, "vdb");
+        assert_eq!(
+            storage.virtio_block.devices[1].guest_device_hint,
+            "/dev/vdb"
+        );
+        assert!(!storage.virtio_block.devices[1].readonly);
+        assert!(storage.virtio_block.devices[1].sparse_backing);
         assert!(layout
             .cmdline
             .contains("earlycon=uart8250,io,0x3f8,115200n8"));
@@ -16250,6 +16410,14 @@ mod tests {
             .any(|window| window == b"pane-port-block-v1"));
         assert!(storage_contract
             .bytes
+            .windows("rust-vmm/vm-virtio".len())
+            .any(|window| window == b"rust-vmm/vm-virtio"));
+        assert!(storage_contract
+            .bytes
+            .windows("/dev/vda1".len())
+            .any(|window| window == b"/dev/vda1"));
+        assert!(storage_contract
+            .bytes
             .windows("/dev/pane1".len())
             .any(|window| window == b"/dev/pane1"));
         assert_eq!(
@@ -16273,6 +16441,12 @@ mod tests {
         let native_runtime =
             build_native_runtime_report(true, &artifacts, &test_native_host_report(true));
         assert!(native_runtime.ready_for_arch_boot_attempt);
+
+        let mut stale_layout = layout;
+        stale_layout.storage.as_mut().unwrap().virtio_block = legacy_virtio_block_backend_plan();
+        write_json_file(&paths.kernel_boot_layout, &stale_layout).unwrap();
+        let artifacts = build_runtime_artifact_report(&paths);
+        assert!(!artifacts.kernel_boot_layout_ready);
 
         let _ = std::fs::remove_dir_all(&paths.root);
     }

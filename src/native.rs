@@ -1224,6 +1224,8 @@ mod windows_whp {
     const LINUX_ENTRY_PROBE_STORAGE_TOTAL_BUDGET_SECONDS: u64 = 1200;
     const LINUX_ENTRY_PROBE_MODULE_LOAD_BUDGET_SECONDS: u64 = 90;
     const LINUX_ENTRY_PROBE_ROOT_MOUNT_BUDGET_SECONDS: u64 = 120;
+    const LINUX_ENTRY_PROBE_ROOT_MOUNT_TIMER_PULSE_SECONDS: u64 = 1;
+    const LINUX_ENTRY_PROBE_ROOT_MOUNT_TIMER_MAX_PULSES: u32 = 16;
     const LINUX_ENTRY_PROBE_TRACE_HEAD: usize = 384;
     const LINUX_ENTRY_PROBE_TRACE_TAIL: usize = 384;
     const SERIAL_COM1_PORT: u16 = 0x03f8;
@@ -2760,6 +2762,10 @@ mod windows_whp {
         let mut legacy_io_state = LegacyDeviceIoState::default();
         let mut timer_interrupt_requested = false;
         let mut timer_interrupt_acknowledged = false;
+        let mut root_mount_timer_requested = false;
+        let mut root_mount_timer_acknowledged = false;
+        let mut root_mount_timer_request_count = 0_u32;
+        let mut last_root_mount_timer_request_at: Option<Instant> = None;
         let mut post_timer_resume_attempted = false;
         let mut interrupt_window_notification_armed = arm_timer_interrupt_window_notification(
             partition,
@@ -2808,6 +2814,39 @@ mod windows_whp {
                 if linux_entry_probe_root_mount_active(serial_text) {
                     let root_mount_started =
                         *root_mount_started_at.get_or_insert_with(Instant::now);
+                    let root_mount_timer_due = root_mount_timer_request_count
+                        < LINUX_ENTRY_PROBE_ROOT_MOUNT_TIMER_MAX_PULSES
+                        && last_root_mount_timer_request_at
+                            .map(|requested_at| {
+                                requested_at.elapsed()
+                                    >= Duration::from_secs(
+                                        LINUX_ENTRY_PROBE_ROOT_MOUNT_TIMER_PULSE_SECONDS,
+                                    )
+                            })
+                            .unwrap_or_else(|| {
+                                root_mount_started.elapsed()
+                                    >= Duration::from_secs(
+                                        LINUX_ENTRY_PROBE_ROOT_MOUNT_TIMER_PULSE_SECONDS,
+                                    )
+                            });
+                    if !root_mount_timer_acknowledged
+                        && root_mount_timer_due
+                        && maybe_prime_root_mount_timer(
+                            partition,
+                            get_virtual_processor_registers,
+                            request_interrupt,
+                            &legacy_io_state,
+                            report,
+                            checkpoint_path.as_deref(),
+                            probe_started_at,
+                            root_mount_timer_request_count + 1,
+                        )
+                    {
+                        root_mount_timer_requested = true;
+                        root_mount_timer_request_count += 1;
+                        last_root_mount_timer_request_at = Some(Instant::now());
+                        last_checkpoint_at = Instant::now();
+                    }
                     if root_mount_started.elapsed()
                         >= Duration::from_secs(LINUX_ENTRY_PROBE_ROOT_MOUNT_BUDGET_SECONDS)
                     {
@@ -2898,6 +2937,23 @@ mod windows_whp {
                         "timeslice-cancelled",
                         probe_started_at,
                     );
+                    last_checkpoint_at = Instant::now();
+                }
+                if !root_mount_timer_requested
+                    && maybe_prime_root_mount_timer(
+                        partition,
+                        get_virtual_processor_registers,
+                        request_interrupt,
+                        &legacy_io_state,
+                        report,
+                        checkpoint_path.as_deref(),
+                        probe_started_at,
+                        root_mount_timer_request_count + 1,
+                    )
+                {
+                    root_mount_timer_requested = true;
+                    root_mount_timer_request_count += 1;
+                    last_root_mount_timer_request_at = Some(Instant::now());
                     last_checkpoint_at = Instant::now();
                 }
                 continue;
@@ -3352,6 +3408,9 @@ mod windows_whp {
                     if timer_interrupt_requested {
                         timer_interrupt_acknowledged = true;
                     }
+                    if root_mount_timer_requested {
+                        root_mount_timer_acknowledged = true;
+                    }
                     report.calls.push(NativeWhpCallReport {
                         name: "ApicEoiObserved",
                         hresult: None,
@@ -3399,6 +3458,25 @@ mod windows_whp {
                             );
                         }
                         break;
+                    }
+
+                    if !root_mount_timer_requested
+                        && maybe_prime_root_mount_timer(
+                            partition,
+                            get_virtual_processor_registers,
+                            request_interrupt,
+                            &legacy_io_state,
+                            report,
+                            checkpoint_path.as_deref(),
+                            probe_started_at,
+                            root_mount_timer_request_count + 1,
+                        )
+                    {
+                        root_mount_timer_requested = true;
+                        root_mount_timer_request_count += 1;
+                        last_root_mount_timer_request_at = Some(Instant::now());
+                        last_checkpoint_at = Instant::now();
+                        continue;
                     }
 
                     if let Some(get_virtual_processor_registers) = get_virtual_processor_registers {
@@ -3603,6 +3681,18 @@ mod windows_whp {
                 },
             });
         }
+        if root_mount_timer_requested {
+            report.calls.push(NativeWhpCallReport {
+                name: "LinuxEntryProbeRootMountTimerAcknowledgement",
+                hresult: None,
+                ok: root_mount_timer_acknowledged,
+                detail: if root_mount_timer_acknowledged {
+                    format!("Guest acknowledged a root-mount timer interrupt with an APIC EOI exit after {root_mount_timer_request_count} requested pulse(s).")
+                } else {
+                    format!("Pane queued {root_mount_timer_request_count} root-mount timer pulse(s), but the guest did not acknowledge with APIC EOI before the probe boundary.")
+                },
+            });
+        }
         compact_linux_entry_probe_calls(report);
         report.calls.push(NativeWhpCallReport {
             name: "LinuxEntryProbeBoundary",
@@ -3610,6 +3700,77 @@ mod windows_whp {
             ok: linux_entry_probe_passed(report),
             detail: linux_entry_probe_detail(report),
         });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn maybe_prime_root_mount_timer(
+        partition: *mut c_void,
+        get_virtual_processor_registers: Option<WhvGetVirtualProcessorRegisters>,
+        request_interrupt: Option<WhvRequestInterrupt>,
+        legacy_io_state: &LegacyDeviceIoState,
+        report: &mut NativePartitionSmokeReport,
+        checkpoint_path: Option<&Path>,
+        probe_started_at: Instant,
+        pulse_number: u32,
+    ) -> bool {
+        let root_mount_active = report
+            .serial_text
+            .as_deref()
+            .map(linux_entry_probe_root_mount_active)
+            .unwrap_or(false);
+        if !root_mount_active {
+            return false;
+        }
+
+        if let Some(get_virtual_processor_registers) = get_virtual_processor_registers {
+            let _ = capture_timer_interrupt_readiness(
+                partition,
+                get_virtual_processor_registers,
+                legacy_io_state.timer_interrupt_vector(),
+                legacy_io_state.timer_interrupt_unmasked(),
+                report,
+            );
+        }
+
+        let Some(request_interrupt) = request_interrupt else {
+            report.calls.push(NativeWhpCallReport {
+                name: "LinuxEntryProbeRootMountTimerPrimed",
+                hresult: None,
+                ok: false,
+                detail: format!("WHvRequestInterrupt is unavailable, so Pane cannot queue root-mount timer pulse {pulse_number}."),
+            });
+            return false;
+        };
+
+        let requested = request_native_timer_interrupt(
+            partition,
+            request_interrupt,
+            legacy_io_state.timer_interrupt_vector(),
+            legacy_io_state.timer_interrupt_unmasked(),
+            report,
+        );
+        report.calls.push(NativeWhpCallReport {
+            name: "LinuxEntryProbeRootMountTimerPrimed",
+            hresult: None,
+            ok: requested,
+            detail: if requested {
+                format!(
+                    "Pane queued native timer vector 0x{:02x} as root-mount timer pulse {pulse_number} after storage I/O stalled; WHP will deliver it when the guest opens a maskable interrupt window.",
+                    legacy_io_state.timer_interrupt_vector(),
+                )
+            } else {
+                format!("Pane attempted to queue root-mount timer pulse {pulse_number}, but WHvRequestInterrupt rejected it.")
+            },
+        });
+        if let Some(path) = checkpoint_path {
+            write_linux_entry_probe_checkpoint(
+                path,
+                report,
+                "root-mount-timer-primed",
+                probe_started_at,
+            );
+        }
+        requested
     }
 
     fn request_native_timer_interrupt(
@@ -4415,6 +4576,9 @@ mod windows_whp {
             "timeslice_cancel_count": report.calls.iter().filter(|call| matches!(call.name, "LinuxEntryProbeTimeslice" | "LinuxEntryProbeTimesliceBoundary")).count(),
             "timer_interrupt_requested": report.calls.iter().any(|call| call.name == "LinuxEntryProbeTimerInterruptRequested" && call.ok),
             "timer_interrupt_acknowledged": report.calls.iter().any(|call| call.name == "LinuxEntryProbeTimerInterruptAcknowledgement" && call.ok),
+            "root_mount_timer_requested": report.calls.iter().any(|call| call.name == "LinuxEntryProbeRootMountTimerPrimed" && call.ok),
+            "root_mount_timer_request_count": report.calls.iter().filter(|call| call.name == "LinuxEntryProbeRootMountTimerPrimed" && call.ok).count(),
+            "root_mount_timer_acknowledged": report.calls.iter().any(|call| call.name == "LinuxEntryProbeRootMountTimerAcknowledgement" && call.ok),
             "exit_reason_label": &report.exit_reason_label,
             "serial_text_bytes": serial_text.len(),
             "serial_text_tail": &serial_text[serial_tail_start..],

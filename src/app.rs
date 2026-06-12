@@ -848,6 +848,22 @@ fn pane_discovery_initramfs_matches_current_driver_bundle(
             == pane_block_module_metadata.map(|metadata| metadata.sha256.as_str())
 }
 
+fn pane_initramfs_driver_metadata_matches_current_sources(
+    metadata: &PaneInitramfsDriverMetadata,
+) -> bool {
+    metadata.hook_sha256 == sha256_bytes(pane_initramfs_hook_source().as_bytes())
+        && metadata.header_sha256 == sha256_bytes(pane_port_block_header_source().as_bytes())
+        && metadata.init_source_sha256 == sha256_bytes(pane_init_source().as_bytes())
+        && metadata.probe_source_sha256 == sha256_bytes(pane_port_probe_source().as_bytes())
+        && metadata.block_driver_source_sha256
+            == sha256_bytes(pane_block_driver_source().as_bytes())
+        && metadata.block_driver_abi_sha256 == pane_block_driver_abi_sha256()
+        && metadata.block_driver_build_script_sha256
+            == sha256_bytes(pane_block_driver_build_script().as_bytes())
+        && metadata.build_script_sha256 == sha256_bytes(pane_initramfs_build_script().as_bytes())
+        && metadata.readme_sha256 == sha256_bytes(pane_initramfs_driver_readme().as_bytes())
+}
+
 fn default_pane_block_dma_gpa() -> String {
     "0x0dfd0000".to_string()
 }
@@ -2138,7 +2154,12 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
         ));
     }
 
-    if args.write_initramfs_driver {
+    let refresh_initramfs_driver_for_discovery = args.build_discovery_initramfs
+        && (args.force
+            || load_verified_pane_initramfs_driver_metadata(&paths)
+                .map(|metadata| !pane_initramfs_driver_metadata_matches_current_sources(&metadata))
+                .unwrap_or(true));
+    if args.write_initramfs_driver || refresh_initramfs_driver_for_discovery {
         write_pane_initramfs_driver_bundle(&paths)?;
     }
 
@@ -5331,6 +5352,9 @@ static int supported_root_fs(const char *value) {
            strcmp(value, "f2fs") == 0;
 }
 
+#define PANE_ROOT_MOUNT_MAX_POLLS 65536U
+#define PANE_ROOT_MOUNT_WAIT_LOG_INTERVAL 4096U
+
 static int mount_root_with_fs(const char *root_device, const char *filesystem, int root_readonly) {
     unsigned long flags = MS_RELATIME | (root_readonly ? MS_RDONLY : 0);
     char line[192];
@@ -5348,7 +5372,7 @@ static int mount_root_with_fs(const char *root_device, const char *filesystem, i
         return -1;
     }
 
-    for (unsigned int attempt = 0; attempt < 5000000; attempt++) {
+    for (unsigned int attempt = 0; attempt < PANE_ROOT_MOUNT_MAX_POLLS; attempt++) {
         int status = 0;
         pid_t waited = waitpid(child, &status, WNOHANG);
         if (waited == child) {
@@ -5374,14 +5398,14 @@ static int mount_root_with_fs(const char *root_device, const char *filesystem, i
             log_line(line);
             return -1;
         }
-        if ((attempt % 1000000U) == 999999U) {
-            snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_WAITING fs=%s", filesystem);
+        if ((attempt % PANE_ROOT_MOUNT_WAIT_LOG_INTERVAL) == (PANE_ROOT_MOUNT_WAIT_LOG_INTERVAL - 1U)) {
+            snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_WAITING fs=%s polls=%u", filesystem, attempt + 1U);
             log_line(line);
         }
         sched_yield();
     }
     kill(child, SIGKILL);
-    snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_TIMEOUT fs=%s", filesystem);
+    snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_TIMEOUT fs=%s polls=%u", filesystem, PANE_ROOT_MOUNT_MAX_POLLS);
     log_line(line);
     return -1;
 }
@@ -15114,6 +15138,7 @@ mod tests {
         let metadata = write_pane_initramfs_driver_bundle(&paths).unwrap();
         let artifacts = build_runtime_artifact_report(&paths);
 
+        assert!(super::pane_initramfs_driver_metadata_matches_current_sources(&metadata));
         assert_eq!(metadata.bundle_kind, "pane-initramfs-driver-source-v1");
         assert_eq!(metadata.block_io_protocol, "pane-port-block-v1");
         assert_eq!(metadata.block_io_port_base, "0x0d00");
@@ -15198,7 +15223,11 @@ mod tests {
         assert!(init_source.contains("PANE_ROOT_MOUNT_TIMEOUT"));
         assert!(init_source.contains("PANE_ROOT_MOUNT_WAITING"));
         assert!(init_source.contains("kill(child, SIGKILL)"));
-        assert!(init_source.contains("attempt < 5000000"));
+        assert!(init_source.contains("#define PANE_ROOT_MOUNT_MAX_POLLS 65536U"));
+        assert!(init_source.contains("#define PANE_ROOT_MOUNT_WAIT_LOG_INTERVAL 4096U"));
+        assert!(init_source.contains("attempt < PANE_ROOT_MOUNT_MAX_POLLS"));
+        assert!(init_source.contains("PANE_ROOT_MOUNT_WAITING fs=%s polls=%u"));
+        assert!(init_source.contains("PANE_ROOT_MOUNT_TIMEOUT fs=%s polls=%u"));
         assert!(init_source.contains("PANE_ROOT_MOUNT_OK"));
         assert!(init_source.contains("execl(\"/sbin/init\""));
         assert!(init_source.contains("#define COM1_PORT 0x3f8"));
@@ -15280,6 +15309,19 @@ mod tests {
         assert!(artifacts.initramfs_driver_bundle_exists);
         assert!(artifacts.initramfs_driver_metadata_exists);
         assert!(artifacts.initramfs_driver_bundle_ready);
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn initramfs_driver_source_freshness_rejects_stale_metadata() {
+        let paths = temp_runtime_paths("runtime-pane-initramfs-driver-stale-source");
+        super::prepare_runtime_paths(&paths).unwrap();
+        let mut metadata = write_pane_initramfs_driver_bundle(&paths).unwrap();
+
+        metadata.init_source_sha256 = "0".repeat(64);
+
+        assert!(!super::pane_initramfs_driver_metadata_matches_current_sources(&metadata));
 
         let _ = std::fs::remove_dir_all(&paths.root);
     }

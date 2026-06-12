@@ -661,10 +661,37 @@ pub(crate) struct NativePartitionSmokeReport {
     pub(crate) guest_exit_budget: u32,
     pub(crate) framebuffer_snapshot: Option<NativeFramebufferSnapshotReport>,
     pub(crate) input_queue_snapshot: Option<NativeInputQueueSnapshotReport>,
+    pub(crate) block_io_trace: Option<NativeBlockIoTraceReport>,
     pub(crate) halt_observed: bool,
     pub(crate) calls: Vec<NativeWhpCallReport>,
     pub(crate) blocker: Option<String>,
     pub(crate) next_step: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct NativeBlockIoTraceReport {
+    pub(crate) total_commands: u64,
+    pub(crate) read_commands: u64,
+    pub(crate) write_commands: u64,
+    pub(crate) base_os_commands: u64,
+    pub(crate) user_disk_commands: u64,
+    pub(crate) distinct_base_os_blocks: usize,
+    pub(crate) distinct_user_disk_blocks: usize,
+    pub(crate) root_mount_commands: u64,
+    pub(crate) root_mount_distinct_base_os_blocks: usize,
+    pub(crate) root_mount_distinct_user_disk_blocks: usize,
+    pub(crate) recent_commands: Vec<NativeBlockIoTraceEntry>,
+    pub(crate) root_mount_recent_commands: Vec<NativeBlockIoTraceEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct NativeBlockIoTraceEntry {
+    pub(crate) device: &'static str,
+    pub(crate) operation: &'static str,
+    pub(crate) block_index: u64,
+    pub(crate) status_code: u8,
+    pub(crate) response_bytes: usize,
+    pub(crate) root_mount_active: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1015,6 +1042,7 @@ fn planned_partition_smoke_report(run_fixture: bool) -> NativePartitionSmokeRepo
         guest_exit_budget: 0,
         framebuffer_snapshot: None,
         input_queue_snapshot: None,
+        block_io_trace: None,
         halt_observed: false,
         calls: Vec::new(),
         blocker: None,
@@ -1077,6 +1105,7 @@ fn skipped_partition_smoke_report(
         guest_exit_budget: 0,
         framebuffer_snapshot: None,
         input_queue_snapshot: None,
+        block_io_trace: None,
         halt_observed: false,
         calls: Vec::new(),
         blocker: Some(blocker.into()),
@@ -1145,7 +1174,7 @@ pub(crate) fn test_native_host_report(ready: bool) -> NativeHostPreflightReport 
 mod windows_whp {
     use std::{
         alloc::{alloc_zeroed, dealloc, Layout},
-        collections::{HashMap, VecDeque},
+        collections::{BTreeSet, HashMap, VecDeque},
         ffi::{c_char, c_void, CString},
         fs, mem,
         path::{Path, PathBuf},
@@ -1153,18 +1182,19 @@ mod windows_whp {
     };
 
     use super::{
-        base_export_checks, NativeBlockIoHandler, NativeExportCheck,
-        NativeFramebufferSnapshotReport, NativeGuestEntryMode, NativeGuestMemoryRegion,
-        NativeGuestRegionReport, NativeInputQueueSnapshotReport, NativePartitionSmokeReport,
-        NativePartitionSmokeStatus, NativeSerialBootImage, NativeWhpCallReport, WhpPreflightReport,
-        LINUX_BOOT_CODE_SELECTOR, LINUX_BOOT_DATA_SELECTOR, LINUX_BOOT_GDT_GPA,
-        LINUX_BOOT_STACK_GPA, REQUIRED_WHP_EXPORTS, SERIAL_BOOT_BANNER_TEXT,
-        SERIAL_BOOT_TEST_IMAGE_SIZE,
+        base_export_checks, NativeBlockIoHandler, NativeBlockIoTraceEntry,
+        NativeBlockIoTraceReport, NativeExportCheck, NativeFramebufferSnapshotReport,
+        NativeGuestEntryMode, NativeGuestMemoryRegion, NativeGuestRegionReport,
+        NativeInputQueueSnapshotReport, NativePartitionSmokeReport, NativePartitionSmokeStatus,
+        NativeSerialBootImage, NativeWhpCallReport, WhpPreflightReport, LINUX_BOOT_CODE_SELECTOR,
+        LINUX_BOOT_DATA_SELECTOR, LINUX_BOOT_GDT_GPA, LINUX_BOOT_STACK_GPA, REQUIRED_WHP_EXPORTS,
+        SERIAL_BOOT_BANNER_TEXT, SERIAL_BOOT_TEST_IMAGE_SIZE,
     };
     use crate::native::{
         native_block_io_exit_can_resume, pane_block_io_access_mask, pane_block_io_port_offset,
-        service_native_block_io_command, NativeBlockIoPortState, NativeBlockOperation,
-        PANE_BLOCK_IO_BLOCK_SIZE_BYTES, PANE_BLOCK_IO_STATUS_SERVICED,
+        service_native_block_io_command, NativeBlockDeviceId, NativeBlockIoCommand,
+        NativeBlockIoPortState, NativeBlockOperation, PANE_BLOCK_IO_BLOCK_SIZE_BYTES,
+        PANE_BLOCK_IO_STATUS_SERVICED,
     };
 
     const WHV_CAPABILITY_CODE_HYPERVISOR_PRESENT: u32 = 0;
@@ -1524,6 +1554,7 @@ mod windows_whp {
             guest_exit_budget: 0,
             framebuffer_snapshot: None,
             input_queue_snapshot: None,
+            block_io_trace: None,
             halt_observed: false,
             calls: Vec::new(),
             blocker: None,
@@ -2725,6 +2756,7 @@ mod windows_whp {
         let mut msr_state = default_linux_msr_state();
         let mut serial_state = Com1SerialState::default();
         let mut block_state = NativeBlockIoPortState::default();
+        let mut block_io_trace = NativeBlockIoTraceCollector::default();
         let mut legacy_io_state = LegacyDeviceIoState::default();
         let mut timer_interrupt_requested = false;
         let mut timer_interrupt_acknowledged = false;
@@ -2940,6 +2972,19 @@ mod windows_whp {
                                 );
                                 let status_code = outcome.status_code;
                                 let mut response_bytes = outcome.response_bytes;
+                                let response_len = response_bytes.len();
+                                let root_mount_active = report
+                                    .serial_text
+                                    .as_deref()
+                                    .map(linux_entry_probe_root_mount_active)
+                                    .unwrap_or(false);
+                                block_io_trace.record(
+                                    &submission.command,
+                                    status_code,
+                                    response_len,
+                                    root_mount_active,
+                                );
+                                report.block_io_trace = block_io_trace.report();
                                 if dma_ready
                                     && status_code == PANE_BLOCK_IO_STATUS_SERVICED
                                     && submission.command.operation == NativeBlockOperation::Read
@@ -4373,6 +4418,7 @@ mod windows_whp {
             "exit_reason_label": &report.exit_reason_label,
             "serial_text_bytes": serial_text.len(),
             "serial_text_tail": &serial_text[serial_tail_start..],
+            "block_io_trace": &report.block_io_trace,
             "recent_calls": recent_calls,
             "recent_failed_calls": failed_calls,
         });
@@ -4541,6 +4587,108 @@ mod windows_whp {
                 SERIAL_MODEM_STATUS_PORT => 0x30,
                 _ => 0,
             }
+        }
+    }
+
+    #[derive(Default)]
+    struct NativeBlockIoTraceCollector {
+        total_commands: u64,
+        read_commands: u64,
+        write_commands: u64,
+        base_os_commands: u64,
+        user_disk_commands: u64,
+        base_os_blocks: BTreeSet<u64>,
+        user_disk_blocks: BTreeSet<u64>,
+        root_mount_commands: u64,
+        root_mount_base_os_blocks: BTreeSet<u64>,
+        root_mount_user_disk_blocks: BTreeSet<u64>,
+        recent_commands: VecDeque<NativeBlockIoTraceEntry>,
+        root_mount_recent_commands: VecDeque<NativeBlockIoTraceEntry>,
+    }
+
+    impl NativeBlockIoTraceCollector {
+        const RECENT_LIMIT: usize = 64;
+
+        fn record(
+            &mut self,
+            command: &NativeBlockIoCommand,
+            status_code: u8,
+            response_bytes: usize,
+            root_mount_active: bool,
+        ) {
+            self.total_commands += 1;
+            match command.operation {
+                NativeBlockOperation::Read => self.read_commands += 1,
+                NativeBlockOperation::Write => self.write_commands += 1,
+            }
+            match command.device {
+                NativeBlockDeviceId::BaseOs => {
+                    self.base_os_commands += 1;
+                    self.base_os_blocks.insert(command.block_index);
+                    if root_mount_active {
+                        self.root_mount_base_os_blocks.insert(command.block_index);
+                    }
+                }
+                NativeBlockDeviceId::UserDisk => {
+                    self.user_disk_commands += 1;
+                    self.user_disk_blocks.insert(command.block_index);
+                    if root_mount_active {
+                        self.root_mount_user_disk_blocks.insert(command.block_index);
+                    }
+                }
+            }
+            if root_mount_active {
+                self.root_mount_commands += 1;
+            }
+
+            let entry = NativeBlockIoTraceEntry {
+                device: command.device.label(),
+                operation: command.operation.label(),
+                block_index: command.block_index,
+                status_code,
+                response_bytes,
+                root_mount_active,
+            };
+            push_limited_trace_entry(&mut self.recent_commands, entry.clone(), Self::RECENT_LIMIT);
+            if root_mount_active {
+                push_limited_trace_entry(
+                    &mut self.root_mount_recent_commands,
+                    entry,
+                    Self::RECENT_LIMIT,
+                );
+            }
+        }
+
+        fn report(&self) -> Option<NativeBlockIoTraceReport> {
+            (self.total_commands > 0).then(|| NativeBlockIoTraceReport {
+                total_commands: self.total_commands,
+                read_commands: self.read_commands,
+                write_commands: self.write_commands,
+                base_os_commands: self.base_os_commands,
+                user_disk_commands: self.user_disk_commands,
+                distinct_base_os_blocks: self.base_os_blocks.len(),
+                distinct_user_disk_blocks: self.user_disk_blocks.len(),
+                root_mount_commands: self.root_mount_commands,
+                root_mount_distinct_base_os_blocks: self.root_mount_base_os_blocks.len(),
+                root_mount_distinct_user_disk_blocks: self.root_mount_user_disk_blocks.len(),
+                recent_commands: self.recent_commands.iter().cloned().collect(),
+                root_mount_recent_commands: self
+                    .root_mount_recent_commands
+                    .iter()
+                    .cloned()
+                    .collect(),
+            })
+        }
+    }
+
+    fn push_limited_trace_entry(
+        entries: &mut VecDeque<NativeBlockIoTraceEntry>,
+        entry: NativeBlockIoTraceEntry,
+        limit: usize,
+    ) {
+        entries.push_back(entry);
+        while entries.len() > limit {
+            entries.pop_front();
         }
     }
 
@@ -5854,10 +6002,10 @@ mod windows_whp {
             serial_contract_passed, serial_markers_observed, timer_interrupt_readiness,
             timer_interrupt_readiness_blocker, timer_interrupt_readiness_report_blocker,
             xapic_state_vectors, Com1SerialState, DecodedExit, LegacyDeviceIoState,
-            ACPI_PM1_CONTROL_PORT, ACPI_PM1_ENABLE_PORT, ACPI_PM1_STATUS_PORT, ACPI_PM_TIMER_PORT,
-            ALT_DELAY_PORT, ALT_POST_DELAY_PORT, CMOS_ADDRESS_PORT, CMOS_DATA_PORT,
-            CPUID_DEFAULT_RAX_OFFSET, CPUID_DEFAULT_RBX_OFFSET, CPUID_DEFAULT_RCX_OFFSET,
-            CPUID_DEFAULT_RDX_OFFSET, CPUID_RAX_OFFSET, CPUID_RCX_OFFSET,
+            NativeBlockIoTraceCollector, ACPI_PM1_CONTROL_PORT, ACPI_PM1_ENABLE_PORT,
+            ACPI_PM1_STATUS_PORT, ACPI_PM_TIMER_PORT, ALT_DELAY_PORT, ALT_POST_DELAY_PORT,
+            CMOS_ADDRESS_PORT, CMOS_DATA_PORT, CPUID_DEFAULT_RAX_OFFSET, CPUID_DEFAULT_RBX_OFFSET,
+            CPUID_DEFAULT_RCX_OFFSET, CPUID_DEFAULT_RDX_OFFSET, CPUID_RAX_OFFSET, CPUID_RCX_OFFSET,
             DMA_PAGE_REGISTER_START_PORT, ELCR1_PORT, ELCR2_PORT, IO_ACCESS_INFO_OFFSET,
             IO_PORT_OFFSET, IO_RAX_OFFSET, LINUX_ENTRY_PROBE_EXIT_BUDGET,
             LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET, LINUX_ENTRY_PROBE_STORAGE_TOTAL_BUDGET_SECONDS,
@@ -6490,6 +6638,43 @@ mod windows_whp {
         }
 
         #[test]
+        fn block_io_trace_collector_summarizes_root_mount_phase() {
+            let mut trace = NativeBlockIoTraceCollector::default();
+            trace.record(
+                &NativeBlockIoCommand {
+                    device: NativeBlockDeviceId::BaseOs,
+                    operation: NativeBlockOperation::Read,
+                    block_index: 256,
+                    block_size_bytes: PANE_BLOCK_IO_BLOCK_SIZE_BYTES,
+                },
+                PANE_BLOCK_IO_STATUS_SERVICED,
+                PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize,
+                false,
+            );
+            trace.record(
+                &NativeBlockIoCommand {
+                    device: NativeBlockDeviceId::BaseOs,
+                    operation: NativeBlockOperation::Read,
+                    block_index: 257,
+                    block_size_bytes: PANE_BLOCK_IO_BLOCK_SIZE_BYTES,
+                },
+                PANE_BLOCK_IO_STATUS_SERVICED,
+                PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize,
+                true,
+            );
+
+            let report = trace.report().expect("trace report");
+
+            assert_eq!(report.total_commands, 2);
+            assert_eq!(report.read_commands, 2);
+            assert_eq!(report.distinct_base_os_blocks, 2);
+            assert_eq!(report.root_mount_commands, 1);
+            assert_eq!(report.root_mount_distinct_base_os_blocks, 1);
+            assert_eq!(report.root_mount_recent_commands.len(), 1);
+            assert_eq!(report.root_mount_recent_commands[0].block_index, 257);
+        }
+
+        #[test]
         fn decodes_io_port_reads_with_original_rax() {
             let mut exit_context = [0_u8; 128];
             exit_context[..4]
@@ -6564,6 +6749,7 @@ mod windows_whp {
                 guest_exit_budget: 0,
                 framebuffer_snapshot: None,
                 input_queue_snapshot: None,
+                block_io_trace: None,
                 halt_observed: false,
                 calls: Vec::new(),
                 blocker: None,

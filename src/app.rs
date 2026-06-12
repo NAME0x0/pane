@@ -484,6 +484,12 @@ struct PaneInitramfsDriverMetadata {
     #[serde(default)]
     packaged_probe_source_sha256: Option<String>,
     #[serde(default)]
+    packaged_init_binary_sha256: Option<String>,
+    #[serde(default)]
+    packaged_probe_binary_sha256: Option<String>,
+    #[serde(default)]
+    packaged_binary_provenance: Option<String>,
+    #[serde(default)]
     packaged_block_driver_source_sha256: Option<String>,
     #[serde(default)]
     packaged_block_driver_abi_sha256: Option<String>,
@@ -833,6 +839,7 @@ fn pane_discovery_initramfs_matches_current_driver_bundle(
             == Some(metadata.init_source_sha256.as_str())
         && metadata.packaged_probe_source_sha256.as_deref()
             == Some(metadata.probe_source_sha256.as_str())
+        && metadata.packaged_binary_provenance.as_deref() == Some("compiled-from-current-source")
         && metadata.packaged_block_driver_source_sha256.as_deref()
             == Some(metadata.block_driver_source_sha256.as_str())
         && metadata.packaged_block_driver_abi_sha256.as_deref()
@@ -4634,6 +4641,9 @@ fn write_pane_initramfs_driver_bundle(
         packaged_hook_sha256: None,
         packaged_init_source_sha256: None,
         packaged_probe_source_sha256: None,
+        packaged_init_binary_sha256: None,
+        packaged_probe_binary_sha256: None,
+        packaged_binary_provenance: None,
         packaged_block_driver_source_sha256: None,
         packaged_block_driver_abi_sha256: None,
         packaged_block_module_sha256: None,
@@ -5295,6 +5305,25 @@ static int load_pane_block_module(const char *device_blocks, const char *root_of
 #endif
 }
 
+static void drop_probe_caches_before_root_mount(void) {
+    sync();
+    int fd = open("/proc/sys/vm/drop_caches", O_WRONLY | O_CLOEXEC);
+    if (fd < 0) {
+        char line[160];
+        snprintf(line, sizeof(line), "PANE_BLOCK_PROBE_CACHE_DROP_OPEN_FAILED errno=%d", errno);
+        log_line(line);
+        return;
+    }
+    if (write(fd, "3\n", 2) != 2) {
+        char line[160];
+        snprintf(line, sizeof(line), "PANE_BLOCK_PROBE_CACHE_DROP_WRITE_FAILED errno=%d", errno);
+        log_line(line);
+    } else {
+        log_line("PANE_BLOCK_PROBE_CACHE_DROPPED");
+    }
+    close(fd);
+}
+
 static int supported_root_fs(const char *value) {
     return strcmp(value, "ext4") == 0 ||
            strcmp(value, "btrfs") == 0 ||
@@ -5479,6 +5508,7 @@ int main(void) {
 
     log_line("PANE_BLOCK_IO_PROBE_OK");
     load_pane_block_module(block_devices, root_offset, block_dma);
+    drop_probe_caches_before_root_mount();
     log_line("PANE_INITRAMFS_DISCOVERY_DONE");
     if (framebuffer[0] != '\0' && input_queue[0] != '\0') {
         log_line("PANE_DISPLAY_CONTRACT_DISCOVERED");
@@ -5726,8 +5756,8 @@ static blk_status_t pane_block_queue_rq(struct blk_mq_hw_ctx *hctx,
          * add_disk can synchronously probe the new gendisk before module init
          * returns. On Pane's current single-vCPU bootstrap path, routing those
          * early probe reads through the host port device can prevent the init
-         * parent from reaching PANE_BLOCK_MODULE_LOAD_OK. These reads are not
-         * root filesystem traffic; normal requests are serviced after init.
+         * parent from reaching PANE_BLOCK_MODULE_LOAD_OK. The initramfs drops
+         * these probe-time cache entries before attempting the real root mount.
          */
         if (pane_block_init_read_log_count < 16) {
             pane_block_init_read_log_count++;
@@ -6261,6 +6291,12 @@ struct InitramfsCompilerCandidate {
     base_args: Vec<String>,
 }
 
+struct DiscoveryInitramfsBuildOutput {
+    init_binary_sha256: String,
+    probe_binary_sha256: String,
+    compiled_from_current_source: bool,
+}
+
 fn initramfs_compiler_candidates() -> Vec<InitramfsCompilerCandidate> {
     let mut candidates = Vec::new();
     if let Some(program) = env::var("PANE_LINUX_CC")
@@ -6334,6 +6370,82 @@ fn run_initramfs_compiler_candidate(
         .map_err(|error| format!("{} produced unusable output: {error}", candidate.label))
 }
 
+fn windows_path_to_wsl_path(path: &Path) -> Option<String> {
+    let path = path.canonicalize().ok()?;
+    windows_absolute_path_to_wsl_path(&path)
+}
+
+fn windows_output_path_to_wsl_path(path: &Path) -> Option<String> {
+    let parent = path.parent()?.canonicalize().ok()?;
+    let file_name = path.file_name()?.to_string_lossy().replace('\\', "/");
+    let parent_wsl = windows_absolute_path_to_wsl_path(&parent)?;
+    Some(format!("{parent_wsl}/{file_name}"))
+}
+
+fn windows_absolute_path_to_wsl_path(path: &Path) -> Option<String> {
+    let mut text = path.to_string_lossy().to_string();
+    if let Some(stripped) = text.strip_prefix(r"\\?\") {
+        text = stripped.to_string();
+    }
+    let mut chars = text.chars();
+    let drive = chars.next()?.to_ascii_lowercase();
+    if chars.next()? != ':' || chars.next()? != '\\' {
+        return None;
+    }
+    Some(format!(
+        "/mnt/{}/{}",
+        drive,
+        chars.as_str().replace('\\', "/")
+    ))
+}
+
+fn run_initramfs_wsl_cc(source: &Path, output: &Path, label: &str) -> Result<(), String> {
+    let source_wsl = windows_path_to_wsl_path(source)
+        .ok_or_else(|| format!("could not convert {} to a WSL path", source.display()))?;
+    let output_parent = output
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", output.display()))?;
+    fs::create_dir_all(output_parent).map_err(|error| {
+        format!(
+            "could not create output directory {}: {error}",
+            output_parent.display()
+        )
+    })?;
+    let output_wsl = windows_output_path_to_wsl_path(output)
+        .ok_or_else(|| format!("could not convert {} to a WSL path", output.display()))?;
+    let distro = env::var("PANE_LINUX_WSL_DISTRO")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let mut command = Command::new("wsl.exe");
+    if let Some(distro) = distro.as_deref() {
+        command.arg("-d").arg(distro);
+    }
+    command
+        .arg("--exec")
+        .arg("sh")
+        .arg("-lc")
+        .arg("cc -Os -static -o \"$1\" \"$2\"")
+        .arg("pane-initramfs-cc")
+        .arg(&output_wsl)
+        .arg(&source_wsl)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let status = command
+        .output()
+        .map_err(|error| format!("wsl.exe cc could not start: {error}"))?;
+    let distro_label = distro.as_deref().unwrap_or("default");
+    if !status.status.success() {
+        return Err(format!(
+            "wsl.exe ({distro_label}) cc exited with status {}.\nstdout:\n{}\nstderr:\n{}",
+            status.status,
+            String::from_utf8_lossy(&status.stdout),
+            String::from_utf8_lossy(&status.stderr)
+        ));
+    }
+    verify_elf_binary(output, label)
+        .map_err(|error| format!("wsl.exe ({distro_label}) cc produced unusable output: {error}"))
+}
+
 fn run_initramfs_cc(source: &Path, output: &Path, label: &str) -> AppResult<()> {
     let mut failures = Vec::new();
     for candidate in initramfs_compiler_candidates() {
@@ -6342,8 +6454,14 @@ fn run_initramfs_cc(source: &Path, output: &Path, label: &str) -> AppResult<()> 
             Err(error) => failures.push(error),
         }
     }
+    if cfg!(windows) {
+        match run_initramfs_wsl_cc(source, output, label) {
+            Ok(()) => return Ok(()),
+            Err(error) => failures.push(error),
+        }
+    }
     Err(AppError::message(format!(
-        "Failed to compile {label} as a static Linux ELF binary. Pane now packages the initramfs archive itself, but the guest `/init` and probe still require a Linux-capable C compiler. Install `cc`, install Zig, set `PANE_LINUX_CC`/`PANE_LINUX_CC_ARGS`, or pass prebuilt ELF binaries with `--discovery-init-binary` and `--discovery-probe-binary`.\nCompiler attempts:\n- {}",
+        "Failed to compile {label} as a static Linux ELF binary. Pane now packages the initramfs archive itself, but the guest `/init` and probe still require a Linux-capable C compiler. Install `cc`, install Zig, set `PANE_LINUX_CC`/`PANE_LINUX_CC_ARGS`, set `PANE_LINUX_WSL_DISTRO` to a WSL distro with `cc`, or pass prebuilt ELF binaries with `--discovery-init-binary` and `--discovery-probe-binary`.\nCompiler attempts:\n- {}",
         failures.join("\n- ")
     )))
 }
@@ -6372,7 +6490,7 @@ fn build_pane_discovery_initramfs_with_native_packager(
     output: &Path,
     prebuilt_init_binary: Option<&Path>,
     prebuilt_probe_binary: Option<&Path>,
-) -> AppResult<()> {
+) -> AppResult<DiscoveryInitramfsBuildOutput> {
     if prebuilt_init_binary.is_some() != prebuilt_probe_binary.is_some() {
         return Err(AppError::message(
             "--discovery-init-binary and --discovery-probe-binary must be provided together.",
@@ -6414,6 +6532,9 @@ fn build_pane_discovery_initramfs_with_native_packager(
             "Pane port probe",
         )?;
     }
+    let compiled_from_current_source = prebuilt_init_binary.is_none();
+    let init_binary_sha256 = sha256_file(&init_binary)?;
+    let probe_binary_sha256 = sha256_file(&probe_binary)?;
 
     let hook = fs::read(Path::new(&metadata.hook_path))?;
     let init = fs::read(&init_binary)?;
@@ -6442,7 +6563,12 @@ fn build_pane_discovery_initramfs_with_native_packager(
         ));
     }
 
-    write_newc_cpio_archive(output, &entries)
+    write_newc_cpio_archive(output, &entries)?;
+    Ok(DiscoveryInitramfsBuildOutput {
+        init_binary_sha256,
+        probe_binary_sha256,
+        compiled_from_current_source,
+    })
 }
 
 fn build_and_register_pane_discovery_initramfs(
@@ -6471,7 +6597,7 @@ fn build_and_register_pane_discovery_initramfs(
     if pane_block_module_path(paths).exists() {
         load_verified_pane_block_module_metadata(paths)?;
     }
-    build_pane_discovery_initramfs_with_native_packager(
+    let build_output = build_pane_discovery_initramfs_with_native_packager(
         paths,
         &metadata,
         &output,
@@ -6480,7 +6606,7 @@ fn build_and_register_pane_discovery_initramfs(
     )?;
 
     register_pane_discovery_initramfs_artifact(paths, &output, force)?;
-    record_pane_discovery_initramfs_package_metadata(paths)
+    record_pane_discovery_initramfs_package_metadata(paths, &build_output)
 }
 
 fn register_pane_discovery_initramfs_artifact(
@@ -6492,7 +6618,10 @@ fn register_pane_discovery_initramfs_artifact(
     register_kernel_boot_plan(paths, None, None, Some(source), Some(&sha256), None, force)
 }
 
-fn record_pane_discovery_initramfs_package_metadata(paths: &RuntimePaths) -> AppResult<()> {
+fn record_pane_discovery_initramfs_package_metadata(
+    paths: &RuntimePaths,
+    build_output: &DiscoveryInitramfsBuildOutput,
+) -> AppResult<()> {
     let mut metadata = load_verified_pane_initramfs_driver_metadata(paths)?;
     let module_metadata = if pane_block_module_path(paths).is_file() {
         Some(load_verified_pane_block_module_metadata(paths)?)
@@ -6503,8 +6632,17 @@ fn record_pane_discovery_initramfs_package_metadata(paths: &RuntimePaths) -> App
     metadata.packaged_initramfs_bytes = Some(fs::metadata(&paths.initramfs_image)?.len());
     metadata.packaged_initramfs_sha256 = Some(sha256_file(&paths.initramfs_image)?);
     metadata.packaged_hook_sha256 = Some(metadata.hook_sha256.clone());
-    metadata.packaged_init_source_sha256 = Some(metadata.init_source_sha256.clone());
-    metadata.packaged_probe_source_sha256 = Some(metadata.probe_source_sha256.clone());
+    if build_output.compiled_from_current_source {
+        metadata.packaged_init_source_sha256 = Some(metadata.init_source_sha256.clone());
+        metadata.packaged_probe_source_sha256 = Some(metadata.probe_source_sha256.clone());
+        metadata.packaged_binary_provenance = Some("compiled-from-current-source".to_string());
+    } else {
+        metadata.packaged_init_source_sha256 = None;
+        metadata.packaged_probe_source_sha256 = None;
+        metadata.packaged_binary_provenance = Some("external-prebuilt-elf".to_string());
+    }
+    metadata.packaged_init_binary_sha256 = Some(build_output.init_binary_sha256.clone());
+    metadata.packaged_probe_binary_sha256 = Some(build_output.probe_binary_sha256.clone());
     metadata.packaged_block_driver_source_sha256 =
         Some(metadata.block_driver_source_sha256.clone());
     metadata.packaged_block_driver_abi_sha256 = Some(metadata.block_driver_abi_sha256.clone());
@@ -13489,7 +13627,15 @@ mod tests {
         )
         .unwrap();
         register_pane_discovery_initramfs_artifact(paths, &discovery_initramfs, false).unwrap();
-        super::record_pane_discovery_initramfs_package_metadata(paths).unwrap();
+        super::record_pane_discovery_initramfs_package_metadata(
+            paths,
+            &super::DiscoveryInitramfsBuildOutput {
+                init_binary_sha256: "fake-init-binary-sha256".to_string(),
+                probe_binary_sha256: "fake-probe-binary-sha256".to_string(),
+                compiled_from_current_source: true,
+            },
+        )
+        .unwrap();
     }
 
     fn register_fake_pane_block_module(paths: &RuntimePaths) {
@@ -15030,6 +15176,9 @@ mod tests {
         assert!(init_source.contains("waitpid(child, &status, WNOHANG)"));
         assert!(init_source.contains("sched_yield();"));
         assert!(init_source.contains("attempt < 50000000"));
+        assert!(init_source.contains("drop_probe_caches_before_root_mount"));
+        assert!(init_source.contains("/proc/sys/vm/drop_caches"));
+        assert!(init_source.contains("PANE_BLOCK_PROBE_CACHE_DROPPED"));
         assert!(init_source.contains("shared_buffer_gpa=%llu shared_buffer_bytes=%llu"));
         assert!(init_source.contains("pane.root_offset"));
         assert!(init_source.contains("pane.root_readonly"));
@@ -15096,7 +15245,7 @@ mod tests {
         assert!(block_driver.contains("block_index + pane_disk->block_offset"));
         assert!(block_driver.contains("PANE_BLOCK_INIT_READ_ZERO_FILL"));
         assert!(block_driver.contains("pane_block_initializing = false"));
-        assert!(block_driver.contains("These reads are not"));
+        assert!(block_driver.contains("probe-time cache entries"));
         assert!(block_driver.contains("partial filesystem writes"));
         assert!(block_driver.contains("PANE_BLOCK_MINORS_PER_DISK 16"));
         assert!(block_driver.contains("index * PANE_BLOCK_MINORS_PER_DISK"));
@@ -15237,7 +15386,16 @@ mod tests {
         .unwrap();
         assert!(artifacts.initramfs_image_exists);
         assert!(artifacts.initramfs_image_verified);
-        assert!(artifacts.discovery_initramfs_matches_driver_bundle);
+        assert!(!artifacts.discovery_initramfs_matches_driver_bundle);
+        let metadata =
+            read_json_file::<PaneInitramfsDriverMetadata>(&paths.initramfs_driver_metadata)
+                .unwrap();
+        assert_eq!(
+            metadata.packaged_binary_provenance.as_deref(),
+            Some("external-prebuilt-elf")
+        );
+        assert!(metadata.packaged_init_binary_sha256.is_some());
+        assert!(metadata.packaged_probe_binary_sha256.is_some());
         assert!(archive
             .windows("pane-prebuilt-init".len())
             .any(|window| window == b"pane-prebuilt-init"));

@@ -1336,6 +1336,9 @@ mod windows_whp {
     const WHV_REGISTER_DELIVERABILITY_NOTIFICATIONS: u32 = 0x8000_0004;
     const WHV_REGISTER_INTERNAL_ACTIVITY_STATE: u32 = 0x8000_0005;
     const WHV_DELIVERABILITY_NOTIFICATION_INTERRUPT: u64 = 1 << 1;
+    const WHV_X64_INTERRUPT_TYPE_FIXED: u64 = 0;
+    const WHV_X64_INTERRUPT_DESTINATION_MODE_PHYSICAL: u64 = 0;
+    const WHV_X64_INTERRUPT_TRIGGER_MODE_EDGE: u64 = 0;
     const WHV_X64_REGISTER_APIC_TPR: u32 = 0x0000_3008;
     const WHV_X64_REGISTER_APIC_PPR: u32 = 0x0000_300a;
     const WHV_X64_REGISTER_APIC_ISR0: u32 = 0x0000_3010;
@@ -3781,7 +3784,12 @@ mod windows_whp {
         report: &mut NativePartitionSmokeReport,
     ) -> bool {
         let interrupt = WhvInterruptControl {
-            control: 0,
+            control: whv_x64_interrupt_control(
+                WHV_X64_INTERRUPT_TYPE_FIXED,
+                WHV_X64_INTERRUPT_DESTINATION_MODE_PHYSICAL,
+                WHV_X64_INTERRUPT_TRIGGER_MODE_EDGE,
+                0,
+            ),
             destination: 0,
             vector: u32::from(vector),
         };
@@ -3811,6 +3819,18 @@ mod windows_whp {
             ),
         });
         ok
+    }
+
+    fn whv_x64_interrupt_control(
+        interrupt_type: u64,
+        destination_mode: u64,
+        trigger_mode: u64,
+        target_vtl: u64,
+    ) -> u64 {
+        (interrupt_type & 0xff)
+            | ((destination_mode & 0x0f) << 8)
+            | ((trigger_mode & 0x0f) << 12)
+            | ((target_vtl & 0xff) << 16)
     }
 
     fn arm_timer_interrupt_window_notification(
@@ -6165,25 +6185,26 @@ mod windows_whp {
             linux_protected_mode_registers, parse_xapic_interrupt_controller_state,
             serial_contract_passed, serial_markers_observed, timer_interrupt_readiness,
             timer_interrupt_readiness_blocker, timer_interrupt_readiness_report_blocker,
-            xapic_state_vectors, Com1SerialState, DecodedExit, LegacyDeviceIoState,
-            NativeBlockIoTraceCollector, ACPI_PM1_CONTROL_PORT, ACPI_PM1_ENABLE_PORT,
-            ACPI_PM1_STATUS_PORT, ACPI_PM_TIMER_PORT, ALT_DELAY_PORT, ALT_POST_DELAY_PORT,
-            CMOS_ADDRESS_PORT, CMOS_DATA_PORT, CPUID_DEFAULT_RAX_OFFSET, CPUID_DEFAULT_RBX_OFFSET,
-            CPUID_DEFAULT_RCX_OFFSET, CPUID_DEFAULT_RDX_OFFSET, CPUID_RAX_OFFSET, CPUID_RCX_OFFSET,
-            DMA_PAGE_REGISTER_START_PORT, ELCR1_PORT, ELCR2_PORT, IO_ACCESS_INFO_OFFSET,
-            IO_PORT_OFFSET, IO_RAX_OFFSET, LINUX_ENTRY_PROBE_EXIT_BUDGET,
-            LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET, LINUX_ENTRY_PROBE_STORAGE_TOTAL_BUDGET_SECONDS,
-            LINUX_ENTRY_PROBE_TOTAL_BUDGET_SECONDS, LINUX_ENTRY_PROBE_TRACE_HEAD,
-            LINUX_ENTRY_PROBE_TRACE_TAIL, MEMORY_ACCESS_INFO_OFFSET, MEMORY_GPA_OFFSET,
-            MEMORY_GVA_OFFSET, MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET, MSR_RAX_OFFSET,
-            MSR_RDX_OFFSET, PCI_CONFIG_ADDRESS_PORT, PCI_CONFIG_DATA_START_PORT, PIC1_COMMAND_PORT,
-            PIC1_DATA_PORT, PIC2_COMMAND_PORT, PIC2_DATA_PORT, PIT_CHANNEL0_PORT, PIT_COMMAND_PORT,
-            POST_DELAY_PORT, PS2_DATA_PORT, PS2_STATUS_COMMAND_PORT, SERIAL_COM1_PORT,
-            SYSTEM_CONTROL_PORT_A, SYSTEM_CONTROL_PORT_B, VGA_ATTRIBUTE_DATA_READ_PORT,
-            VGA_ATTRIBUTE_PORT, VGA_CRTC_COLOR_DATA_PORT, VGA_CRTC_COLOR_INDEX_PORT,
-            VGA_GRAPHICS_DATA_PORT, VGA_GRAPHICS_INDEX_PORT, VGA_INPUT_STATUS_COLOR_PORT,
-            VGA_MISC_OUTPUT_READ_PORT, VGA_MISC_OUTPUT_WRITE_PORT, VGA_SEQUENCER_DATA_PORT,
-            VGA_SEQUENCER_INDEX_PORT, VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET, VP_CONTEXT_RIP_OFFSET,
+            whv_x64_interrupt_control, xapic_state_vectors, Com1SerialState, DecodedExit,
+            LegacyDeviceIoState, NativeBlockIoTraceCollector, ACPI_PM1_CONTROL_PORT,
+            ACPI_PM1_ENABLE_PORT, ACPI_PM1_STATUS_PORT, ACPI_PM_TIMER_PORT, ALT_DELAY_PORT,
+            ALT_POST_DELAY_PORT, CMOS_ADDRESS_PORT, CMOS_DATA_PORT, CPUID_DEFAULT_RAX_OFFSET,
+            CPUID_DEFAULT_RBX_OFFSET, CPUID_DEFAULT_RCX_OFFSET, CPUID_DEFAULT_RDX_OFFSET,
+            CPUID_RAX_OFFSET, CPUID_RCX_OFFSET, DMA_PAGE_REGISTER_START_PORT, ELCR1_PORT,
+            ELCR2_PORT, IO_ACCESS_INFO_OFFSET, IO_PORT_OFFSET, IO_RAX_OFFSET,
+            LINUX_ENTRY_PROBE_EXIT_BUDGET, LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET,
+            LINUX_ENTRY_PROBE_STORAGE_TOTAL_BUDGET_SECONDS, LINUX_ENTRY_PROBE_TOTAL_BUDGET_SECONDS,
+            LINUX_ENTRY_PROBE_TRACE_HEAD, LINUX_ENTRY_PROBE_TRACE_TAIL, MEMORY_ACCESS_INFO_OFFSET,
+            MEMORY_GPA_OFFSET, MEMORY_GVA_OFFSET, MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET,
+            MSR_RAX_OFFSET, MSR_RDX_OFFSET, PCI_CONFIG_ADDRESS_PORT, PCI_CONFIG_DATA_START_PORT,
+            PIC1_COMMAND_PORT, PIC1_DATA_PORT, PIC2_COMMAND_PORT, PIC2_DATA_PORT,
+            PIT_CHANNEL0_PORT, PIT_COMMAND_PORT, POST_DELAY_PORT, PS2_DATA_PORT,
+            PS2_STATUS_COMMAND_PORT, SERIAL_COM1_PORT, SYSTEM_CONTROL_PORT_A,
+            SYSTEM_CONTROL_PORT_B, VGA_ATTRIBUTE_DATA_READ_PORT, VGA_ATTRIBUTE_PORT,
+            VGA_CRTC_COLOR_DATA_PORT, VGA_CRTC_COLOR_INDEX_PORT, VGA_GRAPHICS_DATA_PORT,
+            VGA_GRAPHICS_INDEX_PORT, VGA_INPUT_STATUS_COLOR_PORT, VGA_MISC_OUTPUT_READ_PORT,
+            VGA_MISC_OUTPUT_WRITE_PORT, VGA_SEQUENCER_DATA_PORT, VGA_SEQUENCER_INDEX_PORT,
+            VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET, VP_CONTEXT_RIP_OFFSET,
             WHV_DELIVERABILITY_NOTIFICATION_INTERRUPT, WHV_REGISTER_CR0, WHV_REGISTER_CR3,
             WHV_REGISTER_CR4, WHV_REGISTER_CS, WHV_REGISTER_DS, WHV_REGISTER_ES, WHV_REGISTER_GDTR,
             WHV_REGISTER_IDTR, WHV_REGISTER_RBP, WHV_REGISTER_RBX, WHV_REGISTER_RDI,
@@ -7400,6 +7421,16 @@ mod windows_whp {
             );
             assert!(ready_with_pane_notification.ready);
             assert_eq!(ready_with_pane_notification.blocker, "ready");
+        }
+
+        #[test]
+        fn whp_x64_interrupt_control_encodes_sdk_bitfields() {
+            assert_eq!(whv_x64_interrupt_control(0, 0, 0, 0), 0);
+            assert_eq!(whv_x64_interrupt_control(4, 1, 1, 2), 0x0002_1104);
+            assert_eq!(
+                whv_x64_interrupt_control(0x1ff, 0x1f, 0x1f, 0x1ff),
+                0x00ff_ffff
+            );
         }
 
         #[test]

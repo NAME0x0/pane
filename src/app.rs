@@ -5263,11 +5263,11 @@ static int load_pane_block_module(const char *device_blocks, const char *root_of
     }
     if (device_blocks && device_blocks[0] != '\0') {
         snprintf(params, sizeof(params),
-                 "device_blocks=%s base_block_offset=%llu shared_buffer_gpa=%llu shared_buffer_bytes=%llu",
+                 "device_blocks=%s base_block_offset=%llu shared_buffer_gpa=%llu shared_buffer_bytes=%llu trust_submit_completion=1",
                  device_blocks, base_block_offset, shared_buffer_gpa, shared_buffer_bytes);
     } else {
         snprintf(params, sizeof(params),
-                 "base_block_offset=%llu shared_buffer_gpa=%llu shared_buffer_bytes=%llu",
+                 "base_block_offset=%llu shared_buffer_gpa=%llu shared_buffer_bytes=%llu trust_submit_completion=1",
                  base_block_offset, shared_buffer_gpa, shared_buffer_bytes);
     }
 #ifdef SYS_finit_module
@@ -5622,6 +5622,7 @@ static unsigned long device_blocks[PANE_BLOCK_DEVICE_COUNT] = {
 static unsigned long base_block_offset;
 static unsigned long shared_buffer_gpa;
 static unsigned long shared_buffer_bytes;
+static bool trust_submit_completion = true;
 module_param_array(device_blocks, ulong, NULL, 0444);
 MODULE_PARM_DESC(device_blocks, "Logical Pane I/O blocks for /dev/pane0 and /dev/pane1");
 module_param(base_block_offset, ulong, 0444);
@@ -5630,6 +5631,8 @@ module_param(shared_buffer_gpa, ulong, 0444);
 MODULE_PARM_DESC(shared_buffer_gpa, "Guest physical address of the Pane shared block transfer buffer");
 module_param(shared_buffer_bytes, ulong, 0444);
 MODULE_PARM_DESC(shared_buffer_bytes, "Bytes available in the Pane shared block transfer buffer");
+module_param(trust_submit_completion, bool, 0444);
+MODULE_PARM_DESC(trust_submit_completion, "Treat Pane's synchronous submit-port VM exit as I/O completion");
 
 struct pane_block_disk {
     int pane_device_id;
@@ -5643,13 +5646,27 @@ static struct pane_block_disk pane_disks[PANE_BLOCK_DEVICE_COUNT];
 static int pane_block_major;
 static bool pane_block_initializing = true;
 static void *pane_block_shared_buffer;
-static unsigned int pane_block_transfer_log_count;
+static unsigned char *pane_block_bounce_buffer;
 static unsigned int pane_block_request_log_count;
 static unsigned int pane_block_init_read_log_count;
+static unsigned int pane_block_serial_log_count;
 
 static const struct block_device_operations pane_block_fops = {
     .owner = THIS_MODULE,
 };
+
+static void pane_block_serial_log(const char *line)
+{
+    if (pane_block_serial_log_count >= 64)
+        return;
+    pane_block_serial_log_count++;
+    while (*line) {
+        outb((u8)*line, 0x3f8);
+        line++;
+    }
+    outb('\r', 0x3f8);
+    outb('\n', 0x3f8);
+}
 
 static void pane_block_write_index(u64 block_index)
 {
@@ -5680,14 +5697,7 @@ static int pane_block_transfer(int device_id, int operation, u64 block_index, vo
 {
     unsigned int word_index;
     unsigned char *bytes = buffer;
-    bool log_transfer = pane_block_transfer_log_count < 16;
-
-    if (log_transfer) {
-        pane_block_transfer_log_count++;
-        pr_info(PANE_BLOCK_DRIVER_NAME
-                ": PANE_BLOCK_TRANSFER_START device=%d op=%d block=%llu\n",
-                device_id, operation, block_index);
-    }
+    bool log_transfer = false;
 
     outb(device_id, PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_DEVICE_OFFSET);
     outb(operation, PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_OPERATION_OFFSET);
@@ -5707,21 +5717,20 @@ static int pane_block_transfer(int device_id, int operation, u64 block_index, vo
     }
 
     outb(1, PANE_BLOCK_IO_BASE_PORT + PANE_BLOCK_IO_STATUS_OFFSET);
-    if (log_transfer)
-        pr_info(PANE_BLOCK_DRIVER_NAME
-                ": PANE_BLOCK_SUBMIT_DONE device=%d op=%d block=%llu\n",
-                device_id, operation, block_index);
-    if (pane_block_wait_serviced(log_transfer) != 0) {
-        if (log_transfer)
+    pane_block_serial_log("PANE_BLOCK_TRANSFER_SUBMITTED");
+    if (!trust_submit_completion) {
+        if (pane_block_wait_serviced(log_transfer) != 0) {
             pr_err(PANE_BLOCK_DRIVER_NAME
                    ": PANE_BLOCK_TRANSFER_WAIT_FAILED device=%d op=%d block=%llu\n",
                    device_id, operation, block_index);
-        return -EIO;
+            return -EIO;
+        }
     }
 
     if (operation == PANE_BLOCK_OPERATION_READ) {
         if (pane_block_shared_buffer) {
             memcpy(bytes, pane_block_shared_buffer, PANE_BLOCK_IO_BLOCK_SIZE_BYTES);
+            pane_block_serial_log("PANE_BLOCK_READ_DMA_COPIED");
         } else {
             for (word_index = 0;
                  word_index < PANE_BLOCK_IO_BLOCK_SIZE_BYTES / sizeof(u32);
@@ -5730,14 +5739,10 @@ static int pane_block_transfer(int device_id, int operation, u64 block_index, vo
 
                 memcpy(bytes + word_index * sizeof(word), &word, sizeof(word));
             }
+            pane_block_serial_log("PANE_BLOCK_READ_PORT_COPIED");
         }
     }
 
-    if (log_transfer) {
-        pr_info(PANE_BLOCK_DRIVER_NAME
-                ": PANE_BLOCK_TRANSFER_DONE device=%d op=%d block=%llu\n",
-                device_id, operation, block_index);
-    }
     return 0;
 }
 
@@ -5749,7 +5754,7 @@ static blk_status_t pane_block_queue_rq(struct blk_mq_hw_ctx *hctx,
     struct bio_vec bvec;
     struct req_iterator iter;
     blk_status_t status = BLK_STS_OK;
-    unsigned char *bounce;
+    unsigned char *bounce = pane_block_bounce_buffer;
     int operation;
 
     if (req_op(rq) == REQ_OP_READ)
@@ -5775,6 +5780,7 @@ static blk_status_t pane_block_queue_rq(struct blk_mq_hw_ctx *hctx,
     }
 
     blk_mq_start_request(rq);
+    pane_block_serial_log("PANE_BLOCK_REQUEST_ACTIVE");
     if (pane_block_initializing && operation == PANE_BLOCK_OPERATION_READ) {
         /*
          * add_disk can synchronously probe the new gendisk before module init
@@ -5798,11 +5804,12 @@ static blk_status_t pane_block_queue_rq(struct blk_mq_hw_ctx *hctx,
         return BLK_STS_OK;
     }
 
-    bounce = vmalloc(PANE_BLOCK_IO_BLOCK_SIZE_BYTES);
     if (!bounce) {
+        pane_block_serial_log("PANE_BLOCK_BOUNCE_UNAVAILABLE");
         blk_mq_end_request(rq, BLK_STS_RESOURCE);
         return BLK_STS_RESOURCE;
     }
+    pane_block_serial_log("PANE_BLOCK_BOUNCE_READY");
 
     rq_for_each_segment(bvec, rq, iter) {
         u64 absolute_byte = (u64)iter.iter.bi_sector * PANE_BLOCK_SECTOR_SIZE;
@@ -5866,7 +5873,9 @@ static blk_status_t pane_block_queue_rq(struct blk_mq_hw_ctx *hctx,
             break;
     }
 
-    vfree(bounce);
+    pane_block_serial_log(status == BLK_STS_OK ?
+                          "PANE_BLOCK_REQUEST_END_OK" :
+                          "PANE_BLOCK_REQUEST_END_ERROR");
     blk_mq_end_request(rq, status);
     return status;
 }
@@ -5896,7 +5905,7 @@ static int pane_block_create_disk(int index, int pane_device_id, const char *nam
     strscpy(pane_disk->name, name, sizeof(pane_disk->name));
     pane_disk->tag_set.ops = &pane_block_mq_ops;
     pane_disk->tag_set.nr_hw_queues = 1;
-    pane_disk->tag_set.queue_depth = 64;
+    pane_disk->tag_set.queue_depth = 1;
     pane_disk->tag_set.numa_node = NUMA_NO_NODE;
     pane_disk->tag_set.cmd_size = 0;
     pane_disk->tag_set.driver_data = pane_disk;
@@ -5988,11 +5997,25 @@ static int __init pane_block_init(void)
         }
     }
 
+    pane_block_bounce_buffer = vmalloc(PANE_BLOCK_IO_BLOCK_SIZE_BYTES);
+    if (!pane_block_bounce_buffer) {
+        pr_err(PANE_BLOCK_DRIVER_NAME
+               ": PANE_BLOCK_BOUNCE_ALLOC_FAILED bytes=%u\n",
+               PANE_BLOCK_IO_BLOCK_SIZE_BYTES);
+        if (pane_block_shared_buffer)
+            memunmap(pane_block_shared_buffer);
+        pane_block_shared_buffer = NULL;
+        return -ENOMEM;
+    }
+    pane_block_serial_log("PANE_BLOCK_BOUNCE_ALLOC_OK");
+
     pane_block_major = register_blkdev(0, PANE_BLOCK_DRIVER_NAME);
     if (pane_block_major <= 0) {
         pr_err(PANE_BLOCK_DRIVER_NAME
                ": PANE_BLOCK_REGISTER_BLKDEV_FAILED ret=%d\n",
                pane_block_major);
+        vfree(pane_block_bounce_buffer);
+        pane_block_bounce_buffer = NULL;
         if (pane_block_shared_buffer)
             memunmap(pane_block_shared_buffer);
         pane_block_shared_buffer = NULL;
@@ -6007,6 +6030,8 @@ static int __init pane_block_init(void)
         pr_err(PANE_BLOCK_DRIVER_NAME
                ": PANE_BLOCK_INIT_BASE_DISK_FAILED ret=%d\n", ret);
         unregister_blkdev(pane_block_major, PANE_BLOCK_DRIVER_NAME);
+        vfree(pane_block_bounce_buffer);
+        pane_block_bounce_buffer = NULL;
         if (pane_block_shared_buffer)
             memunmap(pane_block_shared_buffer);
         pane_block_shared_buffer = NULL;
@@ -6019,6 +6044,8 @@ static int __init pane_block_init(void)
                ": PANE_BLOCK_INIT_USER_DISK_FAILED ret=%d\n", ret);
         pane_block_destroy_disk(0);
         unregister_blkdev(pane_block_major, PANE_BLOCK_DRIVER_NAME);
+        vfree(pane_block_bounce_buffer);
+        pane_block_bounce_buffer = NULL;
         if (pane_block_shared_buffer)
             memunmap(pane_block_shared_buffer);
         pane_block_shared_buffer = NULL;
@@ -6037,6 +6064,8 @@ static void __exit pane_block_exit(void)
     pane_block_destroy_disk(0);
     if (pane_block_major > 0)
         unregister_blkdev(pane_block_major, PANE_BLOCK_DRIVER_NAME);
+    vfree(pane_block_bounce_buffer);
+    pane_block_bounce_buffer = NULL;
     if (pane_block_shared_buffer)
         memunmap(pane_block_shared_buffer);
     pane_block_shared_buffer = NULL;
@@ -7640,7 +7669,6 @@ fn linux_guest_mapped_regions(
                     | "bios-data"
                     | "bios-rom"
                     | "legacy-rom"
-                    | "mmio-stub"
                     | "storage-contract"
                     | "block-dma"
                     | "framebuffer"
@@ -7788,8 +7816,6 @@ fn augment_kernel_cmdline_for_runtime_contracts(
     append_kernel_arg(&mut cmdline, "i8042.noaux".to_string());
     append_kernel_arg(&mut cmdline, "acpi=off".to_string());
     append_kernel_arg(&mut cmdline, "pci=off".to_string());
-    append_kernel_arg(&mut cmdline, "noapic".to_string());
-    append_kernel_arg(&mut cmdline, "nolapic".to_string());
     if let Some(storage) = storage {
         append_kernel_arg(
             &mut cmdline,
@@ -14470,12 +14496,12 @@ mod tests {
                 && region.writable
                 && region.executable
         }));
-        assert!(regions.iter().any(|region| {
-            region.label == "linux-local-apic-mmio"
-                && region.guest_gpa == 0xfee0_0000
-                && region.writable
-                && !region.executable
-        }));
+        assert!(!regions
+            .iter()
+            .any(|region| region.label == "linux-local-apic-mmio"));
+        assert!(!regions
+            .iter()
+            .any(|region| region.label == "linux-io-apic-mmio"));
         assert!(regions.iter().any(|region| {
             region.label == "pane-framebuffer"
                 && region.guest_gpa == 0x0e00_0000
@@ -15244,6 +15270,7 @@ mod tests {
         assert!(build_script.contains("-o \"$workdir/init\" pane-init.c"));
         assert!(build_script.contains("pane-port-probe"));
         assert!(build_script.contains("pane-block.ko"));
+        assert!(init_source.contains("trust_submit_completion=1"));
         let block_driver =
             std::fs::read_to_string(paths.initramfs_driver_dir.join("pane-block.c")).unwrap();
         assert!(block_driver.contains("PANE_BLOCK_DRIVER_NAME \"pane_block\""));
@@ -15256,6 +15283,18 @@ mod tests {
         assert!(block_driver.contains("shared_buffer_gpa"));
         assert!(block_driver.contains("pane_block_shared_buffer"));
         assert!(block_driver.contains("PANE_BLOCK_SHARED_BUFFER_OK"));
+        assert!(block_driver.contains("trust_submit_completion"));
+        assert!(block_driver.contains("module_param(trust_submit_completion, bool, 0444)"));
+        assert!(block_driver.contains("if (!trust_submit_completion)"));
+        assert!(block_driver.contains("pane_block_serial_log"));
+        assert!(block_driver.contains("PANE_BLOCK_TRANSFER_SUBMITTED"));
+        assert!(block_driver.contains("PANE_BLOCK_READ_DMA_COPIED"));
+        assert!(block_driver.contains("PANE_BLOCK_REQUEST_ACTIVE"));
+        assert!(block_driver.contains("PANE_BLOCK_BOUNCE_ALLOC_OK"));
+        assert!(block_driver.contains("PANE_BLOCK_BOUNCE_READY"));
+        assert!(block_driver.contains("pane_block_bounce_buffer"));
+        assert!(block_driver.contains("queue_depth = 1"));
+        assert!(block_driver.contains("PANE_BLOCK_REQUEST_END_OK"));
         assert!(block_driver.contains("memremap((phys_addr_t)shared_buffer_gpa"));
         assert!(block_driver.contains("outl((u32)(block_index & 0xffffffff)"));
         assert!(block_driver
@@ -15283,12 +15322,11 @@ mod tests {
         assert!(block_driver.contains("PANE_BLOCK_REGISTER_BLKDEV_OK"));
         assert!(block_driver.contains("PANE_BLOCK_CREATE_DISK_START"));
         assert!(block_driver.contains("PANE_BLOCK_ADD_DISK_START"));
-        assert!(block_driver.contains("PANE_BLOCK_TRANSFER_START"));
-        assert!(block_driver.contains("PANE_BLOCK_SUBMIT_DONE"));
         assert!(block_driver.contains("PANE_BLOCK_STATUS_READ"));
         assert!(block_driver.contains("pane_block_wait_serviced(log_transfer)"));
         assert!(block_driver.contains("log_transfer || status != PANE_BLOCK_STATUS_SERVICED"));
-        assert!(block_driver.contains("PANE_BLOCK_TRANSFER_DONE"));
+        assert!(block_driver.contains("bool log_transfer = false"));
+        assert!(block_driver.contains("PANE_BLOCK_TRANSFER_WAIT_FAILED"));
         assert!(block_driver.contains("/dev/pane0"));
         assert!(block_driver.contains("/dev/pane1"));
         let block_build_script = std::fs::read_to_string(
@@ -15922,8 +15960,8 @@ mod tests {
         assert!(layout.cmdline.contains("i8042.noaux"));
         assert!(layout.cmdline.contains("acpi=off"));
         assert!(layout.cmdline.contains("pci=off"));
-        assert!(layout.cmdline.contains("noapic"));
-        assert!(layout.cmdline.contains("nolapic"));
+        assert!(!layout.cmdline.contains("noapic"));
+        assert!(!layout.cmdline.contains("nolapic"));
         assert_eq!(
             layout
                 .cmdline
@@ -15982,6 +16020,12 @@ mod tests {
         assert!(mapped_regions
             .iter()
             .any(|region| region.label == "pane-block-dma" && region.guest_gpa == 0x0dfd_0000));
+        assert!(!mapped_regions
+            .iter()
+            .any(|region| region.label.contains("local-apic-mmio")));
+        assert!(!mapped_regions
+            .iter()
+            .any(|region| region.label.contains("io-apic-mmio")));
         let storage_contract = mapped_regions
             .iter()
             .find(|region| region.label == "pane-storage-contract")

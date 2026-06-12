@@ -31,3 +31,5 @@ The product target is still a Pane-owned app that boots and renders Arch without
 5. Promote display/input from fixed contracts to virtio-gpu/input-inspired app rendering.
 
 The CLI command `pane native-foundation` prints the current machine-readable version of this contract.
+
+Current implementation status: `pane native-kernel-plan --materialize` emits a `linux_loader` adapter/provenance record inside `kernel-boot-layout.json`. That record deliberately marks the adapter as `adapter-boundary-not-yet-linked`: Pane has created the seam and readiness gate, but has not yet linked the `linux-loader` crate directly. The next implementation step is replacing the manual boot-params writer behind that seam with the crate-backed adapter.

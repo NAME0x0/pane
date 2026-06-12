@@ -537,6 +537,8 @@ struct KernelBootLayout {
     schema_version: u32,
     layout_kind: String,
     session_name: String,
+    #[serde(default = "legacy_linux_loader_adapter_plan")]
+    linux_loader: LinuxLoaderAdapterPlan,
     boot_params_gpa: String,
     cmdline_gpa: String,
     kernel_load_gpa: String,
@@ -568,6 +570,25 @@ struct KernelBootLayout {
     framebuffer: Option<FramebufferContract>,
     input: Option<InputContract>,
     materialized_at_epoch_seconds: Option<u64>,
+    notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct LinuxLoaderAdapterPlan {
+    schema_version: u32,
+    adapter_kind: String,
+    source_crate: String,
+    candidate_crate_version: Option<String>,
+    license: String,
+    source_url: String,
+    adoption_state: String,
+    applicable: bool,
+    kernel_format: String,
+    linux_boot_protocol: Option<String>,
+    kernel_loader: String,
+    cmdline_loader: String,
+    boot_params_writer: String,
+    guest_memory_backend: String,
     notes: Vec<String>,
 }
 
@@ -8056,6 +8077,78 @@ fn build_linux_boot_params_page(
     Ok(boot_params)
 }
 
+fn linux_loader_adapter_plan(
+    kernel_format: &str,
+    linux_boot_protocol: Option<&str>,
+) -> LinuxLoaderAdapterPlan {
+    let applicable = kernel_format == "linux-bzimage";
+    LinuxLoaderAdapterPlan {
+        schema_version: 1,
+        adapter_kind: "pane-linux-loader-adapter-v1".to_string(),
+        source_crate: "rust-vmm/linux-loader".to_string(),
+        candidate_crate_version: Some("0.13.2".to_string()),
+        license: "Apache-2.0 OR BSD-3-Clause".to_string(),
+        source_url: "https://github.com/rust-vmm/linux-loader".to_string(),
+        adoption_state: "adapter-boundary-not-yet-linked".to_string(),
+        applicable,
+        kernel_format: kernel_format.to_string(),
+        linux_boot_protocol: linux_boot_protocol.map(ToOwned::to_owned),
+        kernel_loader: if applicable {
+            "bzImage loader semantics"
+        } else {
+            "not-applicable"
+        }
+        .to_string(),
+        cmdline_loader: if applicable {
+            "load_cmdline-compatible placement"
+        } else {
+            "not-applicable"
+        }
+        .to_string(),
+        boot_params_writer: if applicable {
+            "LinuxBootConfigurator-compatible boot_params page"
+        } else {
+            "not-applicable"
+        }
+        .to_string(),
+        guest_memory_backend: if applicable {
+            "Pane WHP guest memory, planned vm-memory compatibility"
+        } else {
+            "Pane controlled serial candidate memory"
+        }
+        .to_string(),
+        notes: vec![
+            "This record is the narrow seam for replacing Pane's manual bzImage setup with rust-vmm/linux-loader primitives."
+                .to_string(),
+            "Layouts without this current adapter record are stale and must be rematerialized before WHP execution."
+                .to_string(),
+        ],
+    }
+}
+
+fn legacy_linux_loader_adapter_plan() -> LinuxLoaderAdapterPlan {
+    LinuxLoaderAdapterPlan {
+        schema_version: 0,
+        adapter_kind: "legacy-manual-linux-boot-layout".to_string(),
+        source_crate: "none".to_string(),
+        candidate_crate_version: None,
+        license: "not-applicable".to_string(),
+        source_url: String::new(),
+        adoption_state: "legacy-layout-rematerialize-required".to_string(),
+        applicable: false,
+        kernel_format: "unknown".to_string(),
+        linux_boot_protocol: None,
+        kernel_loader: "manual".to_string(),
+        cmdline_loader: "manual".to_string(),
+        boot_params_writer: "manual".to_string(),
+        guest_memory_backend: "Pane WHP guest memory".to_string(),
+        notes: vec![
+            "This layout predates the linux-loader adapter boundary and is intentionally not ready for WHP execution."
+                .to_string(),
+        ],
+    }
+}
+
 fn copy_linux_setup_header_to_boot_params(
     boot_params: &mut [u8],
     kernel_bytes: &[u8],
@@ -8445,6 +8538,10 @@ fn build_kernel_boot_layout(
     }
 
     let is_linux_bzimage = metadata.kernel_format == "linux-bzimage";
+    let linux_loader = linux_loader_adapter_plan(
+        &metadata.kernel_format,
+        metadata.linux_boot_protocol.as_deref(),
+    );
     let linux_entry_point_gpa = is_linux_bzimage.then(|| metadata.kernel_load_gpa.clone());
     let linux_boot_params_register = is_linux_bzimage.then(|| "rsi".to_string());
     let linux_expected_entry_mode = is_linux_bzimage.then(|| "x86-protected-mode-32".to_string());
@@ -8496,6 +8593,7 @@ fn build_kernel_boot_layout(
         schema_version: 1,
         layout_kind: "pane-linux-kernel-boot-layout-v1".to_string(),
         session_name: session_name.to_string(),
+        linux_loader,
         boot_params_gpa: "0x00007000".to_string(),
         cmdline_gpa: "0x00020000".to_string(),
         kernel_load_gpa: metadata.kernel_load_gpa,
@@ -9647,10 +9745,15 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
             } else {
                 Vec::new()
             };
+            let expected_linux_loader = linux_loader_adapter_plan(
+                &metadata.kernel_format,
+                metadata.linux_boot_protocol.as_deref(),
+            );
 
             kernel_boot_plan_ready
                 && layout.schema_version == 1
                 && layout.layout_kind == "pane-linux-kernel-boot-layout-v1"
+                && layout.linux_loader == expected_linux_loader
                 && layout.boot_params_gpa == "0x00007000"
                 && layout.cmdline_gpa == "0x00020000"
                 && layout.kernel_load_gpa == metadata.kernel_load_gpa
@@ -12778,6 +12881,8 @@ fn print_native_kernel_plan_report(report: &NativeKernelPlanReport) {
     if let Some(layout) = &report.layout {
         println!("Layout");
         println!("  Kernel         {}", layout.kernel_path);
+        println!("  Loader Adapter {}", layout.linux_loader.source_crate);
+        println!("  Loader State   {}", layout.linux_loader.adoption_state);
         println!("  Kernel GPA     {}", layout.kernel_load_gpa);
         println!("  Boot Params    {}", layout.boot_params_gpa);
         println!("  Cmdline GPA    {}", layout.cmdline_gpa);
@@ -13592,7 +13697,8 @@ mod tests {
         execute_native_block_io_command, export_user_disk_package, format_doctor_blockers,
         import_user_disk_package, initialize_managed_arch_environment, input_queue_page_bytes,
         inspect_kernel_image_artifact, inspect_workspace, inventory_contains_distro,
-        kernel_layout_execution_image, linux_guest_mapped_regions,
+        kernel_layout_execution_image, legacy_linux_loader_adapter_plan,
+        linux_guest_mapped_regions, linux_loader_adapter_plan,
         load_kernel_layout_boot_image_artifact, load_verified_pane_block_module_metadata,
         pane_block_device_blocks, pane_block_driver_abi_sha256,
         pane_initramfs_expected_serial_milestones, parse_guest_physical_address,
@@ -14128,6 +14234,16 @@ mod tests {
 
         let layout = build_kernel_boot_layout(&paths, "pane", true).unwrap();
         assert_eq!(layout.layout_kind, "pane-linux-kernel-boot-layout-v1");
+        assert_eq!(layout.linux_loader.source_crate, "rust-vmm/linux-loader");
+        assert_eq!(
+            layout.linux_loader.candidate_crate_version.as_deref(),
+            Some("0.13.2")
+        );
+        assert_eq!(
+            layout.linux_loader.adoption_state,
+            "adapter-boundary-not-yet-linked"
+        );
+        assert!(layout.linux_loader.applicable);
         assert_eq!(layout.boot_params_gpa, "0x00007000");
         assert_eq!(layout.cmdline_gpa, "0x00020000");
         assert_eq!(layout.kernel_load_gpa, "0x00100000");
@@ -14200,6 +14316,13 @@ mod tests {
         assert!(artifacts.kernel_boot_layout_exists);
         assert!(artifacts.kernel_boot_layout_ready);
 
+        let mut stale_layout = layout;
+        stale_layout.linux_loader = legacy_linux_loader_adapter_plan();
+        write_json_file(&paths.kernel_boot_layout, &stale_layout).unwrap();
+        let artifacts = build_runtime_artifact_report(&paths);
+        assert!(artifacts.kernel_boot_layout_exists);
+        assert!(!artifacts.kernel_boot_layout_ready);
+
         let _ = std::fs::remove_dir_all(&paths.root);
     }
 
@@ -14258,6 +14381,7 @@ mod tests {
             schema_version: 1,
             layout_kind: "pane-linux-kernel-boot-layout-v1".to_string(),
             session_name: "pane".to_string(),
+            linux_loader: linux_loader_adapter_plan("linux-bzimage", Some("0x020f")),
             boot_params_gpa: "0x00007000".to_string(),
             cmdline_gpa: "0x00020000".to_string(),
             kernel_load_gpa: "0x00100000".to_string(),
@@ -14389,6 +14513,7 @@ mod tests {
             schema_version: 1,
             layout_kind: "pane-linux-kernel-boot-layout-v1".to_string(),
             session_name: "pane".to_string(),
+            linux_loader: linux_loader_adapter_plan("linux-bzimage", Some("0x020f")),
             boot_params_gpa: "0x00007000".to_string(),
             cmdline_gpa: "0x00020000".to_string(),
             kernel_load_gpa: "0x00100000".to_string(),
@@ -14435,6 +14560,7 @@ mod tests {
             schema_version: 1,
             layout_kind: "pane-linux-kernel-boot-layout-v1".to_string(),
             session_name: "pane".to_string(),
+            linux_loader: linux_loader_adapter_plan("linux-bzimage", Some("0x020f")),
             boot_params_gpa: "0x00007000".to_string(),
             cmdline_gpa: "0x00020000".to_string(),
             kernel_load_gpa: "0x00100000".to_string(),
@@ -14502,6 +14628,7 @@ mod tests {
             schema_version: 1,
             layout_kind: "pane-linux-kernel-boot-layout-v1".to_string(),
             session_name: "pane".to_string(),
+            linux_loader: linux_loader_adapter_plan("linux-bzimage", Some("0x020f")),
             boot_params_gpa: "0x00007000".to_string(),
             cmdline_gpa: "0x00020000".to_string(),
             kernel_load_gpa: "0x00100000".to_string(),

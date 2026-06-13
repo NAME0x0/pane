@@ -490,7 +490,7 @@ pub(crate) fn pane_virtio_mmio_window() -> PaneVirtioMmioWindow {
             id: "vda",
             virtio_device_id: VIRTIO_DEVICE_ID_BLOCK,
             purpose: "read-only Arch base disk first, then writable user disk queue support",
-            status: "descriptor-chain-execution-ready-whp-mmio-wiring-pending",
+            status: "descriptor-chain-execution-ready-whp-emulator-wiring-pending",
         },
         future_devices: vec![
             PaneVirtioDeviceSummary {

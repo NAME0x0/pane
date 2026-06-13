@@ -16,6 +16,13 @@ const REQUIRED_WHP_EXPORTS: &[&str] = &[
     "WHvMapGpaRange",
     "WHvUnmapGpaRange",
 ];
+
+const REQUIRED_WHP_EMULATOR_EXPORTS: &[&str] = &[
+    "WHvEmulatorCreateEmulator",
+    "WHvEmulatorDestroyEmulator",
+    "WHvEmulatorTryIoEmulation",
+    "WHvEmulatorTryMmioEmulation",
+];
 pub(crate) const SERIAL_BOOT_BANNER_TEXT: &str = "PANE_BOOT_OK\n";
 pub(crate) const SERIAL_BOOT_TEST_IMAGE_SIZE: usize = 4096;
 pub(crate) const LINUX_BOOT_GDT_GPA: u64 = 0x0000_8000;
@@ -639,6 +646,13 @@ pub(crate) struct WhpPreflightReport {
     pub(crate) hypervisor_present: Option<bool>,
     pub(crate) get_capability_hresult: Option<String>,
     pub(crate) required_exports: Vec<NativeExportCheck>,
+    pub(crate) emulator: WhpEmulatorPreflightReport,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct WhpEmulatorPreflightReport {
+    pub(crate) dll_loaded: bool,
+    pub(crate) required_exports: Vec<NativeExportCheck>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -777,7 +791,14 @@ pub(crate) fn native_device_loop_report() -> NativeDeviceLoopReport {
                 id: "virtio-blk",
                 role: "standard Arch base/user disk backend",
                 backend: "pane-virtio-mmio-block-model-shaped-by-rust-vmm",
-                status: "descriptor-chain-execution-ready-whp-mmio-wiring-pending",
+                status: "descriptor-chain-execution-ready-whp-emulator-wiring-pending",
+                replacement_target: None,
+            },
+            NativeDeviceLoopDevice {
+                id: "whp-instruction-emulator",
+                role: "decode x64 MMIO/PIO instructions and advance the vCPU after callbacks",
+                backend: "WinHvEmulation.dll",
+                status: "preflighted-not-yet-created",
                 replacement_target: None,
             },
             NativeDeviceLoopDevice {
@@ -854,10 +875,17 @@ pub(crate) fn native_device_loop_report() -> NativeDeviceLoopReport {
             },
             NativeDeviceLoopRoute {
                 exit_reason: "memory-access",
-                selector: "virtio-mmio/framebuffer/input MMIO ranges",
-                handler: "virtio-mmio,display-surface,input-queue",
+                selector: "gpa=0x0dfc0000..0x0dfc0fff",
+                handler: "whp-instruction-emulator,virtio-mmio",
+                current_state: "route-classified-instruction-bytes-preserved",
+                target_state: "WHvEmulatorTryMmioEmulation-callback-services-register-or-queue-notify",
+            },
+            NativeDeviceLoopRoute {
+                exit_reason: "memory-access",
+                selector: "framebuffer/input MMIO ranges",
+                handler: "display-surface,input-queue",
                 current_state: "mostly blocker diagnostics plus mapped shared memory snapshots",
-                target_state: "MMIO bus dispatch for virtio queues and display/input surfaces",
+                target_state: "MMIO bus dispatch for display/input surfaces",
             },
             NativeDeviceLoopRoute {
                 exit_reason: "x64-cpuid",
@@ -889,13 +917,13 @@ pub(crate) fn native_device_loop_report() -> NativeDeviceLoopReport {
             },
         ],
         migration_blockers: vec![
-            "virtio queue notification is not yet wired from WHP memory exits to guest descriptor processing",
+            "WHP instruction-emulator callbacks are not yet wired to virtio-MMIO register access and queue notification",
             "display/input contracts are not yet app-rendered device backends",
             "legacy platform I/O side effects remain grouped in one compatibility object",
         ],
         next_steps: vec![
             "extract WHP exit dispatch into a DeviceLoop that returns explicit resume/stop actions",
-            "implement virtio-blk queue handling for vda/vdb and retire pane-block.ko as a boot dependency",
+            "create the WHP instruction emulator and route MMIO callbacks to the virtio-blk executor",
             "route framebuffer/input MMIO through typed display and input devices before building the app window renderer",
         ],
     }
@@ -1148,6 +1176,49 @@ fn build_native_host_preflight_report(
         },
     });
 
+    let missing_emulator_exports = whp
+        .emulator
+        .required_exports
+        .iter()
+        .filter(|export| !export.available)
+        .map(|export| export.symbol)
+        .collect::<Vec<_>>();
+
+    checks.push(NativePreflightCheck {
+        id: "whp-emulator",
+        status: if !windows_host {
+            NativePreflightStatus::Skipped
+        } else if whp.emulator.dll_loaded && missing_emulator_exports.is_empty() {
+            NativePreflightStatus::Pass
+        } else {
+            NativePreflightStatus::Fail
+        },
+        summary: if !windows_host {
+            "WHP instruction-emulator APIs are only probed on Windows hosts.".to_string()
+        } else if !whp.emulator.dll_loaded {
+            "WinHvEmulation.dll could not be loaded; Pane cannot safely emulate x64 MMIO instructions yet."
+                .to_string()
+        } else if missing_emulator_exports.is_empty() {
+            "WinHvEmulation.dll exposes the instruction-emulator APIs required for virtio-MMIO."
+                .to_string()
+        } else {
+            format!(
+                "Missing WHP instruction-emulator symbols: {}.",
+                missing_emulator_exports.join(", ")
+            )
+        },
+        remediation: if windows_host
+            && (!whp.emulator.dll_loaded || !missing_emulator_exports.is_empty())
+        {
+            Some(
+                "Update Windows and enable the Windows Hypervisor Platform feature set before using Pane's native virtio-MMIO path."
+                    .to_string(),
+            )
+        } else {
+            None
+        },
+    });
+
     checks.push(NativePreflightCheck {
         id: "whp-hypervisor-present",
         status: if !windows_host || !whp.dll_loaded || !whp.get_capability_available {
@@ -1232,6 +1303,13 @@ fn build_native_host_preflight_report(
 
 fn base_export_checks(available: bool) -> Vec<NativeExportCheck> {
     REQUIRED_WHP_EXPORTS
+        .iter()
+        .map(|symbol| NativeExportCheck { symbol, available })
+        .collect()
+}
+
+fn base_emulator_export_checks(available: bool) -> Vec<NativeExportCheck> {
+    REQUIRED_WHP_EMULATOR_EXPORTS
         .iter()
         .map(|symbol| NativeExportCheck { symbol, available })
         .collect()
@@ -1359,6 +1437,10 @@ fn probe_whp() -> WhpPreflightReport {
         hypervisor_present: None,
         get_capability_hresult: None,
         required_exports: base_export_checks(false),
+        emulator: WhpEmulatorPreflightReport {
+            dll_loaded: false,
+            required_exports: base_emulator_export_checks(false),
+        },
     }
 }
 
@@ -1398,6 +1480,10 @@ pub(crate) fn test_native_host_report(ready: bool) -> NativeHostPreflightReport 
         hypervisor_present: Some(ready),
         get_capability_hresult: Some("0x00000000".to_string()),
         required_exports: base_export_checks(ready),
+        emulator: WhpEmulatorPreflightReport {
+            dll_loaded: ready,
+            required_exports: base_emulator_export_checks(ready),
+        },
     };
 
     build_native_host_preflight_report("windows".to_string(), "x86_64".to_string(), true, true, whp)
@@ -1415,13 +1501,15 @@ mod windows_whp {
     };
 
     use super::{
-        base_export_checks, NativeBlockIoHandler, NativeBlockIoTraceEntry,
-        NativeBlockIoTraceReport, NativeExportCheck, NativeFramebufferSnapshotReport,
-        NativeGuestEntryMode, NativeGuestMemoryRegion, NativeGuestRegionReport,
-        NativeInputQueueSnapshotReport, NativePartitionSmokeReport, NativePartitionSmokeStatus,
-        NativeSerialBootImage, NativeWhpCallReport, WhpPreflightReport, LINUX_BOOT_CODE_SELECTOR,
-        LINUX_BOOT_DATA_SELECTOR, LINUX_BOOT_GDT_GPA, LINUX_BOOT_STACK_GPA, REQUIRED_WHP_EXPORTS,
-        SERIAL_BOOT_BANNER_TEXT, SERIAL_BOOT_TEST_IMAGE_SIZE,
+        base_emulator_export_checks, base_export_checks, NativeBlockIoHandler,
+        NativeBlockIoTraceEntry, NativeBlockIoTraceReport, NativeExportCheck,
+        NativeFramebufferSnapshotReport, NativeGuestEntryMode, NativeGuestMemoryRegion,
+        NativeGuestRegionReport, NativeInputQueueSnapshotReport, NativePartitionSmokeReport,
+        NativePartitionSmokeStatus, NativeSerialBootImage, NativeWhpCallReport,
+        WhpEmulatorPreflightReport, WhpPreflightReport, LINUX_BOOT_CODE_SELECTOR,
+        LINUX_BOOT_DATA_SELECTOR, LINUX_BOOT_GDT_GPA, LINUX_BOOT_STACK_GPA,
+        REQUIRED_WHP_EMULATOR_EXPORTS, REQUIRED_WHP_EXPORTS, SERIAL_BOOT_BANNER_TEXT,
+        SERIAL_BOOT_TEST_IMAGE_SIZE,
     };
     use crate::native::{
         native_block_io_exit_can_resume, pane_block_io_access_mask, pane_block_io_port_offset,
@@ -1525,6 +1613,8 @@ mod windows_whp {
     const VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET: usize = 10;
     const VP_CONTEXT_RIP_OFFSET: usize = 32;
     const MEMORY_CONTEXT_OFFSET: usize = 48;
+    const MEMORY_INSTRUCTION_LENGTH_OFFSET: usize = MEMORY_CONTEXT_OFFSET;
+    const MEMORY_INSTRUCTION_BYTES_OFFSET: usize = MEMORY_CONTEXT_OFFSET + 4;
     const MEMORY_ACCESS_INFO_OFFSET: usize = MEMORY_CONTEXT_OFFSET + 20;
     const MEMORY_GPA_OFFSET: usize = MEMORY_CONTEXT_OFFSET + 24;
     const MEMORY_GVA_OFFSET: usize = MEMORY_CONTEXT_OFFSET + 32;
@@ -1688,6 +1778,7 @@ mod windows_whp {
         unsafe {
             let library_name = CString::new("WinHvPlatform.dll").expect("static string");
             let module = LoadLibraryA(library_name.as_ptr());
+            let emulator = probe_whp_emulator();
             if module.is_null() {
                 return WhpPreflightReport {
                     dll_loaded: false,
@@ -1695,6 +1786,7 @@ mod windows_whp {
                     hypervisor_present: None,
                     get_capability_hresult: None,
                     required_exports: base_export_checks(false),
+                    emulator,
                 };
             }
 
@@ -1736,7 +1828,34 @@ mod windows_whp {
                 hypervisor_present,
                 get_capability_hresult,
                 required_exports,
+                emulator,
             }
+        }
+    }
+
+    unsafe fn probe_whp_emulator() -> WhpEmulatorPreflightReport {
+        let library_name = CString::new("WinHvEmulation.dll").expect("static string");
+        let module = LoadLibraryA(library_name.as_ptr());
+        if module.is_null() {
+            return WhpEmulatorPreflightReport {
+                dll_loaded: false,
+                required_exports: base_emulator_export_checks(false),
+            };
+        }
+
+        let required_exports = REQUIRED_WHP_EMULATOR_EXPORTS
+            .iter()
+            .map(|symbol| NativeExportCheck {
+                symbol,
+                available: get_proc_address(module, symbol).is_some(),
+            })
+            .collect::<Vec<_>>();
+
+        FreeLibrary(module);
+
+        WhpEmulatorPreflightReport {
+            dll_loaded: true,
+            required_exports,
         }
     }
 
@@ -2920,6 +3039,7 @@ mod windows_whp {
                     gva_valid,
                     gpa,
                     gva,
+                    ..
                 } => {
                     report.calls.push(NativeWhpCallReport {
                         name: "LinuxMemoryAccessBlocker",
@@ -3617,6 +3737,7 @@ mod windows_whp {
                     gva_valid,
                     gpa,
                     gva,
+                    ..
                 } => {
                     report.calls.push(NativeWhpCallReport {
                         name: "SerialMemoryAccessBlocker",
@@ -6460,6 +6581,9 @@ mod windows_whp {
 
     enum DecodedExit {
         MemoryAccess {
+            instruction_length: u8,
+            instruction_bytes: Vec<u8>,
+            rip: u64,
             access_type: u32,
             gpa_unmapped: bool,
             gva_valid: bool,
@@ -6553,19 +6677,37 @@ mod windows_whp {
                 handler: "legacy-platform-io",
                 action: "try-emulate-or-stop",
             },
-            DecodedExit::MemoryAccess { gpa, .. }
+            DecodedExit::MemoryAccess {
+                instruction_length,
+                instruction_bytes,
+                rip,
+                gpa,
+                ..
+            }
                 if crate::virtio::pane_virtio_mmio_contains_gpa(*gpa) =>
             {
                 NativeDeviceDispatchDecision {
                     exit_reason: "memory-access",
-                    selector: format!("gpa=0x{gpa:016x} virtio-mmio"),
+                    selector: format!(
+                        "rip=0x{rip:016x} len={instruction_length} instruction={} gpa=0x{gpa:016x} virtio-mmio",
+                        hex_bytes(instruction_bytes)
+                    ),
                     handler: "virtio-mmio",
                     action: "dispatch-virtio-mmio-register-or-queue-notify",
                 }
             }
-            DecodedExit::MemoryAccess { gpa, .. } => NativeDeviceDispatchDecision {
+            DecodedExit::MemoryAccess {
+                instruction_length,
+                instruction_bytes,
+                rip,
+                gpa,
+                ..
+            } => NativeDeviceDispatchDecision {
                 exit_reason: "memory-access",
-                selector: format!("gpa=0x{gpa:016x}"),
+                selector: format!(
+                    "rip=0x{rip:016x} len={instruction_length} instruction={} gpa=0x{gpa:016x}",
+                    hex_bytes(instruction_bytes)
+                ),
                 handler: "display-surface,input-queue,virtio-mmio",
                 action: "dispatch-mmio-or-report-blocker",
             },
@@ -6623,6 +6765,13 @@ mod windows_whp {
         report.exit_reason_label = Some(exit_reason_label(exit_reason).to_string());
 
         if exit_reason == WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS {
+            let instruction_length = exit_context[MEMORY_INSTRUCTION_LENGTH_OFFSET].min(16);
+            let instruction_bytes = read_fixed_bytes(
+                exit_context,
+                MEMORY_INSTRUCTION_BYTES_OFFSET,
+                instruction_length,
+            );
+            let rip = read_u64(exit_context, VP_CONTEXT_RIP_OFFSET);
             let access_info = read_u32(exit_context, MEMORY_ACCESS_INFO_OFFSET);
             let access_type = access_info & 0x3;
             let gpa_unmapped = ((access_info >> 2) & 0x1) == 0x1;
@@ -6634,8 +6783,9 @@ mod windows_whp {
                 hresult: None,
                 ok: false,
                 detail: format!(
-                    "Guest memory access type={} gpa=0x{gpa:016x} gva={} unmapped={gpa_unmapped}.",
+                    "Guest memory access type={} rip=0x{rip:016x} instruction={} gpa=0x{gpa:016x} gva={} unmapped={gpa_unmapped}.",
                     memory_access_type_label(access_type),
+                    hex_bytes(&instruction_bytes),
                     if gva_valid {
                         format!("0x{gva:016x}")
                     } else {
@@ -6644,6 +6794,9 @@ mod windows_whp {
                 ),
             });
             DecodedExit::MemoryAccess {
+                instruction_length,
+                instruction_bytes,
+                rip,
                 access_type,
                 gpa_unmapped,
                 gva_valid,
@@ -6828,6 +6981,23 @@ mod windows_whp {
         ])
     }
 
+    fn read_fixed_bytes(bytes: &[u8], offset: usize, len: u8) -> Vec<u8> {
+        bytes
+            .get(offset..offset.saturating_add(usize::from(len)))
+            .map_or_else(Vec::new, |slice| slice.to_vec())
+    }
+
+    fn hex_bytes(bytes: &[u8]) -> String {
+        if bytes.is_empty() {
+            return "<none>".to_string();
+        }
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     #[cfg(test)]
     mod tests {
         use super::{
@@ -6852,7 +7022,8 @@ mod windows_whp {
             LINUX_ENTRY_PROBE_EXIT_BUDGET, LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET,
             LINUX_ENTRY_PROBE_STORAGE_TOTAL_BUDGET_SECONDS, LINUX_ENTRY_PROBE_TOTAL_BUDGET_SECONDS,
             LINUX_ENTRY_PROBE_TRACE_HEAD, LINUX_ENTRY_PROBE_TRACE_TAIL, MEMORY_ACCESS_INFO_OFFSET,
-            MEMORY_GPA_OFFSET, MEMORY_GVA_OFFSET, MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET,
+            MEMORY_GPA_OFFSET, MEMORY_GVA_OFFSET, MEMORY_INSTRUCTION_BYTES_OFFSET,
+            MEMORY_INSTRUCTION_LENGTH_OFFSET, MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET,
             MSR_RAX_OFFSET, MSR_RDX_OFFSET, PCI_CONFIG_ADDRESS_PORT, PCI_CONFIG_DATA_START_PORT,
             PIC1_COMMAND_PORT, PIC1_DATA_PORT, PIC2_COMMAND_PORT, PIC2_DATA_PORT,
             PIT_CHANNEL0_PORT, PIT_COMMAND_PORT, POST_DELAY_PORT, PS2_DATA_PORT,
@@ -7636,6 +7807,9 @@ mod windows_whp {
         #[test]
         fn native_device_dispatch_classifies_control_timer_and_mmio_routes() {
             let memory = native_device_dispatch_decision(&DecodedExit::MemoryAccess {
+                instruction_length: 3,
+                instruction_bytes: vec![0x89, 0x18, 0x90],
+                rip: 0x1000,
                 access_type: 1,
                 gpa_unmapped: true,
                 gva_valid: false,
@@ -7643,6 +7817,9 @@ mod windows_whp {
                 gva: 0,
             });
             let virtio_mmio = native_device_dispatch_decision(&DecodedExit::MemoryAccess {
+                instruction_length: 3,
+                instruction_bytes: vec![0x89, 0x18, 0x90],
+                rip: 0x1000,
                 access_type: 1,
                 gpa_unmapped: false,
                 gva_valid: true,
@@ -8424,6 +8601,11 @@ mod windows_whp {
         fn decodes_memory_access_exit_with_guest_addresses() {
             let mut exit_context = [0_u8; 128];
             exit_context[..4].copy_from_slice(&WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS.to_le_bytes());
+            exit_context[VP_CONTEXT_RIP_OFFSET..VP_CONTEXT_RIP_OFFSET + 8]
+                .copy_from_slice(&0x0000_0000_0010_0040_u64.to_le_bytes());
+            exit_context[MEMORY_INSTRUCTION_LENGTH_OFFSET] = 3;
+            exit_context[MEMORY_INSTRUCTION_BYTES_OFFSET..MEMORY_INSTRUCTION_BYTES_OFFSET + 3]
+                .copy_from_slice(&[0x89, 0x18, 0x90]);
             let access_info = 1_u32 | (1 << 2) | (1 << 3);
             exit_context[MEMORY_ACCESS_INFO_OFFSET..MEMORY_ACCESS_INFO_OFFSET + 4]
                 .copy_from_slice(&access_info.to_le_bytes());
@@ -8435,12 +8617,18 @@ mod windows_whp {
 
             match decode_exit_context(&exit_context, &mut report) {
                 DecodedExit::MemoryAccess {
+                    instruction_length,
+                    instruction_bytes,
+                    rip,
                     access_type,
                     gpa_unmapped,
                     gva_valid,
                     gpa,
                     gva,
                 } => {
+                    assert_eq!(instruction_length, 3);
+                    assert_eq!(instruction_bytes, vec![0x89, 0x18, 0x90]);
+                    assert_eq!(rip, 0x0000_0000_0010_0040);
                     assert_eq!(access_type, 1);
                     assert!(gpa_unmapped);
                     assert!(gva_valid);
@@ -8452,6 +8640,7 @@ mod windows_whp {
             assert!(report.calls.iter().any(|call| {
                 call.name == "DecodeMemoryAccess"
                     && call.detail.contains("write")
+                    && call.detail.contains("89 18 90")
                     && call.detail.contains("0x00000000fee00000")
             }));
         }
@@ -8461,9 +8650,10 @@ mod windows_whp {
 #[cfg(test)]
 mod tests {
     use super::{
-        base_export_checks, build_native_host_preflight_report, native_device_loop_report,
-        run_partition_smoke, NativeGuestEntryMode, NativePartitionSmokeStatus,
-        NativePreflightStatus, NativeSerialBootImage, WhpPreflightReport, SERIAL_BOOT_BANNER_TEXT,
+        base_emulator_export_checks, base_export_checks, build_native_host_preflight_report,
+        native_device_loop_report, run_partition_smoke, NativeGuestEntryMode,
+        NativePartitionSmokeStatus, NativePreflightStatus, NativeSerialBootImage,
+        WhpEmulatorPreflightReport, WhpPreflightReport, SERIAL_BOOT_BANNER_TEXT,
     };
 
     fn whp_report(
@@ -8477,6 +8667,10 @@ mod tests {
             hypervisor_present,
             get_capability_hresult: hypervisor_present.map(|_| "0x00000000".to_string()),
             required_exports: base_export_checks(exports_available),
+            emulator: WhpEmulatorPreflightReport {
+                dll_loaded: exports_available,
+                required_exports: base_emulator_export_checks(exports_available),
+            },
         }
     }
 
@@ -8549,6 +8743,26 @@ mod tests {
     }
 
     #[test]
+    fn missing_whp_emulator_is_a_blocker_for_native_mmio() {
+        let mut whp = whp_report(true, true, Some(true));
+        whp.emulator.dll_loaded = false;
+        whp.emulator.required_exports = base_emulator_export_checks(false);
+
+        let report = build_native_host_preflight_report(
+            "windows".to_string(),
+            "x86_64".to_string(),
+            true,
+            true,
+            whp,
+        );
+
+        assert!(!report.ready_for_boot_spike);
+        assert!(report.checks.iter().any(|check| check.id == "whp-emulator"
+            && check.status == NativePreflightStatus::Fail
+            && check.summary.contains("WinHvEmulation.dll")));
+    }
+
+    #[test]
     fn native_device_loop_declares_crosvm_rust_vmm_direction() {
         let report = native_device_loop_report();
 
@@ -8559,6 +8773,10 @@ mod tests {
             .iter()
             .any(|source| *source == "rust-vmm/vm-virtio"));
         assert!(report.reference_architecture.contains("crosvm"));
+        assert!(report
+            .routes
+            .iter()
+            .any(|route| route.handler.contains("whp-instruction-emulator")));
         assert!(report
             .next_steps
             .iter()
@@ -8583,7 +8801,7 @@ mod tests {
         assert_eq!(pane_block.replacement_target, Some("virtio-blk"));
         assert_eq!(
             virtio_block.status,
-            "descriptor-chain-execution-ready-whp-mmio-wiring-pending"
+            "descriptor-chain-execution-ready-whp-emulator-wiring-pending"
         );
         assert_eq!(report.mmio_window.base_gpa, "0x0dfc0000");
         assert_eq!(report.mmio_window.primary_device.id, "vda");

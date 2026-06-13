@@ -719,6 +719,187 @@ pub(crate) struct NativePartitionSmokeReport {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub(crate) struct NativeDeviceLoopReport {
+    pub(crate) strategy: &'static str,
+    pub(crate) reference_architecture: &'static str,
+    pub(crate) source_crates: Vec<&'static str>,
+    pub(crate) active_boundary: &'static str,
+    pub(crate) adoption_state: &'static str,
+    pub(crate) devices: Vec<NativeDeviceLoopDevice>,
+    pub(crate) routes: Vec<NativeDeviceLoopRoute>,
+    pub(crate) migration_blockers: Vec<&'static str>,
+    pub(crate) next_steps: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct NativeDeviceLoopDevice {
+    pub(crate) id: &'static str,
+    pub(crate) role: &'static str,
+    pub(crate) backend: &'static str,
+    pub(crate) status: &'static str,
+    pub(crate) replacement_target: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct NativeDeviceLoopRoute {
+    pub(crate) exit_reason: &'static str,
+    pub(crate) selector: &'static str,
+    pub(crate) handler: &'static str,
+    pub(crate) current_state: &'static str,
+    pub(crate) target_state: &'static str,
+}
+
+pub(crate) fn native_device_loop_report() -> NativeDeviceLoopReport {
+    NativeDeviceLoopReport {
+        strategy: "crosvm-style-typed-device-loop",
+        reference_architecture: "crosvm WHPX run loop with rust-vmm virtio device backends",
+        source_crates: vec!["rust-vmm/vm-virtio", "rust-vmm/linux-loader"],
+        active_boundary: "whp-exit-route-contract-v1",
+        adoption_state: "typed-route-boundary-ready-inline-handlers-not-yet-extracted",
+        devices: vec![
+            NativeDeviceLoopDevice {
+                id: "serial-com1",
+                role: "early boot diagnostics and milestone logging",
+                backend: "pane-built-in-serial",
+                status: "active",
+                replacement_target: None,
+            },
+            NativeDeviceLoopDevice {
+                id: "pane-block-port",
+                role: "temporary root-disk diagnostic bridge",
+                backend: "pane-custom-io-port-plus-shared-dma",
+                status: "diagnostic-only",
+                replacement_target: Some("virtio-blk"),
+            },
+            NativeDeviceLoopDevice {
+                id: "virtio-blk",
+                role: "standard Arch base/user disk backend",
+                backend: "rust-vmm/vm-virtio-compatible-queue-model",
+                status: "contract-ready-not-executing",
+                replacement_target: None,
+            },
+            NativeDeviceLoopDevice {
+                id: "legacy-platform-io",
+                role: "PIC/PIT/RTC/PS2/VGA/PCI compatibility required by early Linux",
+                backend: "pane-legacy-io-state",
+                status: "active-minimal",
+                replacement_target: Some("typed platform device structs"),
+            },
+            NativeDeviceLoopDevice {
+                id: "timer-interrupt",
+                role: "deliver first native timer interrupt after storage/root-mount progress",
+                backend: "WHP WHvRequestInterrupt",
+                status: "active-guarded",
+                replacement_target: Some("event-loop timer source plus interrupt controller model"),
+            },
+            NativeDeviceLoopDevice {
+                id: "display-surface",
+                role: "guest framebuffer and future app window rendering",
+                backend: "pane-framebuffer-contract",
+                status: "contract-ready-not-rendering",
+                replacement_target: Some("virtio-gpu-inspired display backend"),
+            },
+            NativeDeviceLoopDevice {
+                id: "input-queue",
+                role: "guest keyboard/pointer injection for app-window interaction",
+                backend: "pane-input-contract",
+                status: "contract-ready-not-injecting",
+                replacement_target: Some("virtio-input-inspired backend"),
+            },
+            NativeDeviceLoopDevice {
+                id: "cpu-control",
+                role: "CPUID, MSR, APIC EOI, canceled timeslice, and halt handling",
+                backend: "pane-whp-control-handlers",
+                status: "active",
+                replacement_target: Some("typed vcpu control dispatcher"),
+            },
+        ],
+        routes: vec![
+            NativeDeviceLoopRoute {
+                exit_reason: "x64-io-port-access",
+                selector: "0x03f8..=0x03ff",
+                handler: "serial-com1",
+                current_state: "inline serial state update in Linux WHP loop",
+                target_state: "serial device handles read/write and returns resume action",
+            },
+            NativeDeviceLoopRoute {
+                exit_reason: "x64-io-port-access",
+                selector: "pane block diagnostic ports",
+                handler: "pane-block-port",
+                current_state: "inline command assembly plus shared-DMA servicing",
+                target_state: "removed after virtio-blk serves vda/vdb",
+            },
+            NativeDeviceLoopRoute {
+                exit_reason: "x64-io-port-access",
+                selector: "PIC/PIT/RTC/PS2/VGA/PCI platform ports",
+                handler: "legacy-platform-io",
+                current_state: "single legacy I/O state object",
+                target_state: "typed platform devices with explicit interrupt side effects",
+            },
+            NativeDeviceLoopRoute {
+                exit_reason: "x64-interrupt-window",
+                selector: "maskable interrupt window",
+                handler: "timer-interrupt",
+                current_state: "inline root-mount-aware timer injection guard",
+                target_state: "event-loop interrupt source routes through device bus",
+            },
+            NativeDeviceLoopRoute {
+                exit_reason: "x64-apic-eoi",
+                selector: "APIC end of interrupt",
+                handler: "timer-interrupt",
+                current_state: "inline acknowledgement flags",
+                target_state: "interrupt controller model records EOI",
+            },
+            NativeDeviceLoopRoute {
+                exit_reason: "memory-access",
+                selector: "framebuffer/input/MMIO ranges",
+                handler: "display-surface,input-queue,virtio-mmio",
+                current_state: "mostly blocker diagnostics plus mapped shared memory snapshots",
+                target_state: "MMIO bus dispatch for virtio queues and display/input surfaces",
+            },
+            NativeDeviceLoopRoute {
+                exit_reason: "x64-cpuid",
+                selector: "all leaves",
+                handler: "cpu-control",
+                current_state: "inline WHP default CPUID result passthrough",
+                target_state: "typed vCPU control handler with guest feature policy",
+            },
+            NativeDeviceLoopRoute {
+                exit_reason: "x64-msr-access",
+                selector: "supported MSRs",
+                handler: "cpu-control",
+                current_state: "inline MSR state emulation",
+                target_state: "typed vCPU control handler",
+            },
+            NativeDeviceLoopRoute {
+                exit_reason: "canceled",
+                selector: "Pane time-slice boundary",
+                handler: "cpu-control,timer-interrupt",
+                current_state: "inline watchdog/timer/root-mount policy",
+                target_state: "event-loop scheduler tick with device work queue",
+            },
+            NativeDeviceLoopRoute {
+                exit_reason: "x64-halt",
+                selector: "HLT",
+                handler: "cpu-control",
+                current_state: "inline terminal state",
+                target_state: "typed terminal action",
+            },
+        ],
+        migration_blockers: vec![
+            "virtio queue execution is not yet wired to WHP MMIO exits",
+            "display/input contracts are not yet app-rendered device backends",
+            "legacy platform I/O side effects remain grouped in one compatibility object",
+        ],
+        next_steps: vec![
+            "extract WHP exit dispatch into a DeviceLoop that returns explicit resume/stop actions",
+            "implement virtio-blk queue handling for vda/vdb and retire pane-block.ko as a boot dependency",
+            "route framebuffer/input MMIO through typed display and input devices before building the app window renderer",
+        ],
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct NativeBlockIoTraceReport {
     pub(crate) total_commands: u64,
     pub(crate) read_commands: u64,
@@ -8065,9 +8246,9 @@ mod windows_whp {
 #[cfg(test)]
 mod tests {
     use super::{
-        base_export_checks, build_native_host_preflight_report, run_partition_smoke,
-        NativeGuestEntryMode, NativePartitionSmokeStatus, NativePreflightStatus,
-        NativeSerialBootImage, WhpPreflightReport, SERIAL_BOOT_BANNER_TEXT,
+        base_export_checks, build_native_host_preflight_report, native_device_loop_report,
+        run_partition_smoke, NativeGuestEntryMode, NativePartitionSmokeStatus,
+        NativePreflightStatus, NativeSerialBootImage, WhpPreflightReport, SERIAL_BOOT_BANNER_TEXT,
     };
 
     fn whp_report(
@@ -8150,6 +8331,85 @@ mod tests {
             .checks
             .iter()
             .any(|check| check.id == "whp-exports" && check.status == NativePreflightStatus::Fail));
+    }
+
+    #[test]
+    fn native_device_loop_declares_crosvm_rust_vmm_direction() {
+        let report = native_device_loop_report();
+
+        assert_eq!(report.strategy, "crosvm-style-typed-device-loop");
+        assert_eq!(report.active_boundary, "whp-exit-route-contract-v1");
+        assert!(report
+            .source_crates
+            .iter()
+            .any(|source| *source == "rust-vmm/vm-virtio"));
+        assert!(report.reference_architecture.contains("crosvm"));
+        assert!(report
+            .next_steps
+            .iter()
+            .any(|step| step.contains("DeviceLoop")));
+    }
+
+    #[test]
+    fn native_device_loop_routes_storage_from_diagnostic_port_to_virtio_blk() {
+        let report = native_device_loop_report();
+        let pane_block = report
+            .devices
+            .iter()
+            .find(|device| device.id == "pane-block-port")
+            .expect("pane block diagnostic device");
+        let virtio_block = report
+            .devices
+            .iter()
+            .find(|device| device.id == "virtio-blk")
+            .expect("virtio block device");
+
+        assert_eq!(pane_block.status, "diagnostic-only");
+        assert_eq!(pane_block.replacement_target, Some("virtio-blk"));
+        assert_eq!(virtio_block.status, "contract-ready-not-executing");
+        assert!(report.routes.iter().any(|route| {
+            route.exit_reason == "x64-io-port-access"
+                && route.handler == "pane-block-port"
+                && route.target_state.contains("virtio-blk")
+        }));
+    }
+
+    #[test]
+    fn native_device_loop_covers_boot_display_input_and_control_exits() {
+        let report = native_device_loop_report();
+
+        for id in [
+            "serial-com1",
+            "legacy-platform-io",
+            "timer-interrupt",
+            "display-surface",
+            "input-queue",
+            "cpu-control",
+        ] {
+            assert!(
+                report.devices.iter().any(|device| device.id == id),
+                "missing device {id}"
+            );
+        }
+
+        for exit_reason in [
+            "x64-io-port-access",
+            "memory-access",
+            "x64-interrupt-window",
+            "x64-apic-eoi",
+            "x64-cpuid",
+            "x64-msr-access",
+            "canceled",
+            "x64-halt",
+        ] {
+            assert!(
+                report
+                    .routes
+                    .iter()
+                    .any(|route| route.exit_reason == exit_reason),
+                "missing route {exit_reason}"
+            );
+        }
     }
 
     #[test]

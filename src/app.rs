@@ -174,6 +174,7 @@ struct NativePreflightReport {
     session_name: String,
     host: crate::native::NativeHostPreflightReport,
     runtime: RuntimeReport,
+    device_loop: crate::native::NativeDeviceLoopReport,
     ready_for_boot_spike: bool,
     ready_for_arch_boot_attempt: bool,
     blockers: Vec<String>,
@@ -191,6 +192,7 @@ struct NativeBootSpikeReport {
     host: crate::native::NativeHostPreflightReport,
     runtime: RuntimeReport,
     partition_smoke: crate::native::NativePartitionSmokeReport,
+    device_loop: crate::native::NativeDeviceLoopReport,
     ready_for_serial_kernel_spike: bool,
     ready_for_arch_boot_attempt: bool,
     blockers: Vec<String>,
@@ -2408,6 +2410,7 @@ fn native_preflight(args: NativePreflightArgs) -> AppResult<()> {
         session_name,
         host,
         runtime,
+        device_loop: crate::native::native_device_loop_report(),
         ready_for_boot_spike,
         ready_for_arch_boot_attempt,
         blockers,
@@ -2615,6 +2618,7 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
         host,
         runtime,
         partition_smoke,
+        device_loop: crate::native::native_device_loop_report(),
         ready_for_serial_kernel_spike,
         ready_for_arch_boot_attempt,
         blockers,
@@ -12976,6 +12980,12 @@ fn print_native_preflight_report(report: &NativePreflightReport) {
         "  Boot Spike     {}",
         yes_no(report.runtime.native_runtime.ready_for_boot_spike)
     );
+    println!("Device Loop");
+    println!("  Strategy       {}", report.device_loop.strategy);
+    println!("  Boundary       {}", report.device_loop.active_boundary);
+    println!("  State          {}", report.device_loop.adoption_state);
+    println!("  Devices        {}", report.device_loop.devices.len());
+    println!("  Routes         {}", report.device_loop.routes.len());
     if !report.blockers.is_empty() {
         println!("Blockers");
         for blocker in &report.blockers {
@@ -13271,6 +13281,24 @@ fn print_native_boot_spike_report(report: &NativeBootSpikeReport) {
     }
     if let Some(text) = &report.partition_smoke.serial_text {
         println!("  Serial Text    {:?}", text);
+    }
+    println!("Device Loop");
+    println!("  Strategy       {}", report.device_loop.strategy);
+    println!("  Boundary       {}", report.device_loop.active_boundary);
+    println!("  State          {}", report.device_loop.adoption_state);
+    println!("  Devices        {}", report.device_loop.devices.len());
+    for device in &report.device_loop.devices {
+        println!(
+            "  Device         {} [{}] {}",
+            device.id, device.status, device.role
+        );
+    }
+    println!("  Routes         {}", report.device_loop.routes.len());
+    for route in &report.device_loop.routes {
+        println!(
+            "  Route          {} {} -> {}",
+            route.exit_reason, route.selector, route.handler
+        );
     }
     if let Some(snapshot) = &report.partition_smoke.framebuffer_snapshot {
         println!("  Framebuffer    {}", snapshot.label);

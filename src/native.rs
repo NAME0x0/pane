@@ -2853,7 +2853,10 @@ mod windows_whp {
                 break;
             }
 
-            match decode_exit_context(&exit_context, report) {
+            let decoded_exit = decode_exit_context(&exit_context, report);
+            trace_native_device_dispatch(&decoded_exit, report);
+
+            match decoded_exit {
                 DecodedExit::IoPort {
                     instruction_length,
                     rip,
@@ -3318,7 +3321,10 @@ mod windows_whp {
                 }
             }
 
-            match decode_exit_context(&exit_context, report) {
+            let decoded_exit = decode_exit_context(&exit_context, report);
+            trace_native_device_dispatch(&decoded_exit, report);
+
+            match decoded_exit {
                 DecodedExit::IoPort {
                     instruction_length,
                     rip,
@@ -6491,6 +6497,111 @@ mod windows_whp {
         Other,
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct NativeDeviceDispatchDecision {
+        exit_reason: &'static str,
+        selector: String,
+        handler: &'static str,
+        action: &'static str,
+    }
+
+    fn trace_native_device_dispatch(
+        exit: &DecodedExit,
+        report: &mut NativePartitionSmokeReport,
+    ) -> NativeDeviceDispatchDecision {
+        let decision = native_device_dispatch_decision(exit);
+        report.calls.push(NativeWhpCallReport {
+            name: "NativeDeviceLoopDispatch",
+            hresult: None,
+            ok: true,
+            detail: format!(
+                "Device loop route {} selector={} handler={} action={}.",
+                decision.exit_reason, decision.selector, decision.handler, decision.action
+            ),
+        });
+        decision
+    }
+
+    fn native_device_dispatch_decision(exit: &DecodedExit) -> NativeDeviceDispatchDecision {
+        match exit {
+            DecodedExit::IoPort { port, .. } if pane_block_io_port_offset(*port).is_some() => {
+                NativeDeviceDispatchDecision {
+                    exit_reason: "x64-io-port-access",
+                    selector: format!(
+                        "port=0x{port:04x} pane-block-offset={}",
+                        port - crate::native::PANE_BLOCK_IO_BASE_PORT
+                    ),
+                    handler: "pane-block-port",
+                    action: "service-block-command-and-resume-if-status-allows",
+                }
+            }
+            DecodedExit::IoPort { port, .. }
+                if (SERIAL_COM1_PORT..=SERIAL_COM1_LAST_PORT).contains(port) =>
+            {
+                NativeDeviceDispatchDecision {
+                    exit_reason: "x64-io-port-access",
+                    selector: format!("port=0x{port:04x} serial-com1"),
+                    handler: "serial-com1",
+                    action: "emulate-port-and-resume",
+                }
+            }
+            DecodedExit::IoPort { port, .. } => NativeDeviceDispatchDecision {
+                exit_reason: "x64-io-port-access",
+                selector: format!("port=0x{port:04x} legacy-platform"),
+                handler: "legacy-platform-io",
+                action: "try-emulate-or-stop",
+            },
+            DecodedExit::MemoryAccess { gpa, .. } => NativeDeviceDispatchDecision {
+                exit_reason: "memory-access",
+                selector: format!("gpa=0x{gpa:016x}"),
+                handler: "display-surface,input-queue,virtio-mmio",
+                action: "dispatch-mmio-or-report-blocker",
+            },
+            DecodedExit::Halt => NativeDeviceDispatchDecision {
+                exit_reason: "x64-halt",
+                selector: "hlt".to_string(),
+                handler: "cpu-control",
+                action: "stop-success-boundary",
+            },
+            DecodedExit::MsrAccess { msr_number, .. } => NativeDeviceDispatchDecision {
+                exit_reason: "x64-msr-access",
+                selector: format!("msr=0x{msr_number:08x}"),
+                handler: "cpu-control",
+                action: "emulate-msr-and-resume",
+            },
+            DecodedExit::Cpuid { leaf, subleaf, .. } => NativeDeviceDispatchDecision {
+                exit_reason: "x64-cpuid",
+                selector: format!("leaf=0x{leaf:016x} subleaf=0x{subleaf:016x}"),
+                handler: "cpu-control",
+                action: "emulate-cpuid-and-resume",
+            },
+            DecodedExit::InterruptWindow => NativeDeviceDispatchDecision {
+                exit_reason: "x64-interrupt-window",
+                selector: "maskable-interrupt-window".to_string(),
+                handler: "timer-interrupt",
+                action: "inject-timer-if-policy-allows",
+            },
+            DecodedExit::ApicEoi => NativeDeviceDispatchDecision {
+                exit_reason: "x64-apic-eoi",
+                selector: "apic-eoi".to_string(),
+                handler: "timer-interrupt",
+                action: "record-interrupt-ack-and-resume",
+            },
+            DecodedExit::Canceled => NativeDeviceDispatchDecision {
+                exit_reason: "canceled",
+                selector: "pane-timeslice-boundary".to_string(),
+                handler: "cpu-control,timer-interrupt",
+                action: "run-scheduler-tick-and-device-work",
+            },
+            DecodedExit::Other => NativeDeviceDispatchDecision {
+                exit_reason: "unknown",
+                selector: "unsupported-whp-exit".to_string(),
+                handler: "cpu-control",
+                action: "stop-unsupported-exit",
+            },
+        }
+    }
+
     fn decode_exit_context(
         exit_context: &[u8],
         report: &mut NativePartitionSmokeReport,
@@ -6715,9 +6826,10 @@ mod windows_whp {
             linux_entry_probe_detail, linux_entry_probe_exit_budget,
             linux_entry_probe_module_load_active, linux_entry_probe_passed,
             linux_entry_probe_root_mount_active, linux_entry_probe_total_budget_seconds,
-            linux_protected_mode_registers, parse_xapic_interrupt_controller_state,
-            serial_contract_passed, serial_markers_observed, timer_interrupt_readiness,
-            timer_interrupt_readiness_blocker, timer_interrupt_readiness_report_blocker,
+            linux_protected_mode_registers, native_device_dispatch_decision,
+            parse_xapic_interrupt_controller_state, serial_contract_passed,
+            serial_markers_observed, timer_interrupt_readiness, timer_interrupt_readiness_blocker,
+            timer_interrupt_readiness_report_blocker, trace_native_device_dispatch,
             whv_x64_interrupt_control, xapic_state_vectors, Com1SerialState, DecodedExit,
             LegacyDeviceIoState, NativeBlockIoTraceCollector, ACPI_PM1_CONTROL_PORT,
             ACPI_PM1_ENABLE_PORT, ACPI_PM1_STATUS_PORT, ACPI_PM_TIMER_PORT, ALT_DELAY_PORT,
@@ -7475,6 +7587,85 @@ mod windows_whp {
                 blocker: None,
                 next_step: "test".to_string(),
             }
+        }
+
+        #[test]
+        fn native_device_dispatch_classifies_serial_and_block_io_routes() {
+            let serial = native_device_dispatch_decision(&DecodedExit::IoPort {
+                instruction_length: 1,
+                rip: 0x1000,
+                is_write: true,
+                access_size: 1,
+                port: SERIAL_COM1_PORT,
+                serial_byte: b'P',
+                rax: u64::from(b'P'),
+            });
+            let block = native_device_dispatch_decision(&DecodedExit::IoPort {
+                instruction_length: 1,
+                rip: 0x1000,
+                is_write: true,
+                access_size: 1,
+                port: PANE_BLOCK_IO_BASE_PORT + 2,
+                serial_byte: 0,
+                rax: 1,
+            });
+
+            assert_eq!(serial.exit_reason, "x64-io-port-access");
+            assert_eq!(serial.handler, "serial-com1");
+            assert_eq!(serial.action, "emulate-port-and-resume");
+            assert_eq!(block.handler, "pane-block-port");
+            assert!(block.selector.contains("pane-block-offset=2"));
+            assert_eq!(
+                block.action,
+                "service-block-command-and-resume-if-status-allows"
+            );
+        }
+
+        #[test]
+        fn native_device_dispatch_classifies_control_timer_and_mmio_routes() {
+            let memory = native_device_dispatch_decision(&DecodedExit::MemoryAccess {
+                access_type: 1,
+                gpa_unmapped: true,
+                gva_valid: false,
+                gpa: 0x0f00_0000,
+                gva: 0,
+            });
+            let cpuid = native_device_dispatch_decision(&DecodedExit::Cpuid {
+                instruction_length: 2,
+                rip: 0x2000,
+                leaf: 0,
+                subleaf: 0,
+                default_rax: 0,
+                default_rbx: 0,
+                default_rcx: 0,
+                default_rdx: 0,
+            });
+            let interrupt = native_device_dispatch_decision(&DecodedExit::InterruptWindow);
+            let canceled = native_device_dispatch_decision(&DecodedExit::Canceled);
+
+            assert_eq!(memory.handler, "display-surface,input-queue,virtio-mmio");
+            assert_eq!(memory.action, "dispatch-mmio-or-report-blocker");
+            assert_eq!(cpuid.handler, "cpu-control");
+            assert_eq!(cpuid.action, "emulate-cpuid-and-resume");
+            assert_eq!(interrupt.handler, "timer-interrupt");
+            assert_eq!(interrupt.action, "inject-timer-if-policy-allows");
+            assert_eq!(canceled.handler, "cpu-control,timer-interrupt");
+            assert_eq!(canceled.action, "run-scheduler-tick-and-device-work");
+        }
+
+        #[test]
+        fn native_device_dispatch_trace_records_handler_and_action() {
+            let mut report = base_report();
+            let decision = trace_native_device_dispatch(&DecodedExit::Halt, &mut report);
+
+            assert_eq!(decision.handler, "cpu-control");
+            assert_eq!(decision.action, "stop-success-boundary");
+            assert!(report.calls.iter().any(|call| {
+                call.name == "NativeDeviceLoopDispatch"
+                    && call.ok
+                    && call.detail.contains("handler=cpu-control")
+                    && call.detail.contains("action=stop-success-boundary")
+            }));
         }
 
         #[test]

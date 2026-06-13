@@ -487,3 +487,16 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR. Keep claims precise
 ## License
 
 Pane is licensed under the [MIT License](LICENSE).
+
+## Credits And Upstream Foundations
+
+Pane's native runtime direction is informed by established open-source virtualization work:
+
+| Project | How Pane Uses It | License Posture |
+|---------|------------------|-----------------|
+| [crosvm](https://github.com/google/crosvm) | Reference architecture for Rust VMM structure, Windows WHPX handling, instruction-emulator callback flow, virtio devices, display, and input. Pane is not vendoring crosvm wholesale. | BSD-3-Clause |
+| [rust-vmm/linux-loader](https://github.com/rust-vmm/linux-loader) | Planned adapter boundary for Linux bzImage loading, command-line placement, and boot parameters. | Apache-2.0 OR BSD-3-Clause |
+| [rust-vmm/vm-virtio](https://github.com/rust-vmm/vm-virtio) | Planned/reference foundation for virtio queues and device semantics. Pane's current virtio-MMIO block work is a narrow in-repo implementation shaped by these semantics. | Apache-2.0 OR BSD-3-Clause |
+| [rust-vmm/vm-memory](https://github.com/rust-vmm/vm-memory) | Reference for guest-memory abstractions needed by future WHP-backed device dispatch. | Apache-2.0 OR BSD-3-Clause |
+
+If Pane later vendors or directly copies upstream source files, the copied files must keep their original license headers and the release package must include the required notices. GPL components such as QEMU may be useful for comparison, but they are not part of Pane's intended native runtime unless distribution obligations are explicitly accepted.

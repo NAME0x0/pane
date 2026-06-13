@@ -1706,7 +1706,10 @@ mod windows_whp {
         *const WhvMemoryAccessContext,
         *mut WhvEmulatorStatus,
     ) -> i32;
+    const S_OK: i32 = 0;
     const E_UNEXPECTED: i32 = 0x8000_FFFF_u32 as i32;
+    const WHP_EMULATOR_MMIO_READ: u8 = 0;
+    const WHP_EMULATOR_MMIO_WRITE: u8 = 1;
     const WHV_VIRTUAL_PROCESSOR_STATE_TYPE_INTERRUPT_CONTROLLER_STATE2: u32 = 0x0000_1000;
     const XAPIC_STATE_BYTES: usize = 4096;
     const XAPIC_TPR_OFFSET: usize = 0x080;
@@ -1811,6 +1814,13 @@ mod windows_whp {
         >,
         translate_gva_page:
             Option<unsafe extern "system" fn(*mut c_void, u64, u32, *mut u32, *mut u64) -> i32>,
+    }
+
+    struct WhpEmulatorMmioCallbackContext<'a> {
+        handler: &'a mut dyn FnMut(
+            crate::virtio::PaneVirtioMmioAccess,
+        ) -> crate::virtio::PaneVirtioMmioAccessOutcome,
+        last_status: Option<String>,
     }
 
     #[derive(Copy, Clone, Default)]
@@ -2062,13 +2072,54 @@ mod windows_whp {
     }
 
     unsafe extern "system" fn whp_emulator_memory_callback(
-        _context: *mut c_void,
+        context: *mut c_void,
         memory_access: *mut WhvEmulatorMemoryAccessInfo,
     ) -> i32 {
-        if memory_access.is_null() {
+        if context.is_null() || memory_access.is_null() {
             return E_UNEXPECTED;
         }
-        E_UNEXPECTED
+
+        let context = &mut *(context as *mut WhpEmulatorMmioCallbackContext<'_>);
+        let memory_access = &mut *memory_access;
+        let access_size = usize::from(memory_access.access_size);
+        if access_size == 0 || access_size > memory_access.data.len() {
+            context.last_status = Some("invalid-access-size".to_string());
+            return E_UNEXPECTED;
+        }
+
+        let kind = match memory_access.direction {
+            WHP_EMULATOR_MMIO_READ => crate::virtio::PaneVirtioMmioAccessKind::Read,
+            WHP_EMULATOR_MMIO_WRITE => crate::virtio::PaneVirtioMmioAccessKind::Write,
+            _ => {
+                context.last_status = Some("invalid-direction".to_string());
+                return E_UNEXPECTED;
+            }
+        };
+        let data = match kind {
+            crate::virtio::PaneVirtioMmioAccessKind::Read => vec![0; access_size],
+            crate::virtio::PaneVirtioMmioAccessKind::Write => {
+                memory_access.data[..access_size].to_vec()
+            }
+        };
+        let outcome = (context.handler)(crate::virtio::PaneVirtioMmioAccess {
+            kind,
+            gpa: memory_access.gpa_address,
+            data,
+        });
+
+        context.last_status = Some(outcome.status.to_string());
+        if !outcome.accepted {
+            return E_UNEXPECTED;
+        }
+        if kind == crate::virtio::PaneVirtioMmioAccessKind::Read {
+            if outcome.read_data.len() < access_size {
+                context.last_status = Some("short-read-data".to_string());
+                return E_UNEXPECTED;
+            }
+            memory_access.data[..access_size].copy_from_slice(&outcome.read_data[..access_size]);
+        }
+
+        S_OK
     }
 
     unsafe extern "system" fn whp_emulator_get_registers_callback(
@@ -7258,27 +7309,28 @@ mod windows_whp {
             timer_interrupt_readiness_report_blocker, trace_native_device_dispatch,
             whp_emulator_callbacks, whp_emulator_io_port_callback, whp_emulator_memory_callback,
             whv_x64_interrupt_control, xapic_state_vectors, Com1SerialState, DecodedExit,
-            LegacyDeviceIoState, NativeBlockIoTraceCollector, WhvEmulatorCallbacks,
-            WhvEmulatorIoAccessInfo, WhvEmulatorMemoryAccessInfo, ACPI_PM1_CONTROL_PORT,
-            ACPI_PM1_ENABLE_PORT, ACPI_PM1_STATUS_PORT, ACPI_PM_TIMER_PORT, ALT_DELAY_PORT,
-            ALT_POST_DELAY_PORT, CMOS_ADDRESS_PORT, CMOS_DATA_PORT, CPUID_DEFAULT_RAX_OFFSET,
-            CPUID_DEFAULT_RBX_OFFSET, CPUID_DEFAULT_RCX_OFFSET, CPUID_DEFAULT_RDX_OFFSET,
-            CPUID_RAX_OFFSET, CPUID_RCX_OFFSET, DMA_PAGE_REGISTER_START_PORT, ELCR1_PORT,
-            ELCR2_PORT, E_UNEXPECTED, IO_ACCESS_INFO_OFFSET, IO_PORT_OFFSET, IO_RAX_OFFSET,
-            LINUX_ENTRY_PROBE_EXIT_BUDGET, LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET,
-            LINUX_ENTRY_PROBE_STORAGE_TOTAL_BUDGET_SECONDS, LINUX_ENTRY_PROBE_TOTAL_BUDGET_SECONDS,
-            LINUX_ENTRY_PROBE_TRACE_HEAD, LINUX_ENTRY_PROBE_TRACE_TAIL, MEMORY_ACCESS_INFO_OFFSET,
-            MEMORY_GPA_OFFSET, MEMORY_GVA_OFFSET, MEMORY_INSTRUCTION_BYTES_OFFSET,
-            MEMORY_INSTRUCTION_LENGTH_OFFSET, MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET,
-            MSR_RAX_OFFSET, MSR_RDX_OFFSET, PCI_CONFIG_ADDRESS_PORT, PCI_CONFIG_DATA_START_PORT,
-            PIC1_COMMAND_PORT, PIC1_DATA_PORT, PIC2_COMMAND_PORT, PIC2_DATA_PORT,
-            PIT_CHANNEL0_PORT, PIT_COMMAND_PORT, POST_DELAY_PORT, PS2_DATA_PORT,
-            PS2_STATUS_COMMAND_PORT, SERIAL_COM1_PORT, SYSTEM_CONTROL_PORT_A,
-            SYSTEM_CONTROL_PORT_B, VGA_ATTRIBUTE_DATA_READ_PORT, VGA_ATTRIBUTE_PORT,
-            VGA_CRTC_COLOR_DATA_PORT, VGA_CRTC_COLOR_INDEX_PORT, VGA_GRAPHICS_DATA_PORT,
-            VGA_GRAPHICS_INDEX_PORT, VGA_INPUT_STATUS_COLOR_PORT, VGA_MISC_OUTPUT_READ_PORT,
-            VGA_MISC_OUTPUT_WRITE_PORT, VGA_SEQUENCER_DATA_PORT, VGA_SEQUENCER_INDEX_PORT,
-            VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET, VP_CONTEXT_RIP_OFFSET,
+            LegacyDeviceIoState, NativeBlockIoTraceCollector, WhpEmulatorMmioCallbackContext,
+            WhvEmulatorCallbacks, WhvEmulatorIoAccessInfo, WhvEmulatorMemoryAccessInfo,
+            ACPI_PM1_CONTROL_PORT, ACPI_PM1_ENABLE_PORT, ACPI_PM1_STATUS_PORT, ACPI_PM_TIMER_PORT,
+            ALT_DELAY_PORT, ALT_POST_DELAY_PORT, CMOS_ADDRESS_PORT, CMOS_DATA_PORT,
+            CPUID_DEFAULT_RAX_OFFSET, CPUID_DEFAULT_RBX_OFFSET, CPUID_DEFAULT_RCX_OFFSET,
+            CPUID_DEFAULT_RDX_OFFSET, CPUID_RAX_OFFSET, CPUID_RCX_OFFSET,
+            DMA_PAGE_REGISTER_START_PORT, ELCR1_PORT, ELCR2_PORT, E_UNEXPECTED,
+            IO_ACCESS_INFO_OFFSET, IO_PORT_OFFSET, IO_RAX_OFFSET, LINUX_ENTRY_PROBE_EXIT_BUDGET,
+            LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET, LINUX_ENTRY_PROBE_STORAGE_TOTAL_BUDGET_SECONDS,
+            LINUX_ENTRY_PROBE_TOTAL_BUDGET_SECONDS, LINUX_ENTRY_PROBE_TRACE_HEAD,
+            LINUX_ENTRY_PROBE_TRACE_TAIL, MEMORY_ACCESS_INFO_OFFSET, MEMORY_GPA_OFFSET,
+            MEMORY_GVA_OFFSET, MEMORY_INSTRUCTION_BYTES_OFFSET, MEMORY_INSTRUCTION_LENGTH_OFFSET,
+            MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET, MSR_RAX_OFFSET, MSR_RDX_OFFSET,
+            PCI_CONFIG_ADDRESS_PORT, PCI_CONFIG_DATA_START_PORT, PIC1_COMMAND_PORT, PIC1_DATA_PORT,
+            PIC2_COMMAND_PORT, PIC2_DATA_PORT, PIT_CHANNEL0_PORT, PIT_COMMAND_PORT,
+            POST_DELAY_PORT, PS2_DATA_PORT, PS2_STATUS_COMMAND_PORT, SERIAL_COM1_PORT,
+            SYSTEM_CONTROL_PORT_A, SYSTEM_CONTROL_PORT_B, S_OK, VGA_ATTRIBUTE_DATA_READ_PORT,
+            VGA_ATTRIBUTE_PORT, VGA_CRTC_COLOR_DATA_PORT, VGA_CRTC_COLOR_INDEX_PORT,
+            VGA_GRAPHICS_DATA_PORT, VGA_GRAPHICS_INDEX_PORT, VGA_INPUT_STATUS_COLOR_PORT,
+            VGA_MISC_OUTPUT_READ_PORT, VGA_MISC_OUTPUT_WRITE_PORT, VGA_SEQUENCER_DATA_PORT,
+            VGA_SEQUENCER_INDEX_PORT, VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET, VP_CONTEXT_RIP_OFFSET,
+            WHP_EMULATOR_MMIO_READ, WHP_EMULATOR_MMIO_WRITE,
             WHV_DELIVERABILITY_NOTIFICATION_INTERRUPT, WHV_REGISTER_CR0, WHV_REGISTER_CR3,
             WHV_REGISTER_CR4, WHV_REGISTER_CS, WHV_REGISTER_DS, WHV_REGISTER_ES, WHV_REGISTER_GDTR,
             WHV_REGISTER_IDTR, WHV_REGISTER_RBP, WHV_REGISTER_RBX, WHV_REGISTER_RDI,
@@ -7302,6 +7354,109 @@ mod windows_whp {
             PANE_BLOCK_IO_STATUS_DENIED, PANE_BLOCK_IO_STATUS_FAILED,
             PANE_BLOCK_IO_STATUS_SERVICED, PANE_BLOCK_IO_STATUS_SUBMITTED, SERIAL_BOOT_BANNER_TEXT,
         };
+        use crate::virtio::PaneGuestMemory;
+        use std::ffi::c_void;
+
+        struct TestGuestMemory {
+            bytes: Vec<u8>,
+        }
+
+        impl TestGuestMemory {
+            fn new(size: usize) -> Self {
+                Self {
+                    bytes: vec![0; size],
+                }
+            }
+
+            fn read_bytes(&self, gpa: u64, len: usize) -> Vec<u8> {
+                let mut bytes = vec![0; len];
+                self.read(gpa, &mut bytes).unwrap();
+                bytes
+            }
+
+            fn write_u16(&mut self, gpa: u64, value: u16) {
+                self.write(gpa, &value.to_le_bytes()).unwrap();
+            }
+
+            fn write_u32(&mut self, gpa: u64, value: u32) {
+                self.write(gpa, &value.to_le_bytes()).unwrap();
+            }
+
+            fn write_u64(&mut self, gpa: u64, value: u64) {
+                self.write(gpa, &value.to_le_bytes()).unwrap();
+            }
+        }
+
+        impl crate::virtio::PaneGuestMemory for TestGuestMemory {
+            fn read(&self, gpa: u64, bytes: &mut [u8]) -> Result<(), String> {
+                let start = gpa as usize;
+                let end = start + bytes.len();
+                if end > self.bytes.len() {
+                    return Err("guest read out of bounds".to_string());
+                }
+                bytes.copy_from_slice(&self.bytes[start..end]);
+                Ok(())
+            }
+
+            fn write(&mut self, gpa: u64, bytes: &[u8]) -> Result<(), String> {
+                let start = gpa as usize;
+                let end = start + bytes.len();
+                if end > self.bytes.len() {
+                    return Err("guest write out of bounds".to_string());
+                }
+                self.bytes[start..end].copy_from_slice(bytes);
+                Ok(())
+            }
+        }
+
+        fn configure_virtio_test_queue(device: &mut crate::virtio::PaneVirtioMmioBlockDevice) {
+            assert_eq!(
+                device.write_u32(0x038, 8),
+                crate::virtio::PaneVirtioMmioWriteResult::Accepted
+            );
+            assert_eq!(
+                device.write_u32(0x080, 0x1000),
+                crate::virtio::PaneVirtioMmioWriteResult::Accepted
+            );
+            assert_eq!(
+                device.write_u32(0x090, 0x2000),
+                crate::virtio::PaneVirtioMmioWriteResult::Accepted
+            );
+            assert_eq!(
+                device.write_u32(0x0a0, 0x3000),
+                crate::virtio::PaneVirtioMmioWriteResult::Accepted
+            );
+            assert_eq!(
+                device.write_u32(0x044, 1),
+                crate::virtio::PaneVirtioMmioWriteResult::Accepted
+            );
+        }
+
+        fn write_virtio_test_descriptor(
+            memory: &mut TestGuestMemory,
+            index: u16,
+            addr: u64,
+            len: u32,
+            flags: u16,
+            next: u16,
+        ) {
+            let descriptor = 0x1000 + u64::from(index) * 16;
+            memory.write_u64(descriptor, addr);
+            memory.write_u32(descriptor + 8, len);
+            memory.write_u16(descriptor + 12, flags);
+            memory.write_u16(descriptor + 14, next);
+        }
+
+        fn write_virtio_read_request(memory: &mut TestGuestMemory, sector: u64) {
+            memory.write_u32(0x4000, 0);
+            memory.write_u32(0x4004, 0);
+            memory.write_u64(0x4008, sector);
+            write_virtio_test_descriptor(memory, 0, 0x4000, 16, 1, 1);
+            write_virtio_test_descriptor(memory, 1, 0x4100, 512, 1 | 2, 2);
+            write_virtio_test_descriptor(memory, 2, 0x4300, 1, 2, 0);
+            memory.write_u16(0x2002, 1);
+            memory.write_u16(0x2004, 0);
+        }
 
         #[test]
         fn serial_test_image_outputs_the_expected_banner_then_halts() {
@@ -7363,6 +7518,95 @@ mod windows_whp {
 
             assert_eq!(io_result, E_UNEXPECTED);
             assert_eq!(memory_result, E_UNEXPECTED);
+        }
+
+        #[test]
+        fn whp_emulator_memory_callback_reads_virtio_mmio_register() {
+            let mut device = crate::virtio::PaneVirtioMmioBlockDevice::new(1024 * 1024, true);
+            let mut memory = TestGuestMemory::new(0x5000);
+            let mut handler = |access| {
+                crate::virtio::service_virtio_mmio_access(
+                    &mut device,
+                    &mut memory,
+                    access,
+                    |_request, _payload| Err("read must not execute queue".to_string()),
+                )
+            };
+            let mut context = WhpEmulatorMmioCallbackContext {
+                handler: &mut handler,
+                last_status: None,
+            };
+            let mut memory_access = WhvEmulatorMemoryAccessInfo {
+                gpa_address: crate::virtio::PANE_VIRTIO_MMIO_BASE_GPA,
+                direction: WHP_EMULATOR_MMIO_READ,
+                access_size: 4,
+                data: [0; 8],
+            };
+
+            let result = unsafe {
+                whp_emulator_memory_callback(
+                    (&mut context as *mut WhpEmulatorMmioCallbackContext<'_>).cast::<c_void>(),
+                    &mut memory_access,
+                )
+            };
+
+            assert_eq!(result, S_OK);
+            assert_eq!(
+                &memory_access.data[..4],
+                &crate::virtio::VIRTIO_MMIO_MAGIC_VALUE.to_le_bytes()
+            );
+            assert_eq!(context.last_status.as_deref(), Some("register-read"));
+        }
+
+        #[test]
+        fn whp_emulator_memory_callback_executes_virtio_queue_notify() {
+            let mut device = crate::virtio::PaneVirtioMmioBlockDevice::new(8 * 1024 * 1024, false);
+            let mut memory = TestGuestMemory::new(0x5000);
+            configure_virtio_test_queue(&mut device);
+            write_virtio_read_request(&mut memory, 3);
+
+            let mut handler = |access| {
+                crate::virtio::service_virtio_mmio_access(
+                    &mut device,
+                    &mut memory,
+                    access,
+                    |request, _payload| {
+                        assert_eq!(
+                            request.request_type,
+                            crate::virtio::PaneVirtioBlkRequestType::In
+                        );
+                        assert_eq!(request.sector, 3);
+                        Ok(vec![0x7b; 512])
+                    },
+                )
+            };
+            let mut context = WhpEmulatorMmioCallbackContext {
+                handler: &mut handler,
+                last_status: None,
+            };
+            let mut memory_access = WhvEmulatorMemoryAccessInfo {
+                gpa_address: crate::virtio::PANE_VIRTIO_MMIO_BASE_GPA + 0x050,
+                direction: WHP_EMULATOR_MMIO_WRITE,
+                access_size: 4,
+                data: [0; 8],
+            };
+
+            let result = unsafe {
+                whp_emulator_memory_callback(
+                    (&mut context as *mut WhpEmulatorMmioCallbackContext<'_>).cast::<c_void>(),
+                    &mut memory_access,
+                )
+            };
+
+            drop(context);
+            drop(handler);
+
+            assert_eq!(result, S_OK);
+            assert_eq!(memory.read_bytes(0x4100, 4), vec![0x7b; 4]);
+            assert_eq!(
+                memory.read_bytes(0x4300, 1),
+                vec![crate::virtio::VIRTIO_BLK_STATUS_OK]
+            );
         }
 
         #[test]

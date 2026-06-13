@@ -791,14 +791,14 @@ pub(crate) fn native_device_loop_report() -> NativeDeviceLoopReport {
                 id: "virtio-blk",
                 role: "standard Arch base/user disk backend",
                 backend: "pane-virtio-mmio-block-model-shaped-by-rust-vmm",
-                status: "descriptor-chain-execution-ready-whp-emulator-wiring-pending",
+                status: "mmio-service-boundary-ready-whp-emulator-callbacks-pending",
                 replacement_target: None,
             },
             NativeDeviceLoopDevice {
                 id: "whp-instruction-emulator",
                 role: "decode x64 MMIO/PIO instructions and advance the vCPU after callbacks",
                 backend: "WinHvEmulation.dll",
-                status: "preflighted-not-yet-created",
+                status: "preflighted-callback-service-boundary-ready-not-yet-created",
                 replacement_target: None,
             },
             NativeDeviceLoopDevice {
@@ -877,7 +877,7 @@ pub(crate) fn native_device_loop_report() -> NativeDeviceLoopReport {
                 exit_reason: "memory-access",
                 selector: "gpa=0x0dfc0000..0x0dfc0fff",
                 handler: "whp-instruction-emulator,virtio-mmio",
-                current_state: "route-classified-instruction-bytes-preserved",
+                current_state: "route-classified-instruction-bytes-preserved-service-boundary-ready",
                 target_state: "WHvEmulatorTryMmioEmulation-callback-services-register-or-queue-notify",
             },
             NativeDeviceLoopRoute {
@@ -917,13 +917,13 @@ pub(crate) fn native_device_loop_report() -> NativeDeviceLoopReport {
             },
         ],
         migration_blockers: vec![
-            "WHP instruction-emulator callbacks are not yet wired to virtio-MMIO register access and queue notification",
+            "WHP instruction-emulator callbacks are not yet created and wired into Pane's virtio-MMIO service boundary",
             "display/input contracts are not yet app-rendered device backends",
             "legacy platform I/O side effects remain grouped in one compatibility object",
         ],
         next_steps: vec![
             "extract WHP exit dispatch into a DeviceLoop that returns explicit resume/stop actions",
-            "create the WHP instruction emulator and route MMIO callbacks to the virtio-blk executor",
+            "create the WHP instruction emulator and call the virtio-MMIO service boundary from MMIO callbacks",
             "route framebuffer/input MMIO through typed display and input devices before building the app window renderer",
         ],
     }
@@ -8801,7 +8801,7 @@ mod tests {
         assert_eq!(pane_block.replacement_target, Some("virtio-blk"));
         assert_eq!(
             virtio_block.status,
-            "descriptor-chain-execution-ready-whp-emulator-wiring-pending"
+            "mmio-service-boundary-ready-whp-emulator-callbacks-pending"
         );
         assert_eq!(report.mmio_window.base_gpa, "0x0dfc0000");
         assert_eq!(report.mmio_window.primary_device.id, "vda");

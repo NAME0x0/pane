@@ -963,7 +963,7 @@ fn virtio_block_backend_plan(storage: &KernelStorageAttachment) -> VirtioBlockBa
         candidate_crate_version: None,
         license: "Apache-2.0 OR BSD-3-Clause".to_string(),
         source_url: "https://github.com/rust-vmm/vm-virtio".to_string(),
-        adoption_state: "descriptor-chain-execution-ready-whp-emulator-wiring-pending".to_string(),
+        adoption_state: "mmio-service-boundary-ready-whp-emulator-callbacks-pending".to_string(),
         transport: "virtio-mmio".to_string(),
         mmio_base_gpa: default_virtio_mmio_base_gpa(),
         mmio_size_bytes: default_virtio_mmio_size_bytes(),
@@ -16419,7 +16419,7 @@ mod tests {
         assert_eq!(storage.virtio_block.source_crate, "rust-vmm/vm-virtio");
         assert_eq!(
             storage.virtio_block.adoption_state,
-            "descriptor-chain-execution-ready-whp-emulator-wiring-pending"
+            "mmio-service-boundary-ready-whp-emulator-callbacks-pending"
         );
         assert_eq!(storage.virtio_block.transport, "virtio-mmio");
         assert_eq!(storage.virtio_block.mmio_base_gpa, "0x0dfc0000");

@@ -1696,6 +1696,17 @@ mod windows_whp {
         unsafe extern "system" fn(*mut c_void, *const WhvInterruptControl, u32) -> i32;
     type WhvMapGpaRange = unsafe extern "system" fn(*mut c_void, *mut c_void, u64, u64, u32) -> i32;
     type WhvUnmapGpaRange = unsafe extern "system" fn(*mut c_void, u64, u64) -> i32;
+    type WhvEmulatorCreateEmulator =
+        unsafe extern "system" fn(*const WhvEmulatorCallbacks, *mut *mut c_void) -> i32;
+    type WhvEmulatorDestroyEmulator = unsafe extern "system" fn(*mut c_void) -> i32;
+    type WhvEmulatorTryMmioEmulation = unsafe extern "system" fn(
+        *mut c_void,
+        *mut c_void,
+        *const WhvVpExitContext,
+        *const WhvMemoryAccessContext,
+        *mut WhvEmulatorStatus,
+    ) -> i32;
+    const E_UNEXPECTED: i32 = 0x8000_FFFF_u32 as i32;
     const WHV_VIRTUAL_PROCESSOR_STATE_TYPE_INTERRUPT_CONTROLLER_STATE2: u32 = 0x0000_1000;
     const XAPIC_STATE_BYTES: usize = 4096;
     const XAPIC_TPR_OFFSET: usize = 0x080;
@@ -1735,6 +1746,71 @@ mod windows_whp {
         control: u64,
         destination: u32,
         vector: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct WhvEmulatorMemoryAccessInfo {
+        gpa_address: u64,
+        direction: u8,
+        access_size: u8,
+        data: [u8; 8],
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct WhvEmulatorIoAccessInfo {
+        direction: u8,
+        port: u16,
+        access_size: u16,
+        data: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct WhvMemoryAccessContext {
+        instruction_byte_count: u8,
+        reserved: [u8; 3],
+        instruction_bytes: [u8; 16],
+        access_info: u32,
+        gpa: u64,
+        gva: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct WhvVpExitContext {
+        execution_state: u16,
+        instruction_length_and_cr8: u8,
+        reserved: u8,
+        cs: WhvX64SegmentRegister,
+        rip: u64,
+        rflags: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct WhvEmulatorStatus {
+        as_u32: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct WhvEmulatorCallbacks {
+        size: u32,
+        reserved: u32,
+        io_port_callback:
+            Option<unsafe extern "system" fn(*mut c_void, *mut WhvEmulatorIoAccessInfo) -> i32>,
+        memory_callback:
+            Option<unsafe extern "system" fn(*mut c_void, *mut WhvEmulatorMemoryAccessInfo) -> i32>,
+        get_virtual_processor_registers: Option<
+            unsafe extern "system" fn(*mut c_void, *const u32, u32, *mut WhvRegisterValue) -> i32,
+        >,
+        set_virtual_processor_registers: Option<
+            unsafe extern "system" fn(*mut c_void, *const u32, u32, *const WhvRegisterValue) -> i32,
+        >,
+        translate_gva_page:
+            Option<unsafe extern "system" fn(*mut c_void, u64, u32, *mut u32, *mut u64) -> i32>,
     }
 
     #[derive(Copy, Clone, Default)]
@@ -1857,6 +1933,170 @@ mod windows_whp {
             dll_loaded: true,
             required_exports,
         }
+    }
+
+    unsafe fn probe_whp_emulator_lifecycle(report: &mut NativePartitionSmokeReport) {
+        let library_name = CString::new("WinHvEmulation.dll").expect("static string");
+        let module = LoadLibraryA(library_name.as_ptr());
+        if module.is_null() {
+            report.calls.push(NativeWhpCallReport {
+                name: "LoadLibraryA(WinHvEmulation.dll)",
+                hresult: None,
+                ok: false,
+                detail: "WinHvEmulation.dll could not be loaded, so Pane cannot create the WHP instruction emulator for MMIO.".to_string(),
+            });
+            report.blocker = Some(
+                "WinHvEmulation.dll is unavailable; Pane cannot emulate virtio-MMIO instructions."
+                    .to_string(),
+            );
+            return;
+        }
+
+        report.calls.push(NativeWhpCallReport {
+            name: "LoadLibraryA(WinHvEmulation.dll)",
+            hresult: None,
+            ok: true,
+            detail: "Loaded WinHvEmulation.dll for the Pane-owned WHP instruction-emulator bridge."
+                .to_string(),
+        });
+
+        let Some(create_emulator) = resolve_whp_emulator_function::<WhvEmulatorCreateEmulator>(
+            module,
+            "WHvEmulatorCreateEmulator",
+            report,
+        ) else {
+            FreeLibrary(module);
+            return;
+        };
+        let Some(destroy_emulator) = resolve_whp_emulator_function::<WhvEmulatorDestroyEmulator>(
+            module,
+            "WHvEmulatorDestroyEmulator",
+            report,
+        ) else {
+            FreeLibrary(module);
+            return;
+        };
+        let _try_mmio = resolve_whp_emulator_function::<WhvEmulatorTryMmioEmulation>(
+            module,
+            "WHvEmulatorTryMmioEmulation",
+            report,
+        );
+
+        let callbacks = whp_emulator_callbacks();
+        let mut emulator: *mut c_void = std::ptr::null_mut();
+        let hresult = create_emulator(&callbacks, &mut emulator);
+        let created = hresult_succeeded(hresult) && !emulator.is_null();
+        report.calls.push(hresult_call(
+            "WHvEmulatorCreateEmulator",
+            hresult,
+            if created {
+                "Created a WHP instruction emulator with Pane callback entrypoints."
+            } else {
+                "Could not create the WHP instruction emulator required for live MMIO emulation."
+            },
+        ));
+        if !created {
+            report.blocker = Some(
+                "Pane could not create the WHP instruction emulator for virtio-MMIO.".to_string(),
+            );
+            FreeLibrary(module);
+            return;
+        }
+
+        let hresult = destroy_emulator(emulator);
+        let destroyed = hresult_succeeded(hresult);
+        report.calls.push(hresult_call(
+            "WHvEmulatorDestroyEmulator",
+            hresult,
+            if destroyed {
+                "Destroyed the WHP instruction emulator after lifecycle proof."
+            } else {
+                "The WHP instruction emulator was created but did not destroy cleanly."
+            },
+        ));
+        if !destroyed {
+            report.blocker =
+                Some("Pane could not destroy the WHP instruction emulator cleanly.".to_string());
+        }
+
+        FreeLibrary(module);
+    }
+
+    unsafe fn resolve_whp_emulator_function<T>(
+        module: *mut c_void,
+        symbol: &'static str,
+        report: &mut NativePartitionSmokeReport,
+    ) -> Option<T> {
+        let pointer = get_proc_address(module, symbol);
+        report.calls.push(NativeWhpCallReport {
+            name: symbol,
+            hresult: None,
+            ok: pointer.is_some(),
+            detail: if pointer.is_some() {
+                "Resolved WHP instruction-emulator export.".to_string()
+            } else {
+                "Missing required WHP instruction-emulator export.".to_string()
+            },
+        });
+
+        pointer.map(|pointer| mem::transmute_copy::<*mut c_void, T>(&pointer))
+    }
+
+    fn whp_emulator_callbacks() -> WhvEmulatorCallbacks {
+        WhvEmulatorCallbacks {
+            size: mem::size_of::<WhvEmulatorCallbacks>() as u32,
+            reserved: 0,
+            io_port_callback: Some(whp_emulator_io_port_callback),
+            memory_callback: Some(whp_emulator_memory_callback),
+            get_virtual_processor_registers: Some(whp_emulator_get_registers_callback),
+            set_virtual_processor_registers: Some(whp_emulator_set_registers_callback),
+            translate_gva_page: Some(whp_emulator_translate_gva_page_callback),
+        }
+    }
+
+    unsafe extern "system" fn whp_emulator_io_port_callback(
+        _context: *mut c_void,
+        _io_access: *mut WhvEmulatorIoAccessInfo,
+    ) -> i32 {
+        E_UNEXPECTED
+    }
+
+    unsafe extern "system" fn whp_emulator_memory_callback(
+        _context: *mut c_void,
+        memory_access: *mut WhvEmulatorMemoryAccessInfo,
+    ) -> i32 {
+        if memory_access.is_null() {
+            return E_UNEXPECTED;
+        }
+        E_UNEXPECTED
+    }
+
+    unsafe extern "system" fn whp_emulator_get_registers_callback(
+        _context: *mut c_void,
+        _register_names: *const u32,
+        _register_count: u32,
+        _register_values: *mut WhvRegisterValue,
+    ) -> i32 {
+        E_UNEXPECTED
+    }
+
+    unsafe extern "system" fn whp_emulator_set_registers_callback(
+        _context: *mut c_void,
+        _register_names: *const u32,
+        _register_count: u32,
+        _register_values: *const WhvRegisterValue,
+    ) -> i32 {
+        E_UNEXPECTED
+    }
+
+    unsafe extern "system" fn whp_emulator_translate_gva_page_callback(
+        _context: *mut c_void,
+        _gva: u64,
+        _translate_flags: u32,
+        _translation_result: *mut u32,
+        _gpa: *mut u64,
+    ) -> i32 {
+        E_UNEXPECTED
     }
 
     pub(super) fn run_partition_smoke(
@@ -2136,6 +2376,10 @@ mod windows_whp {
             } else {
                 None
             };
+
+            if run_fixture {
+                probe_whp_emulator_lifecycle(&mut report);
+            }
 
             let mut interrupt_controller_configured = !run_fixture;
             let mut partition: *mut c_void = std::ptr::null_mut();
@@ -7012,13 +7256,15 @@ mod windows_whp {
             parse_xapic_interrupt_controller_state, serial_contract_passed,
             serial_markers_observed, timer_interrupt_readiness, timer_interrupt_readiness_blocker,
             timer_interrupt_readiness_report_blocker, trace_native_device_dispatch,
+            whp_emulator_callbacks, whp_emulator_io_port_callback, whp_emulator_memory_callback,
             whv_x64_interrupt_control, xapic_state_vectors, Com1SerialState, DecodedExit,
-            LegacyDeviceIoState, NativeBlockIoTraceCollector, ACPI_PM1_CONTROL_PORT,
+            LegacyDeviceIoState, NativeBlockIoTraceCollector, WhvEmulatorCallbacks,
+            WhvEmulatorIoAccessInfo, WhvEmulatorMemoryAccessInfo, ACPI_PM1_CONTROL_PORT,
             ACPI_PM1_ENABLE_PORT, ACPI_PM1_STATUS_PORT, ACPI_PM_TIMER_PORT, ALT_DELAY_PORT,
             ALT_POST_DELAY_PORT, CMOS_ADDRESS_PORT, CMOS_DATA_PORT, CPUID_DEFAULT_RAX_OFFSET,
             CPUID_DEFAULT_RBX_OFFSET, CPUID_DEFAULT_RCX_OFFSET, CPUID_DEFAULT_RDX_OFFSET,
             CPUID_RAX_OFFSET, CPUID_RCX_OFFSET, DMA_PAGE_REGISTER_START_PORT, ELCR1_PORT,
-            ELCR2_PORT, IO_ACCESS_INFO_OFFSET, IO_PORT_OFFSET, IO_RAX_OFFSET,
+            ELCR2_PORT, E_UNEXPECTED, IO_ACCESS_INFO_OFFSET, IO_PORT_OFFSET, IO_RAX_OFFSET,
             LINUX_ENTRY_PROBE_EXIT_BUDGET, LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET,
             LINUX_ENTRY_PROBE_STORAGE_TOTAL_BUDGET_SECONDS, LINUX_ENTRY_PROBE_TOTAL_BUDGET_SECONDS,
             LINUX_ENTRY_PROBE_TRACE_HEAD, LINUX_ENTRY_PROBE_TRACE_TAIL, MEMORY_ACCESS_INFO_OFFSET,
@@ -7070,6 +7316,53 @@ mod windows_whp {
             }
             assert_eq!(page[offset], 0xf4);
             assert!(page[offset + 1..].iter().all(|byte| *byte == 0));
+        }
+
+        #[test]
+        fn whp_emulator_abi_layout_matches_windows_headers() {
+            assert_eq!(std::mem::size_of::<WhvEmulatorMemoryAccessInfo>(), 24);
+            assert_eq!(std::mem::align_of::<WhvEmulatorMemoryAccessInfo>(), 8);
+            assert_eq!(std::mem::size_of::<WhvEmulatorIoAccessInfo>(), 12);
+            assert_eq!(
+                std::mem::size_of::<WhvEmulatorCallbacks>(),
+                2 * std::mem::size_of::<u32>() + 5 * std::mem::size_of::<usize>()
+            );
+
+            let callbacks = whp_emulator_callbacks();
+
+            assert_eq!(
+                callbacks.size,
+                std::mem::size_of::<WhvEmulatorCallbacks>() as u32
+            );
+            assert!(callbacks.io_port_callback.is_some());
+            assert!(callbacks.memory_callback.is_some());
+            assert!(callbacks.get_virtual_processor_registers.is_some());
+            assert!(callbacks.set_virtual_processor_registers.is_some());
+            assert!(callbacks.translate_gva_page.is_some());
+        }
+
+        #[test]
+        fn whp_emulator_callbacks_fail_closed_until_live_context_is_wired() {
+            let mut io_access = WhvEmulatorIoAccessInfo {
+                direction: 0,
+                port: 0,
+                access_size: 1,
+                data: 0,
+            };
+            let mut memory_access = WhvEmulatorMemoryAccessInfo {
+                gpa_address: crate::virtio::PANE_VIRTIO_MMIO_BASE_GPA,
+                direction: 0,
+                access_size: 4,
+                data: [0; 8],
+            };
+
+            let io_result =
+                unsafe { whp_emulator_io_port_callback(std::ptr::null_mut(), &mut io_access) };
+            let memory_result =
+                unsafe { whp_emulator_memory_callback(std::ptr::null_mut(), &mut memory_access) };
+
+            assert_eq!(io_result, E_UNEXPECTED);
+            assert_eq!(memory_result, E_UNEXPECTED);
         }
 
         #[test]

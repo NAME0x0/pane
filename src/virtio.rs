@@ -10,6 +10,9 @@ pub(crate) const VIRTIO_DEVICE_ID_INPUT: u32 = 18;
 pub(crate) const VIRTIO_MMIO_CONFIG_OFFSET: u64 = 0x100;
 pub(crate) const VIRTIO_BLK_SECTOR_SIZE_BYTES: u64 = 512;
 pub(crate) const PANE_VIRTIO_BLK_QUEUE_SIZE: u16 = 256;
+pub(crate) const VIRTIO_BLK_STATUS_OK: u8 = 0;
+pub(crate) const VIRTIO_BLK_STATUS_IOERR: u8 = 1;
+pub(crate) const VIRTIO_BLK_STATUS_UNSUPP: u8 = 2;
 
 const VIRTIO_MMIO_MAGIC_VALUE_OFFSET: u64 = 0x000;
 const VIRTIO_MMIO_VERSION_OFFSET: u64 = 0x004;
@@ -35,6 +38,12 @@ const VIRTIO_MMIO_QUEUE_USED_LOW_OFFSET: u64 = 0x0a0;
 const VIRTIO_MMIO_QUEUE_USED_HIGH_OFFSET: u64 = 0x0a4;
 const VIRTIO_MMIO_CONFIG_GENERATION_OFFSET: u64 = 0x0fc;
 const PANE_VENDOR_ID: u32 = 0x7061_6e65;
+const VIRTQ_DESC_F_NEXT: u16 = 1;
+const VIRTQ_DESC_F_WRITE: u16 = 2;
+const VIRTIO_BLK_T_IN: u32 = 0;
+const VIRTIO_BLK_T_OUT: u32 = 1;
+const VIRTIO_BLK_T_FLUSH: u32 = 4;
+const VIRTIO_BLK_T_GET_ID: u32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct PaneVirtioMmioWindow {
@@ -43,6 +52,7 @@ pub(crate) struct PaneVirtioMmioWindow {
     pub(crate) size_bytes: u64,
     pub(crate) transport: &'static str,
     pub(crate) handshake_smoke: PaneVirtioMmioHandshakeSmoke,
+    pub(crate) execution_smoke: PaneVirtioBlkExecutionSmoke,
     pub(crate) primary_device: PaneVirtioDeviceSummary,
     pub(crate) future_devices: Vec<PaneVirtioDeviceSummary>,
 }
@@ -73,6 +83,16 @@ pub(crate) struct PaneVirtioMmioHandshakeSmoke {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct PaneVirtioBlkExecutionSmoke {
+    pub(crate) status: &'static str,
+    pub(crate) request_type: PaneVirtioBlkRequestType,
+    pub(crate) sector: u64,
+    pub(crate) bytes_transferred: u32,
+    pub(crate) used_len: u32,
+    pub(crate) interrupt_status: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct PaneVirtioQueueState {
     pub(crate) max_size: u16,
     pub(crate) size: u16,
@@ -97,6 +117,58 @@ pub(crate) struct PaneVirtioMmioBlockDevice {
     pub(crate) queue_select: u16,
     pub(crate) queue: PaneVirtioQueueState,
     pub(crate) config: PaneVirtioBlkConfig,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct PaneVirtioBlkRequest {
+    pub(crate) request_type: PaneVirtioBlkRequestType,
+    pub(crate) sector: u64,
+    pub(crate) data_descriptors: Vec<PaneVirtioDescriptor>,
+    pub(crate) status_addr: u64,
+    pub(crate) status_len: u32,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum PaneVirtioBlkRequestType {
+    In,
+    Out,
+    Flush,
+    GetId,
+    Unsupported(u32),
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct PaneVirtioDescriptor {
+    pub(crate) addr: u64,
+    pub(crate) len: u32,
+    pub(crate) flags: u16,
+    pub(crate) next: u16,
+}
+
+impl PaneVirtioDescriptor {
+    fn has_next(self) -> bool {
+        (self.flags & VIRTQ_DESC_F_NEXT) != 0
+    }
+
+    fn writable(self) -> bool {
+        (self.flags & VIRTQ_DESC_F_WRITE) != 0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct PaneVirtioBlkExecution {
+    pub(crate) request: Option<PaneVirtioBlkRequest>,
+    pub(crate) status: u8,
+    pub(crate) bytes_transferred: u32,
+    pub(crate) used_head_index: u16,
+    pub(crate) used_len: u32,
+    pub(crate) detail: String,
+}
+
+pub(crate) trait PaneGuestMemory {
+    fn read(&self, gpa: u64, bytes: &mut [u8]) -> Result<(), String>;
+    fn write(&mut self, gpa: u64, bytes: &[u8]) -> Result<(), String>;
 }
 
 impl PaneVirtioMmioBlockDevice {
@@ -126,6 +198,143 @@ impl PaneVirtioMmioBlockDevice {
                 sector_size_bytes: VIRTIO_BLK_SECTOR_SIZE_BYTES,
                 readonly,
             },
+        }
+    }
+
+    pub(crate) fn execute_available_block_request<M, F>(
+        &mut self,
+        memory: &mut M,
+        service: F,
+    ) -> PaneVirtioBlkExecution
+    where
+        M: PaneGuestMemory,
+        F: FnOnce(&PaneVirtioBlkRequest, Option<&[u8]>) -> Result<Vec<u8>, String>,
+    {
+        if !self.queue.ready || self.queue.size == 0 {
+            return PaneVirtioBlkExecution {
+                request: None,
+                status: VIRTIO_BLK_STATUS_IOERR,
+                bytes_transferred: 0,
+                used_head_index: 0,
+                used_len: 0,
+                detail: "virtqueue is not ready".to_string(),
+            };
+        }
+
+        let Some(head_index) = read_avail_head(memory, &self.queue) else {
+            return PaneVirtioBlkExecution {
+                request: None,
+                status: VIRTIO_BLK_STATUS_IOERR,
+                bytes_transferred: 0,
+                used_head_index: 0,
+                used_len: 0,
+                detail: "available ring does not contain a request".to_string(),
+            };
+        };
+
+        match parse_virtio_blk_request(memory, &self.queue, head_index) {
+            Ok(request) => self.execute_parsed_block_request(memory, request, head_index, service),
+            Err(error) => PaneVirtioBlkExecution {
+                request: None,
+                status: VIRTIO_BLK_STATUS_IOERR,
+                bytes_transferred: 0,
+                used_head_index: head_index,
+                used_len: 0,
+                detail: error,
+            },
+        }
+    }
+
+    fn execute_parsed_block_request<M, F>(
+        &mut self,
+        memory: &mut M,
+        request: PaneVirtioBlkRequest,
+        head_index: u16,
+        service: F,
+    ) -> PaneVirtioBlkExecution
+    where
+        M: PaneGuestMemory,
+        F: FnOnce(&PaneVirtioBlkRequest, Option<&[u8]>) -> Result<Vec<u8>, String>,
+    {
+        let write_payload = match request.request_type {
+            PaneVirtioBlkRequestType::Out => match read_request_payload(memory, &request) {
+                Ok(payload) => Some(payload),
+                Err(error) => {
+                    let _ = memory.write(request.status_addr, &[VIRTIO_BLK_STATUS_IOERR]);
+                    return PaneVirtioBlkExecution {
+                        request: Some(request),
+                        status: VIRTIO_BLK_STATUS_IOERR,
+                        bytes_transferred: 0,
+                        used_head_index: head_index,
+                        used_len: 0,
+                        detail: error,
+                    };
+                }
+            },
+            _ => None,
+        };
+
+        let service_result = match request.request_type {
+            PaneVirtioBlkRequestType::In | PaneVirtioBlkRequestType::Out => {
+                service(&request, write_payload.as_deref())
+            }
+            PaneVirtioBlkRequestType::Flush => Ok(Vec::new()),
+            PaneVirtioBlkRequestType::GetId => Ok(b"pane-virtio-blk\0".to_vec()),
+            PaneVirtioBlkRequestType::Unsupported(value) => {
+                Err(format!("unsupported virtio-blk request type {value}"))
+            }
+        };
+
+        match service_result {
+            Ok(bytes) => {
+                let status = match request.request_type {
+                    PaneVirtioBlkRequestType::In | PaneVirtioBlkRequestType::GetId => {
+                        write_read_response(memory, &request, &bytes)
+                    }
+                    PaneVirtioBlkRequestType::Out | PaneVirtioBlkRequestType::Flush => {
+                        VIRTIO_BLK_STATUS_OK
+                    }
+                    PaneVirtioBlkRequestType::Unsupported(_) => VIRTIO_BLK_STATUS_UNSUPP,
+                };
+                let _ = memory.write(request.status_addr, &[status]);
+                let used_len = if status == VIRTIO_BLK_STATUS_OK {
+                    bytes.len() as u32 + 1
+                } else {
+                    1
+                };
+                let _ = write_used_entry(memory, &self.queue, head_index, used_len);
+                self.interrupt_status |= 1;
+                PaneVirtioBlkExecution {
+                    request: Some(request),
+                    status,
+                    bytes_transferred: used_len.saturating_sub(1),
+                    used_head_index: head_index,
+                    used_len,
+                    detail: if status == VIRTIO_BLK_STATUS_OK {
+                        "virtio-blk request serviced".to_string()
+                    } else {
+                        "virtio-blk request failed while writing response".to_string()
+                    },
+                }
+            }
+            Err(error) => {
+                let status = if error.contains("unsupported") {
+                    VIRTIO_BLK_STATUS_UNSUPP
+                } else {
+                    VIRTIO_BLK_STATUS_IOERR
+                };
+                let _ = memory.write(request.status_addr, &[status]);
+                let _ = write_used_entry(memory, &self.queue, head_index, 1);
+                self.interrupt_status |= 1;
+                PaneVirtioBlkExecution {
+                    request: Some(request),
+                    status,
+                    bytes_transferred: 0,
+                    used_head_index: head_index,
+                    used_len: 1,
+                    detail: error,
+                }
+            }
         }
     }
 
@@ -276,11 +485,12 @@ pub(crate) fn pane_virtio_mmio_window() -> PaneVirtioMmioWindow {
         size_bytes: PANE_VIRTIO_MMIO_SIZE_BYTES,
         transport: "virtio-mmio",
         handshake_smoke: pane_virtio_mmio_handshake_smoke(),
+        execution_smoke: pane_virtio_blk_execution_smoke(),
         primary_device: PaneVirtioDeviceSummary {
             id: "vda",
             virtio_device_id: VIRTIO_DEVICE_ID_BLOCK,
             purpose: "read-only Arch base disk first, then writable user disk queue support",
-            status: "mmio-register-model-ready-queue-execution-pending",
+            status: "descriptor-chain-execution-ready-whp-mmio-wiring-pending",
         },
         future_devices: vec![
             PaneVirtioDeviceSummary {
@@ -296,6 +506,52 @@ pub(crate) fn pane_virtio_mmio_window() -> PaneVirtioMmioWindow {
                 status: "planned",
             },
         ],
+    }
+}
+
+pub(crate) fn pane_virtio_blk_execution_smoke() -> PaneVirtioBlkExecutionSmoke {
+    let mut device = PaneVirtioMmioBlockDevice::new(8 * 1024 * 1024, true);
+    let mut memory = PaneSmokeGuestMemory::new(0x5000);
+    configure_smoke_queue(&mut device);
+
+    memory.write_u32(0x4000, VIRTIO_BLK_T_IN);
+    memory.write_u32(0x4004, 0);
+    memory.write_u64(0x4008, 4);
+    write_smoke_descriptor(&mut memory, 0, 0x4000, 16, VIRTQ_DESC_F_NEXT, 1);
+    write_smoke_descriptor(
+        &mut memory,
+        1,
+        0x4100,
+        512,
+        VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE,
+        2,
+    );
+    write_smoke_descriptor(&mut memory, 2, 0x4300, 1, VIRTQ_DESC_F_WRITE, 0);
+    memory.write_u16(0x2002, 1);
+    memory.write_u16(0x2004, 0);
+
+    let execution = device.execute_available_block_request(&mut memory, |request, _payload| {
+        if request.request_type == PaneVirtioBlkRequestType::In && request.sector == 4 {
+            Ok(vec![0xa5; 512])
+        } else {
+            Err("unexpected smoke request".to_string())
+        }
+    });
+    let request = execution.request.as_ref();
+
+    PaneVirtioBlkExecutionSmoke {
+        status: if execution.status == VIRTIO_BLK_STATUS_OK {
+            "descriptor-chain-execution-ready"
+        } else {
+            "descriptor-chain-execution-failed"
+        },
+        request_type: request
+            .map(|request| request.request_type)
+            .unwrap_or(PaneVirtioBlkRequestType::Unsupported(u32::MAX)),
+        sector: request.map(|request| request.sector).unwrap_or(0),
+        bytes_transferred: execution.bytes_transferred,
+        used_len: execution.used_len,
+        interrupt_status: device.interrupt_status,
     }
 }
 
@@ -342,6 +598,75 @@ pub(crate) fn pane_virtio_mmio_handshake_smoke() -> PaneVirtioMmioHandshakeSmoke
     }
 }
 
+struct PaneSmokeGuestMemory {
+    bytes: Vec<u8>,
+}
+
+impl PaneSmokeGuestMemory {
+    fn new(size: usize) -> Self {
+        Self {
+            bytes: vec![0_u8; size],
+        }
+    }
+
+    fn write_u16(&mut self, gpa: u64, value: u16) {
+        let _ = self.write(gpa, &value.to_le_bytes());
+    }
+
+    fn write_u32(&mut self, gpa: u64, value: u32) {
+        let _ = self.write(gpa, &value.to_le_bytes());
+    }
+
+    fn write_u64(&mut self, gpa: u64, value: u64) {
+        let _ = self.write(gpa, &value.to_le_bytes());
+    }
+}
+
+impl PaneGuestMemory for PaneSmokeGuestMemory {
+    fn read(&self, gpa: u64, bytes: &mut [u8]) -> Result<(), String> {
+        let start = gpa as usize;
+        let end = start + bytes.len();
+        if end > self.bytes.len() {
+            return Err("smoke memory read out of bounds".to_string());
+        }
+        bytes.copy_from_slice(&self.bytes[start..end]);
+        Ok(())
+    }
+
+    fn write(&mut self, gpa: u64, bytes: &[u8]) -> Result<(), String> {
+        let start = gpa as usize;
+        let end = start + bytes.len();
+        if end > self.bytes.len() {
+            return Err("smoke memory write out of bounds".to_string());
+        }
+        self.bytes[start..end].copy_from_slice(bytes);
+        Ok(())
+    }
+}
+
+fn configure_smoke_queue(device: &mut PaneVirtioMmioBlockDevice) {
+    let _ = device.write_u32(VIRTIO_MMIO_QUEUE_NUM_OFFSET, 8);
+    let _ = device.write_u32(VIRTIO_MMIO_QUEUE_DESC_LOW_OFFSET, 0x1000);
+    let _ = device.write_u32(VIRTIO_MMIO_QUEUE_AVAIL_LOW_OFFSET, 0x2000);
+    let _ = device.write_u32(VIRTIO_MMIO_QUEUE_USED_LOW_OFFSET, 0x3000);
+    let _ = device.write_u32(VIRTIO_MMIO_QUEUE_READY_OFFSET, 1);
+}
+
+fn write_smoke_descriptor(
+    memory: &mut PaneSmokeGuestMemory,
+    index: u16,
+    addr: u64,
+    len: u32,
+    flags: u16,
+    next: u16,
+) {
+    let descriptor = 0x1000 + u64::from(index) * 16;
+    memory.write_u64(descriptor, addr);
+    memory.write_u32(descriptor + 8, len);
+    memory.write_u16(descriptor + 12, flags);
+    memory.write_u16(descriptor + 14, next);
+}
+
 pub(crate) fn pane_virtio_mmio_contains_gpa(gpa: u64) -> bool {
     (PANE_VIRTIO_MMIO_BASE_GPA..PANE_VIRTIO_MMIO_BASE_GPA + PANE_VIRTIO_MMIO_SIZE_BYTES)
         .contains(&gpa)
@@ -349,6 +674,162 @@ pub(crate) fn pane_virtio_mmio_contains_gpa(gpa: u64) -> bool {
 
 pub(crate) fn format_guest_physical_address(gpa: u64) -> String {
     format!("0x{gpa:08x}")
+}
+
+fn read_avail_head<M: PaneGuestMemory>(memory: &M, queue: &PaneVirtioQueueState) -> Option<u16> {
+    let idx = read_u16(memory, queue.avail_ring_gpa + 2).ok()?;
+    if idx == 0 {
+        return None;
+    }
+    read_u16(memory, queue.avail_ring_gpa + 4).ok()
+}
+
+fn parse_virtio_blk_request<M: PaneGuestMemory>(
+    memory: &M,
+    queue: &PaneVirtioQueueState,
+    head_index: u16,
+) -> Result<PaneVirtioBlkRequest, String> {
+    if head_index >= queue.size {
+        return Err(format!(
+            "descriptor head index {head_index} exceeds queue size {}",
+            queue.size
+        ));
+    }
+
+    let mut descriptors = Vec::new();
+    let mut index = head_index;
+    for _ in 0..queue.size {
+        let descriptor = read_descriptor(memory, queue, index)?;
+        let has_next = descriptor.has_next();
+        descriptors.push(descriptor);
+        if !has_next {
+            break;
+        }
+        index = descriptor.next;
+        if index >= queue.size {
+            return Err(format!(
+                "descriptor next index {index} exceeds queue size {}",
+                queue.size
+            ));
+        }
+    }
+
+    if descriptors.len() < 2 {
+        return Err("virtio-blk descriptor chain is too short".to_string());
+    }
+
+    let header = descriptors[0];
+    if header.writable() || header.len < 16 {
+        return Err("virtio-blk header descriptor is invalid".to_string());
+    }
+
+    let status = *descriptors
+        .last()
+        .expect("chain length checked before status descriptor");
+    if !status.writable() || status.len < 1 {
+        return Err("virtio-blk status descriptor is invalid".to_string());
+    }
+
+    let request_type = match read_u32(memory, header.addr)? {
+        VIRTIO_BLK_T_IN => PaneVirtioBlkRequestType::In,
+        VIRTIO_BLK_T_OUT => PaneVirtioBlkRequestType::Out,
+        VIRTIO_BLK_T_FLUSH => PaneVirtioBlkRequestType::Flush,
+        VIRTIO_BLK_T_GET_ID => PaneVirtioBlkRequestType::GetId,
+        value => PaneVirtioBlkRequestType::Unsupported(value),
+    };
+    let sector = read_u64(memory, header.addr + 8)?;
+
+    Ok(PaneVirtioBlkRequest {
+        request_type,
+        sector,
+        data_descriptors: descriptors[1..descriptors.len() - 1].to_vec(),
+        status_addr: status.addr,
+        status_len: status.len,
+    })
+}
+
+fn read_descriptor<M: PaneGuestMemory>(
+    memory: &M,
+    queue: &PaneVirtioQueueState,
+    index: u16,
+) -> Result<PaneVirtioDescriptor, String> {
+    let addr = queue.desc_table_gpa + u64::from(index) * 16;
+    Ok(PaneVirtioDescriptor {
+        addr: read_u64(memory, addr)?,
+        len: read_u32(memory, addr + 8)?,
+        flags: read_u16(memory, addr + 12)?,
+        next: read_u16(memory, addr + 14)?,
+    })
+}
+
+fn read_request_payload<M: PaneGuestMemory>(
+    memory: &M,
+    request: &PaneVirtioBlkRequest,
+) -> Result<Vec<u8>, String> {
+    let mut payload = Vec::new();
+    for descriptor in &request.data_descriptors {
+        if descriptor.writable() {
+            return Err("virtio-blk OUT data descriptor must be device-readable".to_string());
+        }
+        let mut bytes = vec![0_u8; descriptor.len as usize];
+        memory.read(descriptor.addr, &mut bytes)?;
+        payload.extend(bytes);
+    }
+    Ok(payload)
+}
+
+fn write_read_response<M: PaneGuestMemory>(
+    memory: &mut M,
+    request: &PaneVirtioBlkRequest,
+    bytes: &[u8],
+) -> u8 {
+    let mut cursor = 0_usize;
+    for descriptor in &request.data_descriptors {
+        if !descriptor.writable() {
+            return VIRTIO_BLK_STATUS_IOERR;
+        }
+        let len = descriptor.len as usize;
+        let available = bytes.len().saturating_sub(cursor);
+        let transfer = len.min(available);
+        let mut buffer = vec![0_u8; len];
+        buffer[..transfer].copy_from_slice(&bytes[cursor..cursor + transfer]);
+        if memory.write(descriptor.addr, &buffer).is_err() {
+            return VIRTIO_BLK_STATUS_IOERR;
+        }
+        cursor += transfer;
+    }
+    VIRTIO_BLK_STATUS_OK
+}
+
+fn write_used_entry<M: PaneGuestMemory>(
+    memory: &mut M,
+    queue: &PaneVirtioQueueState,
+    head_index: u16,
+    len: u32,
+) -> Result<(), String> {
+    let used_elem = queue.used_ring_gpa + 4;
+    memory.write(used_elem, &u32::from(head_index).to_le_bytes())?;
+    memory.write(used_elem + 4, &len.to_le_bytes())?;
+    memory.write(queue.used_ring_gpa + 2, &1_u16.to_le_bytes())?;
+    Ok(())
+}
+
+fn read_u16<M: PaneGuestMemory>(memory: &M, gpa: u64) -> Result<u16, String> {
+    let mut bytes = [0_u8; 2];
+    memory.read(gpa, &mut bytes)?;
+    Ok(u16::from_le_bytes(bytes))
+}
+
+fn read_u32<M: PaneGuestMemory>(memory: &M, gpa: u64) -> Result<u32, String> {
+    let mut bytes = [0_u8; 4];
+    memory.read(gpa, &mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_u64<M: PaneGuestMemory>(memory: &M, gpa: u64) -> Result<u64, String> {
+    let mut bytes = [0_u8; 8];
+    memory.read(gpa, &mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
 }
 
 fn combine_addr_low(current: u64, low: u32) -> u64 {
@@ -362,11 +843,115 @@ fn combine_addr_high(current: u64, high: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        pane_virtio_mmio_contains_gpa, pane_virtio_mmio_window, PaneVirtioMmioBlockDevice,
-        PaneVirtioMmioWriteResult, PANE_VIRTIO_BLK_QUEUE_SIZE, PANE_VIRTIO_MMIO_BASE_GPA,
-        PANE_VIRTIO_MMIO_SIZE_BYTES, VIRTIO_DEVICE_ID_BLOCK, VIRTIO_MMIO_MAGIC_VALUE,
-        VIRTIO_MMIO_VERSION_MODERN,
+        pane_virtio_mmio_contains_gpa, pane_virtio_mmio_window, PaneGuestMemory,
+        PaneVirtioBlkRequestType, PaneVirtioMmioBlockDevice, PaneVirtioMmioWriteResult,
+        PANE_VIRTIO_BLK_QUEUE_SIZE, PANE_VIRTIO_MMIO_BASE_GPA, PANE_VIRTIO_MMIO_SIZE_BYTES,
+        VIRTIO_BLK_STATUS_IOERR, VIRTIO_BLK_STATUS_OK, VIRTIO_DEVICE_ID_BLOCK,
+        VIRTIO_MMIO_MAGIC_VALUE, VIRTIO_MMIO_VERSION_MODERN,
     };
+
+    struct TestGuestMemory {
+        base: u64,
+        bytes: Vec<u8>,
+    }
+
+    impl TestGuestMemory {
+        fn new(size: usize) -> Self {
+            Self {
+                base: 0,
+                bytes: vec![0_u8; size],
+            }
+        }
+
+        fn write_u16(&mut self, gpa: u64, value: u16) {
+            self.write(gpa, &value.to_le_bytes()).unwrap();
+        }
+
+        fn write_u32(&mut self, gpa: u64, value: u32) {
+            self.write(gpa, &value.to_le_bytes()).unwrap();
+        }
+
+        fn write_u64(&mut self, gpa: u64, value: u64) {
+            self.write(gpa, &value.to_le_bytes()).unwrap();
+        }
+
+        fn read_bytes(&self, gpa: u64, len: usize) -> Vec<u8> {
+            let mut bytes = vec![0_u8; len];
+            self.read(gpa, &mut bytes).unwrap();
+            bytes
+        }
+    }
+
+    impl PaneGuestMemory for TestGuestMemory {
+        fn read(&self, gpa: u64, bytes: &mut [u8]) -> Result<(), String> {
+            let start = gpa
+                .checked_sub(self.base)
+                .ok_or_else(|| "guest read before memory base".to_string())?
+                as usize;
+            let end = start + bytes.len();
+            if end > self.bytes.len() {
+                return Err("guest read out of bounds".to_string());
+            }
+            bytes.copy_from_slice(&self.bytes[start..end]);
+            Ok(())
+        }
+
+        fn write(&mut self, gpa: u64, bytes: &[u8]) -> Result<(), String> {
+            let start = gpa
+                .checked_sub(self.base)
+                .ok_or_else(|| "guest write before memory base".to_string())?
+                as usize;
+            let end = start + bytes.len();
+            if end > self.bytes.len() {
+                return Err("guest write out of bounds".to_string());
+            }
+            self.bytes[start..end].copy_from_slice(bytes);
+            Ok(())
+        }
+    }
+
+    fn configure_queue(device: &mut PaneVirtioMmioBlockDevice) {
+        assert_eq!(
+            device.write_u32(0x038, 8),
+            PaneVirtioMmioWriteResult::Accepted
+        );
+        assert_eq!(
+            device.write_u32(0x080, 0x1000),
+            PaneVirtioMmioWriteResult::Accepted
+        );
+        assert_eq!(
+            device.write_u32(0x090, 0x2000),
+            PaneVirtioMmioWriteResult::Accepted
+        );
+        assert_eq!(
+            device.write_u32(0x0a0, 0x3000),
+            PaneVirtioMmioWriteResult::Accepted
+        );
+        assert_eq!(
+            device.write_u32(0x044, 1),
+            PaneVirtioMmioWriteResult::Accepted
+        );
+    }
+
+    fn write_descriptor(
+        memory: &mut TestGuestMemory,
+        index: u16,
+        addr: u64,
+        len: u32,
+        flags: u16,
+        next: u16,
+    ) {
+        let descriptor = 0x1000 + u64::from(index) * 16;
+        memory.write_u64(descriptor, addr);
+        memory.write_u32(descriptor + 8, len);
+        memory.write_u16(descriptor + 12, flags);
+        memory.write_u16(descriptor + 14, next);
+    }
+
+    fn publish_head(memory: &mut TestGuestMemory, head: u16) {
+        memory.write_u16(0x2002, 1);
+        memory.write_u16(0x2004, head);
+    }
 
     #[test]
     fn virtio_mmio_block_device_reports_modern_block_identity() {
@@ -437,6 +1022,92 @@ mod tests {
     }
 
     #[test]
+    fn virtio_blk_executes_split_queue_read_request() {
+        let mut device = PaneVirtioMmioBlockDevice::new(8 * 1024 * 1024, true);
+        configure_queue(&mut device);
+        let mut memory = TestGuestMemory::new(0x5000);
+
+        memory.write_u32(0x4000, 0);
+        memory.write_u32(0x4004, 0);
+        memory.write_u64(0x4008, 4);
+        write_descriptor(&mut memory, 0, 0x4000, 16, 1, 1);
+        write_descriptor(&mut memory, 1, 0x4100, 512, 3, 2);
+        write_descriptor(&mut memory, 2, 0x4300, 1, 2, 0);
+        publish_head(&mut memory, 0);
+
+        let execution = device.execute_available_block_request(&mut memory, |request, payload| {
+            assert_eq!(request.request_type, PaneVirtioBlkRequestType::In);
+            assert_eq!(request.sector, 4);
+            assert!(payload.is_none());
+            Ok(vec![0x5a; 512])
+        });
+
+        assert_eq!(execution.status, VIRTIO_BLK_STATUS_OK);
+        assert_eq!(execution.bytes_transferred, 512);
+        assert_eq!(execution.used_head_index, 0);
+        assert_eq!(memory.read_bytes(0x4100, 4), vec![0x5a; 4]);
+        assert_eq!(memory.read_bytes(0x4300, 1), vec![VIRTIO_BLK_STATUS_OK]);
+        assert_eq!(memory.read_bytes(0x3004, 4), 0_u32.to_le_bytes());
+        assert_eq!(memory.read_bytes(0x3008, 4), 513_u32.to_le_bytes());
+        assert_eq!(device.interrupt_status, 1);
+    }
+
+    #[test]
+    fn virtio_blk_executes_split_queue_write_request() {
+        let mut device = PaneVirtioMmioBlockDevice::new(8 * 1024 * 1024, false);
+        configure_queue(&mut device);
+        let mut memory = TestGuestMemory::new(0x5000);
+
+        memory.write_u32(0x4000, 1);
+        memory.write_u32(0x4004, 0);
+        memory.write_u64(0x4008, 7);
+        memory.write(0x4100, &[0x33; 512]).unwrap();
+        write_descriptor(&mut memory, 0, 0x4000, 16, 1, 1);
+        write_descriptor(&mut memory, 1, 0x4100, 512, 1, 2);
+        write_descriptor(&mut memory, 2, 0x4300, 1, 2, 0);
+        publish_head(&mut memory, 0);
+
+        let execution = device.execute_available_block_request(&mut memory, |request, payload| {
+            assert_eq!(request.request_type, PaneVirtioBlkRequestType::Out);
+            assert_eq!(request.sector, 7);
+            assert_eq!(payload.expect("write payload")[..4], [0x33; 4]);
+            Ok(Vec::new())
+        });
+
+        assert_eq!(execution.status, VIRTIO_BLK_STATUS_OK);
+        assert_eq!(execution.bytes_transferred, 0);
+        assert_eq!(memory.read_bytes(0x4300, 1), vec![VIRTIO_BLK_STATUS_OK]);
+        assert_eq!(memory.read_bytes(0x3008, 4), 1_u32.to_le_bytes());
+        assert_eq!(device.interrupt_status, 1);
+    }
+
+    #[test]
+    fn virtio_blk_writes_error_status_for_bad_service_result() {
+        let mut device = PaneVirtioMmioBlockDevice::new(8 * 1024 * 1024, true);
+        configure_queue(&mut device);
+        let mut memory = TestGuestMemory::new(0x5000);
+
+        memory.write_u32(0x4000, 0);
+        memory.write_u32(0x4004, 0);
+        memory.write_u64(0x4008, 4);
+        write_descriptor(&mut memory, 0, 0x4000, 16, 1, 1);
+        write_descriptor(&mut memory, 1, 0x4100, 512, 3, 2);
+        write_descriptor(&mut memory, 2, 0x4300, 1, 2, 0);
+        publish_head(&mut memory, 0);
+
+        let execution = device
+            .execute_available_block_request(&mut memory, |_request, _payload| {
+                Err("storage backend unavailable".to_string())
+            });
+
+        assert_eq!(execution.status, VIRTIO_BLK_STATUS_IOERR);
+        assert_eq!(execution.bytes_transferred, 0);
+        assert_eq!(memory.read_bytes(0x4300, 1), vec![VIRTIO_BLK_STATUS_IOERR]);
+        assert_eq!(memory.read_bytes(0x3008, 4), 1_u32.to_le_bytes());
+        assert_eq!(device.interrupt_status, 1);
+    }
+
+    #[test]
     fn pane_virtio_mmio_window_declares_storage_display_and_input_path() {
         let window = pane_virtio_mmio_window();
 
@@ -451,6 +1122,16 @@ mod tests {
         assert_eq!(window.handshake_smoke.avail_ring_gpa, "0x00110000");
         assert_eq!(window.handshake_smoke.used_ring_gpa, "0x00120000");
         assert_eq!(window.handshake_smoke.last_notify, Some(0));
+        assert_eq!(
+            window.execution_smoke.status,
+            "descriptor-chain-execution-ready"
+        );
+        assert_eq!(
+            window.execution_smoke.request_type,
+            PaneVirtioBlkRequestType::In
+        );
+        assert_eq!(window.execution_smoke.bytes_transferred, 512);
+        assert_eq!(window.execution_smoke.interrupt_status, 1);
         assert_eq!(
             window.primary_device.virtio_device_id,
             VIRTIO_DEVICE_ID_BLOCK

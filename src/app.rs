@@ -937,6 +937,10 @@ fn default_pane_block_dma_size_bytes() -> u64 {
     0x00001000
 }
 
+fn storage_contract_size_bytes() -> u64 {
+    0x00002000
+}
+
 fn default_virtio_mmio_base_gpa() -> String {
     crate::virtio::format_guest_physical_address(crate::virtio::PANE_VIRTIO_MMIO_BASE_GPA)
 }
@@ -959,11 +963,11 @@ fn virtio_block_backend_plan(storage: &KernelStorageAttachment) -> VirtioBlockBa
         candidate_crate_version: None,
         license: "Apache-2.0 OR BSD-3-Clause".to_string(),
         source_url: "https://github.com/rust-vmm/vm-virtio".to_string(),
-        adoption_state: "mmio-register-model-ready-queue-execution-pending".to_string(),
+        adoption_state: "descriptor-chain-execution-ready-whp-mmio-wiring-pending".to_string(),
         transport: "virtio-mmio".to_string(),
         mmio_base_gpa: default_virtio_mmio_base_gpa(),
         mmio_size_bytes: default_virtio_mmio_size_bytes(),
-        queue_model: "split-virtqueue-registers-ready-descriptor-execution-pending".to_string(),
+        queue_model: "split-virtqueue-descriptor-chain-execution-ready".to_string(),
         interrupt_model: "WHP interrupt injection through Pane device loop".to_string(),
         sector_size_bytes: 512,
         root_device_hint,
@@ -1001,7 +1005,7 @@ fn virtio_block_backend_plan(storage: &KernelStorageAttachment) -> VirtioBlockBa
         notes: vec![
             "This is the standard Linux block-device target for Pane-owned Arch boot; it is not yet executed by the WHP runner."
                 .to_string(),
-            "Pane reserves and maps a virtio-MMIO page for the block device; queue descriptor execution is the remaining storage milestone."
+            "Pane reserves and maps a virtio-MMIO page for the block device and has a tested split-virtqueue descriptor executor; wiring WHP MMIO exits to that executor is the remaining storage milestone."
                 .to_string(),
             "The existing Pane block-port contract remains only as the current diagnostic bridge until the virtio device loop is implemented."
                 .to_string(),
@@ -7958,7 +7962,7 @@ fn linux_bios_data_area_page_bytes(size: usize) -> Vec<u8> {
 }
 
 fn storage_contract_page_bytes(storage: &KernelStorageAttachment) -> AppResult<Vec<u8>> {
-    let mut page = vec![0_u8; 0x1000];
+    let mut page = vec![0_u8; storage_contract_size_bytes() as usize];
     let mut payload = serde_json::to_vec(storage)?;
     payload.push(0);
     if payload.len() > page.len() {
@@ -8953,7 +8957,7 @@ fn storage_contract_guest_memory_range(
     Ok(KernelGuestMemoryRange {
         label: "pane-storage-contract".to_string(),
         start_gpa: format_guest_physical_address(storage_gpa),
-        size_bytes: 0x00001000,
+        size_bytes: storage_contract_size_bytes(),
         region_type: "storage-contract".to_string(),
     })
 }
@@ -13052,6 +13056,14 @@ fn print_native_preflight_report(report: &NativePreflightReport) {
         "  MMIO Size      {}",
         report.device_loop.mmio_window.size_bytes
     );
+    println!(
+        "  MMIO Handshake {}",
+        report.device_loop.mmio_window.handshake_smoke.status
+    );
+    println!(
+        "  Queue Exec     {}",
+        report.device_loop.mmio_window.execution_smoke.status
+    );
     println!("  Devices        {}", report.device_loop.devices.len());
     println!("  Routes         {}", report.device_loop.routes.len());
     if !report.blockers.is_empty() {
@@ -13361,6 +13373,14 @@ fn print_native_boot_spike_report(report: &NativeBootSpikeReport) {
     println!(
         "  MMIO Size      {}",
         report.device_loop.mmio_window.size_bytes
+    );
+    println!(
+        "  MMIO Handshake {}",
+        report.device_loop.mmio_window.handshake_smoke.status
+    );
+    println!(
+        "  Queue Exec     {}",
+        report.device_loop.mmio_window.execution_smoke.status
     );
     println!("  Devices        {}", report.device_loop.devices.len());
     for device in &report.device_loop.devices {
@@ -16399,14 +16419,14 @@ mod tests {
         assert_eq!(storage.virtio_block.source_crate, "rust-vmm/vm-virtio");
         assert_eq!(
             storage.virtio_block.adoption_state,
-            "mmio-register-model-ready-queue-execution-pending"
+            "descriptor-chain-execution-ready-whp-mmio-wiring-pending"
         );
         assert_eq!(storage.virtio_block.transport, "virtio-mmio");
         assert_eq!(storage.virtio_block.mmio_base_gpa, "0x0dfc0000");
         assert_eq!(storage.virtio_block.mmio_size_bytes, 4096);
         assert_eq!(
             storage.virtio_block.queue_model,
-            "split-virtqueue-registers-ready-descriptor-execution-pending"
+            "split-virtqueue-descriptor-chain-execution-ready"
         );
         assert_eq!(storage.virtio_block.root_device_hint, "/dev/vda1");
         assert_eq!(storage.virtio_block.devices.len(), 2);

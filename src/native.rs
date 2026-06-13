@@ -777,7 +777,7 @@ pub(crate) fn native_device_loop_report() -> NativeDeviceLoopReport {
                 id: "virtio-blk",
                 role: "standard Arch base/user disk backend",
                 backend: "pane-virtio-mmio-block-model-shaped-by-rust-vmm",
-                status: "mmio-register-model-ready-queue-execution-pending",
+                status: "descriptor-chain-execution-ready-whp-mmio-wiring-pending",
                 replacement_target: None,
             },
             NativeDeviceLoopDevice {
@@ -8583,7 +8583,7 @@ mod tests {
         assert_eq!(pane_block.replacement_target, Some("virtio-blk"));
         assert_eq!(
             virtio_block.status,
-            "mmio-register-model-ready-queue-execution-pending"
+            "descriptor-chain-execution-ready-whp-mmio-wiring-pending"
         );
         assert_eq!(report.mmio_window.base_gpa, "0x0dfc0000");
         assert_eq!(report.mmio_window.primary_device.id, "vda");

@@ -725,6 +725,7 @@ pub(crate) struct NativeDeviceLoopReport {
     pub(crate) source_crates: Vec<&'static str>,
     pub(crate) active_boundary: &'static str,
     pub(crate) adoption_state: &'static str,
+    pub(crate) mmio_window: crate::virtio::PaneVirtioMmioWindow,
     pub(crate) devices: Vec<NativeDeviceLoopDevice>,
     pub(crate) routes: Vec<NativeDeviceLoopRoute>,
     pub(crate) migration_blockers: Vec<&'static str>,
@@ -756,6 +757,7 @@ pub(crate) fn native_device_loop_report() -> NativeDeviceLoopReport {
         source_crates: vec!["rust-vmm/vm-virtio", "rust-vmm/linux-loader"],
         active_boundary: "whp-exit-route-contract-v1",
         adoption_state: "typed-route-boundary-ready-inline-handlers-not-yet-extracted",
+        mmio_window: crate::virtio::pane_virtio_mmio_window(),
         devices: vec![
             NativeDeviceLoopDevice {
                 id: "serial-com1",
@@ -774,8 +776,8 @@ pub(crate) fn native_device_loop_report() -> NativeDeviceLoopReport {
             NativeDeviceLoopDevice {
                 id: "virtio-blk",
                 role: "standard Arch base/user disk backend",
-                backend: "rust-vmm/vm-virtio-compatible-queue-model",
-                status: "contract-ready-not-executing",
+                backend: "pane-virtio-mmio-block-model-shaped-by-rust-vmm",
+                status: "mmio-register-model-ready-queue-execution-pending",
                 replacement_target: None,
             },
             NativeDeviceLoopDevice {
@@ -852,8 +854,8 @@ pub(crate) fn native_device_loop_report() -> NativeDeviceLoopReport {
             },
             NativeDeviceLoopRoute {
                 exit_reason: "memory-access",
-                selector: "framebuffer/input/MMIO ranges",
-                handler: "display-surface,input-queue,virtio-mmio",
+                selector: "virtio-mmio/framebuffer/input MMIO ranges",
+                handler: "virtio-mmio,display-surface,input-queue",
                 current_state: "mostly blocker diagnostics plus mapped shared memory snapshots",
                 target_state: "MMIO bus dispatch for virtio queues and display/input surfaces",
             },
@@ -887,7 +889,7 @@ pub(crate) fn native_device_loop_report() -> NativeDeviceLoopReport {
             },
         ],
         migration_blockers: vec![
-            "virtio queue execution is not yet wired to WHP MMIO exits",
+            "virtio queue notification is not yet wired from WHP memory exits to guest descriptor processing",
             "display/input contracts are not yet app-rendered device backends",
             "legacy platform I/O side effects remain grouped in one compatibility object",
         ],
@@ -6551,6 +6553,16 @@ mod windows_whp {
                 handler: "legacy-platform-io",
                 action: "try-emulate-or-stop",
             },
+            DecodedExit::MemoryAccess { gpa, .. }
+                if crate::virtio::pane_virtio_mmio_contains_gpa(*gpa) =>
+            {
+                NativeDeviceDispatchDecision {
+                    exit_reason: "memory-access",
+                    selector: format!("gpa=0x{gpa:016x} virtio-mmio"),
+                    handler: "virtio-mmio",
+                    action: "dispatch-virtio-mmio-register-or-queue-notify",
+                }
+            }
             DecodedExit::MemoryAccess { gpa, .. } => NativeDeviceDispatchDecision {
                 exit_reason: "memory-access",
                 selector: format!("gpa=0x{gpa:016x}"),
@@ -7630,6 +7642,13 @@ mod windows_whp {
                 gpa: 0x0f00_0000,
                 gva: 0,
             });
+            let virtio_mmio = native_device_dispatch_decision(&DecodedExit::MemoryAccess {
+                access_type: 1,
+                gpa_unmapped: false,
+                gva_valid: true,
+                gpa: crate::virtio::PANE_VIRTIO_MMIO_BASE_GPA,
+                gva: crate::virtio::PANE_VIRTIO_MMIO_BASE_GPA,
+            });
             let cpuid = native_device_dispatch_decision(&DecodedExit::Cpuid {
                 instruction_length: 2,
                 rip: 0x2000,
@@ -7645,6 +7664,11 @@ mod windows_whp {
 
             assert_eq!(memory.handler, "display-surface,input-queue,virtio-mmio");
             assert_eq!(memory.action, "dispatch-mmio-or-report-blocker");
+            assert_eq!(virtio_mmio.handler, "virtio-mmio");
+            assert_eq!(
+                virtio_mmio.action,
+                "dispatch-virtio-mmio-register-or-queue-notify"
+            );
             assert_eq!(cpuid.handler, "cpu-control");
             assert_eq!(cpuid.action, "emulate-cpuid-and-resume");
             assert_eq!(interrupt.handler, "timer-interrupt");
@@ -8557,7 +8581,12 @@ mod tests {
 
         assert_eq!(pane_block.status, "diagnostic-only");
         assert_eq!(pane_block.replacement_target, Some("virtio-blk"));
-        assert_eq!(virtio_block.status, "contract-ready-not-executing");
+        assert_eq!(
+            virtio_block.status,
+            "mmio-register-model-ready-queue-execution-pending"
+        );
+        assert_eq!(report.mmio_window.base_gpa, "0x0dfc0000");
+        assert_eq!(report.mmio_window.primary_device.id, "vda");
         assert!(report.routes.iter().any(|route| {
             route.exit_reason == "x64-io-port-access"
                 && route.handler == "pane-block-port"

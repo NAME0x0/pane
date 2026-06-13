@@ -7,6 +7,7 @@ mod native;
 mod plan;
 mod rdp;
 mod state;
+mod virtio;
 mod vmm_foundation;
 mod wsl;
 

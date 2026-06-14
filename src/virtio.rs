@@ -440,14 +440,20 @@ impl PaneVirtioMmioBlockDevice {
 
         match parse_virtio_blk_request(memory, &self.queue, head_index) {
             Ok(request) => self.execute_parsed_block_request(memory, request, head_index, service),
-            Err(error) => PaneVirtioBlkExecution {
-                request: None,
-                status: VIRTIO_BLK_STATUS_IOERR,
-                bytes_transferred: 0,
-                used_head_index: head_index,
-                used_len: 0,
-                detail: error,
-            },
+            Err(error) => {
+                let _ = write_used_entry(memory, &self.queue, head_index, 0);
+                self.queue.next_avail_index = self.queue.next_avail_index.wrapping_add(1);
+                self.queue.used_index = self.queue.used_index.wrapping_add(1);
+                self.interrupt_status |= 1;
+                PaneVirtioBlkExecution {
+                    request: None,
+                    status: VIRTIO_BLK_STATUS_IOERR,
+                    bytes_transferred: 0,
+                    used_head_index: head_index,
+                    used_len: 0,
+                    detail: error,
+                }
+            }
         }
     }
 
@@ -464,6 +470,9 @@ impl PaneVirtioMmioBlockDevice {
         for _ in 0..self.queue.size {
             let execution = self.execute_available_block_request(memory, &mut *service);
             if execution.request.is_none() {
+                if execution.used_len > 0 || execution.detail.contains("descriptor") {
+                    executions.push(execution);
+                }
                 break;
             }
             let terminal_error = execution.status != VIRTIO_BLK_STATUS_OK;
@@ -491,12 +500,16 @@ impl PaneVirtioMmioBlockDevice {
                 Ok(payload) => Some(payload),
                 Err(error) => {
                     let _ = memory.write(request.status_addr, &[VIRTIO_BLK_STATUS_IOERR]);
+                    let _ = write_used_entry(memory, &self.queue, head_index, 1);
+                    self.queue.next_avail_index = self.queue.next_avail_index.wrapping_add(1);
+                    self.queue.used_index = self.queue.used_index.wrapping_add(1);
+                    self.interrupt_status |= 1;
                     return PaneVirtioBlkExecution {
                         request: Some(request),
                         status: VIRTIO_BLK_STATUS_IOERR,
                         bytes_transferred: 0,
                         used_head_index: head_index,
-                        used_len: 0,
+                        used_len: 1,
                         detail: error,
                     };
                 }
@@ -1035,8 +1048,15 @@ fn parse_virtio_blk_request<M: PaneGuestMemory>(
     }
 
     let mut descriptors = Vec::new();
+    let mut seen_indexes = Vec::new();
     let mut index = head_index;
     for _ in 0..queue.size {
+        if seen_indexes.contains(&index) {
+            return Err(format!(
+                "virtio-blk descriptor chain contains a cycle at index {index}"
+            ));
+        }
+        seen_indexes.push(index);
         let descriptor = read_descriptor(memory, queue, index)?;
         let has_next = descriptor.has_next();
         descriptors.push(descriptor);
@@ -1050,6 +1070,12 @@ fn parse_virtio_blk_request<M: PaneGuestMemory>(
                 queue.size
             ));
         }
+    }
+    if descriptors
+        .last()
+        .is_some_and(|descriptor| descriptor.has_next())
+    {
+        return Err("virtio-blk descriptor chain is unterminated".to_string());
     }
 
     if descriptors.len() < 2 {
@@ -1661,6 +1687,40 @@ mod tests {
     }
 
     #[test]
+    fn virtio_mmio_queue_notify_consumes_bad_descriptor_chain() {
+        let mut device = PaneVirtioMmioBlockDevice::new(8 * 1024 * 1024, true);
+        let mut memory = TestGuestMemory::new(0x5000);
+        configure_queue(&mut device);
+
+        memory.write_u32(0x4000, 0);
+        memory.write_u32(0x4004, 0);
+        memory.write_u64(0x4008, 11);
+        write_descriptor(&mut memory, 0, 0x4000, 16, 1, 0);
+        publish_head(&mut memory, 0);
+
+        let outcome = service_virtio_mmio_access(
+            &mut device,
+            &mut memory,
+            PaneVirtioMmioAccess {
+                kind: PaneVirtioMmioAccessKind::Write,
+                gpa: PANE_VIRTIO_MMIO_BASE_GPA + 0x050,
+                data: 0_u32.to_le_bytes().to_vec(),
+            },
+            |_request, _payload| unreachable!("bad descriptor chain must not reach backend"),
+        );
+
+        assert!(outcome.accepted);
+        assert_eq!(outcome.status, "queue-notify-completed-with-guest-error");
+        assert_eq!(outcome.queue_execution_count, 1);
+        assert_eq!(device.queue.next_avail_index, 1);
+        assert_eq!(device.queue.used_index, 1);
+        assert_eq!(memory.read_bytes(0x3002, 2), 1_u16.to_le_bytes());
+        assert_eq!(memory.read_bytes(0x3004, 4), 0_u32.to_le_bytes());
+        assert_eq!(memory.read_bytes(0x3008, 4), 0_u32.to_le_bytes());
+        assert_eq!(device.interrupt_status, 1);
+    }
+
+    #[test]
     fn virtio_mmio_block_device_rejects_invalid_queue_size() {
         let mut device = PaneVirtioMmioBlockDevice::new(1024 * 1024, true);
 
@@ -1724,6 +1784,35 @@ mod tests {
         assert_eq!(execution.used_len, 129);
         assert_eq!(memory.read_bytes(0x4100, 4), vec![0x7a; 4]);
         assert_eq!(memory.read_bytes(0x3008, 4), 129_u32.to_le_bytes());
+    }
+
+    #[test]
+    fn virtio_blk_rejects_cyclic_descriptor_chain_without_stalling_queue() {
+        let mut device = PaneVirtioMmioBlockDevice::new(8 * 1024 * 1024, true);
+        configure_queue(&mut device);
+        let mut memory = TestGuestMemory::new(0x5000);
+
+        memory.write_u32(0x4000, 0);
+        memory.write_u32(0x4004, 0);
+        memory.write_u64(0x4008, 4);
+        write_descriptor(&mut memory, 0, 0x4000, 16, 1, 1);
+        write_descriptor(&mut memory, 1, 0x4100, 512, 1, 0);
+        publish_head(&mut memory, 0);
+
+        let execution = device
+            .execute_available_block_request(&mut memory, |_request, _payload| {
+                unreachable!("cyclic descriptor chain must not reach backend")
+            });
+
+        assert_eq!(execution.status, VIRTIO_BLK_STATUS_IOERR);
+        assert!(execution.detail.contains("cycle"));
+        assert_eq!(execution.used_head_index, 0);
+        assert_eq!(execution.used_len, 0);
+        assert_eq!(device.queue.next_avail_index, 1);
+        assert_eq!(device.queue.used_index, 1);
+        assert_eq!(memory.read_bytes(0x3002, 2), 1_u16.to_le_bytes());
+        assert_eq!(memory.read_bytes(0x3004, 4), 0_u32.to_le_bytes());
+        assert_eq!(device.interrupt_status, 1);
     }
 
     #[test]

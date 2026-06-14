@@ -1921,6 +1921,7 @@ mod windows_whp {
             crate::virtio::PaneVirtioMmioAccess,
         ) -> crate::virtio::PaneVirtioMmioAccessOutcome,
         last_status: Option<String>,
+        last_detail: Option<String>,
     }
 
     struct WhpLiveInstructionEmulator {
@@ -2293,6 +2294,10 @@ mod windows_whp {
         let access_size = usize::from(memory_access.access_size);
         if access_size == 0 || access_size > memory_access.data.len() {
             context.last_status = Some("invalid-access-size".to_string());
+            context.last_detail = Some(format!(
+                "Invalid WHP emulator MMIO access size {access_size}; buffer_len={}.",
+                memory_access.data.len()
+            ));
             return E_UNEXPECTED;
         }
 
@@ -2301,6 +2306,10 @@ mod windows_whp {
             WHP_EMULATOR_MMIO_WRITE => crate::virtio::PaneVirtioMmioAccessKind::Write,
             _ => {
                 context.last_status = Some("invalid-direction".to_string());
+                context.last_detail = Some(format!(
+                    "Invalid WHP emulator MMIO direction {}.",
+                    memory_access.direction
+                ));
                 return E_UNEXPECTED;
             }
         };
@@ -2317,12 +2326,17 @@ mod windows_whp {
         });
 
         context.last_status = Some(outcome.status.to_string());
+        context.last_detail = Some(outcome.detail.clone());
         if !outcome.accepted {
             return E_UNEXPECTED;
         }
         if kind == crate::virtio::PaneVirtioMmioAccessKind::Read {
             if outcome.read_data.len() < access_size {
                 context.last_status = Some("short-read-data".to_string());
+                context.last_detail = Some(format!(
+                    "Virtio-MMIO read returned {} byte(s), expected {access_size}.",
+                    outcome.read_data.len()
+                ));
                 return E_UNEXPECTED;
             }
             memory_access.data[..access_size].copy_from_slice(&outcome.read_data[..access_size]);
@@ -2534,6 +2548,7 @@ mod windows_whp {
             translate_gva: Some(translate_gva),
             handler: &mut handler,
             last_status: None,
+            last_detail: None,
         };
         let mut status = WhvEmulatorStatus { as_u32: 0 };
         let hresult = unsafe {
@@ -2561,9 +2576,10 @@ mod windows_whp {
             hresult: None,
             ok,
             detail: format!(
-                "status=0x{:08x}, callback_status={}.",
+                "status=0x{:08x}, callback_status={}, callback_detail={}.",
                 status.as_u32,
-                callback_context.last_status.as_deref().unwrap_or("none")
+                callback_context.last_status.as_deref().unwrap_or("none"),
+                callback_context.last_detail.as_deref().unwrap_or("none")
             ),
         });
         ok
@@ -8359,6 +8375,7 @@ mod windows_whp {
                 translate_gva: Some(test_translate_gva),
                 handler: &mut handler,
                 last_status: None,
+                last_detail: None,
             };
             let register_names = [WHV_REGISTER_RIP, WHV_REGISTER_RAX];
             let mut register_values = [WhvRegisterValue { reg64: 0 }; 2];
@@ -8430,6 +8447,7 @@ mod windows_whp {
                 translate_gva: Some(test_translate_gva),
                 handler: &mut handler,
                 last_status: None,
+                last_detail: None,
             };
             let mut translation_result = u32::MAX;
             let mut gpa = 0;
@@ -8477,6 +8495,7 @@ mod windows_whp {
                 translate_gva: None,
                 handler: &mut handler,
                 last_status: None,
+                last_detail: None,
             };
             let mut memory_access = WhvEmulatorMemoryAccessInfo {
                 gpa_address: crate::virtio::PANE_VIRTIO_MMIO_BASE_GPA,
@@ -8530,6 +8549,7 @@ mod windows_whp {
                 translate_gva: None,
                 handler: &mut handler,
                 last_status: None,
+                last_detail: None,
             };
             let mut memory_access = WhvEmulatorMemoryAccessInfo {
                 gpa_address: crate::virtio::PANE_VIRTIO_MMIO_BASE_GPA + 0x050,
@@ -8544,11 +8564,18 @@ mod windows_whp {
                     &mut memory_access,
                 )
             };
-
+            assert_eq!(result, S_OK);
+            assert_eq!(
+                context.last_status.as_deref(),
+                Some("queue-notify-executed")
+            );
+            assert_eq!(
+                context.last_detail.as_deref(),
+                Some("Queue notify 0 executed 1 request(s).")
+            );
             drop(context);
             drop(handler);
 
-            assert_eq!(result, S_OK);
             assert_eq!(memory.read_bytes(0x4100, 4), vec![0x7b; 4]);
             assert_eq!(
                 memory.read_bytes(0x4300, 1),

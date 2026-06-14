@@ -975,7 +975,8 @@ fn virtio_block_backend_plan(storage: &KernelStorageAttachment) -> VirtioBlockBa
         candidate_crate_version: None,
         license: "Apache-2.0 OR BSD-3-Clause".to_string(),
         source_url: "https://github.com/rust-vmm/vm-virtio".to_string(),
-        adoption_state: "live-whp-mmio-execution-ready-irq-pending".to_string(),
+        adoption_state: "live-whp-mmio-execution-and-irq-request-ready-guest-ack-pending"
+            .to_string(),
         transport: "virtio-mmio".to_string(),
         mmio_base_gpa: default_virtio_mmio_base_gpa(),
         mmio_size_bytes: default_virtio_mmio_size_bytes(),
@@ -1019,7 +1020,7 @@ fn virtio_block_backend_plan(storage: &KernelStorageAttachment) -> VirtioBlockBa
         notes: vec![
             "This is the standard Linux block-device target for Pane-owned Arch boot; Pane now routes live WHP virtio-MMIO exits into the in-repo block model."
                 .to_string(),
-            "Pane reserves a virtio-MMIO aperture, advertises it with Linux's virtio_mmio.device kernel parameter, executes WHP MMIO exits through WinHvEmulation.dll, and bridges virtio reads to the verified native block handler; IRQ injection is the remaining storage milestone."
+            "Pane reserves a virtio-MMIO aperture, advertises it with Linux's virtio_mmio.device kernel parameter, executes WHP MMIO exits through WinHvEmulation.dll, bridges virtio reads to the verified native block handler, and requests the virtio IRQ after queue completion; guest IRQ acknowledgement and root-mount proof are the remaining storage milestone."
                 .to_string(),
             "The existing Pane block-port contract remains only as the current diagnostic bridge until the virtio device loop is implemented."
                 .to_string(),
@@ -16421,7 +16422,7 @@ mod tests {
         assert_eq!(storage.virtio_block.source_crate, "rust-vmm/vm-virtio");
         assert_eq!(
             storage.virtio_block.adoption_state,
-            "live-whp-mmio-execution-ready-irq-pending"
+            "live-whp-mmio-execution-and-irq-request-ready-guest-ack-pending"
         );
         assert_eq!(storage.virtio_block.transport, "virtio-mmio");
         assert_eq!(storage.virtio_block.mmio_base_gpa, "0x0dfc0000");

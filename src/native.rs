@@ -865,7 +865,7 @@ pub(crate) fn native_device_loop_report() -> NativeDeviceLoopReport {
                 id: "virtio-blk",
                 role: "standard Arch base/user disk backend",
                 backend: "pane-virtio-mmio-block-model-shaped-by-rust-vmm",
-                status: "live-whp-mmio-execution-ready-irq-pending",
+                status: "live-whp-mmio-execution-and-irq-request-ready-guest-ack-pending",
                 replacement_target: None,
             },
             NativeDeviceLoopDevice {
@@ -4330,6 +4330,7 @@ mod windows_whp {
                         break;
                     };
                     let mut memory = MappedGuestMemoryView::new(mapped_regions);
+                    let interrupt_status_before = device.interrupt_status;
                     let emulated = try_emulate_virtio_mmio_exit(
                         WhpMmioEmulationDeps {
                             partition,
@@ -4351,6 +4352,31 @@ mod windows_whp {
                     );
                     if emulated {
                         last_progress_at = Instant::now();
+                        if interrupt_status_before == 0 && device.interrupt_status != 0 {
+                            let irq = crate::virtio::PANE_VIRTIO_MMIO_IRQ as u8;
+                            let vector = legacy_io_state.irq_vector(irq);
+                            let unmasked = legacy_io_state.irq_unmasked(irq);
+                            if let Some(request_interrupt) = request_interrupt {
+                                let _ = request_native_virtio_mmio_interrupt(
+                                    partition,
+                                    request_interrupt,
+                                    irq,
+                                    vector,
+                                    unmasked,
+                                    report,
+                                );
+                            } else {
+                                report.calls.push(NativeWhpCallReport {
+                                    name: "VirtioMmioInterruptRequested",
+                                    hresult: None,
+                                    ok: false,
+                                    detail: format!(
+                                        "Virtio-MMIO completion set interrupt_status=0x{:08x}, but WHvRequestInterrupt is unavailable; irq={irq}, vector=0x{vector:02x}, irq_unmasked={unmasked}.",
+                                        device.interrupt_status
+                                    ),
+                                });
+                            }
+                        }
                         if let Some(path) = checkpoint_path.as_deref() {
                             write_linux_entry_probe_checkpoint(
                                 path,
@@ -5305,6 +5331,52 @@ mod windows_whp {
             ok,
             detail: format!(
                 "Requested native timer interrupt vector 0x{vector:02x} from the emulated PIC/PIT state; irq0_unmasked={unmasked}."
+            ),
+        });
+        ok
+    }
+
+    fn request_native_virtio_mmio_interrupt(
+        partition: *mut c_void,
+        request_interrupt: WhvRequestInterrupt,
+        irq: u8,
+        vector: u8,
+        unmasked: bool,
+        report: &mut NativePartitionSmokeReport,
+    ) -> bool {
+        let interrupt = WhvInterruptControl {
+            control: whv_x64_interrupt_control(
+                WHV_X64_INTERRUPT_TYPE_FIXED,
+                WHV_X64_INTERRUPT_DESTINATION_MODE_PHYSICAL,
+                WHV_X64_INTERRUPT_TRIGGER_MODE_EDGE,
+                0,
+            ),
+            destination: 0,
+            vector: u32::from(vector),
+        };
+        let hresult = unsafe {
+            request_interrupt(
+                partition,
+                &interrupt,
+                mem::size_of::<WhvInterruptControl>() as u32,
+            )
+        };
+        let ok = hresult_succeeded(hresult);
+        report.calls.push(hresult_call(
+            "WHvRequestInterrupt(virtio-mmio)",
+            hresult,
+            if ok {
+                "Requested a fixed edge-triggered virtio-MMIO interrupt for vCPU 0."
+            } else {
+                "Could not request the virtio-MMIO interrupt through WHP."
+            },
+        ));
+        report.calls.push(NativeWhpCallReport {
+            name: "VirtioMmioInterruptRequested",
+            hresult: None,
+            ok,
+            detail: format!(
+                "Requested virtio-MMIO IRQ {irq} as vector 0x{vector:02x}; irq_unmasked={unmasked}."
             ),
         });
         ok
@@ -6762,6 +6834,27 @@ mod windows_whp {
 
         fn timer_interrupt_unmasked(&self) -> bool {
             self.pic1_mask & PIC_IRQ0_TIMER_BIT == 0
+        }
+
+        fn irq_vector(&self, irq: u8) -> u8 {
+            if irq < 8 {
+                let base = if self.pic1_vector_offset < 0x10 {
+                    PIC1_SAFE_TIMER_VECTOR_OFFSET
+                } else {
+                    self.pic1_vector_offset
+                };
+                base.saturating_add(irq)
+            } else {
+                self.pic2_vector_offset.saturating_add(irq - 8)
+            }
+        }
+
+        fn irq_unmasked(&self, irq: u8) -> bool {
+            if irq < 8 {
+                self.pic1_mask & (1_u8 << irq) == 0
+            } else {
+                self.pic2_mask & (1_u8 << (irq - 8)) == 0
+            }
         }
 
         fn read_value(&mut self, port: u16, access_size: u32) -> Option<u32> {
@@ -8603,6 +8696,11 @@ mod windows_whp {
 
             assert_eq!(io.timer_interrupt_vector(), 0x20);
             assert!(io.timer_interrupt_unmasked());
+            assert_eq!(
+                io.irq_vector(crate::virtio::PANE_VIRTIO_MMIO_IRQ as u8),
+                0x25
+            );
+            assert!(io.irq_unmasked(crate::virtio::PANE_VIRTIO_MMIO_IRQ as u8));
 
             assert_eq!(io.access(PIC1_COMMAND_PORT, true, 1, 0x11), Some(0x11));
             assert_eq!(io.access(PIC2_COMMAND_PORT, true, 1, 0x11), Some(0x11));
@@ -8615,8 +8713,14 @@ mod windows_whp {
 
             assert_eq!(io.timer_interrupt_vector(), 0x20);
             assert!(io.timer_interrupt_unmasked());
+            assert_eq!(
+                io.irq_vector(crate::virtio::PANE_VIRTIO_MMIO_IRQ as u8),
+                0x25
+            );
+            assert!(io.irq_unmasked(crate::virtio::PANE_VIRTIO_MMIO_IRQ as u8));
             assert_eq!(io.access(PIC1_DATA_PORT, true, 1, 0xff), Some(0xff));
             assert!(!io.timer_interrupt_unmasked());
+            assert!(!io.irq_unmasked(crate::virtio::PANE_VIRTIO_MMIO_IRQ as u8));
         }
 
         #[test]
@@ -10242,7 +10346,7 @@ mod tests {
         assert_eq!(pane_block.replacement_target, Some("virtio-blk"));
         assert_eq!(
             virtio_block.status,
-            "live-whp-mmio-execution-ready-irq-pending"
+            "live-whp-mmio-execution-and-irq-request-ready-guest-ack-pending"
         );
         assert_eq!(report.mmio_window.base_gpa, "0x0dfc0000");
         assert_eq!(report.mmio_window.primary_device.id, "vda");

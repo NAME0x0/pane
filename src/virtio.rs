@@ -586,11 +586,26 @@ impl PaneVirtioMmioBlockDevice {
                 1 => Some((self.device_features >> 32) as u32),
                 _ => Some(0),
             },
+            VIRTIO_MMIO_DEVICE_FEATURES_SEL_OFFSET => Some(self.device_features_select),
+            VIRTIO_MMIO_DRIVER_FEATURES_OFFSET => match self.driver_features_select {
+                0 => Some(self.driver_features as u32),
+                1 => Some((self.driver_features >> 32) as u32),
+                _ => Some(0),
+            },
+            VIRTIO_MMIO_DRIVER_FEATURES_SEL_OFFSET => Some(self.driver_features_select),
+            VIRTIO_MMIO_QUEUE_SEL_OFFSET => Some(u32::from(self.queue_select)),
             VIRTIO_MMIO_QUEUE_NUM_MAX_OFFSET => Some(u32::from(self.queue.max_size)),
             VIRTIO_MMIO_QUEUE_NUM_OFFSET => Some(u32::from(self.queue.size)),
             VIRTIO_MMIO_QUEUE_READY_OFFSET => Some(u32::from(self.queue.ready)),
+            VIRTIO_MMIO_QUEUE_NOTIFY_OFFSET => self.queue.last_notify,
             VIRTIO_MMIO_INTERRUPT_STATUS_OFFSET => Some(self.interrupt_status),
             VIRTIO_MMIO_STATUS_OFFSET => Some(self.status),
+            VIRTIO_MMIO_QUEUE_DESC_LOW_OFFSET => Some(self.queue.desc_table_gpa as u32),
+            VIRTIO_MMIO_QUEUE_DESC_HIGH_OFFSET => Some((self.queue.desc_table_gpa >> 32) as u32),
+            VIRTIO_MMIO_QUEUE_AVAIL_LOW_OFFSET => Some(self.queue.avail_ring_gpa as u32),
+            VIRTIO_MMIO_QUEUE_AVAIL_HIGH_OFFSET => Some((self.queue.avail_ring_gpa >> 32) as u32),
+            VIRTIO_MMIO_QUEUE_USED_LOW_OFFSET => Some(self.queue.used_ring_gpa as u32),
+            VIRTIO_MMIO_QUEUE_USED_HIGH_OFFSET => Some((self.queue.used_ring_gpa >> 32) as u32),
             VIRTIO_MMIO_CONFIG_GENERATION_OFFSET => Some(self.config_generation),
             offset if offset >= VIRTIO_MMIO_CONFIG_OFFSET => self.read_config_u32(offset),
             _ => None,
@@ -1379,6 +1394,45 @@ mod tests {
         assert_eq!(device.queue.avail_ring_gpa, 0x2000);
         assert_eq!(device.queue.used_ring_gpa, 0x3000);
         assert_eq!(device.queue.last_notify, Some(0));
+        assert_eq!(device.read_u32(0x030), Some(0));
+        assert_eq!(device.read_u32(0x038), Some(128));
+        assert_eq!(device.read_u32(0x044), Some(1));
+        assert_eq!(device.read_u32(0x050), Some(0));
+        assert_eq!(device.read_u32(0x080), Some(0x1000));
+        assert_eq!(device.read_u32(0x084), Some(0x1));
+        assert_eq!(device.read_u32(0x090), Some(0x2000));
+        assert_eq!(device.read_u32(0x0a0), Some(0x3000));
+    }
+
+    #[test]
+    fn virtio_mmio_block_device_reads_back_feature_negotiation_registers() {
+        let mut device = PaneVirtioMmioBlockDevice::new(8 * 1024 * 1024, true);
+
+        assert_eq!(
+            device.write_u32(0x014, 1),
+            PaneVirtioMmioWriteResult::Accepted
+        );
+        assert_eq!(device.read_u32(0x014), Some(1));
+        assert_eq!(
+            device.write_u32(0x024, 1),
+            PaneVirtioMmioWriteResult::Accepted
+        );
+        assert_eq!(
+            device.write_u32(0x020, (VIRTIO_F_VERSION_1 >> 32) as u32),
+            PaneVirtioMmioWriteResult::Accepted
+        );
+
+        assert_eq!(device.read_u32(0x024), Some(1));
+        assert_eq!(
+            device.read_u32(0x020),
+            Some((VIRTIO_F_VERSION_1 >> 32) as u32)
+        );
+        assert_eq!(
+            device.write_u32(0x070, 0),
+            PaneVirtioMmioWriteResult::Accepted
+        );
+        assert_eq!(device.read_u32(0x024), Some(0));
+        assert_eq!(device.read_u32(0x020), Some(0));
     }
 
     #[test]

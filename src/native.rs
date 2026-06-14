@@ -12,6 +12,7 @@ const REQUIRED_WHP_EXPORTS: &[&str] = &[
     "WHvSetVirtualProcessorRegisters",
     "WHvRunVirtualProcessor",
     "WHvCancelRunVirtualProcessor",
+    "WHvTranslateGva",
     "WHvRequestInterrupt",
     "WHvMapGpaRange",
     "WHvUnmapGpaRange",
@@ -1686,6 +1687,14 @@ mod windows_whp {
     type WhvRunVirtualProcessor =
         unsafe extern "system" fn(*mut c_void, u32, *mut c_void, u32) -> i32;
     type WhvCancelRunVirtualProcessor = unsafe extern "system" fn(*mut c_void, u32, u32) -> i32;
+    type WhvTranslateGva = unsafe extern "system" fn(
+        *mut c_void,
+        u32,
+        u64,
+        u32,
+        *mut WhvTranslateGvaResult,
+        *mut u64,
+    ) -> i32;
     type WhvGetVirtualProcessorState =
         unsafe extern "system" fn(*mut c_void, u32, u32, *mut c_void, u32, *mut u32) -> i32;
     type WhvGetVirtualProcessorInterruptControllerState2 =
@@ -1708,6 +1717,7 @@ mod windows_whp {
     ) -> i32;
     const S_OK: i32 = 0;
     const E_UNEXPECTED: i32 = 0x8000_FFFF_u32 as i32;
+    const WHV_TRANSLATE_GVA_RESULT_SUCCESS: u32 = 0;
     const WHP_EMULATOR_MMIO_READ: u8 = 0;
     const WHP_EMULATOR_MMIO_WRITE: u8 = 1;
     const WHV_VIRTUAL_PROCESSOR_STATE_TYPE_INTERRUPT_CONTROLLER_STATE2: u32 = 0x0000_1000;
@@ -1749,6 +1759,13 @@ mod windows_whp {
         control: u64,
         destination: u32,
         vector: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct WhvTranslateGvaResult {
+        result_code: u32,
+        reserved: u32,
     }
 
     #[repr(C)]
@@ -1817,6 +1834,11 @@ mod windows_whp {
     }
 
     struct WhpEmulatorMmioCallbackContext<'a> {
+        partition: *mut c_void,
+        vp_index: u32,
+        get_virtual_processor_registers: Option<WhvGetVirtualProcessorRegisters>,
+        set_virtual_processor_registers: Option<WhvSetVirtualProcessorRegisters>,
+        translate_gva: Option<WhvTranslateGva>,
         handler: &'a mut dyn FnMut(
             crate::virtio::PaneVirtioMmioAccess,
         ) -> crate::virtio::PaneVirtioMmioAccessOutcome,
@@ -2123,31 +2145,106 @@ mod windows_whp {
     }
 
     unsafe extern "system" fn whp_emulator_get_registers_callback(
-        _context: *mut c_void,
-        _register_names: *const u32,
-        _register_count: u32,
-        _register_values: *mut WhvRegisterValue,
+        context: *mut c_void,
+        register_names: *const u32,
+        register_count: u32,
+        register_values: *mut WhvRegisterValue,
     ) -> i32 {
-        E_UNEXPECTED
+        if context.is_null()
+            || (register_count > 0 && (register_names.is_null() || register_values.is_null()))
+        {
+            return E_UNEXPECTED;
+        }
+        let context = &mut *(context as *mut WhpEmulatorMmioCallbackContext<'_>);
+        let Some(get_virtual_processor_registers) = context.get_virtual_processor_registers else {
+            context.last_status = Some("get-registers-unavailable".to_string());
+            return E_UNEXPECTED;
+        };
+        let hresult = get_virtual_processor_registers(
+            context.partition,
+            context.vp_index,
+            register_names,
+            register_count,
+            register_values,
+        );
+        context.last_status = Some(if hresult_succeeded(hresult) {
+            "get-registers-ok".to_string()
+        } else {
+            format!("get-registers-failed:{}", format_hresult(hresult))
+        });
+        hresult
     }
 
     unsafe extern "system" fn whp_emulator_set_registers_callback(
-        _context: *mut c_void,
-        _register_names: *const u32,
-        _register_count: u32,
-        _register_values: *const WhvRegisterValue,
+        context: *mut c_void,
+        register_names: *const u32,
+        register_count: u32,
+        register_values: *const WhvRegisterValue,
     ) -> i32 {
-        E_UNEXPECTED
+        if context.is_null()
+            || (register_count > 0 && (register_names.is_null() || register_values.is_null()))
+        {
+            return E_UNEXPECTED;
+        }
+        let context = &mut *(context as *mut WhpEmulatorMmioCallbackContext<'_>);
+        let Some(set_virtual_processor_registers) = context.set_virtual_processor_registers else {
+            context.last_status = Some("set-registers-unavailable".to_string());
+            return E_UNEXPECTED;
+        };
+        let hresult = set_virtual_processor_registers(
+            context.partition,
+            context.vp_index,
+            register_names,
+            register_count,
+            register_values,
+        );
+        context.last_status = Some(if hresult_succeeded(hresult) {
+            "set-registers-ok".to_string()
+        } else {
+            format!("set-registers-failed:{}", format_hresult(hresult))
+        });
+        hresult
     }
 
     unsafe extern "system" fn whp_emulator_translate_gva_page_callback(
-        _context: *mut c_void,
-        _gva: u64,
-        _translate_flags: u32,
-        _translation_result: *mut u32,
-        _gpa: *mut u64,
+        context: *mut c_void,
+        gva: u64,
+        translate_flags: u32,
+        translation_result: *mut u32,
+        gpa: *mut u64,
     ) -> i32 {
-        E_UNEXPECTED
+        if context.is_null() || translation_result.is_null() || gpa.is_null() {
+            return E_UNEXPECTED;
+        }
+        let context = &mut *(context as *mut WhpEmulatorMmioCallbackContext<'_>);
+        let Some(translate_gva) = context.translate_gva else {
+            context.last_status = Some("translate-gva-unavailable".to_string());
+            return E_UNEXPECTED;
+        };
+        let mut whp_result = WhvTranslateGvaResult {
+            result_code: WHV_TRANSLATE_GVA_RESULT_SUCCESS,
+            reserved: 0,
+        };
+        let hresult = translate_gva(
+            context.partition,
+            context.vp_index,
+            gva,
+            translate_flags,
+            &mut whp_result,
+            gpa,
+        );
+        if hresult_succeeded(hresult) {
+            *translation_result = whp_result.result_code;
+        }
+        context.last_status = Some(if hresult_succeeded(hresult) {
+            format!(
+                "translate-gva-result={} gva=0x{gva:016x} gpa=0x{:016x}",
+                whp_result.result_code, *gpa
+            )
+        } else {
+            format!("translate-gva-failed:{}", format_hresult(hresult))
+        });
+        hresult
     }
 
     pub(super) fn run_partition_smoke(
@@ -2347,6 +2444,21 @@ mod windows_whp {
                 match resolve_whp_function::<WhvGetVirtualProcessorRegisters>(
                     module,
                     "WHvGetVirtualProcessorRegisters",
+                    &mut report,
+                ) {
+                    Some(function) => Some(function),
+                    None => {
+                        FreeLibrary(module);
+                        return report;
+                    }
+                }
+            } else {
+                None
+            };
+            let translate_gva = if run_fixture {
+                match resolve_whp_function::<WhvTranslateGva>(
+                    module,
+                    "WHvTranslateGva",
                     &mut report,
                 ) {
                     Some(function) => Some(function),
@@ -2566,6 +2678,7 @@ mod windows_whp {
                             run_virtual_processor,
                             cancel_run_virtual_processor,
                             get_virtual_processor_registers,
+                            translate_gva,
                             interrupt_controller_state_readers,
                             request_interrupt,
                             set_virtual_processor_registers,
@@ -3301,6 +3414,7 @@ mod windows_whp {
         run_virtual_processor: WhvRunVirtualProcessor,
         cancel_run_virtual_processor: Option<WhvCancelRunVirtualProcessor>,
         get_virtual_processor_registers: Option<WhvGetVirtualProcessorRegisters>,
+        translate_gva: Option<WhvTranslateGva>,
         interrupt_controller_state_readers: WhpInterruptControllerStateReaders,
         request_interrupt: Option<WhvRequestInterrupt>,
         set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
@@ -3322,6 +3436,7 @@ mod windows_whp {
                 run_virtual_processor,
                 cancel_run_virtual_processor,
                 get_virtual_processor_registers,
+                translate_gva,
                 interrupt_controller_state_readers,
                 request_interrupt,
                 set_virtual_processor_registers,
@@ -3482,6 +3597,7 @@ mod windows_whp {
         run_virtual_processor: WhvRunVirtualProcessor,
         cancel_run_virtual_processor: Option<WhvCancelRunVirtualProcessor>,
         get_virtual_processor_registers: Option<WhvGetVirtualProcessorRegisters>,
+        translate_gva: Option<WhvTranslateGva>,
         interrupt_controller_state_readers: WhpInterruptControllerStateReaders,
         request_interrupt: Option<WhvRequestInterrupt>,
         set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
@@ -3529,6 +3645,18 @@ mod windows_whp {
         let mut last_progress_at = probe_started_at;
         let mut module_load_started_at: Option<Instant> = None;
         let mut root_mount_started_at: Option<Instant> = None;
+        report.calls.push(NativeWhpCallReport {
+            name: "LinuxEntryProbeWhpTranslateGva",
+            hresult: None,
+            ok: translate_gva.is_some(),
+            detail: if translate_gva.is_some() {
+                "WHvTranslateGva is available for live WHP instruction-emulator address translation."
+                    .to_string()
+            } else {
+                "WHvTranslateGva is unavailable, so live WHP instruction-emulator MMIO dispatch cannot be enabled."
+                    .to_string()
+            },
+        });
         if let Some(path) = checkpoint_path.as_deref() {
             write_linux_entry_probe_checkpoint(path, report, "started", probe_started_at);
         }
@@ -7408,41 +7536,44 @@ mod windows_whp {
             parse_xapic_interrupt_controller_state, serial_contract_passed,
             serial_markers_observed, timer_interrupt_readiness, timer_interrupt_readiness_blocker,
             timer_interrupt_readiness_report_blocker, trace_native_device_dispatch,
-            whp_emulator_callbacks, whp_emulator_io_port_callback, whp_emulator_memory_callback,
+            whp_emulator_callbacks, whp_emulator_get_registers_callback,
+            whp_emulator_io_port_callback, whp_emulator_memory_callback,
+            whp_emulator_set_registers_callback, whp_emulator_translate_gva_page_callback,
             whv_x64_interrupt_control, xapic_state_vectors, Com1SerialState, DecodedExit,
             GuestMemory, LegacyDeviceIoState, MappedGuestMemoryView, MappedGuestRegion,
             NativeBlockIoTraceCollector, WhpEmulatorMmioCallbackContext, WhvEmulatorCallbacks,
-            WhvEmulatorIoAccessInfo, WhvEmulatorMemoryAccessInfo, ACPI_PM1_CONTROL_PORT,
-            ACPI_PM1_ENABLE_PORT, ACPI_PM1_STATUS_PORT, ACPI_PM_TIMER_PORT, ALT_DELAY_PORT,
-            ALT_POST_DELAY_PORT, CMOS_ADDRESS_PORT, CMOS_DATA_PORT, CPUID_DEFAULT_RAX_OFFSET,
-            CPUID_DEFAULT_RBX_OFFSET, CPUID_DEFAULT_RCX_OFFSET, CPUID_DEFAULT_RDX_OFFSET,
-            CPUID_RAX_OFFSET, CPUID_RCX_OFFSET, DMA_PAGE_REGISTER_START_PORT, ELCR1_PORT,
-            ELCR2_PORT, E_UNEXPECTED, IO_ACCESS_INFO_OFFSET, IO_PORT_OFFSET, IO_RAX_OFFSET,
-            LINUX_ENTRY_PROBE_EXIT_BUDGET, LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET,
-            LINUX_ENTRY_PROBE_STORAGE_TOTAL_BUDGET_SECONDS, LINUX_ENTRY_PROBE_TOTAL_BUDGET_SECONDS,
-            LINUX_ENTRY_PROBE_TRACE_HEAD, LINUX_ENTRY_PROBE_TRACE_TAIL, MEMORY_ACCESS_INFO_OFFSET,
-            MEMORY_GPA_OFFSET, MEMORY_GVA_OFFSET, MEMORY_INSTRUCTION_BYTES_OFFSET,
-            MEMORY_INSTRUCTION_LENGTH_OFFSET, MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET,
-            MSR_RAX_OFFSET, MSR_RDX_OFFSET, PCI_CONFIG_ADDRESS_PORT, PCI_CONFIG_DATA_START_PORT,
-            PIC1_COMMAND_PORT, PIC1_DATA_PORT, PIC2_COMMAND_PORT, PIC2_DATA_PORT,
-            PIT_CHANNEL0_PORT, PIT_COMMAND_PORT, POST_DELAY_PORT, PS2_DATA_PORT,
-            PS2_STATUS_COMMAND_PORT, SERIAL_COM1_PORT, SYSTEM_CONTROL_PORT_A,
-            SYSTEM_CONTROL_PORT_B, S_OK, VGA_ATTRIBUTE_DATA_READ_PORT, VGA_ATTRIBUTE_PORT,
-            VGA_CRTC_COLOR_DATA_PORT, VGA_CRTC_COLOR_INDEX_PORT, VGA_GRAPHICS_DATA_PORT,
-            VGA_GRAPHICS_INDEX_PORT, VGA_INPUT_STATUS_COLOR_PORT, VGA_MISC_OUTPUT_READ_PORT,
-            VGA_MISC_OUTPUT_WRITE_PORT, VGA_SEQUENCER_DATA_PORT, VGA_SEQUENCER_INDEX_PORT,
-            VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET, VP_CONTEXT_RIP_OFFSET, WHP_EMULATOR_MMIO_READ,
-            WHP_EMULATOR_MMIO_WRITE, WHV_DELIVERABILITY_NOTIFICATION_INTERRUPT, WHV_REGISTER_CR0,
-            WHV_REGISTER_CR3, WHV_REGISTER_CR4, WHV_REGISTER_CS, WHV_REGISTER_DS, WHV_REGISTER_ES,
-            WHV_REGISTER_GDTR, WHV_REGISTER_IDTR, WHV_REGISTER_RBP, WHV_REGISTER_RBX,
+            WhvEmulatorIoAccessInfo, WhvEmulatorMemoryAccessInfo, WhvRegisterValue,
+            WhvTranslateGvaResult, ACPI_PM1_CONTROL_PORT, ACPI_PM1_ENABLE_PORT,
+            ACPI_PM1_STATUS_PORT, ACPI_PM_TIMER_PORT, ALT_DELAY_PORT, ALT_POST_DELAY_PORT,
+            CMOS_ADDRESS_PORT, CMOS_DATA_PORT, CPUID_DEFAULT_RAX_OFFSET, CPUID_DEFAULT_RBX_OFFSET,
+            CPUID_DEFAULT_RCX_OFFSET, CPUID_DEFAULT_RDX_OFFSET, CPUID_RAX_OFFSET, CPUID_RCX_OFFSET,
+            DMA_PAGE_REGISTER_START_PORT, ELCR1_PORT, ELCR2_PORT, E_UNEXPECTED,
+            IO_ACCESS_INFO_OFFSET, IO_PORT_OFFSET, IO_RAX_OFFSET, LINUX_ENTRY_PROBE_EXIT_BUDGET,
+            LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET, LINUX_ENTRY_PROBE_STORAGE_TOTAL_BUDGET_SECONDS,
+            LINUX_ENTRY_PROBE_TOTAL_BUDGET_SECONDS, LINUX_ENTRY_PROBE_TRACE_HEAD,
+            LINUX_ENTRY_PROBE_TRACE_TAIL, MEMORY_ACCESS_INFO_OFFSET, MEMORY_GPA_OFFSET,
+            MEMORY_GVA_OFFSET, MEMORY_INSTRUCTION_BYTES_OFFSET, MEMORY_INSTRUCTION_LENGTH_OFFSET,
+            MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET, MSR_RAX_OFFSET, MSR_RDX_OFFSET,
+            PCI_CONFIG_ADDRESS_PORT, PCI_CONFIG_DATA_START_PORT, PIC1_COMMAND_PORT, PIC1_DATA_PORT,
+            PIC2_COMMAND_PORT, PIC2_DATA_PORT, PIT_CHANNEL0_PORT, PIT_COMMAND_PORT,
+            POST_DELAY_PORT, PS2_DATA_PORT, PS2_STATUS_COMMAND_PORT, SERIAL_COM1_PORT,
+            SYSTEM_CONTROL_PORT_A, SYSTEM_CONTROL_PORT_B, S_OK, VGA_ATTRIBUTE_DATA_READ_PORT,
+            VGA_ATTRIBUTE_PORT, VGA_CRTC_COLOR_DATA_PORT, VGA_CRTC_COLOR_INDEX_PORT,
+            VGA_GRAPHICS_DATA_PORT, VGA_GRAPHICS_INDEX_PORT, VGA_INPUT_STATUS_COLOR_PORT,
+            VGA_MISC_OUTPUT_READ_PORT, VGA_MISC_OUTPUT_WRITE_PORT, VGA_SEQUENCER_DATA_PORT,
+            VGA_SEQUENCER_INDEX_PORT, VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET, VP_CONTEXT_RIP_OFFSET,
+            WHP_EMULATOR_MMIO_READ, WHP_EMULATOR_MMIO_WRITE,
+            WHV_DELIVERABILITY_NOTIFICATION_INTERRUPT, WHV_REGISTER_CR0, WHV_REGISTER_CR3,
+            WHV_REGISTER_CR4, WHV_REGISTER_CS, WHV_REGISTER_DS, WHV_REGISTER_ES, WHV_REGISTER_GDTR,
+            WHV_REGISTER_IDTR, WHV_REGISTER_RAX, WHV_REGISTER_RBP, WHV_REGISTER_RBX,
             WHV_REGISTER_RDI, WHV_REGISTER_RFLAGS, WHV_REGISTER_RIP, WHV_REGISTER_RSI,
             WHV_REGISTER_RSP, WHV_REGISTER_SS, WHV_RUN_VP_EXIT_REASON_CANCELED,
             WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE, WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS,
             WHV_RUN_VP_EXIT_REASON_X64_APIC_EOI, WHV_RUN_VP_EXIT_REASON_X64_CPUID,
             WHV_RUN_VP_EXIT_REASON_X64_HALT, WHV_RUN_VP_EXIT_REASON_X64_INTERRUPT_WINDOW,
             WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS, WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS,
-            XAPIC_IRR_BASE_OFFSET, XAPIC_ISR_BASE_OFFSET, XAPIC_PPR_OFFSET, XAPIC_REGISTER_STRIDE,
-            XAPIC_STATE_BYTES, XAPIC_TPR_OFFSET,
+            WHV_TRANSLATE_GVA_RESULT_SUCCESS, XAPIC_IRR_BASE_OFFSET, XAPIC_ISR_BASE_OFFSET,
+            XAPIC_PPR_OFFSET, XAPIC_REGISTER_STRIDE, XAPIC_STATE_BYTES, XAPIC_TPR_OFFSET,
         };
         use crate::native::{
             evaluate_native_block_io, linux_boot_gdt_page_bytes, native_block_io_exit_can_resume,
@@ -7457,6 +7588,68 @@ mod windows_whp {
         };
         use crate::virtio::PaneGuestMemory;
         use std::ffi::c_void;
+
+        struct TestWhpCallbackState {
+            get_count: u32,
+            set_count: u32,
+            translate_count: u32,
+            last_vp_index: u32,
+            last_register_name: u32,
+            last_register_value: u64,
+            last_translate_flags: u32,
+            last_gva: u64,
+        }
+
+        unsafe extern "system" fn test_get_virtual_processor_registers(
+            partition: *mut c_void,
+            vp_index: u32,
+            register_names: *const u32,
+            register_count: u32,
+            register_values: *mut WhvRegisterValue,
+        ) -> i32 {
+            let state = &mut *(partition as *mut TestWhpCallbackState);
+            state.get_count += 1;
+            state.last_vp_index = vp_index;
+            state.last_register_name = *register_names;
+            for index in 0..register_count as usize {
+                (*register_values.add(index)).reg64 =
+                    u64::from(*register_names.add(index)) + 0x1000;
+            }
+            S_OK
+        }
+
+        unsafe extern "system" fn test_set_virtual_processor_registers(
+            partition: *mut c_void,
+            vp_index: u32,
+            register_names: *const u32,
+            register_count: u32,
+            register_values: *const WhvRegisterValue,
+        ) -> i32 {
+            let state = &mut *(partition as *mut TestWhpCallbackState);
+            state.set_count += register_count;
+            state.last_vp_index = vp_index;
+            state.last_register_name = *register_names;
+            state.last_register_value = (*register_values).reg64;
+            S_OK
+        }
+
+        unsafe extern "system" fn test_translate_gva(
+            partition: *mut c_void,
+            vp_index: u32,
+            gva: u64,
+            translate_flags: u32,
+            translation_result: *mut WhvTranslateGvaResult,
+            gpa: *mut u64,
+        ) -> i32 {
+            let state = &mut *(partition as *mut TestWhpCallbackState);
+            state.translate_count += 1;
+            state.last_vp_index = vp_index;
+            state.last_translate_flags = translate_flags;
+            state.last_gva = gva;
+            (*translation_result).result_code = WHV_TRANSLATE_GVA_RESULT_SUCCESS;
+            *gpa = gva & !0xfff;
+            S_OK
+        }
 
         struct TestGuestMemory {
             bytes: Vec<u8>,
@@ -7622,6 +7815,132 @@ mod windows_whp {
         }
 
         #[test]
+        fn whp_emulator_register_callbacks_forward_to_whp_functions() {
+            let mut state = TestWhpCallbackState {
+                get_count: 0,
+                set_count: 0,
+                translate_count: 0,
+                last_vp_index: 0,
+                last_register_name: 0,
+                last_register_value: 0,
+                last_translate_flags: 0,
+                last_gva: 0,
+            };
+            let mut handler = |_access| crate::virtio::PaneVirtioMmioAccessOutcome {
+                accepted: false,
+                status: "unused",
+                offset: None,
+                read_data: Vec::new(),
+                write_result: None,
+                queue_execution: None,
+                detail: String::new(),
+            };
+            let mut context = WhpEmulatorMmioCallbackContext {
+                partition: (&mut state as *mut TestWhpCallbackState).cast::<c_void>(),
+                vp_index: 7,
+                get_virtual_processor_registers: Some(test_get_virtual_processor_registers),
+                set_virtual_processor_registers: Some(test_set_virtual_processor_registers),
+                translate_gva: Some(test_translate_gva),
+                handler: &mut handler,
+                last_status: None,
+            };
+            let register_names = [WHV_REGISTER_RIP, WHV_REGISTER_RAX];
+            let mut register_values = [WhvRegisterValue { reg64: 0 }; 2];
+
+            let get_result = unsafe {
+                whp_emulator_get_registers_callback(
+                    (&mut context as *mut WhpEmulatorMmioCallbackContext<'_>).cast::<c_void>(),
+                    register_names.as_ptr(),
+                    register_names.len() as u32,
+                    register_values.as_mut_ptr(),
+                )
+            };
+
+            assert_eq!(get_result, S_OK);
+            assert_eq!(state.get_count, 1);
+            assert_eq!(state.last_vp_index, 7);
+            assert_eq!(state.last_register_name, WHV_REGISTER_RIP);
+            assert_eq!(
+                unsafe { register_values[0].reg64 },
+                u64::from(WHV_REGISTER_RIP) + 0x1000
+            );
+            assert_eq!(context.last_status.as_deref(), Some("get-registers-ok"));
+
+            register_values[0] = WhvRegisterValue { reg64: 0xfeed_beef };
+            let set_result = unsafe {
+                whp_emulator_set_registers_callback(
+                    (&mut context as *mut WhpEmulatorMmioCallbackContext<'_>).cast::<c_void>(),
+                    register_names.as_ptr(),
+                    1,
+                    register_values.as_ptr(),
+                )
+            };
+
+            assert_eq!(set_result, S_OK);
+            assert_eq!(state.set_count, 1);
+            assert_eq!(state.last_vp_index, 7);
+            assert_eq!(state.last_register_name, WHV_REGISTER_RIP);
+            assert_eq!(state.last_register_value, 0xfeed_beef);
+            assert_eq!(context.last_status.as_deref(), Some("set-registers-ok"));
+        }
+
+        #[test]
+        fn whp_emulator_translate_callback_forwards_to_whp_translate_gva() {
+            let mut state = TestWhpCallbackState {
+                get_count: 0,
+                set_count: 0,
+                translate_count: 0,
+                last_vp_index: 0,
+                last_register_name: 0,
+                last_register_value: 0,
+                last_translate_flags: 0,
+                last_gva: 0,
+            };
+            let mut handler = |_access| crate::virtio::PaneVirtioMmioAccessOutcome {
+                accepted: false,
+                status: "unused",
+                offset: None,
+                read_data: Vec::new(),
+                write_result: None,
+                queue_execution: None,
+                detail: String::new(),
+            };
+            let mut context = WhpEmulatorMmioCallbackContext {
+                partition: (&mut state as *mut TestWhpCallbackState).cast::<c_void>(),
+                vp_index: 3,
+                get_virtual_processor_registers: Some(test_get_virtual_processor_registers),
+                set_virtual_processor_registers: Some(test_set_virtual_processor_registers),
+                translate_gva: Some(test_translate_gva),
+                handler: &mut handler,
+                last_status: None,
+            };
+            let mut translation_result = u32::MAX;
+            let mut gpa = 0;
+
+            let result = unsafe {
+                whp_emulator_translate_gva_page_callback(
+                    (&mut context as *mut WhpEmulatorMmioCallbackContext<'_>).cast::<c_void>(),
+                    0x1234_5678,
+                    0x2,
+                    &mut translation_result,
+                    &mut gpa,
+                )
+            };
+
+            assert_eq!(result, S_OK);
+            assert_eq!(state.translate_count, 1);
+            assert_eq!(state.last_vp_index, 3);
+            assert_eq!(state.last_translate_flags, 0x2);
+            assert_eq!(state.last_gva, 0x1234_5678);
+            assert_eq!(translation_result, WHV_TRANSLATE_GVA_RESULT_SUCCESS);
+            assert_eq!(gpa, 0x1234_5000);
+            assert!(context
+                .last_status
+                .as_deref()
+                .is_some_and(|status| status.contains("translate-gva-result=0")));
+        }
+
+        #[test]
         fn whp_emulator_memory_callback_reads_virtio_mmio_register() {
             let mut device = crate::virtio::PaneVirtioMmioBlockDevice::new(1024 * 1024, true);
             let mut memory = TestGuestMemory::new(0x5000);
@@ -7634,6 +7953,11 @@ mod windows_whp {
                 )
             };
             let mut context = WhpEmulatorMmioCallbackContext {
+                partition: std::ptr::null_mut(),
+                vp_index: 0,
+                get_virtual_processor_registers: None,
+                set_virtual_processor_registers: None,
+                translate_gva: None,
                 handler: &mut handler,
                 last_status: None,
             };
@@ -7682,6 +8006,11 @@ mod windows_whp {
                 )
             };
             let mut context = WhpEmulatorMmioCallbackContext {
+                partition: std::ptr::null_mut(),
+                vp_index: 0,
+                get_virtual_processor_registers: None,
+                set_virtual_processor_registers: None,
+                translate_gva: None,
                 handler: &mut handler,
                 last_status: None,
             };

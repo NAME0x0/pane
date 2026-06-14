@@ -5166,6 +5166,7 @@ pane_block_io="$(pane_cmdline_value pane.block_io || true)"
 pane_block_dma="$(pane_cmdline_value pane.block_dma || true)"
 pane_root="$(pane_cmdline_value pane.root || true)"
 pane_user="$(pane_cmdline_value pane.user || true)"
+pane_virtio_root="$(pane_cmdline_value pane.virtio_root || true)"
 pane_block_devices="$(pane_cmdline_value pane.block_devices || true)"
 pane_framebuffer="$(pane_cmdline_value pane.framebuffer || true)"
 pane_input_queue="$(pane_cmdline_value pane.input_queue || true)"
@@ -5177,6 +5178,7 @@ PANE_BLOCK_IO=$pane_block_io
 PANE_BLOCK_DMA=$pane_block_dma
 PANE_ROOT=$pane_root
 PANE_USER=$pane_user
+PANE_VIRTIO_ROOT=$pane_virtio_root
 PANE_BLOCK_DEVICES=$pane_block_devices
 PANE_FRAMEBUFFER=$pane_framebuffer
 PANE_INPUT_QUEUE=$pane_input_queue
@@ -5337,6 +5339,7 @@ static void write_native_storage_env(
     const char *block_dma,
     const char *root_device,
     const char *user_device,
+    const char *virtio_root_device,
     const char *root_readonly,
     const char *root_fs,
     const char *framebuffer,
@@ -5354,6 +5357,7 @@ static void write_native_storage_env(
     dprintf(fd, "PANE_BLOCK_DMA=%s\n", block_dma);
     dprintf(fd, "PANE_ROOT=%s\n", root_device);
     dprintf(fd, "PANE_USER=%s\n", user_device);
+    dprintf(fd, "PANE_VIRTIO_ROOT=%s\n", virtio_root_device);
     dprintf(fd, "PANE_ROOT_READONLY=%s\n", root_readonly);
     dprintf(fd, "PANE_ROOT_FS=%s\n", root_fs);
     dprintf(fd, "PANE_FRAMEBUFFER=%s\n", framebuffer);
@@ -5673,6 +5677,7 @@ int main(void) {
     char block_dma[128] = {0};
     char root_device[128] = {0};
     char user_device[128] = {0};
+    char virtio_root_device[128] = {0};
     char root_readonly[32] = {0};
     char root_fs[32] = {0};
     char root_offset[128] = {0};
@@ -5693,6 +5698,7 @@ int main(void) {
     find_arg(cmdline, "pane.block_dma", block_dma, sizeof(block_dma));
     find_arg(cmdline, "pane.root", root_device, sizeof(root_device));
     find_arg(cmdline, "pane.user", user_device, sizeof(user_device));
+    find_arg(cmdline, "pane.virtio_root", virtio_root_device, sizeof(virtio_root_device));
     find_arg(cmdline, "pane.root_readonly", root_readonly, sizeof(root_readonly));
     find_arg(cmdline, "pane.root_fs", root_fs, sizeof(root_fs));
     find_arg(cmdline, "pane.root_offset", root_offset, sizeof(root_offset));
@@ -5705,6 +5711,7 @@ int main(void) {
     log_key_value("pane.block_dma", block_dma);
     log_key_value("pane.root", root_device);
     log_key_value("pane.user", user_device);
+    log_key_value("pane.virtio_root", virtio_root_device);
     log_key_value("pane.root_readonly", root_readonly);
     log_key_value("pane.root_fs", root_fs);
     log_key_value("pane.root_offset", root_offset);
@@ -5742,8 +5749,19 @@ int main(void) {
     } else {
         log_line("PANE_DISPLAY_CONTRACT_MISSING");
     }
-    write_native_storage_env(storage_contract, block_io, block_dma, root_device, user_device, root_readonly, root_fs, framebuffer, input_queue);
+    write_native_storage_env(storage_contract, block_io, block_dma, root_device, user_device, virtio_root_device, root_readonly, root_fs, framebuffer, input_queue);
 
+    if (virtio_root_device[0] != '\0') {
+        log_line("PANE_VIRTIO_ROOT_MOUNT_ATTEMPT");
+        if (wait_for_device(virtio_root_device) == 0) {
+            if (try_mount_root(virtio_root_device, truthy_arg(root_readonly), root_fs) == 0) {
+                exec_real_init();
+            }
+            log_line("PANE_VIRTIO_ROOT_MOUNT_FALLBACK");
+        } else {
+            log_line("PANE_VIRTIO_ROOT_DEVICE_WAIT_TIMEOUT");
+        }
+    }
     log_line("PANE_ROOT_MOUNT_ATTEMPT");
     if (wait_for_device(root_device) != 0) {
         log_line("PANE_ROOT_DEVICE_WAIT_TIMEOUT");
@@ -8086,6 +8104,12 @@ fn augment_kernel_cmdline_for_runtime_contracts(
             append_kernel_arg(&mut cmdline, format!("pane.root_length={length}"));
         }
         append_kernel_arg(&mut cmdline, format!("pane.user={}", storage.user_device));
+        if !storage.virtio_block.root_device_hint.is_empty() {
+            append_kernel_arg(
+                &mut cmdline,
+                format!("pane.virtio_root={}", storage.virtio_block.root_device_hint),
+            );
+        }
         append_kernel_arg(
             &mut cmdline,
             format!(
@@ -15669,6 +15693,7 @@ mod tests {
         assert!(hook.contains("pane.block_io"));
         assert!(hook.contains("pane.block_dma"));
         assert!(hook.contains("pane.block_devices"));
+        assert!(hook.contains("pane.virtio_root"));
         assert!(hook.contains("pane.framebuffer"));
         assert!(hook.contains("pane.input_queue"));
         let header =
@@ -15694,10 +15719,15 @@ mod tests {
         assert!(init_source.contains("PANE_BLOCK_PROBE_CACHE_DROPPED"));
         assert!(init_source.contains("shared_buffer_gpa=%llu shared_buffer_bytes=%llu"));
         assert!(init_source.contains("pane.root_offset"));
+        assert!(init_source.contains("pane.virtio_root"));
         assert!(init_source.contains("pane.root_readonly"));
         assert!(init_source.contains("pane.root_fs"));
+        assert!(init_source.contains("PANE_VIRTIO_ROOT"));
         assert!(init_source.contains("PANE_ROOT_READONLY"));
         assert!(init_source.contains("PANE_ROOT_FS"));
+        assert!(init_source.contains("PANE_VIRTIO_ROOT_MOUNT_ATTEMPT"));
+        assert!(init_source.contains("PANE_VIRTIO_ROOT_DEVICE_WAIT_TIMEOUT"));
+        assert!(init_source.contains("PANE_VIRTIO_ROOT_MOUNT_FALLBACK"));
         assert!(init_source.contains("supported_root_fs"));
         assert!(init_source.contains("MS_RELATIME | (root_readonly ? MS_RDONLY : 0)"));
         assert!(init_source.contains("pane.block_devices"));
@@ -16492,6 +16522,7 @@ mod tests {
         assert!(layout.cmdline.contains("pane.root_fs=ext4"));
         assert!(layout.cmdline.contains("pane.root_partition=1"));
         assert!(layout.cmdline.contains("pane.user=/dev/pane1"));
+        assert!(layout.cmdline.contains("pane.virtio_root=/dev/vda1"));
         assert!(layout.cmdline.contains("virtio_mmio.device=4K@0xdfc0000:5"));
         assert!(layout.cmdline.contains("pane.block_io=0x0d00,16,4096"));
         assert!(layout.cmdline.contains("pane.block_devices=512,786432"));

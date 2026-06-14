@@ -51,6 +51,7 @@ pub(crate) struct NativeSerialBootImage {
     pub(crate) guest_entry_gpa: u64,
     pub(crate) entry_mode: NativeGuestEntryMode,
     pub(crate) boot_params_gpa: Option<u64>,
+    pub(crate) virtio_block_logical_size_bytes: Option<u64>,
     pub(crate) extra_regions: Vec<NativeGuestMemoryRegion>,
 }
 
@@ -307,6 +308,78 @@ pub(crate) fn service_native_block_io_command(
             status_code: PANE_BLOCK_IO_STATUS_FAILED,
             response_bytes: Vec::new(),
         },
+    }
+}
+
+fn service_virtio_block_request_with_native_handler(
+    request: &crate::virtio::PaneVirtioBlkRequest,
+    handler: Option<&NativeBlockIoHandler<'_>>,
+) -> Result<Vec<u8>, String> {
+    match request.request_type {
+        crate::virtio::PaneVirtioBlkRequestType::In => {
+            let requested_bytes =
+                request
+                    .data_descriptors
+                    .iter()
+                    .try_fold(0_u64, |total, descriptor| {
+                        total
+                            .checked_add(u64::from(descriptor.len))
+                            .ok_or_else(|| "virtio read request length overflowed".to_string())
+                    })?;
+            let start_byte = request
+                .sector
+                .checked_mul(crate::virtio::VIRTIO_BLK_SECTOR_SIZE_BYTES)
+                .ok_or_else(|| "virtio read sector offset overflowed".to_string())?;
+            let end_byte = start_byte
+                .checked_add(requested_bytes)
+                .ok_or_else(|| "virtio read end offset overflowed".to_string())?;
+            let native_block_size = u64::from(PANE_BLOCK_IO_BLOCK_SIZE_BYTES);
+            let first_block = start_byte / native_block_size;
+            let last_block_exclusive =
+                end_byte.saturating_add(native_block_size - 1) / native_block_size;
+            let mut joined = Vec::new();
+            for block_index in first_block..last_block_exclusive {
+                let command = NativeBlockIoCommand {
+                    device: NativeBlockDeviceId::BaseOs,
+                    operation: NativeBlockOperation::Read,
+                    block_index,
+                    block_size_bytes: PANE_BLOCK_IO_BLOCK_SIZE_BYTES,
+                };
+                let outcome = service_native_block_io_command(&command, handler, None);
+                if outcome.status_code != PANE_BLOCK_IO_STATUS_SERVICED {
+                    return Err(format!(
+                        "native block service returned status 0x{:02x} for virtio read block {block_index}",
+                        outcome.status_code
+                    ));
+                }
+                if outcome.response_bytes.len() < PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize {
+                    return Err(format!(
+                        "native block service returned {} bytes for block {block_index}, expected {}",
+                        outcome.response_bytes.len(),
+                        PANE_BLOCK_IO_BLOCK_SIZE_BYTES
+                    ));
+                }
+                joined.extend_from_slice(
+                    &outcome.response_bytes[..PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize],
+                );
+            }
+            let slice_start = (start_byte - first_block * native_block_size) as usize;
+            let slice_end = slice_start
+                .checked_add(requested_bytes as usize)
+                .ok_or_else(|| "virtio read slice overflowed".to_string())?;
+            if slice_end > joined.len() {
+                return Err("virtio read exceeded coalesced native block data".to_string());
+            }
+            Ok(joined[slice_start..slice_end].to_vec())
+        }
+        crate::virtio::PaneVirtioBlkRequestType::Flush => Ok(Vec::new()),
+        crate::virtio::PaneVirtioBlkRequestType::GetId => Ok(b"pane-base-os".to_vec()),
+        crate::virtio::PaneVirtioBlkRequestType::Out => {
+            Err("Pane's current virtio vda backend is read-only".to_string())
+        }
+        crate::virtio::PaneVirtioBlkRequestType::Unsupported(value) => {
+            Err(format!("unsupported virtio block request type {value}"))
+        }
     }
 }
 
@@ -792,14 +865,14 @@ pub(crate) fn native_device_loop_report() -> NativeDeviceLoopReport {
                 id: "virtio-blk",
                 role: "standard Arch base/user disk backend",
                 backend: "pane-virtio-mmio-block-model-shaped-by-rust-vmm",
-                status: "mmio-service-boundary-ready-whp-emulator-callbacks-pending",
+                status: "live-whp-mmio-execution-ready-irq-pending",
                 replacement_target: None,
             },
             NativeDeviceLoopDevice {
                 id: "whp-instruction-emulator",
                 role: "decode x64 MMIO/PIO instructions and advance the vCPU after callbacks",
                 backend: "WinHvEmulation.dll",
-                status: "preflighted-callback-service-boundary-ready-not-yet-created",
+                status: "preflighted-live-emulator-created-for-linux-mmio-runs",
                 replacement_target: None,
             },
             NativeDeviceLoopDevice {
@@ -1611,6 +1684,7 @@ mod windows_whp {
     const PCI_CONFIG_ADDRESS_END_PORT: u16 = 0x0cfb;
     const PCI_CONFIG_DATA_START_PORT: u16 = 0x0cfc;
     const PCI_CONFIG_DATA_END_PORT: u16 = 0x0cff;
+    const VP_CONTEXT_OFFSET: usize = 8;
     const VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET: usize = 10;
     const VP_CONTEXT_RIP_OFFSET: usize = 32;
     const MEMORY_CONTEXT_OFFSET: usize = 48;
@@ -1717,6 +1791,7 @@ mod windows_whp {
     ) -> i32;
     const S_OK: i32 = 0;
     const E_UNEXPECTED: i32 = 0x8000_FFFF_u32 as i32;
+    const WHV_EMULATOR_STATUS_EMULATION_SUCCESSFUL: u32 = 1;
     const WHV_TRANSLATE_GVA_RESULT_SUCCESS: u32 = 0;
     const WHP_EMULATOR_MMIO_READ: u8 = 0;
     const WHP_EMULATOR_MMIO_WRITE: u8 = 1;
@@ -1843,6 +1918,13 @@ mod windows_whp {
             crate::virtio::PaneVirtioMmioAccess,
         ) -> crate::virtio::PaneVirtioMmioAccessOutcome,
         last_status: Option<String>,
+    }
+
+    struct WhpLiveInstructionEmulator {
+        module: *mut c_void,
+        handle: *mut c_void,
+        destroy_emulator: WhvEmulatorDestroyEmulator,
+        try_mmio_emulation: WhvEmulatorTryMmioEmulation,
     }
 
     #[derive(Copy, Clone, Default)]
@@ -2054,6 +2136,108 @@ mod windows_whp {
         FreeLibrary(module);
     }
 
+    unsafe fn create_live_whp_instruction_emulator(
+        report: &mut NativePartitionSmokeReport,
+    ) -> Option<WhpLiveInstructionEmulator> {
+        let library_name = CString::new("WinHvEmulation.dll").expect("static string");
+        let module = LoadLibraryA(library_name.as_ptr());
+        if module.is_null() {
+            report.calls.push(NativeWhpCallReport {
+                name: "LoadLibraryA(WinHvEmulation.dll/live)",
+                hresult: None,
+                ok: false,
+                detail: "WinHvEmulation.dll could not be loaded for live virtio-MMIO instruction emulation.".to_string(),
+            });
+            report.blocker = Some(
+                "WinHvEmulation.dll is unavailable for live virtio-MMIO emulation.".to_string(),
+            );
+            return None;
+        }
+
+        report.calls.push(NativeWhpCallReport {
+            name: "LoadLibraryA(WinHvEmulation.dll/live)",
+            hresult: None,
+            ok: true,
+            detail: "Loaded WinHvEmulation.dll for live virtio-MMIO instruction emulation."
+                .to_string(),
+        });
+
+        let Some(create_emulator) = resolve_whp_emulator_function::<WhvEmulatorCreateEmulator>(
+            module,
+            "WHvEmulatorCreateEmulator",
+            report,
+        ) else {
+            FreeLibrary(module);
+            return None;
+        };
+        let Some(destroy_emulator) = resolve_whp_emulator_function::<WhvEmulatorDestroyEmulator>(
+            module,
+            "WHvEmulatorDestroyEmulator",
+            report,
+        ) else {
+            FreeLibrary(module);
+            return None;
+        };
+        let Some(try_mmio_emulation) = resolve_whp_emulator_function::<WhvEmulatorTryMmioEmulation>(
+            module,
+            "WHvEmulatorTryMmioEmulation",
+            report,
+        ) else {
+            FreeLibrary(module);
+            return None;
+        };
+
+        let callbacks = whp_emulator_callbacks();
+        let mut handle: *mut c_void = std::ptr::null_mut();
+        let hresult = create_emulator(&callbacks, &mut handle);
+        let created = hresult_succeeded(hresult) && !handle.is_null();
+        report.calls.push(hresult_call(
+            "WHvEmulatorCreateEmulator(live)",
+            hresult,
+            if created {
+                "Created a live WHP instruction emulator for Pane's virtio-MMIO device loop."
+            } else {
+                "Could not create a live WHP instruction emulator for Pane's virtio-MMIO device loop."
+            },
+        ));
+        if !created {
+            report.blocker =
+                Some("Pane could not create a live WHP instruction emulator.".to_string());
+            FreeLibrary(module);
+            return None;
+        }
+
+        Some(WhpLiveInstructionEmulator {
+            module,
+            handle,
+            destroy_emulator,
+            try_mmio_emulation,
+        })
+    }
+
+    unsafe fn destroy_live_whp_instruction_emulator(
+        emulator: WhpLiveInstructionEmulator,
+        report: &mut NativePartitionSmokeReport,
+    ) {
+        let hresult = (emulator.destroy_emulator)(emulator.handle);
+        let ok = hresult_succeeded(hresult);
+        report.calls.push(hresult_call(
+            "WHvEmulatorDestroyEmulator(live)",
+            hresult,
+            if ok {
+                "Destroyed the live WHP instruction emulator after the Pane device-loop run."
+            } else {
+                "The live WHP instruction emulator did not destroy cleanly."
+            },
+        ));
+        FreeLibrary(emulator.module);
+        if !ok {
+            report.blocker = Some(
+                "Pane could not destroy the live WHP instruction emulator cleanly.".to_string(),
+            );
+        }
+    }
+
     unsafe fn resolve_whp_emulator_function<T>(
         module: *mut c_void,
         symbol: &'static str,
@@ -2245,6 +2429,146 @@ mod windows_whp {
             format!("translate-gva-failed:{}", format_hresult(hresult))
         });
         hresult
+    }
+
+    fn copy_whp_exit_struct<T: Copy>(exit_context: &[u8], offset: usize) -> Option<T> {
+        let size = mem::size_of::<T>();
+        if exit_context.len() < offset.saturating_add(size) {
+            return None;
+        }
+        let mut value = mem::MaybeUninit::<T>::uninit();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                exit_context.as_ptr().add(offset),
+                value.as_mut_ptr().cast::<u8>(),
+                size,
+            );
+            Some(value.assume_init())
+        }
+    }
+
+    fn whp_exit_vp_context(exit_context: &[u8]) -> Option<WhvVpExitContext> {
+        copy_whp_exit_struct(exit_context, VP_CONTEXT_OFFSET)
+    }
+
+    fn whp_exit_memory_access_context(exit_context: &[u8]) -> Option<WhvMemoryAccessContext> {
+        copy_whp_exit_struct(exit_context, MEMORY_CONTEXT_OFFSET)
+    }
+
+    struct WhpMmioEmulationDeps<'a> {
+        partition: *mut c_void,
+        get_virtual_processor_registers: Option<WhvGetVirtualProcessorRegisters>,
+        set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
+        translate_gva: Option<WhvTranslateGva>,
+        live_instruction_emulator: Option<&'a WhpLiveInstructionEmulator>,
+    }
+
+    fn try_emulate_virtio_mmio_exit<M, F>(
+        deps: WhpMmioEmulationDeps<'_>,
+        exit_context: &[u8],
+        device: &mut crate::virtio::PaneVirtioMmioBlockDevice,
+        memory: &mut M,
+        service: F,
+        report: &mut NativePartitionSmokeReport,
+    ) -> bool
+    where
+        M: crate::virtio::PaneGuestMemory,
+        F: FnOnce(&crate::virtio::PaneVirtioBlkRequest, Option<&[u8]>) -> Result<Vec<u8>, String>,
+    {
+        let Some(emulator) = deps.live_instruction_emulator else {
+            report.calls.push(NativeWhpCallReport {
+                name: "WHvEmulatorTryMmioEmulation(virtio-mmio)",
+                hresult: None,
+                ok: false,
+                detail: "Live WHP instruction emulator is unavailable for the virtio-MMIO exit."
+                    .to_string(),
+            });
+            return false;
+        };
+        let (Some(get_virtual_processor_registers), Some(translate_gva)) =
+            (deps.get_virtual_processor_registers, deps.translate_gva)
+        else {
+            report.calls.push(NativeWhpCallReport {
+                name: "WHvEmulatorTryMmioEmulation(virtio-mmio)",
+                hresult: None,
+                ok: false,
+                detail: "WHP register or GVA translation callbacks are unavailable for live virtio-MMIO emulation.".to_string(),
+            });
+            return false;
+        };
+        let Some(vp_context) = whp_exit_vp_context(exit_context) else {
+            report.calls.push(NativeWhpCallReport {
+                name: "WHvEmulatorTryMmioEmulation(virtio-mmio)",
+                hresult: None,
+                ok: false,
+                detail: "WHP memory-access exit buffer was too small for WHV_VP_EXIT_CONTEXT."
+                    .to_string(),
+            });
+            return false;
+        };
+        let Some(memory_context) = whp_exit_memory_access_context(exit_context) else {
+            report.calls.push(NativeWhpCallReport {
+                name: "WHvEmulatorTryMmioEmulation(virtio-mmio)",
+                hresult: None,
+                ok: false,
+                detail:
+                    "WHP memory-access exit buffer was too small for WHV_MEMORY_ACCESS_CONTEXT."
+                        .to_string(),
+            });
+            return false;
+        };
+
+        let mut service = Some(service);
+        let mut handler = |access| {
+            crate::virtio::service_virtio_mmio_access(device, memory, access, |request, payload| {
+                service
+                    .take()
+                    .ok_or_else(|| "virtio-MMIO service was invoked more than once".to_string())?(
+                    request, payload,
+                )
+            })
+        };
+        let mut callback_context = WhpEmulatorMmioCallbackContext {
+            partition: deps.partition,
+            vp_index: 0,
+            get_virtual_processor_registers: Some(get_virtual_processor_registers),
+            set_virtual_processor_registers: Some(deps.set_virtual_processor_registers),
+            translate_gva: Some(translate_gva),
+            handler: &mut handler,
+            last_status: None,
+        };
+        let mut status = WhvEmulatorStatus { as_u32: 0 };
+        let hresult = unsafe {
+            (emulator.try_mmio_emulation)(
+                emulator.handle,
+                (&mut callback_context as *mut WhpEmulatorMmioCallbackContext<'_>).cast::<c_void>(),
+                &vp_context,
+                &memory_context,
+                &mut status,
+            )
+        };
+        let ok = hresult_succeeded(hresult)
+            && status.as_u32 & WHV_EMULATOR_STATUS_EMULATION_SUCCESSFUL != 0;
+        report.calls.push(hresult_call(
+            "WHvEmulatorTryMmioEmulation(virtio-mmio)",
+            hresult,
+            if ok {
+                "WHP decoded and executed a virtio-MMIO instruction through Pane's device service."
+            } else {
+                "WHP could not complete virtio-MMIO instruction emulation through Pane's device service."
+            },
+        ));
+        report.calls.push(NativeWhpCallReport {
+            name: "WHvEmulatorStatus(virtio-mmio)",
+            hresult: None,
+            ok,
+            detail: format!(
+                "status=0x{:08x}, callback_status={}.",
+                status.as_u32,
+                callback_context.last_status.as_deref().unwrap_or("none")
+            ),
+        });
+        ok
     }
 
     pub(super) fn run_partition_smoke(
@@ -2668,6 +2992,17 @@ mod windows_whp {
                 }
             }
 
+            let live_instruction_emulator = if run_fixture
+                && report.registers_configured
+                && boot_image
+                    .map(|image| image.entry_mode == NativeGuestEntryMode::LinuxProtectedMode32)
+                    .unwrap_or(false)
+            {
+                create_live_whp_instruction_emulator(&mut report)
+            } else {
+                None
+            };
+
             if run_fixture && report.registers_configured {
                 if let (Some(run_virtual_processor), Some(set_virtual_processor_registers)) =
                     (run_virtual_processor, set_virtual_processor_registers)
@@ -2679,6 +3014,7 @@ mod windows_whp {
                             cancel_run_virtual_processor,
                             get_virtual_processor_registers,
                             translate_gva,
+                            live_instruction_emulator.as_ref(),
                             interrupt_controller_state_readers,
                             request_interrupt,
                             set_virtual_processor_registers,
@@ -2689,6 +3025,10 @@ mod windows_whp {
                         );
                     }
                 }
+            }
+
+            if let Some(live_instruction_emulator) = live_instruction_emulator {
+                destroy_live_whp_instruction_emulator(live_instruction_emulator, &mut report);
             }
 
             if run_fixture && report.memory_mapped {
@@ -3415,6 +3755,7 @@ mod windows_whp {
         cancel_run_virtual_processor: Option<WhvCancelRunVirtualProcessor>,
         get_virtual_processor_registers: Option<WhvGetVirtualProcessorRegisters>,
         translate_gva: Option<WhvTranslateGva>,
+        live_instruction_emulator: Option<&WhpLiveInstructionEmulator>,
         interrupt_controller_state_readers: WhpInterruptControllerStateReaders,
         request_interrupt: Option<WhvRequestInterrupt>,
         set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
@@ -3437,11 +3778,13 @@ mod windows_whp {
                 cancel_run_virtual_processor,
                 get_virtual_processor_registers,
                 translate_gva,
+                live_instruction_emulator,
+                boot_image.virtio_block_logical_size_bytes,
                 interrupt_controller_state_readers,
                 request_interrupt,
                 set_virtual_processor_registers,
                 block_io_handler,
-                pane_block_dma_window(mapped_regions),
+                mapped_regions,
                 report,
             ),
         }
@@ -3598,11 +3941,13 @@ mod windows_whp {
         cancel_run_virtual_processor: Option<WhvCancelRunVirtualProcessor>,
         get_virtual_processor_registers: Option<WhvGetVirtualProcessorRegisters>,
         translate_gva: Option<WhvTranslateGva>,
+        live_instruction_emulator: Option<&WhpLiveInstructionEmulator>,
+        virtio_block_logical_size_bytes: Option<u64>,
         interrupt_controller_state_readers: WhpInterruptControllerStateReaders,
         request_interrupt: Option<WhvRequestInterrupt>,
         set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
         block_io_handler: Option<&NativeBlockIoHandler<'_>>,
-        mut block_dma_window: Option<&mut [u8]>,
+        mapped_regions: &mut [MappedGuestRegion],
         report: &mut NativePartitionSmokeReport,
     ) {
         report.serial_expected_text = None;
@@ -3631,6 +3976,8 @@ mod windows_whp {
         let mut block_state = NativeBlockIoPortState::default();
         let mut block_io_trace = NativeBlockIoTraceCollector::default();
         let mut legacy_io_state = LegacyDeviceIoState::default();
+        let mut virtio_block_device = virtio_block_logical_size_bytes
+            .map(|bytes| crate::virtio::PaneVirtioMmioBlockDevice::new(bytes, true));
         let mut timer_interrupt_requested = false;
         let mut timer_interrupt_acknowledged = false;
         let mut root_mount_timer_requested = false;
@@ -3672,17 +4019,16 @@ mod windows_whp {
             if let Some(submission) =
                 block_state.take_ready_pending_submission(report.serial_text.as_deref())
             {
-                let dma_ready = block_dma_window
-                    .as_ref()
+                let dma_ready = pane_block_dma_window(mapped_regions)
                     .is_some_and(|window| window.len() >= PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize);
-                let dma_write_payload =
-                    if dma_ready && submission.command.operation == NativeBlockOperation::Write {
-                        block_dma_window.as_deref().map(|window| {
-                            window[..PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize].to_vec()
-                        })
-                    } else {
-                        None
-                    };
+                let dma_write_payload = if dma_ready
+                    && submission.command.operation == NativeBlockOperation::Write
+                {
+                    pane_block_dma_window(mapped_regions)
+                        .map(|window| window[..PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize].to_vec())
+                } else {
+                    None
+                };
                 let outcome = service_native_block_io_command(
                     &submission.command,
                     block_io_handler,
@@ -3709,7 +4055,7 @@ mod windows_whp {
                     && status_code == PANE_BLOCK_IO_STATUS_SERVICED
                     && submission.command.operation == NativeBlockOperation::Read
                 {
-                    if let Some(window) = block_dma_window.as_deref_mut() {
+                    if let Some(window) = pane_block_dma_window(mapped_regions) {
                         let transfer_len = response_bytes
                             .len()
                             .min(PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize);
@@ -3971,6 +4317,53 @@ mod windows_whp {
             trace_native_device_dispatch(&decoded_exit, report);
 
             match decoded_exit {
+                DecodedExit::MemoryAccess { gpa, .. }
+                    if crate::virtio::pane_virtio_mmio_contains_gpa(gpa) =>
+                {
+                    let Some(device) = virtio_block_device.as_mut() else {
+                        report.calls.push(NativeWhpCallReport {
+                            name: "VirtioMmioStorageUnavailable",
+                            hresult: None,
+                            ok: false,
+                            detail: "Linux accessed Pane's virtio-MMIO block aperture, but this boot image has no verified virtio block capacity metadata.".to_string(),
+                        });
+                        break;
+                    };
+                    let mut memory = MappedGuestMemoryView::new(mapped_regions);
+                    let emulated = try_emulate_virtio_mmio_exit(
+                        WhpMmioEmulationDeps {
+                            partition,
+                            get_virtual_processor_registers,
+                            set_virtual_processor_registers,
+                            translate_gva,
+                            live_instruction_emulator,
+                        },
+                        &exit_context,
+                        device,
+                        &mut memory,
+                        |request, _payload| {
+                            crate::native::service_virtio_block_request_with_native_handler(
+                                request,
+                                block_io_handler,
+                            )
+                        },
+                        report,
+                    );
+                    if emulated {
+                        last_progress_at = Instant::now();
+                        if let Some(path) = checkpoint_path.as_deref() {
+                            write_linux_entry_probe_checkpoint(
+                                path,
+                                report,
+                                "virtio-mmio-emulated",
+                                probe_started_at,
+                            );
+                            last_checkpoint_at = Instant::now();
+                        }
+                        continue;
+                    }
+                    break;
+                }
                 DecodedExit::IoPort {
                     instruction_length,
                     rip,
@@ -4008,13 +4401,14 @@ mod windows_whp {
                                     .note_pending_submit_serial_position(report.serial_bytes.len());
                             }
                             if let Some(submission) = submission {
-                                let dma_ready = block_dma_window.as_ref().is_some_and(|window| {
-                                    window.len() >= PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize
-                                });
+                                let dma_ready =
+                                    pane_block_dma_window(mapped_regions).is_some_and(|window| {
+                                        window.len() >= PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize
+                                    });
                                 let dma_write_payload = if dma_ready
                                     && submission.command.operation == NativeBlockOperation::Write
                                 {
-                                    block_dma_window.as_deref().map(|window| {
+                                    pane_block_dma_window(mapped_regions).map(|window| {
                                         window[..PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize].to_vec()
                                     })
                                 } else {
@@ -4046,7 +4440,7 @@ mod windows_whp {
                                     && status_code == PANE_BLOCK_IO_STATUS_SERVICED
                                     && submission.command.operation == NativeBlockOperation::Read
                                 {
-                                    if let Some(window) = block_dma_window.as_deref_mut() {
+                                    if let Some(window) = pane_block_dma_window(mapped_regions) {
                                         let transfer_len = response_bytes
                                             .len()
                                             .min(PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize);
@@ -7578,13 +7972,14 @@ mod windows_whp {
         use crate::native::{
             evaluate_native_block_io, linux_boot_gdt_page_bytes, native_block_io_exit_can_resume,
             pane_block_io_port_offset, serial_boot_test_image_bytes,
-            service_native_block_io_command, NativeBlockDeviceId, NativeBlockIoCommand,
-            NativeBlockIoPortState, NativeBlockIoServiceResult, NativeBlockOperation,
-            NativePartitionSmokeReport, NativePartitionSmokeStatus, LINUX_BOOT_CODE_SELECTOR,
-            LINUX_BOOT_DATA_SELECTOR, LINUX_BOOT_GDT_GPA, LINUX_BOOT_STACK_GPA,
-            PANE_BLOCK_IO_BASE_PORT, PANE_BLOCK_IO_BLOCK_SIZE_BYTES, PANE_BLOCK_IO_LAST_PORT,
-            PANE_BLOCK_IO_STATUS_DENIED, PANE_BLOCK_IO_STATUS_FAILED,
-            PANE_BLOCK_IO_STATUS_SERVICED, PANE_BLOCK_IO_STATUS_SUBMITTED, SERIAL_BOOT_BANNER_TEXT,
+            service_native_block_io_command, service_virtio_block_request_with_native_handler,
+            NativeBlockDeviceId, NativeBlockIoCommand, NativeBlockIoPortState,
+            NativeBlockIoServiceResult, NativeBlockOperation, NativePartitionSmokeReport,
+            NativePartitionSmokeStatus, LINUX_BOOT_CODE_SELECTOR, LINUX_BOOT_DATA_SELECTOR,
+            LINUX_BOOT_GDT_GPA, LINUX_BOOT_STACK_GPA, PANE_BLOCK_IO_BASE_PORT,
+            PANE_BLOCK_IO_BLOCK_SIZE_BYTES, PANE_BLOCK_IO_LAST_PORT, PANE_BLOCK_IO_STATUS_DENIED,
+            PANE_BLOCK_IO_STATUS_FAILED, PANE_BLOCK_IO_STATUS_SERVICED,
+            PANE_BLOCK_IO_STATUS_SUBMITTED, SERIAL_BOOT_BANNER_TEXT,
         };
         use crate::virtio::PaneGuestMemory;
         use std::ffi::c_void;
@@ -8580,6 +8975,38 @@ mod windows_whp {
                 outcome.response_bytes,
                 vec![0x7b_u8; PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize]
             );
+        }
+
+        #[test]
+        fn virtio_block_read_coalesces_512_byte_sectors_through_native_blocks() {
+            let request = crate::virtio::PaneVirtioBlkRequest {
+                request_type: crate::virtio::PaneVirtioBlkRequestType::In,
+                sector: 7,
+                data_descriptors: vec![crate::virtio::PaneVirtioDescriptor {
+                    addr: 0x4100,
+                    len: 1536,
+                    flags: 2,
+                    next: 0,
+                }],
+                status_addr: 0x4300,
+                status_len: 1,
+            };
+            let handler = |command: &NativeBlockIoCommand, payload: Option<&[u8]>| {
+                assert_eq!(command.device, NativeBlockDeviceId::BaseOs);
+                assert_eq!(command.operation, NativeBlockOperation::Read);
+                assert!(payload.is_none());
+                Ok(NativeBlockIoServiceResult {
+                    decision: evaluate_native_block_io(command),
+                    bytes: vec![command.block_index as u8; PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize],
+                })
+            };
+
+            let bytes =
+                service_virtio_block_request_with_native_handler(&request, Some(&handler)).unwrap();
+
+            assert_eq!(bytes.len(), 1536);
+            assert!(bytes[..512].iter().all(|byte| *byte == 0));
+            assert!(bytes[512..].iter().all(|byte| *byte == 1));
         }
 
         #[test]
@@ -9815,7 +10242,7 @@ mod tests {
         assert_eq!(pane_block.replacement_target, Some("virtio-blk"));
         assert_eq!(
             virtio_block.status,
-            "mmio-service-boundary-ready-whp-emulator-callbacks-pending"
+            "live-whp-mmio-execution-ready-irq-pending"
         );
         assert_eq!(report.mmio_window.base_gpa, "0x0dfc0000");
         assert_eq!(report.mmio_window.primary_device.id, "vda");
@@ -9962,6 +10389,7 @@ mod tests {
             guest_entry_gpa: 0x0010_0000,
             entry_mode: NativeGuestEntryMode::LinuxProtectedMode32,
             boot_params_gpa: Some(0x7000),
+            virtio_block_logical_size_bytes: None,
             extra_regions: Vec::new(),
         };
 

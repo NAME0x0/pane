@@ -975,7 +975,7 @@ fn virtio_block_backend_plan(storage: &KernelStorageAttachment) -> VirtioBlockBa
         candidate_crate_version: None,
         license: "Apache-2.0 OR BSD-3-Clause".to_string(),
         source_url: "https://github.com/rust-vmm/vm-virtio".to_string(),
-        adoption_state: "mmio-service-boundary-ready-whp-emulator-callbacks-pending".to_string(),
+        adoption_state: "live-whp-mmio-execution-ready-irq-pending".to_string(),
         transport: "virtio-mmio".to_string(),
         mmio_base_gpa: default_virtio_mmio_base_gpa(),
         mmio_size_bytes: default_virtio_mmio_size_bytes(),
@@ -1017,9 +1017,9 @@ fn virtio_block_backend_plan(storage: &KernelStorageAttachment) -> VirtioBlockBa
             },
         ],
         notes: vec![
-            "This is the standard Linux block-device target for Pane-owned Arch boot; it is not yet executed by the WHP runner."
+            "This is the standard Linux block-device target for Pane-owned Arch boot; Pane now routes live WHP virtio-MMIO exits into the in-repo block model."
                 .to_string(),
-            "Pane reserves a virtio-MMIO aperture, advertises it with Linux's virtio_mmio.device kernel parameter, and has a tested split-virtqueue descriptor executor; completing WHP MMIO exit execution and IRQ injection is the remaining storage milestone."
+            "Pane reserves a virtio-MMIO aperture, advertises it with Linux's virtio_mmio.device kernel parameter, executes WHP MMIO exits through WinHvEmulation.dll, and bridges virtio reads to the verified native block handler; IRQ injection is the remaining storage milestone."
                 .to_string(),
             "The existing Pane block-port contract remains only as the current diagnostic bridge until the virtio device loop is implemented."
                 .to_string(),
@@ -7549,6 +7549,7 @@ fn load_serial_boot_image_artifact(
         guest_entry_gpa: 0x1000,
         entry_mode: crate::native::NativeGuestEntryMode::RealModeSerial,
         boot_params_gpa: None,
+        virtio_block_logical_size_bytes: None,
         extra_regions: Vec::new(),
     })
 }
@@ -7684,6 +7685,7 @@ fn load_boot_loader_image_artifact(
         guest_entry_gpa: 0x1000,
         entry_mode: crate::native::NativeGuestEntryMode::RealModeSerial,
         boot_params_gpa: None,
+        virtio_block_logical_size_bytes: None,
         extra_regions: Vec::new(),
     })
 }
@@ -7783,6 +7785,12 @@ fn load_kernel_layout_boot_image_artifact(
         boot_params_gpa: (layout.kernel_format == "linux-bzimage")
             .then(|| parse_guest_physical_address(&layout.boot_params_gpa))
             .transpose()?,
+        virtio_block_logical_size_bytes: layout.storage.as_ref().map(|storage| {
+            storage
+                .root_handoff
+                .partition_byte_length
+                .unwrap_or(storage.base_os_bytes)
+        }),
         extra_regions,
     })
 }
@@ -16413,7 +16421,7 @@ mod tests {
         assert_eq!(storage.virtio_block.source_crate, "rust-vmm/vm-virtio");
         assert_eq!(
             storage.virtio_block.adoption_state,
-            "mmio-service-boundary-ready-whp-emulator-callbacks-pending"
+            "live-whp-mmio-execution-ready-irq-pending"
         );
         assert_eq!(storage.virtio_block.transport, "virtio-mmio");
         assert_eq!(storage.virtio_block.mmio_base_gpa, "0x0dfc0000");

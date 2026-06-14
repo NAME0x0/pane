@@ -2,6 +2,7 @@ use serde::Serialize;
 
 pub(crate) const PANE_VIRTIO_MMIO_BASE_GPA: u64 = 0x0dfc_0000;
 pub(crate) const PANE_VIRTIO_MMIO_SIZE_BYTES: u64 = 0x0000_1000;
+pub(crate) const PANE_VIRTIO_MMIO_IRQ: u32 = 5;
 pub(crate) const VIRTIO_MMIO_MAGIC_VALUE: u32 = 0x7472_6976;
 pub(crate) const VIRTIO_MMIO_VERSION_MODERN: u32 = 2;
 pub(crate) const VIRTIO_DEVICE_ID_BLOCK: u32 = 2;
@@ -664,6 +665,10 @@ pub(crate) fn pane_virtio_mmio_window() -> PaneVirtioMmioWindow {
     }
 }
 
+pub(crate) fn pane_virtio_mmio_kernel_arg() -> String {
+    format!("virtio_mmio.device=4K@0x{PANE_VIRTIO_MMIO_BASE_GPA:x}:{PANE_VIRTIO_MMIO_IRQ}")
+}
+
 pub(crate) fn pane_virtio_mmio_service_smoke() -> PaneVirtioMmioServiceSmoke {
     let mut device = PaneVirtioMmioBlockDevice::new(8 * 1024 * 1024, true);
     let mut memory = PaneSmokeGuestMemory::new(0x5000);
@@ -1069,12 +1074,13 @@ fn combine_addr_high(current: u64, high: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        pane_virtio_mmio_contains_gpa, pane_virtio_mmio_offset, pane_virtio_mmio_window,
-        service_virtio_mmio_access, PaneGuestMemory, PaneVirtioBlkRequestType,
-        PaneVirtioMmioAccess, PaneVirtioMmioAccessKind, PaneVirtioMmioBlockDevice,
-        PaneVirtioMmioWriteResult, PANE_VIRTIO_BLK_QUEUE_SIZE, PANE_VIRTIO_MMIO_BASE_GPA,
-        PANE_VIRTIO_MMIO_SIZE_BYTES, VIRTIO_BLK_STATUS_IOERR, VIRTIO_BLK_STATUS_OK,
-        VIRTIO_DEVICE_ID_BLOCK, VIRTIO_MMIO_MAGIC_VALUE, VIRTIO_MMIO_VERSION_MODERN,
+        pane_virtio_mmio_contains_gpa, pane_virtio_mmio_kernel_arg, pane_virtio_mmio_offset,
+        pane_virtio_mmio_window, service_virtio_mmio_access, PaneGuestMemory,
+        PaneVirtioBlkRequestType, PaneVirtioMmioAccess, PaneVirtioMmioAccessKind,
+        PaneVirtioMmioBlockDevice, PaneVirtioMmioWriteResult, PANE_VIRTIO_BLK_QUEUE_SIZE,
+        PANE_VIRTIO_MMIO_BASE_GPA, PANE_VIRTIO_MMIO_SIZE_BYTES, VIRTIO_BLK_STATUS_IOERR,
+        VIRTIO_BLK_STATUS_OK, VIRTIO_DEVICE_ID_BLOCK, VIRTIO_MMIO_MAGIC_VALUE,
+        VIRTIO_MMIO_VERSION_MODERN,
     };
 
     struct TestGuestMemory {
@@ -1478,5 +1484,13 @@ mod tests {
         assert!(!pane_virtio_mmio_contains_gpa(
             PANE_VIRTIO_MMIO_BASE_GPA + PANE_VIRTIO_MMIO_SIZE_BYTES
         ));
+    }
+
+    #[test]
+    fn pane_virtio_mmio_kernel_arg_matches_linux_discovery_syntax() {
+        assert_eq!(
+            pane_virtio_mmio_kernel_arg(),
+            "virtio_mmio.device=4K@0xdfc0000:5"
+        );
     }
 }

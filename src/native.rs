@@ -2528,6 +2528,10 @@ mod windows_whp {
             };
 
             if run_fixture && report.memory_mapped {
+                prove_mapped_guest_memory_view(&mut guest_regions, &mut report);
+            }
+
+            if run_fixture && report.memory_mapped {
                 if let Some(set_virtual_processor_registers) = set_virtual_processor_registers {
                     if let Some(boot_image) = boot_image {
                         let (register_names, register_values) = boot_image_registers(boot_image);
@@ -2759,6 +2763,103 @@ mod windows_whp {
             .iter_mut()
             .find(|region| region.label == "pane-block-dma")
             .map(|region| region._memory.as_mut_slice())
+    }
+
+    fn prove_mapped_guest_memory_view(
+        mapped_regions: &mut [MappedGuestRegion],
+        report: &mut NativePartitionSmokeReport,
+    ) {
+        let Some(first_region) = mapped_regions.first() else {
+            report.calls.push(NativeWhpCallReport {
+                name: "MappedGuestMemoryView",
+                hresult: None,
+                ok: false,
+                detail: "No WHP guest regions are mapped, so Pane cannot create a virtio-compatible guest-memory view.".to_string(),
+            });
+            return;
+        };
+        let gpa = first_region.guest_gpa;
+        let mut byte = [0_u8; 1];
+        let view = MappedGuestMemoryView::new(mapped_regions);
+        let ok = crate::virtio::PaneGuestMemory::read(&view, gpa, &mut byte).is_ok();
+        report.calls.push(NativeWhpCallReport {
+            name: "MappedGuestMemoryView",
+            hresult: None,
+            ok,
+            detail: if ok {
+                format!(
+                    "Pane created a virtio-compatible guest-memory view over mapped WHP regions and read gpa=0x{gpa:016x}."
+                )
+            } else {
+                format!(
+                    "Pane could not read gpa=0x{gpa:016x} through the virtio-compatible guest-memory view."
+                )
+            },
+        });
+    }
+
+    struct MappedGuestMemoryView<'a> {
+        regions: &'a mut [MappedGuestRegion],
+    }
+
+    impl<'a> MappedGuestMemoryView<'a> {
+        fn new(regions: &'a mut [MappedGuestRegion]) -> Self {
+            Self { regions }
+        }
+
+        fn access_region_mut(&mut self, gpa: u64, len: usize) -> Option<(usize, usize)> {
+            let len = u64::try_from(len).ok()?;
+            self.regions.iter().enumerate().find_map(|(index, region)| {
+                let offset = gpa.checked_sub(region.guest_gpa)?;
+                let end = offset.checked_add(len)?;
+                if end <= region.size {
+                    Some((index, offset as usize))
+                } else {
+                    None
+                }
+            })
+        }
+
+        fn access_region(&self, gpa: u64, len: usize) -> Option<(usize, usize)> {
+            let len = u64::try_from(len).ok()?;
+            self.regions.iter().enumerate().find_map(|(index, region)| {
+                let offset = gpa.checked_sub(region.guest_gpa)?;
+                let end = offset.checked_add(len)?;
+                if end <= region.size {
+                    Some((index, offset as usize))
+                } else {
+                    None
+                }
+            })
+        }
+    }
+
+    impl crate::virtio::PaneGuestMemory for MappedGuestMemoryView<'_> {
+        fn read(&self, gpa: u64, bytes: &mut [u8]) -> Result<(), String> {
+            let Some((index, offset)) = self.access_region(gpa, bytes.len()) else {
+                return Err(format!(
+                    "guest read gpa=0x{gpa:016x} len={} outside mapped regions",
+                    bytes.len()
+                ));
+            };
+            let region = &self.regions[index];
+            let source = &region._memory.as_slice()[offset..offset + bytes.len()];
+            bytes.copy_from_slice(source);
+            Ok(())
+        }
+
+        fn write(&mut self, gpa: u64, bytes: &[u8]) -> Result<(), String> {
+            let Some((index, offset)) = self.access_region_mut(gpa, bytes.len()) else {
+                return Err(format!(
+                    "guest write gpa=0x{gpa:016x} len={} outside mapped regions",
+                    bytes.len()
+                ));
+            };
+            let region = &mut self.regions[index];
+            let target = &mut region._memory.as_mut_slice()[offset..offset + bytes.len()];
+            target.copy_from_slice(bytes);
+            Ok(())
+        }
     }
 
     struct GuestMemory {
@@ -7309,33 +7410,33 @@ mod windows_whp {
             timer_interrupt_readiness_report_blocker, trace_native_device_dispatch,
             whp_emulator_callbacks, whp_emulator_io_port_callback, whp_emulator_memory_callback,
             whv_x64_interrupt_control, xapic_state_vectors, Com1SerialState, DecodedExit,
-            LegacyDeviceIoState, NativeBlockIoTraceCollector, WhpEmulatorMmioCallbackContext,
-            WhvEmulatorCallbacks, WhvEmulatorIoAccessInfo, WhvEmulatorMemoryAccessInfo,
-            ACPI_PM1_CONTROL_PORT, ACPI_PM1_ENABLE_PORT, ACPI_PM1_STATUS_PORT, ACPI_PM_TIMER_PORT,
-            ALT_DELAY_PORT, ALT_POST_DELAY_PORT, CMOS_ADDRESS_PORT, CMOS_DATA_PORT,
-            CPUID_DEFAULT_RAX_OFFSET, CPUID_DEFAULT_RBX_OFFSET, CPUID_DEFAULT_RCX_OFFSET,
-            CPUID_DEFAULT_RDX_OFFSET, CPUID_RAX_OFFSET, CPUID_RCX_OFFSET,
-            DMA_PAGE_REGISTER_START_PORT, ELCR1_PORT, ELCR2_PORT, E_UNEXPECTED,
-            IO_ACCESS_INFO_OFFSET, IO_PORT_OFFSET, IO_RAX_OFFSET, LINUX_ENTRY_PROBE_EXIT_BUDGET,
-            LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET, LINUX_ENTRY_PROBE_STORAGE_TOTAL_BUDGET_SECONDS,
-            LINUX_ENTRY_PROBE_TOTAL_BUDGET_SECONDS, LINUX_ENTRY_PROBE_TRACE_HEAD,
-            LINUX_ENTRY_PROBE_TRACE_TAIL, MEMORY_ACCESS_INFO_OFFSET, MEMORY_GPA_OFFSET,
-            MEMORY_GVA_OFFSET, MEMORY_INSTRUCTION_BYTES_OFFSET, MEMORY_INSTRUCTION_LENGTH_OFFSET,
-            MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET, MSR_RAX_OFFSET, MSR_RDX_OFFSET,
-            PCI_CONFIG_ADDRESS_PORT, PCI_CONFIG_DATA_START_PORT, PIC1_COMMAND_PORT, PIC1_DATA_PORT,
-            PIC2_COMMAND_PORT, PIC2_DATA_PORT, PIT_CHANNEL0_PORT, PIT_COMMAND_PORT,
-            POST_DELAY_PORT, PS2_DATA_PORT, PS2_STATUS_COMMAND_PORT, SERIAL_COM1_PORT,
-            SYSTEM_CONTROL_PORT_A, SYSTEM_CONTROL_PORT_B, S_OK, VGA_ATTRIBUTE_DATA_READ_PORT,
-            VGA_ATTRIBUTE_PORT, VGA_CRTC_COLOR_DATA_PORT, VGA_CRTC_COLOR_INDEX_PORT,
-            VGA_GRAPHICS_DATA_PORT, VGA_GRAPHICS_INDEX_PORT, VGA_INPUT_STATUS_COLOR_PORT,
-            VGA_MISC_OUTPUT_READ_PORT, VGA_MISC_OUTPUT_WRITE_PORT, VGA_SEQUENCER_DATA_PORT,
-            VGA_SEQUENCER_INDEX_PORT, VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET, VP_CONTEXT_RIP_OFFSET,
-            WHP_EMULATOR_MMIO_READ, WHP_EMULATOR_MMIO_WRITE,
-            WHV_DELIVERABILITY_NOTIFICATION_INTERRUPT, WHV_REGISTER_CR0, WHV_REGISTER_CR3,
-            WHV_REGISTER_CR4, WHV_REGISTER_CS, WHV_REGISTER_DS, WHV_REGISTER_ES, WHV_REGISTER_GDTR,
-            WHV_REGISTER_IDTR, WHV_REGISTER_RBP, WHV_REGISTER_RBX, WHV_REGISTER_RDI,
-            WHV_REGISTER_RFLAGS, WHV_REGISTER_RIP, WHV_REGISTER_RSI, WHV_REGISTER_RSP,
-            WHV_REGISTER_SS, WHV_RUN_VP_EXIT_REASON_CANCELED,
+            GuestMemory, LegacyDeviceIoState, MappedGuestMemoryView, MappedGuestRegion,
+            NativeBlockIoTraceCollector, WhpEmulatorMmioCallbackContext, WhvEmulatorCallbacks,
+            WhvEmulatorIoAccessInfo, WhvEmulatorMemoryAccessInfo, ACPI_PM1_CONTROL_PORT,
+            ACPI_PM1_ENABLE_PORT, ACPI_PM1_STATUS_PORT, ACPI_PM_TIMER_PORT, ALT_DELAY_PORT,
+            ALT_POST_DELAY_PORT, CMOS_ADDRESS_PORT, CMOS_DATA_PORT, CPUID_DEFAULT_RAX_OFFSET,
+            CPUID_DEFAULT_RBX_OFFSET, CPUID_DEFAULT_RCX_OFFSET, CPUID_DEFAULT_RDX_OFFSET,
+            CPUID_RAX_OFFSET, CPUID_RCX_OFFSET, DMA_PAGE_REGISTER_START_PORT, ELCR1_PORT,
+            ELCR2_PORT, E_UNEXPECTED, IO_ACCESS_INFO_OFFSET, IO_PORT_OFFSET, IO_RAX_OFFSET,
+            LINUX_ENTRY_PROBE_EXIT_BUDGET, LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET,
+            LINUX_ENTRY_PROBE_STORAGE_TOTAL_BUDGET_SECONDS, LINUX_ENTRY_PROBE_TOTAL_BUDGET_SECONDS,
+            LINUX_ENTRY_PROBE_TRACE_HEAD, LINUX_ENTRY_PROBE_TRACE_TAIL, MEMORY_ACCESS_INFO_OFFSET,
+            MEMORY_GPA_OFFSET, MEMORY_GVA_OFFSET, MEMORY_INSTRUCTION_BYTES_OFFSET,
+            MEMORY_INSTRUCTION_LENGTH_OFFSET, MSR_ACCESS_INFO_OFFSET, MSR_NUMBER_OFFSET,
+            MSR_RAX_OFFSET, MSR_RDX_OFFSET, PCI_CONFIG_ADDRESS_PORT, PCI_CONFIG_DATA_START_PORT,
+            PIC1_COMMAND_PORT, PIC1_DATA_PORT, PIC2_COMMAND_PORT, PIC2_DATA_PORT,
+            PIT_CHANNEL0_PORT, PIT_COMMAND_PORT, POST_DELAY_PORT, PS2_DATA_PORT,
+            PS2_STATUS_COMMAND_PORT, SERIAL_COM1_PORT, SYSTEM_CONTROL_PORT_A,
+            SYSTEM_CONTROL_PORT_B, S_OK, VGA_ATTRIBUTE_DATA_READ_PORT, VGA_ATTRIBUTE_PORT,
+            VGA_CRTC_COLOR_DATA_PORT, VGA_CRTC_COLOR_INDEX_PORT, VGA_GRAPHICS_DATA_PORT,
+            VGA_GRAPHICS_INDEX_PORT, VGA_INPUT_STATUS_COLOR_PORT, VGA_MISC_OUTPUT_READ_PORT,
+            VGA_MISC_OUTPUT_WRITE_PORT, VGA_SEQUENCER_DATA_PORT, VGA_SEQUENCER_INDEX_PORT,
+            VP_CONTEXT_INSTRUCTION_LENGTH_OFFSET, VP_CONTEXT_RIP_OFFSET, WHP_EMULATOR_MMIO_READ,
+            WHP_EMULATOR_MMIO_WRITE, WHV_DELIVERABILITY_NOTIFICATION_INTERRUPT, WHV_REGISTER_CR0,
+            WHV_REGISTER_CR3, WHV_REGISTER_CR4, WHV_REGISTER_CS, WHV_REGISTER_DS, WHV_REGISTER_ES,
+            WHV_REGISTER_GDTR, WHV_REGISTER_IDTR, WHV_REGISTER_RBP, WHV_REGISTER_RBX,
+            WHV_REGISTER_RDI, WHV_REGISTER_RFLAGS, WHV_REGISTER_RIP, WHV_REGISTER_RSI,
+            WHV_REGISTER_RSP, WHV_REGISTER_SS, WHV_RUN_VP_EXIT_REASON_CANCELED,
             WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE, WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS,
             WHV_RUN_VP_EXIT_REASON_X64_APIC_EOI, WHV_RUN_VP_EXIT_REASON_X64_CPUID,
             WHV_RUN_VP_EXIT_REASON_X64_HALT, WHV_RUN_VP_EXIT_REASON_X64_INTERRUPT_WINDOW,
@@ -7607,6 +7708,53 @@ mod windows_whp {
                 memory.read_bytes(0x4300, 1),
                 vec![crate::virtio::VIRTIO_BLK_STATUS_OK]
             );
+        }
+
+        #[test]
+        fn mapped_guest_memory_view_reads_and_writes_single_region() {
+            let mut memory = GuestMemory::new(0x1000).expect("guest memory");
+            memory.as_mut_slice()[0x20..0x24].copy_from_slice(&[1, 2, 3, 4]);
+            let mut regions = vec![MappedGuestRegion {
+                label: "test".to_string(),
+                guest_gpa: 0x1000,
+                size: memory.size as u64,
+                _memory: memory,
+            }];
+            let mut view = MappedGuestMemoryView::new(&mut regions);
+            let mut bytes = [0; 4];
+
+            view.read(0x1020, &mut bytes).unwrap();
+            assert_eq!(bytes, [1, 2, 3, 4]);
+
+            view.write(0x1022, &[0xaa, 0xbb]).unwrap();
+            view.read(0x1020, &mut bytes).unwrap();
+            assert_eq!(bytes, [1, 2, 0xaa, 0xbb]);
+        }
+
+        #[test]
+        fn mapped_guest_memory_view_rejects_unmapped_or_cross_region_access() {
+            let first = GuestMemory::new(0x1000).expect("first region");
+            let second = GuestMemory::new(0x1000).expect("second region");
+            let mut regions = vec![
+                MappedGuestRegion {
+                    label: "first".to_string(),
+                    guest_gpa: 0x1000,
+                    size: first.size as u64,
+                    _memory: first,
+                },
+                MappedGuestRegion {
+                    label: "second".to_string(),
+                    guest_gpa: 0x3000,
+                    size: second.size as u64,
+                    _memory: second,
+                },
+            ];
+            let mut view = MappedGuestMemoryView::new(&mut regions);
+            let mut bytes = [0; 8];
+
+            assert!(view.read(0x1ffc, &mut bytes).is_err());
+            assert!(view.write(0x2000, &[1, 2, 3, 4]).is_err());
+            assert!(view.read(0x3000, &mut bytes[..4]).is_ok());
         }
 
         #[test]

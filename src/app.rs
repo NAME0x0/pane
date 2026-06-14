@@ -662,6 +662,10 @@ struct VirtioBlockBackendPlan {
     mmio_base_gpa: String,
     #[serde(default = "default_virtio_mmio_size_bytes")]
     mmio_size_bytes: u64,
+    #[serde(default = "default_virtio_mmio_irq")]
+    mmio_irq: u32,
+    #[serde(default = "default_virtio_mmio_linux_kernel_parameter")]
+    linux_kernel_parameter: String,
     queue_model: String,
     interrupt_model: String,
     sector_size_bytes: u64,
@@ -949,6 +953,14 @@ fn default_virtio_mmio_size_bytes() -> u64 {
     crate::virtio::PANE_VIRTIO_MMIO_SIZE_BYTES
 }
 
+fn default_virtio_mmio_irq() -> u32 {
+    crate::virtio::PANE_VIRTIO_MMIO_IRQ
+}
+
+fn default_virtio_mmio_linux_kernel_parameter() -> String {
+    crate::virtio::pane_virtio_mmio_kernel_arg()
+}
+
 fn virtio_block_backend_plan(storage: &KernelStorageAttachment) -> VirtioBlockBackendPlan {
     let root_device_hint = storage
         .root_handoff
@@ -967,6 +979,8 @@ fn virtio_block_backend_plan(storage: &KernelStorageAttachment) -> VirtioBlockBa
         transport: "virtio-mmio".to_string(),
         mmio_base_gpa: default_virtio_mmio_base_gpa(),
         mmio_size_bytes: default_virtio_mmio_size_bytes(),
+        mmio_irq: default_virtio_mmio_irq(),
+        linux_kernel_parameter: default_virtio_mmio_linux_kernel_parameter(),
         queue_model: "split-virtqueue-descriptor-chain-execution-ready".to_string(),
         interrupt_model: "WHP interrupt injection through Pane device loop".to_string(),
         sector_size_bytes: 512,
@@ -1005,7 +1019,7 @@ fn virtio_block_backend_plan(storage: &KernelStorageAttachment) -> VirtioBlockBa
         notes: vec![
             "This is the standard Linux block-device target for Pane-owned Arch boot; it is not yet executed by the WHP runner."
                 .to_string(),
-            "Pane reserves and maps a virtio-MMIO page for the block device and has a tested split-virtqueue descriptor executor; wiring WHP MMIO exits to that executor is the remaining storage milestone."
+            "Pane reserves a virtio-MMIO aperture, advertises it with Linux's virtio_mmio.device kernel parameter, and has a tested split-virtqueue descriptor executor; completing WHP MMIO exit execution and IRQ injection is the remaining storage milestone."
                 .to_string(),
             "The existing Pane block-port contract remains only as the current diagnostic bridge until the virtio device loop is implemented."
                 .to_string(),
@@ -1025,6 +1039,8 @@ fn legacy_virtio_block_backend_plan() -> VirtioBlockBackendPlan {
         transport: "none".to_string(),
         mmio_base_gpa: String::new(),
         mmio_size_bytes: 0,
+        mmio_irq: 0,
+        linux_kernel_parameter: String::new(),
         queue_model: "none".to_string(),
         interrupt_model: "none".to_string(),
         sector_size_bytes: 0,
@@ -7870,7 +7886,6 @@ fn linux_guest_mapped_regions(
                     | "bios-data"
                     | "bios-rom"
                     | "legacy-rom"
-                    | "virtio-mmio"
                     | "storage-contract"
                     | "block-dma"
                     | "framebuffer"
@@ -7887,8 +7902,9 @@ fn linux_guest_mapped_regions(
             let label = match range.region_type.as_str() {
                 "usable" => format!("linux-ram-{}", range.label),
                 "bios-data" | "bios-rom" | "legacy-rom" => format!("linux-{}", range.label),
-                "virtio-mmio" | "storage-contract" | "block-dma" | "framebuffer"
-                | "input-queue" => range.label.clone(),
+                "storage-contract" | "block-dma" | "framebuffer" | "input-queue" => {
+                    range.label.clone()
+                }
                 _ => format!("linux-{}", range.label),
             };
             let bytes = match range.region_type.as_str() {
@@ -7898,12 +7914,6 @@ fn linux_guest_mapped_regions(
                     .storage
                     .as_ref()
                     .map(storage_contract_page_bytes)
-                    .transpose()?
-                    .unwrap_or_else(|| vec![0_u8; size]),
-                "virtio-mmio" => layout
-                    .storage
-                    .as_ref()
-                    .map(|storage| virtio_mmio_page_bytes(storage, size))
                     .transpose()?
                     .unwrap_or_else(|| vec![0_u8; size]),
                 "input-queue" => layout
@@ -7927,28 +7937,6 @@ fn linux_guest_mapped_regions(
             })
         })
         .collect()
-}
-
-fn virtio_mmio_page_bytes(storage: &KernelStorageAttachment, size: usize) -> AppResult<Vec<u8>> {
-    if size < crate::virtio::PANE_VIRTIO_MMIO_SIZE_BYTES as usize {
-        return Err(AppError::message(
-            "Virtio-MMIO guest range is smaller than one modern MMIO transport page.",
-        ));
-    }
-
-    let device =
-        crate::virtio::PaneVirtioMmioBlockDevice::new(storage.base_os_bytes, storage.readonly_base);
-    let mut page = vec![0_u8; size];
-    for offset in [
-        0x000_u64, 0x004, 0x008, 0x00c, 0x010, 0x034, 0x038, 0x044, 0x060, 0x070, 0x0fc, 0x100,
-        0x104, 0x114,
-    ] {
-        if let Some(value) = device.read_u32(offset) {
-            let start = offset as usize;
-            page[start..start + 4].copy_from_slice(&value.to_le_bytes());
-        }
-    }
-    Ok(page)
 }
 
 fn linux_bios_data_area_page_bytes(size: usize) -> Vec<u8> {
@@ -8046,6 +8034,12 @@ fn augment_kernel_cmdline_for_runtime_contracts(
     append_kernel_arg(&mut cmdline, "acpi=off".to_string());
     append_kernel_arg(&mut cmdline, "pci=off".to_string());
     if let Some(storage) = storage {
+        if !storage.virtio_block.linux_kernel_parameter.is_empty() {
+            append_kernel_arg(
+                &mut cmdline,
+                storage.virtio_block.linux_kernel_parameter.clone(),
+            );
+        }
         append_kernel_arg(
             &mut cmdline,
             format!("pane.storage_contract={}", storage.contract_gpa),
@@ -16425,6 +16419,14 @@ mod tests {
         assert_eq!(storage.virtio_block.mmio_base_gpa, "0x0dfc0000");
         assert_eq!(storage.virtio_block.mmio_size_bytes, 4096);
         assert_eq!(
+            storage.virtio_block.mmio_irq,
+            crate::virtio::PANE_VIRTIO_MMIO_IRQ
+        );
+        assert_eq!(
+            storage.virtio_block.linux_kernel_parameter,
+            "virtio_mmio.device=4K@0xdfc0000:5"
+        );
+        assert_eq!(
             storage.virtio_block.queue_model,
             "split-virtqueue-descriptor-chain-execution-ready"
         );
@@ -16481,6 +16483,7 @@ mod tests {
         assert!(layout.cmdline.contains("pane.root_fs=ext4"));
         assert!(layout.cmdline.contains("pane.root_partition=1"));
         assert!(layout.cmdline.contains("pane.user=/dev/pane1"));
+        assert!(layout.cmdline.contains("virtio_mmio.device=4K@0xdfc0000:5"));
         assert!(layout.cmdline.contains("pane.block_io=0x0d00,16,4096"));
         assert!(layout.cmdline.contains("pane.block_devices=512,786432"));
         assert!(layout.cmdline.contains("pane.block_dma=0x0dfd0000,4096"));
@@ -16525,9 +16528,9 @@ mod tests {
                 && range.region_type == "block-dma"
         }));
         let mapped_regions = linux_guest_mapped_regions(&layout).unwrap();
-        assert!(mapped_regions
+        assert!(!mapped_regions
             .iter()
-            .any(|region| region.label == "pane-virtio-mmio" && region.guest_gpa == 0x0dfc_0000));
+            .any(|region| region.label == "pane-virtio-mmio" || region.guest_gpa == 0x0dfc_0000));
         assert!(mapped_regions
             .iter()
             .any(|region| region.label == "pane-block-dma" && region.guest_gpa == 0x0dfd_0000));
@@ -16537,18 +16540,6 @@ mod tests {
         assert!(!mapped_regions
             .iter()
             .any(|region| region.label.contains("io-apic-mmio")));
-        let virtio_mmio = mapped_regions
-            .iter()
-            .find(|region| region.label == "pane-virtio-mmio")
-            .expect("virtio-mmio mapped region");
-        assert_eq!(
-            &virtio_mmio.bytes[0x000..0x004],
-            &crate::virtio::VIRTIO_MMIO_MAGIC_VALUE.to_le_bytes()
-        );
-        assert_eq!(
-            &virtio_mmio.bytes[0x008..0x00c],
-            &crate::virtio::VIRTIO_DEVICE_ID_BLOCK.to_le_bytes()
-        );
         let storage_contract = mapped_regions
             .iter()
             .find(|region| region.label == "pane-storage-contract")

@@ -982,7 +982,7 @@ fn virtio_block_backend_plan(storage: &KernelStorageAttachment) -> VirtioBlockBa
         mmio_size_bytes: default_virtio_mmio_size_bytes(),
         mmio_irq: default_virtio_mmio_irq(),
         linux_kernel_parameter: default_virtio_mmio_linux_kernel_parameter(),
-        queue_model: "split-virtqueue-descriptor-chain-execution-ready".to_string(),
+        queue_model: "linux-compatible-split-virtqueue-batch-drain-ready".to_string(),
         interrupt_model: "WHP interrupt injection through Pane device loop".to_string(),
         sector_size_bytes: 512,
         root_device_hint,
@@ -1020,7 +1020,7 @@ fn virtio_block_backend_plan(storage: &KernelStorageAttachment) -> VirtioBlockBa
         notes: vec![
             "This is the standard Linux block-device target for Pane-owned Arch boot; Pane now routes live WHP virtio-MMIO exits into the in-repo block model."
                 .to_string(),
-            "Pane reserves a virtio-MMIO aperture, advertises it with Linux's virtio_mmio.device kernel parameter, executes WHP MMIO exits through WinHvEmulation.dll, bridges virtio reads to the verified native block handler, and requests the virtio IRQ after queue completion; guest IRQ acknowledgement and root-mount proof are the remaining storage milestone."
+            "Pane reserves a virtio-MMIO aperture, advertises it with Linux's virtio_mmio.device kernel parameter, executes WHP MMIO exits through WinHvEmulation.dll, negotiates Linux-compatible modern virtio-blk features, drains batched split-virtqueue notifications into the verified native block handler, and requests the virtio IRQ after queue completion; guest IRQ acknowledgement and root-mount proof are the remaining storage milestone."
                 .to_string(),
             "The existing Pane block-port contract remains only as the current diagnostic bridge until the virtio device loop is implemented."
                 .to_string(),
@@ -16437,7 +16437,7 @@ mod tests {
         );
         assert_eq!(
             storage.virtio_block.queue_model,
-            "split-virtqueue-descriptor-chain-execution-ready"
+            "linux-compatible-split-virtqueue-batch-drain-ready"
         );
         assert_eq!(storage.virtio_block.root_device_hint, "/dev/vda1");
         assert_eq!(storage.virtio_block.devices.len(), 2);

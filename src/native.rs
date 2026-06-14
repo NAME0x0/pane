@@ -2468,12 +2468,12 @@ mod windows_whp {
         exit_context: &[u8],
         device: &mut crate::virtio::PaneVirtioMmioBlockDevice,
         memory: &mut M,
-        service: F,
+        mut service: F,
         report: &mut NativePartitionSmokeReport,
     ) -> bool
     where
         M: crate::virtio::PaneGuestMemory,
-        F: FnOnce(&crate::virtio::PaneVirtioBlkRequest, Option<&[u8]>) -> Result<Vec<u8>, String>,
+        F: FnMut(&crate::virtio::PaneVirtioBlkRequest, Option<&[u8]>) -> Result<Vec<u8>, String>,
     {
         let Some(emulator) = deps.live_instruction_emulator else {
             report.calls.push(NativeWhpCallReport {
@@ -2518,14 +2518,9 @@ mod windows_whp {
             return false;
         };
 
-        let mut service = Some(service);
         let mut handler = |access| {
             crate::virtio::service_virtio_mmio_access(device, memory, access, |request, payload| {
-                service
-                    .take()
-                    .ok_or_else(|| "virtio-MMIO service was invoked more than once".to_string())?(
-                    request, payload,
-                )
+                service(request, payload)
             })
         };
         let mut callback_context = WhpEmulatorMmioCallbackContext {
@@ -8344,6 +8339,7 @@ mod windows_whp {
                 read_data: Vec::new(),
                 write_result: None,
                 queue_execution: None,
+                queue_execution_count: 0,
                 detail: String::new(),
             };
             let mut context = WhpEmulatorMmioCallbackContext {
@@ -8414,6 +8410,7 @@ mod windows_whp {
                 read_data: Vec::new(),
                 write_result: None,
                 queue_execution: None,
+                queue_execution_count: 0,
                 detail: String::new(),
             };
             let mut context = WhpEmulatorMmioCallbackContext {

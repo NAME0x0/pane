@@ -14,6 +14,10 @@ pub(crate) const PANE_VIRTIO_BLK_QUEUE_SIZE: u16 = 256;
 pub(crate) const VIRTIO_BLK_STATUS_OK: u8 = 0;
 pub(crate) const VIRTIO_BLK_STATUS_IOERR: u8 = 1;
 pub(crate) const VIRTIO_BLK_STATUS_UNSUPP: u8 = 2;
+pub(crate) const VIRTIO_BLK_F_RO: u64 = 1 << 5;
+pub(crate) const VIRTIO_BLK_F_BLK_SIZE: u64 = 1 << 6;
+pub(crate) const VIRTIO_BLK_F_FLUSH: u64 = 1 << 9;
+pub(crate) const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 
 const VIRTIO_MMIO_MAGIC_VALUE_OFFSET: u64 = 0x000;
 const VIRTIO_MMIO_VERSION_OFFSET: u64 = 0x004;
@@ -112,6 +116,8 @@ pub(crate) struct PaneVirtioQueueState {
     pub(crate) avail_ring_gpa: u64,
     pub(crate) used_ring_gpa: u64,
     pub(crate) last_notify: Option<u32>,
+    pub(crate) next_avail_index: u16,
+    pub(crate) used_index: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -199,6 +205,7 @@ pub(crate) struct PaneVirtioMmioAccessOutcome {
     pub(crate) read_data: Vec<u8>,
     pub(crate) write_result: Option<PaneVirtioMmioWriteResult>,
     pub(crate) queue_execution: Option<PaneVirtioBlkExecution>,
+    pub(crate) queue_execution_count: usize,
     pub(crate) detail: String,
 }
 
@@ -211,11 +218,11 @@ pub(crate) fn service_virtio_mmio_access<M, F>(
     device: &mut PaneVirtioMmioBlockDevice,
     memory: &mut M,
     access: PaneVirtioMmioAccess,
-    service: F,
+    mut service: F,
 ) -> PaneVirtioMmioAccessOutcome
 where
     M: PaneGuestMemory,
-    F: FnOnce(&PaneVirtioBlkRequest, Option<&[u8]>) -> Result<Vec<u8>, String>,
+    F: FnMut(&PaneVirtioBlkRequest, Option<&[u8]>) -> Result<Vec<u8>, String>,
 {
     let Some(offset) = pane_virtio_mmio_offset(access.gpa) else {
         return PaneVirtioMmioAccessOutcome {
@@ -225,6 +232,7 @@ where
             read_data: Vec::new(),
             write_result: None,
             queue_execution: None,
+            queue_execution_count: 0,
             detail: format!(
                 "GPA {} is outside the Pane virtio-MMIO window.",
                 format_guest_physical_address(access.gpa)
@@ -245,6 +253,7 @@ where
                     read_data: value.to_le_bytes().to_vec(),
                     write_result: None,
                     queue_execution: None,
+                    queue_execution_count: 0,
                     detail: format!("Read virtio-MMIO register offset 0x{offset:03x}."),
                 },
                 None => PaneVirtioMmioAccessOutcome {
@@ -254,6 +263,7 @@ where
                     read_data: Vec::new(),
                     write_result: None,
                     queue_execution: None,
+                    queue_execution_count: 0,
                     detail: format!("No virtio-MMIO register exists at offset 0x{offset:03x}."),
                 },
             }
@@ -279,21 +289,28 @@ where
                         read_data: Vec::new(),
                         write_result: Some(write_result),
                         queue_execution: None,
+                        queue_execution_count: 0,
                         detail: format!("Wrote virtio-MMIO register offset 0x{offset:03x}."),
                     }
                 }
                 PaneVirtioMmioWriteResult::QueueNotified(queue_index) => {
-                    let execution = device.execute_available_block_request(memory, service);
+                    let executions = device.execute_available_block_requests(memory, &mut service);
+                    let execution = executions.last().cloned();
+                    let queue_execution_count = executions.len();
+                    let accepted = queue_execution_count > 0
+                        && executions
+                            .iter()
+                            .all(|execution| execution.status == VIRTIO_BLK_STATUS_OK);
                     PaneVirtioMmioAccessOutcome {
-                        accepted: execution.status == VIRTIO_BLK_STATUS_OK,
+                        accepted,
                         status: "queue-notify-executed",
                         offset: Some(offset),
                         read_data: Vec::new(),
                         write_result: Some(write_result),
-                        queue_execution: Some(execution.clone()),
+                        queue_execution: execution,
+                        queue_execution_count,
                         detail: format!(
-                            "Queue notify {queue_index} executed with status {}.",
-                            execution.status
+                            "Queue notify {queue_index} executed {queue_execution_count} request(s)."
                         ),
                     }
                 }
@@ -304,6 +321,7 @@ where
                     read_data: Vec::new(),
                     write_result: Some(write_result),
                     queue_execution: None,
+                    queue_execution_count: 0,
                     detail: reason.to_string(),
                 },
                 PaneVirtioMmioWriteResult::Ignored => PaneVirtioMmioAccessOutcome {
@@ -313,6 +331,7 @@ where
                     read_data: Vec::new(),
                     write_result: Some(write_result),
                     queue_execution: None,
+                    queue_execution_count: 0,
                     detail: format!("Ignored virtio-MMIO write at offset 0x{offset:03x}."),
                 },
             }
@@ -328,16 +347,21 @@ fn unsupported_mmio_width(offset: u64, width: usize) -> PaneVirtioMmioAccessOutc
         read_data: Vec::new(),
         write_result: None,
         queue_execution: None,
+        queue_execution_count: 0,
         detail: format!("Pane virtio-MMIO currently supports 4-byte accesses, got {width}."),
     }
 }
 
 impl PaneVirtioMmioBlockDevice {
     pub(crate) fn new(logical_size_bytes: u64, readonly: bool) -> Self {
+        let device_features = VIRTIO_F_VERSION_1
+            | VIRTIO_BLK_F_BLK_SIZE
+            | VIRTIO_BLK_F_FLUSH
+            | if readonly { VIRTIO_BLK_F_RO } else { 0 };
         Self {
             device_id: VIRTIO_DEVICE_ID_BLOCK,
             vendor_id: PANE_VENDOR_ID,
-            device_features: 0,
+            device_features,
             driver_features: 0,
             device_features_select: 0,
             driver_features_select: 0,
@@ -353,6 +377,8 @@ impl PaneVirtioMmioBlockDevice {
                 avail_ring_gpa: 0,
                 used_ring_gpa: 0,
                 last_notify: None,
+                next_avail_index: 0,
+                used_index: 0,
             },
             config: PaneVirtioBlkConfig {
                 capacity_sectors: logical_size_bytes / VIRTIO_BLK_SECTOR_SIZE_BYTES,
@@ -369,7 +395,7 @@ impl PaneVirtioMmioBlockDevice {
     ) -> PaneVirtioBlkExecution
     where
         M: PaneGuestMemory,
-        F: FnOnce(&PaneVirtioBlkRequest, Option<&[u8]>) -> Result<Vec<u8>, String>,
+        F: FnMut(&PaneVirtioBlkRequest, Option<&[u8]>) -> Result<Vec<u8>, String>,
     {
         if !self.queue.ready || self.queue.size == 0 {
             return PaneVirtioBlkExecution {
@@ -382,15 +408,28 @@ impl PaneVirtioMmioBlockDevice {
             };
         }
 
-        let Some(head_index) = read_avail_head(memory, &self.queue) else {
-            return PaneVirtioBlkExecution {
-                request: None,
-                status: VIRTIO_BLK_STATUS_IOERR,
-                bytes_transferred: 0,
-                used_head_index: 0,
-                used_len: 0,
-                detail: "available ring does not contain a request".to_string(),
-            };
+        let head_index = match read_available_head(memory, &self.queue) {
+            Ok(Some(head_index)) => head_index,
+            Ok(None) => {
+                return PaneVirtioBlkExecution {
+                    request: None,
+                    status: VIRTIO_BLK_STATUS_IOERR,
+                    bytes_transferred: 0,
+                    used_head_index: 0,
+                    used_len: 0,
+                    detail: "available ring does not contain a new request".to_string(),
+                };
+            }
+            Err(error) => {
+                return PaneVirtioBlkExecution {
+                    request: None,
+                    status: VIRTIO_BLK_STATUS_IOERR,
+                    bytes_transferred: 0,
+                    used_head_index: 0,
+                    used_len: 0,
+                    detail: error,
+                };
+            }
         };
 
         match parse_virtio_blk_request(memory, &self.queue, head_index) {
@@ -406,16 +445,40 @@ impl PaneVirtioMmioBlockDevice {
         }
     }
 
+    pub(crate) fn execute_available_block_requests<M, F>(
+        &mut self,
+        memory: &mut M,
+        service: &mut F,
+    ) -> Vec<PaneVirtioBlkExecution>
+    where
+        M: PaneGuestMemory,
+        F: FnMut(&PaneVirtioBlkRequest, Option<&[u8]>) -> Result<Vec<u8>, String>,
+    {
+        let mut executions = Vec::new();
+        for _ in 0..self.queue.size {
+            let execution = self.execute_available_block_request(memory, &mut *service);
+            if execution.request.is_none() {
+                break;
+            }
+            let terminal_error = execution.status != VIRTIO_BLK_STATUS_OK;
+            executions.push(execution);
+            if terminal_error {
+                break;
+            }
+        }
+        executions
+    }
+
     fn execute_parsed_block_request<M, F>(
         &mut self,
         memory: &mut M,
         request: PaneVirtioBlkRequest,
         head_index: u16,
-        service: F,
+        mut service: F,
     ) -> PaneVirtioBlkExecution
     where
         M: PaneGuestMemory,
-        F: FnOnce(&PaneVirtioBlkRequest, Option<&[u8]>) -> Result<Vec<u8>, String>,
+        F: FnMut(&PaneVirtioBlkRequest, Option<&[u8]>) -> Result<Vec<u8>, String>,
     {
         let write_payload = match request.request_type {
             PaneVirtioBlkRequestType::Out => match read_request_payload(memory, &request) {
@@ -464,6 +527,8 @@ impl PaneVirtioMmioBlockDevice {
                     1
                 };
                 let _ = write_used_entry(memory, &self.queue, head_index, used_len);
+                self.queue.next_avail_index = self.queue.next_avail_index.wrapping_add(1);
+                self.queue.used_index = self.queue.used_index.wrapping_add(1);
                 self.interrupt_status |= 1;
                 PaneVirtioBlkExecution {
                     request: Some(request),
@@ -486,6 +551,8 @@ impl PaneVirtioMmioBlockDevice {
                 };
                 let _ = memory.write(request.status_addr, &[status]);
                 let _ = write_used_entry(memory, &self.queue, head_index, 1);
+                self.queue.next_avail_index = self.queue.next_avail_index.wrapping_add(1);
+                self.queue.used_index = self.queue.used_index.wrapping_add(1);
                 self.interrupt_status |= 1;
                 PaneVirtioBlkExecution {
                     request: Some(request),
@@ -628,6 +695,8 @@ impl PaneVirtioMmioBlockDevice {
         self.queue.avail_ring_gpa = 0;
         self.queue.used_ring_gpa = 0;
         self.queue.last_notify = None;
+        self.queue.next_avail_index = 0;
+        self.queue.used_index = 0;
     }
 }
 
@@ -914,12 +983,19 @@ pub(crate) fn format_guest_physical_address(gpa: u64) -> String {
     format!("0x{gpa:08x}")
 }
 
-fn read_avail_head<M: PaneGuestMemory>(memory: &M, queue: &PaneVirtioQueueState) -> Option<u16> {
-    let idx = read_u16(memory, queue.avail_ring_gpa + 2).ok()?;
-    if idx == 0 {
-        return None;
+fn read_available_head<M: PaneGuestMemory>(
+    memory: &M,
+    queue: &PaneVirtioQueueState,
+) -> Result<Option<u16>, String> {
+    if queue.avail_ring_gpa == 0 {
+        return Ok(None);
     }
-    read_u16(memory, queue.avail_ring_gpa + 4).ok()
+    let available_index = read_u16(memory, queue.avail_ring_gpa + 2)?;
+    if available_index == queue.next_avail_index {
+        return Ok(None);
+    }
+    let ring_index = queue.next_avail_index % queue.size;
+    read_u16(memory, queue.avail_ring_gpa + 4 + u64::from(ring_index) * 2).map(Some)
 }
 
 fn parse_virtio_blk_request<M: PaneGuestMemory>(
@@ -1045,10 +1121,14 @@ fn write_used_entry<M: PaneGuestMemory>(
     head_index: u16,
     len: u32,
 ) -> Result<(), String> {
-    let used_elem = queue.used_ring_gpa + 4;
+    let ring_index = queue.used_index % queue.size;
+    let used_elem = queue.used_ring_gpa + 4 + u64::from(ring_index) * 8;
     memory.write(used_elem, &u32::from(head_index).to_le_bytes())?;
     memory.write(used_elem + 4, &len.to_le_bytes())?;
-    memory.write(queue.used_ring_gpa + 2, &1_u16.to_le_bytes())?;
+    memory.write(
+        queue.used_ring_gpa + 2,
+        &queue.used_index.wrapping_add(1).to_le_bytes(),
+    )?;
     Ok(())
 }
 
@@ -1085,8 +1165,9 @@ mod tests {
         pane_virtio_mmio_window, service_virtio_mmio_access, PaneGuestMemory,
         PaneVirtioBlkRequestType, PaneVirtioMmioAccess, PaneVirtioMmioAccessKind,
         PaneVirtioMmioBlockDevice, PaneVirtioMmioWriteResult, PANE_VIRTIO_BLK_QUEUE_SIZE,
-        PANE_VIRTIO_MMIO_BASE_GPA, PANE_VIRTIO_MMIO_SIZE_BYTES, VIRTIO_BLK_STATUS_IOERR,
-        VIRTIO_BLK_STATUS_OK, VIRTIO_DEVICE_ID_BLOCK, VIRTIO_MMIO_INTERRUPT_ACK_OFFSET,
+        PANE_VIRTIO_MMIO_BASE_GPA, PANE_VIRTIO_MMIO_SIZE_BYTES, VIRTIO_BLK_F_BLK_SIZE,
+        VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_RO, VIRTIO_BLK_STATUS_IOERR, VIRTIO_BLK_STATUS_OK,
+        VIRTIO_DEVICE_ID_BLOCK, VIRTIO_F_VERSION_1, VIRTIO_MMIO_INTERRUPT_ACK_OFFSET,
         VIRTIO_MMIO_MAGIC_VALUE, VIRTIO_MMIO_VERSION_MODERN,
     };
 
@@ -1193,6 +1274,13 @@ mod tests {
         memory.write_u16(0x2004, head);
     }
 
+    fn publish_heads(memory: &mut TestGuestMemory, heads: &[u16]) {
+        memory.write_u16(0x2002, heads.len() as u16);
+        for (index, head) in heads.iter().enumerate() {
+            memory.write_u16(0x2004 + (index as u64 * 2), *head);
+        }
+    }
+
     #[test]
     fn virtio_mmio_block_device_reports_modern_block_identity() {
         let device = PaneVirtioMmioBlockDevice::new(1024 * 1024, true);
@@ -1207,6 +1295,40 @@ mod tests {
         assert_eq!(device.read_u32(0x100), Some(2048));
         assert_eq!(device.read_u32(0x104), Some(0));
         assert_eq!(device.read_u32(0x114), Some(512));
+    }
+
+    #[test]
+    fn virtio_mmio_block_device_advertises_linux_compatible_features() {
+        let mut readonly = PaneVirtioMmioBlockDevice::new(1024 * 1024, true);
+        let mut writable = PaneVirtioMmioBlockDevice::new(1024 * 1024, false);
+
+        assert_eq!(
+            readonly.read_u32(0x010),
+            Some((VIRTIO_BLK_F_RO | VIRTIO_BLK_F_BLK_SIZE | VIRTIO_BLK_F_FLUSH) as u32)
+        );
+        assert_eq!(
+            writable.read_u32(0x010),
+            Some((VIRTIO_BLK_F_BLK_SIZE | VIRTIO_BLK_F_FLUSH) as u32)
+        );
+
+        assert_eq!(
+            readonly.write_u32(0x014, 1),
+            PaneVirtioMmioWriteResult::Accepted
+        );
+        assert_eq!(
+            readonly.read_u32(0x010),
+            Some((VIRTIO_F_VERSION_1 >> 32) as u32)
+        );
+
+        assert_eq!(
+            writable.write_u32(0x024, 1),
+            PaneVirtioMmioWriteResult::Accepted
+        );
+        assert_eq!(
+            writable.write_u32(0x020, (VIRTIO_F_VERSION_1 >> 32) as u32),
+            PaneVirtioMmioWriteResult::Accepted
+        );
+        assert_eq!(writable.driver_features, VIRTIO_F_VERSION_1);
     }
 
     #[test]
@@ -1371,6 +1493,55 @@ mod tests {
     }
 
     #[test]
+    fn virtio_mmio_access_service_drains_batched_queue_notify() {
+        let mut device = PaneVirtioMmioBlockDevice::new(8 * 1024 * 1024, true);
+        let mut memory = TestGuestMemory::new(0x7000);
+        configure_queue(&mut device);
+
+        memory.write_u32(0x4000, 0);
+        memory.write_u32(0x4004, 0);
+        memory.write_u64(0x4008, 8);
+        write_descriptor(&mut memory, 0, 0x4000, 16, 1, 1);
+        write_descriptor(&mut memory, 1, 0x4100, 512, 3, 2);
+        write_descriptor(&mut memory, 2, 0x4300, 1, 2, 0);
+
+        memory.write_u32(0x5000, 0);
+        memory.write_u32(0x5004, 0);
+        memory.write_u64(0x5008, 9);
+        write_descriptor(&mut memory, 3, 0x5000, 16, 1, 4);
+        write_descriptor(&mut memory, 4, 0x5100, 512, 3, 5);
+        write_descriptor(&mut memory, 5, 0x5300, 1, 2, 0);
+        publish_heads(&mut memory, &[0, 3]);
+
+        let outcome = service_virtio_mmio_access(
+            &mut device,
+            &mut memory,
+            PaneVirtioMmioAccess {
+                kind: PaneVirtioMmioAccessKind::Write,
+                gpa: PANE_VIRTIO_MMIO_BASE_GPA + 0x050,
+                data: 0_u32.to_le_bytes().to_vec(),
+            },
+            |request, _payload| Ok(vec![request.sector as u8; 512]),
+        );
+
+        assert!(outcome.accepted);
+        assert_eq!(outcome.status, "queue-notify-executed");
+        assert_eq!(outcome.queue_execution_count, 2);
+        assert_eq!(
+            outcome
+                .queue_execution
+                .as_ref()
+                .map(|execution| execution.used_head_index),
+            Some(3)
+        );
+        assert_eq!(memory.read_bytes(0x4100, 1), vec![8]);
+        assert_eq!(memory.read_bytes(0x5100, 1), vec![9]);
+        assert_eq!(memory.read_bytes(0x3002, 2), 2_u16.to_le_bytes());
+        assert_eq!(device.queue.next_avail_index, 2);
+        assert_eq!(device.queue.used_index, 2);
+    }
+
+    #[test]
     fn virtio_mmio_block_device_rejects_invalid_queue_size() {
         let mut device = PaneVirtioMmioBlockDevice::new(1024 * 1024, true);
 
@@ -1410,6 +1581,59 @@ mod tests {
         assert_eq!(memory.read_bytes(0x3004, 4), 0_u32.to_le_bytes());
         assert_eq!(memory.read_bytes(0x3008, 4), 513_u32.to_le_bytes());
         assert_eq!(device.interrupt_status, 1);
+    }
+
+    #[test]
+    fn virtio_blk_advances_available_and_used_rings_across_requests() {
+        let mut device = PaneVirtioMmioBlockDevice::new(8 * 1024 * 1024, true);
+        configure_queue(&mut device);
+        let mut memory = TestGuestMemory::new(0x7000);
+
+        memory.write_u32(0x4000, 0);
+        memory.write_u32(0x4004, 0);
+        memory.write_u64(0x4008, 4);
+        write_descriptor(&mut memory, 0, 0x4000, 16, 1, 1);
+        write_descriptor(&mut memory, 1, 0x4100, 512, 3, 2);
+        write_descriptor(&mut memory, 2, 0x4300, 1, 2, 0);
+
+        memory.write_u32(0x5000, 0);
+        memory.write_u32(0x5004, 0);
+        memory.write_u64(0x5008, 5);
+        write_descriptor(&mut memory, 3, 0x5000, 16, 1, 4);
+        write_descriptor(&mut memory, 4, 0x5100, 512, 3, 5);
+        write_descriptor(&mut memory, 5, 0x5300, 1, 2, 0);
+        publish_heads(&mut memory, &[0, 3]);
+
+        let first = device.execute_available_block_request(&mut memory, |request, _payload| {
+            assert_eq!(request.sector, 4);
+            Ok(vec![0x44; 512])
+        });
+        let second = device.execute_available_block_request(&mut memory, |request, _payload| {
+            assert_eq!(request.sector, 5);
+            Ok(vec![0x55; 512])
+        });
+        let empty = device.execute_available_block_request(&mut memory, |_request, _payload| {
+            unreachable!("no unpublished request should execute")
+        });
+
+        assert_eq!(first.status, VIRTIO_BLK_STATUS_OK);
+        assert_eq!(second.status, VIRTIO_BLK_STATUS_OK);
+        assert_eq!(first.used_head_index, 0);
+        assert_eq!(second.used_head_index, 3);
+        assert_eq!(device.queue.next_avail_index, 2);
+        assert_eq!(device.queue.used_index, 2);
+        assert_eq!(memory.read_bytes(0x4100, 1), vec![0x44]);
+        assert_eq!(memory.read_bytes(0x5100, 1), vec![0x55]);
+        assert_eq!(memory.read_bytes(0x3002, 2), 2_u16.to_le_bytes());
+        assert_eq!(memory.read_bytes(0x3004, 4), 0_u32.to_le_bytes());
+        assert_eq!(memory.read_bytes(0x3008, 4), 513_u32.to_le_bytes());
+        assert_eq!(memory.read_bytes(0x300c, 4), 3_u32.to_le_bytes());
+        assert_eq!(memory.read_bytes(0x3010, 4), 513_u32.to_le_bytes());
+        assert_eq!(empty.status, VIRTIO_BLK_STATUS_IOERR);
+        assert_eq!(
+            empty.detail,
+            "available ring does not contain a new request"
+        );
     }
 
     #[test]

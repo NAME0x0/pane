@@ -266,15 +266,22 @@ where
                 u32::from_le_bytes(access.data[..4].try_into().expect("checked write width"));
             let write_result = device.write_u32(offset, value);
             match write_result {
-                PaneVirtioMmioWriteResult::Accepted => PaneVirtioMmioAccessOutcome {
-                    accepted: true,
-                    status: "register-write",
-                    offset: Some(offset),
-                    read_data: Vec::new(),
-                    write_result: Some(write_result),
-                    queue_execution: None,
-                    detail: format!("Wrote virtio-MMIO register offset 0x{offset:03x}."),
-                },
+                PaneVirtioMmioWriteResult::Accepted => {
+                    let status = if offset == VIRTIO_MMIO_INTERRUPT_ACK_OFFSET {
+                        "interrupt-ack"
+                    } else {
+                        "register-write"
+                    };
+                    PaneVirtioMmioAccessOutcome {
+                        accepted: true,
+                        status,
+                        offset: Some(offset),
+                        read_data: Vec::new(),
+                        write_result: Some(write_result),
+                        queue_execution: None,
+                        detail: format!("Wrote virtio-MMIO register offset 0x{offset:03x}."),
+                    }
+                }
                 PaneVirtioMmioWriteResult::QueueNotified(queue_index) => {
                     let execution = device.execute_available_block_request(memory, service);
                     PaneVirtioMmioAccessOutcome {
@@ -1079,8 +1086,8 @@ mod tests {
         PaneVirtioBlkRequestType, PaneVirtioMmioAccess, PaneVirtioMmioAccessKind,
         PaneVirtioMmioBlockDevice, PaneVirtioMmioWriteResult, PANE_VIRTIO_BLK_QUEUE_SIZE,
         PANE_VIRTIO_MMIO_BASE_GPA, PANE_VIRTIO_MMIO_SIZE_BYTES, VIRTIO_BLK_STATUS_IOERR,
-        VIRTIO_BLK_STATUS_OK, VIRTIO_DEVICE_ID_BLOCK, VIRTIO_MMIO_MAGIC_VALUE,
-        VIRTIO_MMIO_VERSION_MODERN,
+        VIRTIO_BLK_STATUS_OK, VIRTIO_DEVICE_ID_BLOCK, VIRTIO_MMIO_INTERRUPT_ACK_OFFSET,
+        VIRTIO_MMIO_MAGIC_VALUE, VIRTIO_MMIO_VERSION_MODERN,
     };
 
     struct TestGuestMemory {
@@ -1288,6 +1295,33 @@ mod tests {
         assert!(!outcome.accepted);
         assert_eq!(outcome.status, "unsupported-width");
         assert_eq!(outcome.offset, Some(0x038));
+    }
+
+    #[test]
+    fn virtio_mmio_access_service_reports_interrupt_ack() {
+        let mut device = PaneVirtioMmioBlockDevice::new(1024 * 1024, true);
+        let mut memory = TestGuestMemory::new(0x5000);
+        device.interrupt_status = 1;
+
+        let outcome = service_virtio_mmio_access(
+            &mut device,
+            &mut memory,
+            PaneVirtioMmioAccess {
+                kind: PaneVirtioMmioAccessKind::Write,
+                gpa: PANE_VIRTIO_MMIO_BASE_GPA + VIRTIO_MMIO_INTERRUPT_ACK_OFFSET,
+                data: 1_u32.to_le_bytes().to_vec(),
+            },
+            |_request, _payload| unreachable!("interrupt ack must not execute queues"),
+        );
+
+        assert!(outcome.accepted);
+        assert_eq!(outcome.status, "interrupt-ack");
+        assert_eq!(outcome.offset, Some(VIRTIO_MMIO_INTERRUPT_ACK_OFFSET));
+        assert_eq!(
+            outcome.write_result,
+            Some(PaneVirtioMmioWriteResult::Accepted)
+        );
+        assert_eq!(device.interrupt_status, 0);
     }
 
     #[test]

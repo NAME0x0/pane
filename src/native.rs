@@ -4376,6 +4376,13 @@ mod windows_whp {
                                     ),
                                 });
                             }
+                        } else if interrupt_status_before != 0 && device.interrupt_status == 0 {
+                            report.calls.push(NativeWhpCallReport {
+                                name: "VirtioMmioInterruptAcknowledged",
+                                hresult: None,
+                                ok: true,
+                                detail: "Guest acknowledged the pending virtio-MMIO interrupt through the interrupt-ack register.".to_string(),
+                            });
                         }
                         if let Some(path) = checkpoint_path.as_deref() {
                             write_linux_entry_probe_checkpoint(

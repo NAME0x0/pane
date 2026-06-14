@@ -18,6 +18,7 @@ pub(crate) const VIRTIO_BLK_F_RO: u64 = 1 << 5;
 pub(crate) const VIRTIO_BLK_F_BLK_SIZE: u64 = 1 << 6;
 pub(crate) const VIRTIO_BLK_F_FLUSH: u64 = 1 << 9;
 pub(crate) const VIRTIO_F_VERSION_1: u64 = 1 << 32;
+const VIRTIO_CONFIG_S_FEATURES_OK: u32 = 8;
 
 const VIRTIO_MMIO_MAGIC_VALUE_OFFSET: u64 = 0x000;
 const VIRTIO_MMIO_VERSION_OFFSET: u64 = 0x004;
@@ -126,6 +127,7 @@ pub(crate) struct PaneVirtioMmioBlockDevice {
     pub(crate) vendor_id: u32,
     pub(crate) device_features: u64,
     pub(crate) driver_features: u64,
+    pub(crate) unsupported_driver_features: u64,
     pub(crate) device_features_select: u32,
     pub(crate) driver_features_select: u32,
     pub(crate) status: u32,
@@ -397,6 +399,7 @@ impl PaneVirtioMmioBlockDevice {
             vendor_id: PANE_VENDOR_ID,
             device_features,
             driver_features: 0,
+            unsupported_driver_features: 0,
             device_features_select: 0,
             driver_features_select: 0,
             status: 0,
@@ -726,7 +729,13 @@ impl PaneVirtioMmioBlockDevice {
                 if value == 0 {
                     self.reset_driver_state();
                 } else {
-                    self.status |= value;
+                    let mut accepted_status = value;
+                    if (value & VIRTIO_CONFIG_S_FEATURES_OK) != 0
+                        && self.unsupported_driver_features != 0
+                    {
+                        accepted_status &= !VIRTIO_CONFIG_S_FEATURES_OK;
+                    }
+                    self.status |= accepted_status;
                 }
                 PaneVirtioMmioWriteResult::Accepted
             }
@@ -759,13 +768,16 @@ impl PaneVirtioMmioBlockDevice {
     }
 
     fn set_driver_features(&mut self, value: u32) {
-        let low = self.driver_features & 0xffff_ffff_0000_0000;
-        let high = self.driver_features & 0x0000_0000_ffff_ffff;
-        self.driver_features = match self.driver_features_select {
-            0 => low | u64::from(value),
-            1 => high | (u64::from(value) << 32),
-            _ => self.driver_features,
+        let Some((bank_mask, raw_features)) =
+            selected_feature_bank(self.driver_features_select, value)
+        else {
+            return;
         };
+        let accepted = raw_features & self.device_features & bank_mask;
+        let unsupported = raw_features & !self.device_features & bank_mask;
+        self.driver_features = (self.driver_features & !bank_mask) | accepted;
+        self.unsupported_driver_features =
+            (self.unsupported_driver_features & !bank_mask) | unsupported;
     }
 
     fn read_config_u32(&self, offset: u64) -> Option<u32> {
@@ -785,6 +797,7 @@ impl PaneVirtioMmioBlockDevice {
 
     fn reset_driver_state(&mut self) {
         self.driver_features = 0;
+        self.unsupported_driver_features = 0;
         self.driver_features_select = 0;
         self.status = 0;
         self.interrupt_status = 0;
@@ -1271,6 +1284,14 @@ fn combine_addr_high(current: u64, high: u32) -> u64 {
     (current & 0x0000_0000_ffff_ffff) | (u64::from(high) << 32)
 }
 
+fn selected_feature_bank(select: u32, value: u32) -> Option<(u64, u64)> {
+    match select {
+        0 => Some((0x0000_0000_ffff_ffff, u64::from(value))),
+        1 => Some((0xffff_ffff_0000_0000, u64::from(value) << 32)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1280,8 +1301,9 @@ mod tests {
         PaneVirtioMmioBlockDevice, PaneVirtioMmioWriteResult, PANE_VIRTIO_BLK_QUEUE_SIZE,
         PANE_VIRTIO_MMIO_BASE_GPA, PANE_VIRTIO_MMIO_SIZE_BYTES, VIRTIO_BLK_F_BLK_SIZE,
         VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_RO, VIRTIO_BLK_STATUS_IOERR, VIRTIO_BLK_STATUS_OK,
-        VIRTIO_DEVICE_ID_BLOCK, VIRTIO_F_VERSION_1, VIRTIO_MMIO_CONFIG_OFFSET,
-        VIRTIO_MMIO_INTERRUPT_ACK_OFFSET, VIRTIO_MMIO_MAGIC_VALUE, VIRTIO_MMIO_VERSION_MODERN,
+        VIRTIO_CONFIG_S_FEATURES_OK, VIRTIO_DEVICE_ID_BLOCK, VIRTIO_F_VERSION_1,
+        VIRTIO_MMIO_CONFIG_OFFSET, VIRTIO_MMIO_INTERRUPT_ACK_OFFSET, VIRTIO_MMIO_MAGIC_VALUE,
+        VIRTIO_MMIO_VERSION_MODERN,
     };
 
     struct TestGuestMemory {
@@ -1522,6 +1544,47 @@ mod tests {
         );
         assert_eq!(device.read_u32(0x024), Some(0));
         assert_eq!(device.read_u32(0x020), Some(0));
+    }
+
+    #[test]
+    fn virtio_mmio_block_device_masks_unsupported_features_until_negotiation_is_valid() {
+        let mut device = PaneVirtioMmioBlockDevice::new(8 * 1024 * 1024, false);
+
+        assert_eq!(
+            device.write_u32(0x020, (VIRTIO_BLK_F_RO | VIRTIO_BLK_F_BLK_SIZE) as u32),
+            PaneVirtioMmioWriteResult::Accepted
+        );
+        assert_eq!(device.driver_features, VIRTIO_BLK_F_BLK_SIZE);
+        assert_eq!(device.unsupported_driver_features, VIRTIO_BLK_F_RO);
+
+        assert_eq!(
+            device.write_u32(0x070, 1 | 2 | VIRTIO_CONFIG_S_FEATURES_OK),
+            PaneVirtioMmioWriteResult::Accepted
+        );
+        assert_eq!(device.read_u32(0x070), Some(1 | 2));
+
+        assert_eq!(
+            device.write_u32(0x020, VIRTIO_BLK_F_BLK_SIZE as u32),
+            PaneVirtioMmioWriteResult::Accepted
+        );
+        assert_eq!(
+            device.write_u32(0x024, 1),
+            PaneVirtioMmioWriteResult::Accepted
+        );
+        assert_eq!(
+            device.write_u32(0x020, (VIRTIO_F_VERSION_1 >> 32) as u32),
+            PaneVirtioMmioWriteResult::Accepted
+        );
+        assert_eq!(device.unsupported_driver_features, 0);
+
+        assert_eq!(
+            device.write_u32(0x070, VIRTIO_CONFIG_S_FEATURES_OK),
+            PaneVirtioMmioWriteResult::Accepted
+        );
+        assert_eq!(
+            device.read_u32(0x070),
+            Some(1 | 2 | VIRTIO_CONFIG_S_FEATURES_OK)
+        );
     }
 
     #[test]

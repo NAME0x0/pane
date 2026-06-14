@@ -294,6 +294,20 @@ where
                     }
                 }
                 PaneVirtioMmioWriteResult::QueueNotified(queue_index) => {
+                    if queue_index != 0 {
+                        return PaneVirtioMmioAccessOutcome {
+                            accepted: true,
+                            status: "queue-notify-ignored",
+                            offset: Some(offset),
+                            read_data: Vec::new(),
+                            write_result: Some(write_result),
+                            queue_execution: None,
+                            queue_execution_count: 0,
+                            detail: format!(
+                                "Ignored queue notify {queue_index}; Pane virtio-blk currently exposes only queue 0."
+                            ),
+                        };
+                    }
                     let executions = device.execute_available_block_requests(memory, &mut service);
                     let execution = executions.last().cloned();
                     let queue_execution_count = executions.len();
@@ -1663,6 +1677,40 @@ mod tests {
         assert!(outcome.accepted);
         assert_eq!(outcome.status, "queue-notify-empty");
         assert_eq!(outcome.queue_execution_count, 0);
+        assert_eq!(device.interrupt_status, 0);
+    }
+
+    #[test]
+    fn virtio_mmio_queue_notify_ignores_unknown_queue_index() {
+        let mut device = PaneVirtioMmioBlockDevice::new(8 * 1024 * 1024, true);
+        let mut memory = TestGuestMemory::new(0x5000);
+        configure_queue(&mut device);
+
+        memory.write_u32(0x4000, 0);
+        memory.write_u32(0x4004, 0);
+        memory.write_u64(0x4008, 11);
+        write_descriptor(&mut memory, 0, 0x4000, 16, 1, 1);
+        write_descriptor(&mut memory, 1, 0x4100, 512, 3, 2);
+        write_descriptor(&mut memory, 2, 0x4300, 1, 2, 0);
+        publish_head(&mut memory, 0);
+
+        let outcome = service_virtio_mmio_access(
+            &mut device,
+            &mut memory,
+            PaneVirtioMmioAccess {
+                kind: PaneVirtioMmioAccessKind::Write,
+                gpa: PANE_VIRTIO_MMIO_BASE_GPA + 0x050,
+                data: 1_u32.to_le_bytes().to_vec(),
+            },
+            |_request, _payload| unreachable!("unknown queue notify must not invoke backend"),
+        );
+
+        assert!(outcome.accepted);
+        assert_eq!(outcome.status, "queue-notify-ignored");
+        assert_eq!(outcome.queue_execution_count, 0);
+        assert_eq!(device.queue.last_notify, Some(1));
+        assert_eq!(device.queue.next_avail_index, 0);
+        assert_eq!(device.queue.used_index, 0);
         assert_eq!(device.interrupt_status, 0);
     }
 

@@ -19,6 +19,7 @@ pub(crate) const VIRTIO_BLK_F_BLK_SIZE: u64 = 1 << 6;
 pub(crate) const VIRTIO_BLK_F_FLUSH: u64 = 1 << 9;
 pub(crate) const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 const VIRTIO_CONFIG_S_FEATURES_OK: u32 = 8;
+const VIRTIO_CONFIG_S_DRIVER_OK: u32 = 4;
 
 const VIRTIO_MMIO_MAGIC_VALUE_OFFSET: u64 = 0x000;
 const VIRTIO_MMIO_VERSION_OFFSET: u64 = 0x004;
@@ -726,7 +727,11 @@ impl PaneVirtioMmioBlockDevice {
                 if !self.selected_queue_exists() {
                     return PaneVirtioMmioWriteResult::Rejected("unsupported virtqueue index");
                 }
-                self.queue.ready = value == 1;
+                match value {
+                    0 => self.reset_selected_queue_runtime(),
+                    1 => self.queue.ready = true,
+                    _ => return PaneVirtioMmioWriteResult::Rejected("invalid queue ready value"),
+                }
                 PaneVirtioMmioWriteResult::Accepted
             }
             VIRTIO_MMIO_QUEUE_NOTIFY_OFFSET => {
@@ -741,13 +746,7 @@ impl PaneVirtioMmioBlockDevice {
                 if value == 0 {
                     self.reset_driver_state();
                 } else {
-                    let mut accepted_status = value;
-                    if (value & VIRTIO_CONFIG_S_FEATURES_OK) != 0
-                        && self.unsupported_driver_features != 0
-                    {
-                        accepted_status &= !VIRTIO_CONFIG_S_FEATURES_OK;
-                    }
-                    self.status |= accepted_status;
+                    self.apply_driver_status(value);
                 }
                 PaneVirtioMmioWriteResult::Accepted
             }
@@ -808,6 +807,22 @@ impl PaneVirtioMmioBlockDevice {
         self.driver_features = (self.driver_features & !bank_mask) | accepted;
         self.unsupported_driver_features =
             (self.unsupported_driver_features & !bank_mask) | unsupported;
+    }
+
+    fn apply_driver_status(&mut self, value: u32) {
+        let mut accepted_status = value;
+        if (value & VIRTIO_CONFIG_S_FEATURES_OK) != 0 && self.unsupported_driver_features != 0 {
+            accepted_status &= !VIRTIO_CONFIG_S_FEATURES_OK;
+        }
+
+        let status_after_features = self.status | accepted_status;
+        if (value & VIRTIO_CONFIG_S_DRIVER_OK) != 0
+            && (status_after_features & VIRTIO_CONFIG_S_FEATURES_OK) == 0
+        {
+            accepted_status &= !VIRTIO_CONFIG_S_DRIVER_OK;
+        }
+
+        self.status |= accepted_status;
     }
 
     fn read_config_u32(&self, offset: u64) -> Option<u32> {
@@ -871,6 +886,13 @@ impl PaneVirtioMmioBlockDevice {
         } else {
             0
         }
+    }
+
+    fn reset_selected_queue_runtime(&mut self) {
+        self.queue.ready = false;
+        self.queue.last_notify = None;
+        self.queue.next_avail_index = 0;
+        self.queue.used_index = 0;
     }
 
     fn reset_driver_state(&mut self) {
@@ -1379,9 +1401,9 @@ mod tests {
         PaneVirtioMmioBlockDevice, PaneVirtioMmioWriteResult, PANE_VIRTIO_BLK_QUEUE_SIZE,
         PANE_VIRTIO_MMIO_BASE_GPA, PANE_VIRTIO_MMIO_SIZE_BYTES, VIRTIO_BLK_F_BLK_SIZE,
         VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_RO, VIRTIO_BLK_STATUS_IOERR, VIRTIO_BLK_STATUS_OK,
-        VIRTIO_CONFIG_S_FEATURES_OK, VIRTIO_DEVICE_ID_BLOCK, VIRTIO_F_VERSION_1,
-        VIRTIO_MMIO_CONFIG_OFFSET, VIRTIO_MMIO_INTERRUPT_ACK_OFFSET, VIRTIO_MMIO_MAGIC_VALUE,
-        VIRTIO_MMIO_VERSION_MODERN,
+        VIRTIO_CONFIG_S_DRIVER_OK, VIRTIO_CONFIG_S_FEATURES_OK, VIRTIO_DEVICE_ID_BLOCK,
+        VIRTIO_F_VERSION_1, VIRTIO_MMIO_CONFIG_OFFSET, VIRTIO_MMIO_INTERRUPT_ACK_OFFSET,
+        VIRTIO_MMIO_MAGIC_VALUE, VIRTIO_MMIO_VERSION_MODERN,
     };
 
     struct TestGuestMemory {
@@ -1634,6 +1656,33 @@ mod tests {
     }
 
     #[test]
+    fn virtio_mmio_block_device_resets_queue_runtime_when_queue_ready_is_cleared() {
+        let mut device = PaneVirtioMmioBlockDevice::new(8 * 1024 * 1024, false);
+        configure_queue(&mut device);
+        device.queue.last_notify = Some(0);
+        device.queue.next_avail_index = 7;
+        device.queue.used_index = 5;
+
+        assert_eq!(
+            device.write_u32(0x044, 0),
+            PaneVirtioMmioWriteResult::Accepted
+        );
+        assert!(!device.queue.ready);
+        assert_eq!(device.queue.last_notify, None);
+        assert_eq!(device.queue.next_avail_index, 0);
+        assert_eq!(device.queue.used_index, 0);
+        assert_eq!(device.read_u32(0x038), Some(8));
+        assert_eq!(device.read_u32(0x080), Some(0x1000));
+        assert_eq!(device.read_u32(0x090), Some(0x2000));
+        assert_eq!(device.read_u32(0x0a0), Some(0x3000));
+
+        assert_eq!(
+            device.write_u32(0x044, 2),
+            PaneVirtioMmioWriteResult::Rejected("invalid queue ready value")
+        );
+    }
+
+    #[test]
     fn virtio_mmio_block_device_reads_back_feature_negotiation_registers() {
         let mut device = PaneVirtioMmioBlockDevice::new(8 * 1024 * 1024, true);
 
@@ -1702,6 +1751,41 @@ mod tests {
         assert_eq!(
             device.read_u32(0x070),
             Some(1 | 2 | VIRTIO_CONFIG_S_FEATURES_OK)
+        );
+    }
+
+    #[test]
+    fn virtio_mmio_block_device_requires_features_ok_before_driver_ok() {
+        let mut device = PaneVirtioMmioBlockDevice::new(8 * 1024 * 1024, false);
+
+        assert_eq!(
+            device.write_u32(0x070, 1 | 2 | VIRTIO_CONFIG_S_DRIVER_OK),
+            PaneVirtioMmioWriteResult::Accepted
+        );
+        assert_eq!(device.read_u32(0x070), Some(1 | 2));
+
+        assert_eq!(
+            device.write_u32(0x020, VIRTIO_BLK_F_BLK_SIZE as u32),
+            PaneVirtioMmioWriteResult::Accepted
+        );
+        assert_eq!(
+            device.write_u32(0x024, 1),
+            PaneVirtioMmioWriteResult::Accepted
+        );
+        assert_eq!(
+            device.write_u32(0x020, (VIRTIO_F_VERSION_1 >> 32) as u32),
+            PaneVirtioMmioWriteResult::Accepted
+        );
+        assert_eq!(
+            device.write_u32(
+                0x070,
+                VIRTIO_CONFIG_S_FEATURES_OK | VIRTIO_CONFIG_S_DRIVER_OK
+            ),
+            PaneVirtioMmioWriteResult::Accepted
+        );
+        assert_eq!(
+            device.read_u32(0x070),
+            Some(1 | 2 | VIRTIO_CONFIG_S_FEATURES_OK | VIRTIO_CONFIG_S_DRIVER_OK)
         );
     }
 

@@ -6269,6 +6269,12 @@ mod windows_whp {
             "virtio_mmio_interrupt_request_count": report_ok_call_count(report, "VirtioMmioInterruptRequested"),
             "virtio_mmio_interrupt_acknowledged": report_has_ok_call(report, "VirtioMmioInterruptAcknowledged"),
             "virtio_mmio_interrupt_acknowledgement_count": report_ok_call_count(report, "VirtioMmioInterruptAcknowledged"),
+            "virtio_root_mount_attempted": serial_text.contains("PANE_VIRTIO_ROOT_MOUNT_ATTEMPT"),
+            "virtio_root_device_wait_timeout": serial_text.contains("PANE_VIRTIO_ROOT_DEVICE_WAIT_TIMEOUT"),
+            "virtio_root_mount_fallback": serial_text.contains("PANE_VIRTIO_ROOT_MOUNT_FALLBACK"),
+            "root_mount_attempted": serial_text.contains("PANE_ROOT_MOUNT_ATTEMPT"),
+            "root_mount_ok": serial_text.contains("PANE_ROOT_MOUNT_OK"),
+            "init_exec_reached": serial_text.contains("PANE_INIT_EXEC"),
             "exit_reason_label": &report.exit_reason_label,
             "serial_text_bytes": serial_text.len(),
             "serial_text_tail": &serial_text[serial_tail_start..],
@@ -8044,11 +8050,11 @@ mod windows_whp {
             whp_emulator_callbacks, whp_emulator_get_registers_callback,
             whp_emulator_io_port_callback, whp_emulator_memory_callback,
             whp_emulator_set_registers_callback, whp_emulator_translate_gva_page_callback,
-            whv_x64_interrupt_control, xapic_state_vectors, Com1SerialState, DecodedExit,
-            GuestMemory, LegacyDeviceIoState, MappedGuestMemoryView, MappedGuestRegion,
-            NativeBlockIoTraceCollector, WhpEmulatorMmioCallbackContext, WhvEmulatorCallbacks,
-            WhvEmulatorIoAccessInfo, WhvEmulatorMemoryAccessInfo, WhvRegisterValue,
-            WhvTranslateGvaResult, ACPI_PM1_CONTROL_PORT, ACPI_PM1_ENABLE_PORT,
+            whv_x64_interrupt_control, write_linux_entry_probe_checkpoint, xapic_state_vectors,
+            Com1SerialState, DecodedExit, GuestMemory, LegacyDeviceIoState, MappedGuestMemoryView,
+            MappedGuestRegion, NativeBlockIoTraceCollector, WhpEmulatorMmioCallbackContext,
+            WhvEmulatorCallbacks, WhvEmulatorIoAccessInfo, WhvEmulatorMemoryAccessInfo,
+            WhvRegisterValue, WhvTranslateGvaResult, ACPI_PM1_CONTROL_PORT, ACPI_PM1_ENABLE_PORT,
             ACPI_PM1_STATUS_PORT, ACPI_PM_TIMER_PORT, ALT_DELAY_PORT, ALT_POST_DELAY_PORT,
             CMOS_ADDRESS_PORT, CMOS_DATA_PORT, CPUID_DEFAULT_RAX_OFFSET, CPUID_DEFAULT_RBX_OFFSET,
             CPUID_DEFAULT_RCX_OFFSET, CPUID_DEFAULT_RDX_OFFSET, CPUID_RAX_OFFSET, CPUID_RCX_OFFSET,
@@ -9335,6 +9341,32 @@ mod windows_whp {
                 blocker: None,
                 next_step: "test".to_string(),
             }
+        }
+
+        #[test]
+        fn linux_entry_probe_checkpoint_summarizes_virtio_root_handoff() {
+            let mut report = base_report();
+            report.serial_text = Some(
+                "PANE_VIRTIO_ROOT_MOUNT_ATTEMPT\nPANE_VIRTIO_ROOT_MOUNT_FALLBACK\nPANE_ROOT_MOUNT_ATTEMPT\nPANE_ROOT_MOUNT_OK fs=ext4 readonly=true\nPANE_INIT_EXEC\n"
+                    .to_string(),
+            );
+            let path = std::env::temp_dir().join(format!(
+                "pane-checkpoint-{}-{}.json",
+                std::process::id(),
+                "virtio-root"
+            ));
+
+            write_linux_entry_probe_checkpoint(&path, &report, "test", std::time::Instant::now());
+            let value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let _ = std::fs::remove_file(&path);
+
+            assert_eq!(value["virtio_root_mount_attempted"], true);
+            assert_eq!(value["virtio_root_mount_fallback"], true);
+            assert_eq!(value["virtio_root_device_wait_timeout"], false);
+            assert_eq!(value["root_mount_attempted"], true);
+            assert_eq!(value["root_mount_ok"], true);
+            assert_eq!(value["init_exec_reached"], true);
         }
 
         #[test]

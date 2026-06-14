@@ -8257,6 +8257,29 @@ mod windows_whp {
             );
         }
 
+        fn activate_virtio_test_driver(device: &mut crate::virtio::PaneVirtioMmioBlockDevice) {
+            assert_eq!(
+                device.write_u32(0x020, crate::virtio::VIRTIO_BLK_F_BLK_SIZE as u32),
+                crate::virtio::PaneVirtioMmioWriteResult::Accepted
+            );
+            assert_eq!(
+                device.write_u32(0x024, 1),
+                crate::virtio::PaneVirtioMmioWriteResult::Accepted
+            );
+            assert_eq!(
+                device.write_u32(0x020, (crate::virtio::VIRTIO_F_VERSION_1 >> 32) as u32),
+                crate::virtio::PaneVirtioMmioWriteResult::Accepted
+            );
+            assert_eq!(
+                device.write_u32(0x070, 1 | 2 | crate::virtio::VIRTIO_CONFIG_S_FEATURES_OK),
+                crate::virtio::PaneVirtioMmioWriteResult::Accepted
+            );
+            assert_eq!(
+                device.write_u32(0x070, crate::virtio::VIRTIO_CONFIG_S_DRIVER_OK),
+                crate::virtio::PaneVirtioMmioWriteResult::Accepted
+            );
+        }
+
         fn write_virtio_test_descriptor(
             memory: &mut TestGuestMemory,
             index: u16,
@@ -8524,6 +8547,7 @@ mod windows_whp {
             let mut device = crate::virtio::PaneVirtioMmioBlockDevice::new(8 * 1024 * 1024, false);
             let mut memory = TestGuestMemory::new(0x5000);
             configure_virtio_test_queue(&mut device);
+            activate_virtio_test_driver(&mut device);
             write_virtio_read_request(&mut memory, 3);
 
             let mut handler = |access| {

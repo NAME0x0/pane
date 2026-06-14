@@ -18,8 +18,8 @@ pub(crate) const VIRTIO_BLK_F_RO: u64 = 1 << 5;
 pub(crate) const VIRTIO_BLK_F_BLK_SIZE: u64 = 1 << 6;
 pub(crate) const VIRTIO_BLK_F_FLUSH: u64 = 1 << 9;
 pub(crate) const VIRTIO_F_VERSION_1: u64 = 1 << 32;
-const VIRTIO_CONFIG_S_FEATURES_OK: u32 = 8;
-const VIRTIO_CONFIG_S_DRIVER_OK: u32 = 4;
+pub(crate) const VIRTIO_CONFIG_S_DRIVER_OK: u32 = 4;
+pub(crate) const VIRTIO_CONFIG_S_FEATURES_OK: u32 = 8;
 
 const VIRTIO_MMIO_MAGIC_VALUE_OFFSET: u64 = 0x000;
 const VIRTIO_MMIO_VERSION_OFFSET: u64 = 0x004;
@@ -323,6 +323,18 @@ where
                             detail: format!(
                                 "Ignored queue notify {queue_index}; Pane virtio-blk currently exposes only queue 0."
                             ),
+                        };
+                    }
+                    if !device.driver_ready_for_queue_service() {
+                        return PaneVirtioMmioAccessOutcome {
+                            accepted: true,
+                            status: "queue-notify-not-ready",
+                            offset: Some(offset),
+                            read_data: Vec::new(),
+                            write_result: Some(write_result),
+                            queue_execution: None,
+                            queue_execution_count: 0,
+                            detail: "Ignored queue notify 0 because the virtio driver has not reached DRIVER_OK with a ready queue.".to_string(),
                         };
                     }
                     let executions = device.execute_available_block_requests(memory, &mut service);
@@ -895,6 +907,10 @@ impl PaneVirtioMmioBlockDevice {
         self.queue.used_index = 0;
     }
 
+    fn driver_ready_for_queue_service(&self) -> bool {
+        (self.status & VIRTIO_CONFIG_S_DRIVER_OK) != 0 && self.selected_queue_ready()
+    }
+
     fn reset_driver_state(&mut self) {
         self.driver_features = 0;
         self.unsupported_driver_features = 0;
@@ -962,6 +978,10 @@ pub(crate) fn pane_virtio_mmio_service_smoke() -> PaneVirtioMmioServiceSmoke {
     let mut device = PaneVirtioMmioBlockDevice::new(8 * 1024 * 1024, true);
     let mut memory = PaneSmokeGuestMemory::new(0x5000);
     configure_smoke_queue(&mut device);
+    let _ = device.write_u32(
+        VIRTIO_MMIO_STATUS_OFFSET,
+        1 | 2 | VIRTIO_CONFIG_S_FEATURES_OK | VIRTIO_CONFIG_S_DRIVER_OK,
+    );
 
     let read_outcome = service_virtio_mmio_access(
         &mut device,
@@ -1489,6 +1509,33 @@ mod tests {
         );
     }
 
+    fn activate_driver(device: &mut PaneVirtioMmioBlockDevice) {
+        assert_eq!(
+            device.write_u32(0x020, VIRTIO_BLK_F_BLK_SIZE as u32),
+            PaneVirtioMmioWriteResult::Accepted
+        );
+        assert_eq!(
+            device.write_u32(0x024, 1),
+            PaneVirtioMmioWriteResult::Accepted
+        );
+        assert_eq!(
+            device.write_u32(0x020, (VIRTIO_F_VERSION_1 >> 32) as u32),
+            PaneVirtioMmioWriteResult::Accepted
+        );
+        assert_eq!(
+            device.write_u32(0x070, 1 | 2 | VIRTIO_CONFIG_S_FEATURES_OK),
+            PaneVirtioMmioWriteResult::Accepted
+        );
+        assert_eq!(
+            device.write_u32(0x070, VIRTIO_CONFIG_S_DRIVER_OK),
+            PaneVirtioMmioWriteResult::Accepted
+        );
+        assert_eq!(
+            device.read_u32(0x070),
+            Some(1 | 2 | VIRTIO_CONFIG_S_FEATURES_OK | VIRTIO_CONFIG_S_DRIVER_OK)
+        );
+    }
+
     fn write_descriptor(
         memory: &mut TestGuestMemory,
         index: u16,
@@ -1941,6 +1988,7 @@ mod tests {
         let mut device = PaneVirtioMmioBlockDevice::new(8 * 1024 * 1024, false);
         let mut memory = TestGuestMemory::new(0x5000);
         configure_queue(&mut device);
+        activate_driver(&mut device);
 
         memory.write_u32(0x4000, 0);
         memory.write_u32(0x4004, 0);
@@ -1987,6 +2035,7 @@ mod tests {
         let mut device = PaneVirtioMmioBlockDevice::new(8 * 1024 * 1024, true);
         let mut memory = TestGuestMemory::new(0x7000);
         configure_queue(&mut device);
+        activate_driver(&mut device);
 
         memory.write_u32(0x4000, 0);
         memory.write_u32(0x4004, 0);
@@ -2036,6 +2085,7 @@ mod tests {
         let mut device = PaneVirtioMmioBlockDevice::new(8 * 1024 * 1024, true);
         let mut memory = TestGuestMemory::new(0x5000);
         configure_queue(&mut device);
+        activate_driver(&mut device);
 
         let outcome = service_virtio_mmio_access(
             &mut device,
@@ -2051,6 +2101,39 @@ mod tests {
         assert!(outcome.accepted);
         assert_eq!(outcome.status, "queue-notify-empty");
         assert_eq!(outcome.queue_execution_count, 0);
+        assert_eq!(device.interrupt_status, 0);
+    }
+
+    #[test]
+    fn virtio_mmio_queue_notify_before_driver_ok_does_not_execute_storage() {
+        let mut device = PaneVirtioMmioBlockDevice::new(8 * 1024 * 1024, true);
+        let mut memory = TestGuestMemory::new(0x5000);
+        configure_queue(&mut device);
+
+        memory.write_u32(0x4000, 0);
+        memory.write_u32(0x4004, 0);
+        memory.write_u64(0x4008, 11);
+        write_descriptor(&mut memory, 0, 0x4000, 16, 1, 1);
+        write_descriptor(&mut memory, 1, 0x4100, 512, 3, 2);
+        write_descriptor(&mut memory, 2, 0x4300, 1, 2, 0);
+        publish_head(&mut memory, 0);
+
+        let outcome = service_virtio_mmio_access(
+            &mut device,
+            &mut memory,
+            PaneVirtioMmioAccess {
+                kind: PaneVirtioMmioAccessKind::Write,
+                gpa: PANE_VIRTIO_MMIO_BASE_GPA + 0x050,
+                data: 0_u32.to_le_bytes().to_vec(),
+            },
+            |_request, _payload| unreachable!("pre-DRIVER_OK notify must not invoke backend"),
+        );
+
+        assert!(outcome.accepted);
+        assert_eq!(outcome.status, "queue-notify-not-ready");
+        assert_eq!(outcome.queue_execution_count, 0);
+        assert_eq!(device.queue.next_avail_index, 0);
+        assert_eq!(device.queue.used_index, 0);
         assert_eq!(device.interrupt_status, 0);
     }
 
@@ -2093,6 +2176,7 @@ mod tests {
         let mut device = PaneVirtioMmioBlockDevice::new(8 * 1024 * 1024, true);
         let mut memory = TestGuestMemory::new(0x5000);
         configure_queue(&mut device);
+        activate_driver(&mut device);
 
         memory.write_u32(0x4000, 0);
         memory.write_u32(0x4004, 0);
@@ -2126,6 +2210,7 @@ mod tests {
         let mut device = PaneVirtioMmioBlockDevice::new(8 * 1024 * 1024, true);
         let mut memory = TestGuestMemory::new(0x5000);
         configure_queue(&mut device);
+        activate_driver(&mut device);
 
         memory.write_u32(0x4000, 0);
         memory.write_u32(0x4004, 0);

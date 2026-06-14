@@ -242,20 +242,34 @@ where
 
     match access.kind {
         PaneVirtioMmioAccessKind::Read => {
-            if !access.data.is_empty() && access.data.len() != 4 {
-                return unsupported_mmio_width(offset, access.data.len());
-            }
-            match device.read_u32(offset) {
-                Some(value) => PaneVirtioMmioAccessOutcome {
+            let access_width = if access.data.is_empty() {
+                4
+            } else {
+                access.data.len()
+            };
+            match device.read_access_bytes(offset, access_width) {
+                Some(read_data) => PaneVirtioMmioAccessOutcome {
                     accepted: true,
-                    status: "register-read",
+                    status: if offset >= VIRTIO_MMIO_CONFIG_OFFSET {
+                        "config-read"
+                    } else {
+                        "register-read"
+                    },
                     offset: Some(offset),
-                    read_data: value.to_le_bytes().to_vec(),
+                    read_data,
                     write_result: None,
                     queue_execution: None,
                     queue_execution_count: 0,
-                    detail: format!("Read virtio-MMIO register offset 0x{offset:03x}."),
+                    detail: format!(
+                        "Read {access_width}-byte virtio-MMIO access at offset 0x{offset:03x}."
+                    ),
                 },
+                None if !matches!(access_width, 1 | 2 | 4 | 8) => {
+                    unsupported_mmio_width(offset, access_width)
+                }
+                None if offset < VIRTIO_MMIO_CONFIG_OFFSET && access_width != 4 => {
+                    unsupported_mmio_width(offset, access_width)
+                }
                 None => PaneVirtioMmioAccessOutcome {
                     accepted: false,
                     status: "unknown-register",
@@ -652,6 +666,23 @@ impl PaneVirtioMmioBlockDevice {
         }
     }
 
+    pub(crate) fn read_access_bytes(&self, offset: u64, width: usize) -> Option<Vec<u8>> {
+        if !matches!(width, 1 | 2 | 4 | 8) {
+            return None;
+        }
+
+        if offset >= VIRTIO_MMIO_CONFIG_OFFSET {
+            return self.read_config_bytes(offset - VIRTIO_MMIO_CONFIG_OFFSET, width);
+        }
+
+        if width != 4 {
+            return None;
+        }
+
+        self.read_u32(offset)
+            .map(|value| value.to_le_bytes().to_vec())
+    }
+
     pub(crate) fn write_u32(&mut self, offset: u64, value: u32) -> PaneVirtioMmioWriteResult {
         match offset {
             VIRTIO_MMIO_DEVICE_FEATURES_SEL_OFFSET => {
@@ -738,13 +769,18 @@ impl PaneVirtioMmioBlockDevice {
     }
 
     fn read_config_u32(&self, offset: u64) -> Option<u32> {
-        let config_offset = offset - VIRTIO_MMIO_CONFIG_OFFSET;
-        match config_offset {
-            0x00 => Some(self.config.capacity_sectors as u32),
-            0x04 => Some((self.config.capacity_sectors >> 32) as u32),
-            0x14 => Some(self.config.sector_size_bytes as u32),
-            _ => Some(0),
-        }
+        let bytes = self.read_config_bytes(offset - VIRTIO_MMIO_CONFIG_OFFSET, 4)?;
+        Some(u32::from_le_bytes(bytes.try_into().ok()?))
+    }
+
+    fn read_config_bytes(&self, config_offset: u64, width: usize) -> Option<Vec<u8>> {
+        let mut config = [0_u8; 0x40];
+        config[0x00..0x08].copy_from_slice(&self.config.capacity_sectors.to_le_bytes());
+        config[0x14..0x18].copy_from_slice(&(self.config.sector_size_bytes as u32).to_le_bytes());
+
+        let start = usize::try_from(config_offset).ok()?;
+        let end = start.checked_add(width)?;
+        config.get(start..end).map(|bytes| bytes.to_vec())
     }
 
     fn reset_driver_state(&mut self) {
@@ -1244,8 +1280,8 @@ mod tests {
         PaneVirtioMmioBlockDevice, PaneVirtioMmioWriteResult, PANE_VIRTIO_BLK_QUEUE_SIZE,
         PANE_VIRTIO_MMIO_BASE_GPA, PANE_VIRTIO_MMIO_SIZE_BYTES, VIRTIO_BLK_F_BLK_SIZE,
         VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_RO, VIRTIO_BLK_STATUS_IOERR, VIRTIO_BLK_STATUS_OK,
-        VIRTIO_DEVICE_ID_BLOCK, VIRTIO_F_VERSION_1, VIRTIO_MMIO_INTERRUPT_ACK_OFFSET,
-        VIRTIO_MMIO_MAGIC_VALUE, VIRTIO_MMIO_VERSION_MODERN,
+        VIRTIO_DEVICE_ID_BLOCK, VIRTIO_F_VERSION_1, VIRTIO_MMIO_CONFIG_OFFSET,
+        VIRTIO_MMIO_INTERRUPT_ACK_OFFSET, VIRTIO_MMIO_MAGIC_VALUE, VIRTIO_MMIO_VERSION_MODERN,
     };
 
     struct TestGuestMemory {
@@ -1512,6 +1548,79 @@ mod tests {
             pane_virtio_mmio_offset(PANE_VIRTIO_MMIO_BASE_GPA + 0x034),
             Some(0x034)
         );
+    }
+
+    #[test]
+    fn virtio_mmio_access_service_reads_config_with_guest_widths() {
+        let mut device = PaneVirtioMmioBlockDevice::new(1024 * 1024, true);
+        let mut memory = TestGuestMemory::new(0x5000);
+
+        let capacity = service_virtio_mmio_access(
+            &mut device,
+            &mut memory,
+            PaneVirtioMmioAccess {
+                kind: PaneVirtioMmioAccessKind::Read,
+                gpa: PANE_VIRTIO_MMIO_BASE_GPA + VIRTIO_MMIO_CONFIG_OFFSET,
+                data: vec![0; 8],
+            },
+            |_request, _payload| unreachable!("config reads must not execute queues"),
+        );
+
+        assert!(capacity.accepted);
+        assert_eq!(capacity.status, "config-read");
+        assert_eq!(capacity.offset, Some(VIRTIO_MMIO_CONFIG_OFFSET));
+        assert_eq!(capacity.read_data, 2048_u64.to_le_bytes());
+
+        let block_size_low = service_virtio_mmio_access(
+            &mut device,
+            &mut memory,
+            PaneVirtioMmioAccess {
+                kind: PaneVirtioMmioAccessKind::Read,
+                gpa: PANE_VIRTIO_MMIO_BASE_GPA + VIRTIO_MMIO_CONFIG_OFFSET + 0x14,
+                data: vec![0; 2],
+            },
+            |_request, _payload| unreachable!("config reads must not execute queues"),
+        );
+
+        assert!(block_size_low.accepted);
+        assert_eq!(block_size_low.status, "config-read");
+        assert_eq!(block_size_low.read_data, 512_u16.to_le_bytes());
+
+        let block_size_high_byte = service_virtio_mmio_access(
+            &mut device,
+            &mut memory,
+            PaneVirtioMmioAccess {
+                kind: PaneVirtioMmioAccessKind::Read,
+                gpa: PANE_VIRTIO_MMIO_BASE_GPA + VIRTIO_MMIO_CONFIG_OFFSET + 0x15,
+                data: vec![0; 1],
+            },
+            |_request, _payload| unreachable!("config reads must not execute queues"),
+        );
+
+        assert!(block_size_high_byte.accepted);
+        assert_eq!(block_size_high_byte.status, "config-read");
+        assert_eq!(block_size_high_byte.read_data, vec![0x02]);
+    }
+
+    #[test]
+    fn virtio_mmio_access_service_rejects_narrow_control_register_reads() {
+        let mut device = PaneVirtioMmioBlockDevice::new(1024 * 1024, true);
+        let mut memory = TestGuestMemory::new(0x5000);
+
+        let outcome = service_virtio_mmio_access(
+            &mut device,
+            &mut memory,
+            PaneVirtioMmioAccess {
+                kind: PaneVirtioMmioAccessKind::Read,
+                gpa: PANE_VIRTIO_MMIO_BASE_GPA,
+                data: vec![0; 1],
+            },
+            |_request, _payload| unreachable!("invalid widths must not execute queues"),
+        );
+
+        assert!(!outcome.accepted);
+        assert_eq!(outcome.status, "unsupported-width");
+        assert_eq!(outcome.offset, Some(0));
     }
 
     #[test]

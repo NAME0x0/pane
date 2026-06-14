@@ -6221,6 +6221,18 @@ mod windows_whp {
             .map(PathBuf::from)
     }
 
+    fn report_has_ok_call(report: &NativePartitionSmokeReport, name: &str) -> bool {
+        report.calls.iter().any(|call| call.name == name && call.ok)
+    }
+
+    fn report_ok_call_count(report: &NativePartitionSmokeReport, name: &str) -> usize {
+        report
+            .calls
+            .iter()
+            .filter(|call| call.name == name && call.ok)
+            .count()
+    }
+
     fn write_linux_entry_probe_checkpoint(
         path: &Path,
         report: &NativePartitionSmokeReport,
@@ -6253,11 +6265,15 @@ mod windows_whp {
             "serial_markers_observed": report.serial_markers_observed,
             "serial_expected_markers": &report.serial_expected_markers,
             "timeslice_cancel_count": report.calls.iter().filter(|call| matches!(call.name, "LinuxEntryProbeTimeslice" | "LinuxEntryProbeTimesliceBoundary")).count(),
-            "timer_interrupt_requested": report.calls.iter().any(|call| call.name == "LinuxEntryProbeTimerInterruptRequested" && call.ok),
-            "timer_interrupt_acknowledged": report.calls.iter().any(|call| call.name == "LinuxEntryProbeTimerInterruptAcknowledgement" && call.ok),
-            "root_mount_timer_requested": report.calls.iter().any(|call| call.name == "LinuxEntryProbeRootMountTimerPrimed" && call.ok),
-            "root_mount_timer_request_count": report.calls.iter().filter(|call| call.name == "LinuxEntryProbeRootMountTimerPrimed" && call.ok).count(),
-            "root_mount_timer_acknowledged": report.calls.iter().any(|call| call.name == "LinuxEntryProbeRootMountTimerAcknowledgement" && call.ok),
+            "timer_interrupt_requested": report_has_ok_call(report, "LinuxEntryProbeTimerInterruptRequested"),
+            "timer_interrupt_acknowledged": report_has_ok_call(report, "LinuxEntryProbeTimerInterruptAcknowledgement"),
+            "root_mount_timer_requested": report_has_ok_call(report, "LinuxEntryProbeRootMountTimerPrimed"),
+            "root_mount_timer_request_count": report_ok_call_count(report, "LinuxEntryProbeRootMountTimerPrimed"),
+            "root_mount_timer_acknowledged": report_has_ok_call(report, "LinuxEntryProbeRootMountTimerAcknowledgement"),
+            "virtio_mmio_interrupt_requested": report_has_ok_call(report, "VirtioMmioInterruptRequested"),
+            "virtio_mmio_interrupt_request_count": report_ok_call_count(report, "VirtioMmioInterruptRequested"),
+            "virtio_mmio_interrupt_acknowledged": report_has_ok_call(report, "VirtioMmioInterruptAcknowledged"),
+            "virtio_mmio_interrupt_acknowledgement_count": report_ok_call_count(report, "VirtioMmioInterruptAcknowledged"),
             "exit_reason_label": &report.exit_reason_label,
             "serial_text_bytes": serial_text.len(),
             "serial_text_tail": &serial_text[serial_tail_start..],

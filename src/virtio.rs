@@ -495,6 +495,22 @@ impl PaneVirtioMmioBlockDevice {
         M: PaneGuestMemory,
         F: FnMut(&PaneVirtioBlkRequest, Option<&[u8]>) -> Result<Vec<u8>, String>,
     {
+        if request.request_type == PaneVirtioBlkRequestType::Out && self.config.readonly {
+            let _ = memory.write(request.status_addr, &[VIRTIO_BLK_STATUS_IOERR]);
+            let _ = write_used_entry(memory, &self.queue, head_index, 1);
+            self.queue.next_avail_index = self.queue.next_avail_index.wrapping_add(1);
+            self.queue.used_index = self.queue.used_index.wrapping_add(1);
+            self.interrupt_status |= 1;
+            return PaneVirtioBlkExecution {
+                request: Some(request),
+                status: VIRTIO_BLK_STATUS_IOERR,
+                bytes_transferred: 0,
+                used_head_index: head_index,
+                used_len: 1,
+                detail: "virtio-blk write denied on read-only device".to_string(),
+            };
+        }
+
         let write_payload = match request.request_type {
             PaneVirtioBlkRequestType::Out => match read_request_payload(memory, &request) {
                 Ok(payload) => Some(payload),
@@ -518,9 +534,6 @@ impl PaneVirtioMmioBlockDevice {
         };
 
         let service_result = match request.request_type {
-            PaneVirtioBlkRequestType::Out if self.config.readonly => {
-                Err("virtio-blk write denied on read-only device".to_string())
-            }
             PaneVirtioBlkRequestType::In | PaneVirtioBlkRequestType::Out => {
                 service(&request, write_payload.as_deref())
             }
@@ -1922,6 +1935,36 @@ mod tests {
         assert_eq!(memory.read_bytes(0x4300, 1), vec![VIRTIO_BLK_STATUS_IOERR]);
         assert_eq!(memory.read_bytes(0x3008, 4), 1_u32.to_le_bytes());
         assert_eq!(device.interrupt_status, 1);
+    }
+
+    #[test]
+    fn virtio_blk_readonly_write_does_not_read_guest_payload() {
+        let mut device = PaneVirtioMmioBlockDevice::new(8 * 1024 * 1024, true);
+        configure_queue(&mut device);
+        let mut memory = TestGuestMemory::new(0x5000);
+
+        memory.write_u32(0x4000, 1);
+        memory.write_u32(0x4004, 0);
+        memory.write_u64(0x4008, 7);
+        write_descriptor(&mut memory, 0, 0x4000, 16, 1, 1);
+        write_descriptor(&mut memory, 1, 0xffff_0000, 512, 1, 2);
+        write_descriptor(&mut memory, 2, 0x4300, 1, 2, 0);
+        publish_head(&mut memory, 0);
+
+        let execution =
+            device.execute_available_block_request(&mut memory, |_request, _payload| {
+                unreachable!("read-only virtio-blk writes must not reach the backend")
+            });
+
+        assert_eq!(execution.status, VIRTIO_BLK_STATUS_IOERR);
+        assert_eq!(
+            execution.detail,
+            "virtio-blk write denied on read-only device"
+        );
+        assert_eq!(memory.read_bytes(0x4300, 1), vec![VIRTIO_BLK_STATUS_IOERR]);
+        assert_eq!(memory.read_bytes(0x3002, 2), 1_u16.to_le_bytes());
+        assert_eq!(device.queue.next_avail_index, 1);
+        assert_eq!(device.queue.used_index, 1);
     }
 
     #[test]

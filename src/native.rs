@@ -326,6 +326,9 @@ fn service_virtio_block_request_with_native_handler(
                             .checked_add(u64::from(descriptor.len))
                             .ok_or_else(|| "virtio read request length overflowed".to_string())
                     })?;
+            if requested_bytes == 0 {
+                return Ok(Vec::new());
+            }
             let start_byte = request
                 .sector
                 .checked_mul(crate::virtio::VIRTIO_BLK_SECTOR_SIZE_BYTES)
@@ -9137,6 +9140,30 @@ mod windows_whp {
             assert_eq!(bytes.len(), 1536);
             assert!(bytes[..512].iter().all(|byte| *byte == 0));
             assert!(bytes[512..].iter().all(|byte| *byte == 1));
+        }
+
+        #[test]
+        fn virtio_block_zero_length_read_does_not_touch_native_storage() {
+            let request = crate::virtio::PaneVirtioBlkRequest {
+                request_type: crate::virtio::PaneVirtioBlkRequestType::In,
+                sector: 7,
+                data_descriptors: vec![crate::virtio::PaneVirtioDescriptor {
+                    addr: 0x4100,
+                    len: 0,
+                    flags: 2,
+                    next: 0,
+                }],
+                status_addr: 0x4300,
+                status_len: 1,
+            };
+            let handler = |_command: &NativeBlockIoCommand, _payload: Option<&[u8]>| {
+                panic!("zero-length virtio reads must not reach native storage")
+            };
+
+            let bytes =
+                service_virtio_block_request_with_native_handler(&request, Some(&handler)).unwrap();
+
+            assert!(bytes.is_empty());
         }
 
         #[test]

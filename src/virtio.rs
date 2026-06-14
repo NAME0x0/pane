@@ -297,13 +297,19 @@ where
                     let executions = device.execute_available_block_requests(memory, &mut service);
                     let execution = executions.last().cloned();
                     let queue_execution_count = executions.len();
-                    let accepted = queue_execution_count > 0
-                        && executions
-                            .iter()
-                            .all(|execution| execution.status == VIRTIO_BLK_STATUS_OK);
+                    let status = if queue_execution_count == 0 {
+                        "queue-notify-empty"
+                    } else if executions
+                        .iter()
+                        .all(|execution| execution.status == VIRTIO_BLK_STATUS_OK)
+                    {
+                        "queue-notify-executed"
+                    } else {
+                        "queue-notify-completed-with-guest-error"
+                    };
                     PaneVirtioMmioAccessOutcome {
-                        accepted,
-                        status: "queue-notify-executed",
+                        accepted: true,
+                        status,
                         offset: Some(offset),
                         read_data: Vec::new(),
                         write_result: Some(write_result),
@@ -499,6 +505,9 @@ impl PaneVirtioMmioBlockDevice {
         };
 
         let service_result = match request.request_type {
+            PaneVirtioBlkRequestType::Out if self.config.readonly => {
+                Err("virtio-blk write denied on read-only device".to_string())
+            }
             PaneVirtioBlkRequestType::In | PaneVirtioBlkRequestType::Out => {
                 service(&request, write_payload.as_deref())
             }
@@ -511,18 +520,18 @@ impl PaneVirtioMmioBlockDevice {
 
         match service_result {
             Ok(bytes) => {
-                let status = match request.request_type {
+                let (status, bytes_transferred) = match request.request_type {
                     PaneVirtioBlkRequestType::In | PaneVirtioBlkRequestType::GetId => {
                         write_read_response(memory, &request, &bytes)
                     }
                     PaneVirtioBlkRequestType::Out | PaneVirtioBlkRequestType::Flush => {
-                        VIRTIO_BLK_STATUS_OK
+                        (VIRTIO_BLK_STATUS_OK, 0)
                     }
-                    PaneVirtioBlkRequestType::Unsupported(_) => VIRTIO_BLK_STATUS_UNSUPP,
+                    PaneVirtioBlkRequestType::Unsupported(_) => (VIRTIO_BLK_STATUS_UNSUPP, 0),
                 };
                 let _ = memory.write(request.status_addr, &[status]);
                 let used_len = if status == VIRTIO_BLK_STATUS_OK {
-                    bytes.len() as u32 + 1
+                    bytes_transferred + 1
                 } else {
                     1
                 };
@@ -533,7 +542,7 @@ impl PaneVirtioMmioBlockDevice {
                 PaneVirtioBlkExecution {
                     request: Some(request),
                     status,
-                    bytes_transferred: used_len.saturating_sub(1),
+                    bytes_transferred,
                     used_head_index: head_index,
                     used_len,
                     detail: if status == VIRTIO_BLK_STATUS_OK {
@@ -1096,11 +1105,11 @@ fn write_read_response<M: PaneGuestMemory>(
     memory: &mut M,
     request: &PaneVirtioBlkRequest,
     bytes: &[u8],
-) -> u8 {
+) -> (u8, u32) {
     let mut cursor = 0_usize;
     for descriptor in &request.data_descriptors {
         if !descriptor.writable() {
-            return VIRTIO_BLK_STATUS_IOERR;
+            return (VIRTIO_BLK_STATUS_IOERR, cursor as u32);
         }
         let len = descriptor.len as usize;
         let available = bytes.len().saturating_sub(cursor);
@@ -1108,11 +1117,11 @@ fn write_read_response<M: PaneGuestMemory>(
         let mut buffer = vec![0_u8; len];
         buffer[..transfer].copy_from_slice(&bytes[cursor..cursor + transfer]);
         if memory.write(descriptor.addr, &buffer).is_err() {
-            return VIRTIO_BLK_STATUS_IOERR;
+            return (VIRTIO_BLK_STATUS_IOERR, cursor as u32);
         }
         cursor += transfer;
     }
-    VIRTIO_BLK_STATUS_OK
+    (VIRTIO_BLK_STATUS_OK, cursor as u32)
 }
 
 fn write_used_entry<M: PaneGuestMemory>(
@@ -1542,6 +1551,62 @@ mod tests {
     }
 
     #[test]
+    fn virtio_mmio_queue_notify_without_new_descriptors_is_accepted() {
+        let mut device = PaneVirtioMmioBlockDevice::new(8 * 1024 * 1024, true);
+        let mut memory = TestGuestMemory::new(0x5000);
+        configure_queue(&mut device);
+
+        let outcome = service_virtio_mmio_access(
+            &mut device,
+            &mut memory,
+            PaneVirtioMmioAccess {
+                kind: PaneVirtioMmioAccessKind::Write,
+                gpa: PANE_VIRTIO_MMIO_BASE_GPA + 0x050,
+                data: 0_u32.to_le_bytes().to_vec(),
+            },
+            |_request, _payload| unreachable!("empty notify must not invoke storage service"),
+        );
+
+        assert!(outcome.accepted);
+        assert_eq!(outcome.status, "queue-notify-empty");
+        assert_eq!(outcome.queue_execution_count, 0);
+        assert_eq!(device.interrupt_status, 0);
+    }
+
+    #[test]
+    fn virtio_mmio_queue_notify_with_guest_error_still_completes_mmio() {
+        let mut device = PaneVirtioMmioBlockDevice::new(8 * 1024 * 1024, true);
+        let mut memory = TestGuestMemory::new(0x5000);
+        configure_queue(&mut device);
+
+        memory.write_u32(0x4000, 0);
+        memory.write_u32(0x4004, 0);
+        memory.write_u64(0x4008, 11);
+        write_descriptor(&mut memory, 0, 0x4000, 16, 1, 1);
+        write_descriptor(&mut memory, 1, 0x4100, 512, 3, 2);
+        write_descriptor(&mut memory, 2, 0x4300, 1, 2, 0);
+        publish_head(&mut memory, 0);
+
+        let outcome = service_virtio_mmio_access(
+            &mut device,
+            &mut memory,
+            PaneVirtioMmioAccess {
+                kind: PaneVirtioMmioAccessKind::Write,
+                gpa: PANE_VIRTIO_MMIO_BASE_GPA + 0x050,
+                data: 0_u32.to_le_bytes().to_vec(),
+            },
+            |_request, _payload| Err("backend read failed".to_string()),
+        );
+
+        assert!(outcome.accepted);
+        assert_eq!(outcome.status, "queue-notify-completed-with-guest-error");
+        assert_eq!(outcome.queue_execution_count, 1);
+        assert_eq!(memory.read_bytes(0x4300, 1), vec![VIRTIO_BLK_STATUS_IOERR]);
+        assert_eq!(memory.read_bytes(0x3002, 2), 1_u16.to_le_bytes());
+        assert_eq!(device.interrupt_status, 1);
+    }
+
+    #[test]
     fn virtio_mmio_block_device_rejects_invalid_queue_size() {
         let mut device = PaneVirtioMmioBlockDevice::new(1024 * 1024, true);
 
@@ -1581,6 +1646,30 @@ mod tests {
         assert_eq!(memory.read_bytes(0x3004, 4), 0_u32.to_le_bytes());
         assert_eq!(memory.read_bytes(0x3008, 4), 513_u32.to_le_bytes());
         assert_eq!(device.interrupt_status, 1);
+    }
+
+    #[test]
+    fn virtio_blk_used_length_reports_guest_transferred_bytes() {
+        let mut device = PaneVirtioMmioBlockDevice::new(8 * 1024 * 1024, true);
+        configure_queue(&mut device);
+        let mut memory = TestGuestMemory::new(0x5000);
+
+        memory.write_u32(0x4000, 0);
+        memory.write_u32(0x4004, 0);
+        memory.write_u64(0x4008, 4);
+        write_descriptor(&mut memory, 0, 0x4000, 16, 1, 1);
+        write_descriptor(&mut memory, 1, 0x4100, 128, 3, 2);
+        write_descriptor(&mut memory, 2, 0x4300, 1, 2, 0);
+        publish_head(&mut memory, 0);
+
+        let execution = device
+            .execute_available_block_request(&mut memory, |_request, _payload| Ok(vec![0x7a; 512]));
+
+        assert_eq!(execution.status, VIRTIO_BLK_STATUS_OK);
+        assert_eq!(execution.bytes_transferred, 128);
+        assert_eq!(execution.used_len, 129);
+        assert_eq!(memory.read_bytes(0x4100, 4), vec![0x7a; 4]);
+        assert_eq!(memory.read_bytes(0x3008, 4), 129_u32.to_le_bytes());
     }
 
     #[test]
@@ -1661,6 +1750,33 @@ mod tests {
         assert_eq!(execution.status, VIRTIO_BLK_STATUS_OK);
         assert_eq!(execution.bytes_transferred, 0);
         assert_eq!(memory.read_bytes(0x4300, 1), vec![VIRTIO_BLK_STATUS_OK]);
+        assert_eq!(memory.read_bytes(0x3008, 4), 1_u32.to_le_bytes());
+        assert_eq!(device.interrupt_status, 1);
+    }
+
+    #[test]
+    fn virtio_blk_denies_writes_on_readonly_device_without_backend_call() {
+        let mut device = PaneVirtioMmioBlockDevice::new(8 * 1024 * 1024, true);
+        configure_queue(&mut device);
+        let mut memory = TestGuestMemory::new(0x5000);
+
+        memory.write_u32(0x4000, 1);
+        memory.write_u32(0x4004, 0);
+        memory.write_u64(0x4008, 7);
+        memory.write(0x4100, &[0x33; 512]).unwrap();
+        write_descriptor(&mut memory, 0, 0x4000, 16, 1, 1);
+        write_descriptor(&mut memory, 1, 0x4100, 512, 1, 2);
+        write_descriptor(&mut memory, 2, 0x4300, 1, 2, 0);
+        publish_head(&mut memory, 0);
+
+        let execution =
+            device.execute_available_block_request(&mut memory, |_request, _payload| {
+                unreachable!("read-only virtio-blk writes must not reach the backend")
+            });
+
+        assert_eq!(execution.status, VIRTIO_BLK_STATUS_IOERR);
+        assert_eq!(execution.bytes_transferred, 0);
+        assert_eq!(memory.read_bytes(0x4300, 1), vec![VIRTIO_BLK_STATUS_IOERR]);
         assert_eq!(memory.read_bytes(0x3008, 4), 1_u32.to_le_bytes());
         assert_eq!(device.interrupt_status, 1);
     }

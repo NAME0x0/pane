@@ -727,6 +727,9 @@ impl PaneVirtioMmioBlockDevice {
                 if !self.selected_queue_exists() {
                     return PaneVirtioMmioWriteResult::Rejected("unsupported virtqueue index");
                 }
+                if !self.selected_queue_configuration_mutable() {
+                    return PaneVirtioMmioWriteResult::Rejected("virtqueue is ready");
+                }
                 if value == 0 || value > u32::from(self.queue.max_size) || !value.is_power_of_two()
                 {
                     PaneVirtioMmioWriteResult::Rejected("invalid virtqueue size")
@@ -766,12 +769,18 @@ impl PaneVirtioMmioBlockDevice {
                 if !self.selected_queue_exists() {
                     return PaneVirtioMmioWriteResult::Rejected("unsupported virtqueue index");
                 }
+                if !self.selected_queue_configuration_mutable() {
+                    return PaneVirtioMmioWriteResult::Rejected("virtqueue is ready");
+                }
                 self.queue.desc_table_gpa = combine_addr_low(self.queue.desc_table_gpa, value);
                 PaneVirtioMmioWriteResult::Accepted
             }
             VIRTIO_MMIO_QUEUE_DESC_HIGH_OFFSET => {
                 if !self.selected_queue_exists() {
                     return PaneVirtioMmioWriteResult::Rejected("unsupported virtqueue index");
+                }
+                if !self.selected_queue_configuration_mutable() {
+                    return PaneVirtioMmioWriteResult::Rejected("virtqueue is ready");
                 }
                 self.queue.desc_table_gpa = combine_addr_high(self.queue.desc_table_gpa, value);
                 PaneVirtioMmioWriteResult::Accepted
@@ -780,12 +789,18 @@ impl PaneVirtioMmioBlockDevice {
                 if !self.selected_queue_exists() {
                     return PaneVirtioMmioWriteResult::Rejected("unsupported virtqueue index");
                 }
+                if !self.selected_queue_configuration_mutable() {
+                    return PaneVirtioMmioWriteResult::Rejected("virtqueue is ready");
+                }
                 self.queue.avail_ring_gpa = combine_addr_low(self.queue.avail_ring_gpa, value);
                 PaneVirtioMmioWriteResult::Accepted
             }
             VIRTIO_MMIO_QUEUE_AVAIL_HIGH_OFFSET => {
                 if !self.selected_queue_exists() {
                     return PaneVirtioMmioWriteResult::Rejected("unsupported virtqueue index");
+                }
+                if !self.selected_queue_configuration_mutable() {
+                    return PaneVirtioMmioWriteResult::Rejected("virtqueue is ready");
                 }
                 self.queue.avail_ring_gpa = combine_addr_high(self.queue.avail_ring_gpa, value);
                 PaneVirtioMmioWriteResult::Accepted
@@ -794,12 +809,18 @@ impl PaneVirtioMmioBlockDevice {
                 if !self.selected_queue_exists() {
                     return PaneVirtioMmioWriteResult::Rejected("unsupported virtqueue index");
                 }
+                if !self.selected_queue_configuration_mutable() {
+                    return PaneVirtioMmioWriteResult::Rejected("virtqueue is ready");
+                }
                 self.queue.used_ring_gpa = combine_addr_low(self.queue.used_ring_gpa, value);
                 PaneVirtioMmioWriteResult::Accepted
             }
             VIRTIO_MMIO_QUEUE_USED_HIGH_OFFSET => {
                 if !self.selected_queue_exists() {
                     return PaneVirtioMmioWriteResult::Rejected("unsupported virtqueue index");
+                }
+                if !self.selected_queue_configuration_mutable() {
+                    return PaneVirtioMmioWriteResult::Rejected("virtqueue is ready");
                 }
                 self.queue.used_ring_gpa = combine_addr_high(self.queue.used_ring_gpa, value);
                 PaneVirtioMmioWriteResult::Accepted
@@ -874,6 +895,10 @@ impl PaneVirtioMmioBlockDevice {
 
     fn selected_queue_ready(&self) -> bool {
         self.selected_queue_exists() && self.queue.ready
+    }
+
+    fn selected_queue_configuration_mutable(&self) -> bool {
+        self.selected_queue_exists() && !self.queue.ready
     }
 
     fn selected_queue_desc_table_gpa(&self) -> u64 {
@@ -1727,6 +1752,48 @@ mod tests {
             device.write_u32(0x044, 2),
             PaneVirtioMmioWriteResult::Rejected("invalid queue ready value")
         );
+    }
+
+    #[test]
+    fn virtio_mmio_block_device_rejects_queue_reconfiguration_while_ready() {
+        let mut device = PaneVirtioMmioBlockDevice::new(8 * 1024 * 1024, false);
+        configure_queue(&mut device);
+
+        assert_eq!(
+            device.write_u32(0x038, 16),
+            PaneVirtioMmioWriteResult::Rejected("virtqueue is ready")
+        );
+        assert_eq!(
+            device.write_u32(0x080, 0x5000),
+            PaneVirtioMmioWriteResult::Rejected("virtqueue is ready")
+        );
+        assert_eq!(
+            device.write_u32(0x090, 0x6000),
+            PaneVirtioMmioWriteResult::Rejected("virtqueue is ready")
+        );
+        assert_eq!(
+            device.write_u32(0x0a0, 0x7000),
+            PaneVirtioMmioWriteResult::Rejected("virtqueue is ready")
+        );
+        assert_eq!(device.read_u32(0x038), Some(8));
+        assert_eq!(device.read_u32(0x080), Some(0x1000));
+        assert_eq!(device.read_u32(0x090), Some(0x2000));
+        assert_eq!(device.read_u32(0x0a0), Some(0x3000));
+
+        assert_eq!(
+            device.write_u32(0x044, 0),
+            PaneVirtioMmioWriteResult::Accepted
+        );
+        assert_eq!(
+            device.write_u32(0x038, 16),
+            PaneVirtioMmioWriteResult::Accepted
+        );
+        assert_eq!(
+            device.write_u32(0x080, 0x5000),
+            PaneVirtioMmioWriteResult::Accepted
+        );
+        assert_eq!(device.read_u32(0x038), Some(16));
+        assert_eq!(device.read_u32(0x080), Some(0x5000));
     }
 
     #[test]

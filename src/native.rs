@@ -1,4 +1,9 @@
 use serde::Serialize;
+use std::path::Path;
+
+#[cfg(windows)]
+#[path = "native/whp_bindings.rs"]
+mod whp_bindings;
 
 const REQUIRED_WHP_EXPORTS: &[&str] = &[
     "WHvGetCapability",
@@ -1106,6 +1111,7 @@ pub(crate) fn run_partition_smoke(
     boot_image: Option<&NativeSerialBootImage>,
     host: &NativeHostPreflightReport,
     block_io_handler: Option<&NativeBlockIoHandler<'_>>,
+    trace_checkpoint: Option<&Path>,
 ) -> NativePartitionSmokeReport {
     if !execute {
         return planned_partition_smoke_report(run_fixture);
@@ -1129,7 +1135,7 @@ pub(crate) fn run_partition_smoke(
         );
     }
 
-    run_whp_partition_smoke(run_fixture, boot_image, block_io_handler)
+    run_whp_partition_smoke(run_fixture, boot_image, block_io_handler, trace_checkpoint)
 }
 
 fn supported_host_arch(arch: &str) -> bool {
@@ -1526,6 +1532,7 @@ fn run_whp_partition_smoke(
     run_fixture: bool,
     boot_image: Option<&NativeSerialBootImage>,
     _block_io_handler: Option<&NativeBlockIoHandler<'_>>,
+    _trace_checkpoint: Option<&Path>,
 ) -> NativePartitionSmokeReport {
     skipped_partition_smoke_report(
         true,
@@ -1545,8 +1552,9 @@ fn run_whp_partition_smoke(
     run_fixture: bool,
     boot_image: Option<&NativeSerialBootImage>,
     block_io_handler: Option<&NativeBlockIoHandler<'_>>,
+    trace_checkpoint: Option<&Path>,
 ) -> NativePartitionSmokeReport {
-    windows_whp::run_partition_smoke(run_fixture, boot_image, block_io_handler)
+    windows_whp::run_partition_smoke(run_fixture, boot_image, block_io_handler, trace_checkpoint)
 }
 
 #[cfg(test)]
@@ -1571,12 +1579,24 @@ mod windows_whp {
     use std::{
         alloc::{alloc_zeroed, dealloc, Layout},
         collections::{BTreeSet, HashMap, VecDeque},
-        ffi::{c_char, c_void, CString},
+        ffi::{c_void, CString},
         fs, mem,
-        path::{Path, PathBuf},
+        path::Path,
         time::{Duration, Instant},
     };
 
+    use super::whp_bindings::{
+        free_library as FreeLibrary, get_proc_address as GetProcAddress,
+        load_library as LoadLibraryA, WHV_CAPABILITY_CODE_HYPERVISOR_PRESENT,
+        WHV_MAP_GPA_RANGE_FLAG_EXECUTE, WHV_MAP_GPA_RANGE_FLAG_READ, WHV_MAP_GPA_RANGE_FLAG_WRITE,
+        WHV_PARTITION_PROPERTY_CODE_LOCAL_APIC_EMULATION_MODE,
+        WHV_PARTITION_PROPERTY_CODE_PROCESSOR_COUNT, WHV_RUN_VP_EXIT_REASON_CANCELED,
+        WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE, WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS,
+        WHV_RUN_VP_EXIT_REASON_UNRECOVERABLE_EXCEPTION, WHV_RUN_VP_EXIT_REASON_X64_APIC_EOI,
+        WHV_RUN_VP_EXIT_REASON_X64_CPUID, WHV_RUN_VP_EXIT_REASON_X64_HALT,
+        WHV_RUN_VP_EXIT_REASON_X64_INTERRUPT_WINDOW, WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS,
+        WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS, WHV_X64_LOCAL_APIC_EMULATION_MODE_XAPIC,
+    };
     use super::{
         base_emulator_export_checks, base_export_checks, NativeBlockIoHandler,
         NativeBlockIoTraceEntry, NativeBlockIoTraceReport, NativeExportCheck,
@@ -1595,23 +1615,6 @@ mod windows_whp {
         PANE_BLOCK_IO_STATUS_SERVICED,
     };
 
-    const WHV_CAPABILITY_CODE_HYPERVISOR_PRESENT: u32 = 0;
-    const WHV_PARTITION_PROPERTY_CODE_PROCESSOR_COUNT: u32 = 0x0000_1fff;
-    const WHV_PARTITION_PROPERTY_CODE_LOCAL_APIC_EMULATION_MODE: u32 = 0x0000_1005;
-    const WHV_X64_LOCAL_APIC_EMULATION_MODE_XAPIC: u32 = 1;
-    const WHV_MAP_GPA_RANGE_FLAG_READ: u32 = 0x0000_0001;
-    const WHV_MAP_GPA_RANGE_FLAG_WRITE: u32 = 0x0000_0002;
-    const WHV_MAP_GPA_RANGE_FLAG_EXECUTE: u32 = 0x0000_0004;
-    const WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS: u32 = 0x0000_0001;
-    const WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS: u32 = 0x0000_0002;
-    const WHV_RUN_VP_EXIT_REASON_UNRECOVERABLE_EXCEPTION: u32 = 0x0000_0004;
-    const WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE: u32 = 0x0000_0005;
-    const WHV_RUN_VP_EXIT_REASON_X64_INTERRUPT_WINDOW: u32 = 0x0000_0007;
-    const WHV_RUN_VP_EXIT_REASON_X64_HALT: u32 = 0x0000_0008;
-    const WHV_RUN_VP_EXIT_REASON_X64_APIC_EOI: u32 = 0x0000_0009;
-    const WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS: u32 = 0x0000_1000;
-    const WHV_RUN_VP_EXIT_REASON_X64_CPUID: u32 = 0x0000_1001;
-    const WHV_RUN_VP_EXIT_REASON_CANCELED: u32 = 0x0000_2001;
     const GUEST_PAGE_SIZE: usize = SERIAL_BOOT_TEST_IMAGE_SIZE;
     const LINUX_ENTRY_PROBE_EXIT_BUDGET: usize = 131072;
     const LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET: usize = 256;
@@ -1959,13 +1962,6 @@ mod windows_whp {
         irq0_unmasked: bool,
         ready: bool,
         blocker: &'static str,
-    }
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn LoadLibraryA(lp_lib_file_name: *const c_char) -> *mut c_void;
-        fn GetProcAddress(h_module: *mut c_void, lp_proc_name: *const c_char) -> *mut c_void;
-        fn FreeLibrary(h_lib_module: *mut c_void) -> i32;
     }
 
     pub(super) fn probe_whp() -> WhpPreflightReport {
@@ -2589,6 +2585,7 @@ mod windows_whp {
         run_fixture: bool,
         boot_image: Option<&NativeSerialBootImage>,
         block_io_handler: Option<&NativeBlockIoHandler<'_>>,
+        trace_checkpoint: Option<&Path>,
     ) -> NativePartitionSmokeReport {
         let mut report = NativePartitionSmokeReport {
             product_shape:
@@ -3034,6 +3031,7 @@ mod windows_whp {
                             set_virtual_processor_registers,
                             boot_image,
                             block_io_handler,
+                            trace_checkpoint,
                             &mut guest_regions,
                             &mut report,
                         );
@@ -3230,6 +3228,16 @@ mod windows_whp {
             .iter_mut()
             .find(|region| region.label == "pane-block-dma")
             .map(|region| region._memory.as_mut_slice())
+    }
+
+    fn pane_block_dma_guest_enabled(serial_text: Option<&str>) -> bool {
+        serial_text.is_some_and(|text| {
+            (text.contains("PANE_BLOCK_SHARED_BUFFER_OK")
+                || text.contains("PANE_BLOCK_DMA_ENABLED_FOR_SHARED_BUFFER"))
+                && !text.contains("PANE_BLOCK_DMA_DISABLED_FOR_PORT_STREAM")
+                && !text.contains("PANE_BLOCK_DMA_CONTRACT_INVALID")
+                && !text.contains("PANE_BLOCK_SHARED_BUFFER_UNAVAILABLE")
+        })
     }
 
     fn prove_mapped_guest_memory_view(
@@ -3775,6 +3783,7 @@ mod windows_whp {
         set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
         boot_image: &NativeSerialBootImage,
         block_io_handler: Option<&NativeBlockIoHandler<'_>>,
+        trace_checkpoint: Option<&Path>,
         mapped_regions: &mut [MappedGuestRegion],
         report: &mut NativePartitionSmokeReport,
     ) {
@@ -3798,6 +3807,7 @@ mod windows_whp {
                 request_interrupt,
                 set_virtual_processor_registers,
                 block_io_handler,
+                trace_checkpoint,
                 mapped_regions,
                 report,
             ),
@@ -3961,6 +3971,7 @@ mod windows_whp {
         request_interrupt: Option<WhvRequestInterrupt>,
         set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
         block_io_handler: Option<&NativeBlockIoHandler<'_>>,
+        trace_checkpoint: Option<&Path>,
         mapped_regions: &mut [MappedGuestRegion],
         report: &mut NativePartitionSmokeReport,
     ) {
@@ -3968,7 +3979,7 @@ mod windows_whp {
         let max_guest_exits = linux_entry_probe_exit_budget(report);
         let total_budget_seconds = linux_entry_probe_total_budget_seconds(report);
         report.guest_exit_budget = max_guest_exits as u32;
-        let checkpoint_path = linux_entry_probe_checkpoint_path();
+        let checkpoint_path = trace_checkpoint.map(Path::to_path_buf);
         let Some(cancel_run_virtual_processor) = cancel_run_virtual_processor else {
             report.calls.push(NativeWhpCallReport {
                 name: "WHvCancelRunVirtualProcessor",
@@ -4033,8 +4044,10 @@ mod windows_whp {
             if let Some(submission) =
                 block_state.take_ready_pending_submission(report.serial_text.as_deref())
             {
-                let dma_ready = pane_block_dma_window(mapped_regions)
-                    .is_some_and(|window| window.len() >= PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize);
+                let dma_ready = pane_block_dma_guest_enabled(report.serial_text.as_deref())
+                    && pane_block_dma_window(mapped_regions).is_some_and(|window| {
+                        window.len() >= PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize
+                    });
                 let dma_write_payload = if dma_ready
                     && submission.command.operation == NativeBlockOperation::Write
                 {
@@ -4449,9 +4462,13 @@ mod windows_whp {
                             }
                             if let Some(submission) = submission {
                                 let dma_ready =
-                                    pane_block_dma_window(mapped_regions).is_some_and(|window| {
-                                        window.len() >= PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize
-                                    });
+                                    pane_block_dma_guest_enabled(report.serial_text.as_deref())
+                                        && pane_block_dma_window(mapped_regions).is_some_and(
+                                            |window| {
+                                                window.len()
+                                                    >= PANE_BLOCK_IO_BLOCK_SIZE_BYTES as usize
+                                            },
+                                        );
                                 let dma_write_payload = if dma_ready
                                     && submission.command.operation == NativeBlockOperation::Write
                                 {
@@ -5288,6 +5305,7 @@ mod windows_whp {
             legacy_io_state.timer_interrupt_unmasked(),
             report,
         );
+
         report.calls.push(NativeWhpCallReport {
             name: "LinuxEntryProbeRootMountTimerPrimed",
             hresult: None,
@@ -6227,12 +6245,6 @@ mod windows_whp {
         } else {
             LINUX_ENTRY_PROBE_TOTAL_BUDGET_SECONDS
         }
-    }
-
-    fn linux_entry_probe_checkpoint_path() -> Option<PathBuf> {
-        std::env::var_os("PANE_NATIVE_BOOT_TRACE_CHECKPOINT")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
     }
 
     fn report_has_ok_call(report: &NativePartitionSmokeReport, name: &str) -> bool {
@@ -8063,17 +8075,18 @@ mod windows_whp {
             linux_entry_probe_module_load_active, linux_entry_probe_passed,
             linux_entry_probe_root_mount_active, linux_entry_probe_total_budget_seconds,
             linux_protected_mode_registers, native_device_dispatch_decision,
-            parse_xapic_interrupt_controller_state, serial_contract_passed,
-            serial_markers_observed, timer_interrupt_readiness, timer_interrupt_readiness_blocker,
-            timer_interrupt_readiness_report_blocker, trace_native_device_dispatch,
-            whp_emulator_callbacks, whp_emulator_get_registers_callback,
-            whp_emulator_io_port_callback, whp_emulator_memory_callback,
-            whp_emulator_set_registers_callback, whp_emulator_translate_gva_page_callback,
-            whv_x64_interrupt_control, write_linux_entry_probe_checkpoint, xapic_state_vectors,
-            Com1SerialState, DecodedExit, GuestMemory, LegacyDeviceIoState, MappedGuestMemoryView,
-            MappedGuestRegion, NativeBlockIoTraceCollector, WhpEmulatorMmioCallbackContext,
-            WhvEmulatorCallbacks, WhvEmulatorIoAccessInfo, WhvEmulatorMemoryAccessInfo,
-            WhvRegisterValue, WhvTranslateGvaResult, ACPI_PM1_CONTROL_PORT, ACPI_PM1_ENABLE_PORT,
+            pane_block_dma_guest_enabled, parse_xapic_interrupt_controller_state,
+            serial_contract_passed, serial_markers_observed, timer_interrupt_readiness,
+            timer_interrupt_readiness_blocker, timer_interrupt_readiness_report_blocker,
+            trace_native_device_dispatch, whp_emulator_callbacks,
+            whp_emulator_get_registers_callback, whp_emulator_io_port_callback,
+            whp_emulator_memory_callback, whp_emulator_set_registers_callback,
+            whp_emulator_translate_gva_page_callback, whv_x64_interrupt_control,
+            write_linux_entry_probe_checkpoint, xapic_state_vectors, Com1SerialState, DecodedExit,
+            GuestMemory, LegacyDeviceIoState, MappedGuestMemoryView, MappedGuestRegion,
+            NativeBlockIoTraceCollector, WhpEmulatorMmioCallbackContext, WhvEmulatorCallbacks,
+            WhvEmulatorIoAccessInfo, WhvEmulatorMemoryAccessInfo, WhvRegisterValue,
+            WhvTranslateGvaResult, ACPI_PM1_CONTROL_PORT, ACPI_PM1_ENABLE_PORT,
             ACPI_PM1_STATUS_PORT, ACPI_PM_TIMER_PORT, ALT_DELAY_PORT, ALT_POST_DELAY_PORT,
             CMOS_ADDRESS_PORT, CMOS_DATA_PORT, CPUID_DEFAULT_RAX_OFFSET, CPUID_DEFAULT_RBX_OFFSET,
             CPUID_DEFAULT_RCX_OFFSET, CPUID_DEFAULT_RDX_OFFSET, CPUID_RAX_OFFSET, CPUID_RCX_OFFSET,
@@ -8118,7 +8131,7 @@ mod windows_whp {
             PANE_BLOCK_IO_STATUS_SUBMITTED, SERIAL_BOOT_BANNER_TEXT,
         };
         use crate::virtio::PaneGuestMemory;
-        use std::ffi::c_void;
+        use std::{ffi::c_void, mem};
 
         struct TestWhpCallbackState {
             get_count: u32,
@@ -9286,6 +9299,26 @@ mod windows_whp {
         }
 
         #[test]
+        fn pane_block_dma_requires_positive_guest_negotiation() {
+            assert!(!pane_block_dma_guest_enabled(None));
+            assert!(!pane_block_dma_guest_enabled(Some(
+                "PANE_BLOCK_MODULE_LOAD_OK\n"
+            )));
+            assert!(!pane_block_dma_guest_enabled(Some(
+                "PANE_BLOCK_SHARED_BUFFER_OK\nPANE_BLOCK_DMA_DISABLED_FOR_PORT_STREAM\n"
+            )));
+            assert!(!pane_block_dma_guest_enabled(Some(
+                "PANE_BLOCK_DMA_ENABLED_FOR_SHARED_BUFFER\nPANE_BLOCK_SHARED_BUFFER_UNAVAILABLE\n"
+            )));
+            assert!(pane_block_dma_guest_enabled(Some(
+                "PANE_BLOCK_DMA_ENABLED_FOR_SHARED_BUFFER\n"
+            )));
+            assert!(pane_block_dma_guest_enabled(Some(
+                "PANE_BLOCK_SHARED_BUFFER_OK gpa=234684416 bytes=4096\n"
+            )));
+        }
+
+        #[test]
         fn native_block_io_runner_only_resumes_after_serviced_exits() {
             assert!(native_block_io_exit_can_resume(
                 PANE_BLOCK_IO_STATUS_SERVICED
@@ -10036,6 +10069,61 @@ mod windows_whp {
         }
 
         #[test]
+        fn delayed_whp_compatibility_layouts_match_official_windows_bindings() {
+            use crate::native::whp_bindings::{
+                OfficialEmulatorCallbacks, OfficialEmulatorIoAccessInfo,
+                OfficialEmulatorMemoryAccessInfo, OfficialEmulatorStatus, OfficialInterruptControl,
+                OfficialMemoryAccessContext, OfficialRegisterValue, OfficialTranslateGvaResult,
+                OfficialVpExitContext, OfficialX64SegmentRegister, OfficialX64TableRegister,
+            };
+
+            assert_eq!(
+                mem::size_of::<super::WhvX64SegmentRegister>(),
+                mem::size_of::<OfficialX64SegmentRegister>()
+            );
+            assert_eq!(
+                mem::size_of::<super::WhvX64TableRegister>(),
+                mem::size_of::<OfficialX64TableRegister>()
+            );
+            assert_eq!(
+                mem::size_of::<WhvRegisterValue>(),
+                mem::size_of::<OfficialRegisterValue>()
+            );
+            assert_eq!(
+                mem::size_of::<super::WhvInterruptControl>(),
+                mem::size_of::<OfficialInterruptControl>()
+            );
+            assert_eq!(
+                mem::size_of::<WhvTranslateGvaResult>(),
+                mem::size_of::<OfficialTranslateGvaResult>()
+            );
+            assert_eq!(
+                mem::size_of::<WhvEmulatorMemoryAccessInfo>(),
+                mem::size_of::<OfficialEmulatorMemoryAccessInfo>()
+            );
+            assert_eq!(
+                mem::size_of::<WhvEmulatorIoAccessInfo>(),
+                mem::size_of::<OfficialEmulatorIoAccessInfo>()
+            );
+            assert_eq!(
+                mem::size_of::<super::WhvMemoryAccessContext>(),
+                mem::size_of::<OfficialMemoryAccessContext>()
+            );
+            assert_eq!(
+                mem::size_of::<super::WhvVpExitContext>(),
+                mem::size_of::<OfficialVpExitContext>()
+            );
+            assert_eq!(
+                mem::size_of::<super::WhvEmulatorStatus>(),
+                mem::size_of::<OfficialEmulatorStatus>()
+            );
+            assert_eq!(
+                mem::size_of::<WhvEmulatorCallbacks>(),
+                mem::size_of::<OfficialEmulatorCallbacks>()
+            );
+        }
+
+        #[test]
         fn xapic_interrupt_controller_state_parser_reads_isr_and_irr_vectors() {
             let mut state = vec![0_u8; XAPIC_STATE_BYTES];
             state[XAPIC_TPR_OFFSET..XAPIC_TPR_OFFSET + 4].copy_from_slice(&0x10_u32.to_le_bytes());
@@ -10535,7 +10623,7 @@ mod tests {
             whp_report(true, true, Some(true)),
         );
 
-        let report = run_partition_smoke(false, false, None, &host, None);
+        let report = run_partition_smoke(false, false, None, &host, None, None);
 
         assert_eq!(report.status, NativePartitionSmokeStatus::Planned);
         assert!(!report.attempted);
@@ -10552,7 +10640,7 @@ mod tests {
             whp_report(true, true, Some(true)),
         );
 
-        let report = run_partition_smoke(false, true, None, &host, None);
+        let report = run_partition_smoke(false, true, None, &host, None, None);
 
         assert_eq!(report.status, NativePartitionSmokeStatus::Planned);
         assert!(report.fixture_requested);
@@ -10569,7 +10657,7 @@ mod tests {
             whp_report(false, false, None),
         );
 
-        let report = run_partition_smoke(true, false, None, &host, None);
+        let report = run_partition_smoke(true, false, None, &host, None, None);
 
         assert_eq!(report.status, NativePartitionSmokeStatus::Skipped);
         assert!(!report.attempted);
@@ -10586,7 +10674,7 @@ mod tests {
             whp_report(false, false, None),
         );
 
-        let report = run_partition_smoke(true, true, None, &host, None);
+        let report = run_partition_smoke(true, true, None, &host, None, None);
 
         assert_eq!(report.status, NativePartitionSmokeStatus::Skipped);
         assert!(report.fixture_requested);
@@ -10627,7 +10715,7 @@ mod tests {
             extra_regions: Vec::new(),
         };
 
-        let report = run_partition_smoke(true, true, Some(&image), &host, None);
+        let report = run_partition_smoke(true, true, Some(&image), &host, None, None);
 
         assert_eq!(report.status, NativePartitionSmokeStatus::Skipped);
         assert_eq!(

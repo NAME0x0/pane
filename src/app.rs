@@ -2516,17 +2516,8 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
         } else {
             None
         };
-    let previous_trace_checkpoint = env::var_os("PANE_NATIVE_BOOT_TRACE_CHECKPOINT");
     if let Some(path) = &args.trace_checkpoint {
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent)?;
-        }
-        env::set_var("PANE_NATIVE_BOOT_TRACE_CHECKPOINT", path);
-    } else {
-        env::remove_var("PANE_NATIVE_BOOT_TRACE_CHECKPOINT");
+        initialize_native_boot_trace_checkpoint(path, &session_name)?;
     }
     let partition_smoke = crate::native::run_partition_smoke(
         args.execute,
@@ -2534,12 +2525,8 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
         boot_image.as_ref(),
         &host,
         block_io_handler,
+        args.trace_checkpoint.as_deref(),
     );
-    if let Some(previous) = previous_trace_checkpoint {
-        env::set_var("PANE_NATIVE_BOOT_TRACE_CHECKPOINT", previous);
-    } else {
-        env::remove_var("PANE_NATIVE_BOOT_TRACE_CHECKPOINT");
-    }
     let protected_linux_entry_requested =
         partition_smoke.entry_mode.as_deref() == Some("linux-protected-mode-32");
     let ready_for_arch_boot_attempt = runtime.native_runtime.ready_for_arch_boot_attempt;
@@ -2685,6 +2672,24 @@ fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
     }
 
     print_native_boot_spike_report(&report);
+    Ok(())
+}
+
+fn initialize_native_boot_trace_checkpoint(path: &Path, session_name: &str) -> AppResult<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let checkpoint = serde_json::json!({
+        "schema_version": 1,
+        "kind": "pane-native-boot-trace-checkpoint",
+        "reason": "requested",
+        "session_name": session_name,
+        "status": "pending",
+    });
+    fs::write(path, serde_json::to_string_pretty(&checkpoint)?)?;
     Ok(())
 }
 
@@ -5437,11 +5442,11 @@ static void prepare_minimal_mounts(void) {
 }
 
 static int wait_for_device(const char *path) {
-    for (unsigned int attempt = 0; attempt < 100; attempt++) {
+    for (unsigned int attempt = 0; attempt < 65536; attempt++) {
         if (access(path, F_OK) == 0) {
             return 0;
         }
-        usleep(100000);
+        sched_yield();
     }
     return -1;
 }
@@ -5449,6 +5454,8 @@ static int wait_for_device(const char *path) {
 static int load_pane_block_module(const char *device_blocks, const char *root_offset, const char *block_dma) {
     const char *module_path = "/lib/modules/pane-block.ko";
     char params[256] = {0};
+    char *dma_separator = NULL;
+    char *dma_end = NULL;
     unsigned long long base_block_offset = 0;
     unsigned long long shared_buffer_gpa = 0;
     unsigned long long shared_buffer_bytes = 0;
@@ -5469,14 +5476,23 @@ static int load_pane_block_module(const char *device_blocks, const char *root_of
         base_block_offset = strtoull(root_offset, NULL, 10) / PANE_BLOCK_IO_BLOCK_SIZE_BYTES;
     }
     if (block_dma && block_dma[0] != '\0') {
-        /*
-         * Keep the host-side DMA window mapped for the future fast path, but
-         * force the early Arch root-mount spike through the simpler data-port
-         * streaming path until WHP/shared-buffer guest visibility is proven.
-         */
-        log_line("PANE_BLOCK_DMA_DISABLED_FOR_PORT_STREAM");
-        shared_buffer_gpa = 0;
-        shared_buffer_bytes = 0;
+        errno = 0;
+        shared_buffer_gpa = strtoull(block_dma, &dma_separator, 0);
+        if (errno != 0 || dma_separator == block_dma || *dma_separator != ',') {
+            log_line("PANE_BLOCK_DMA_CONTRACT_INVALID");
+            shared_buffer_gpa = 0;
+        } else {
+            errno = 0;
+            shared_buffer_bytes = strtoull(dma_separator + 1, &dma_end, 0);
+            if (errno != 0 || dma_end == dma_separator + 1 || *dma_end != '\0' ||
+                shared_buffer_bytes < PANE_BLOCK_IO_BLOCK_SIZE_BYTES) {
+                log_line("PANE_BLOCK_DMA_CONTRACT_INVALID");
+                shared_buffer_gpa = 0;
+                shared_buffer_bytes = 0;
+            } else {
+                log_line("PANE_BLOCK_DMA_ENABLED_FOR_SHARED_BUFFER");
+            }
+        }
     }
     if (device_blocks && device_blocks[0] != '\0') {
         snprintf(params, sizeof(params),
@@ -6236,10 +6252,12 @@ static int __init pane_block_init(void)
             pr_info(PANE_BLOCK_DRIVER_NAME
                     ": PANE_BLOCK_SHARED_BUFFER_OK gpa=%lu bytes=%lu\n",
                     shared_buffer_gpa, shared_buffer_bytes);
+            pane_block_serial_log("PANE_BLOCK_SHARED_BUFFER_OK");
         } else {
             pr_warn(PANE_BLOCK_DRIVER_NAME
                     ": PANE_BLOCK_SHARED_BUFFER_UNAVAILABLE gpa=%lu bytes=%lu\n",
                     shared_buffer_gpa, shared_buffer_bytes);
+            pane_block_serial_log("PANE_BLOCK_SHARED_BUFFER_UNAVAILABLE");
         }
     }
 
@@ -15742,12 +15760,15 @@ mod tests {
         assert!(init_source.contains("PANE_VIRTIO_ROOT_MOUNT_ATTEMPT"));
         assert!(init_source.contains("PANE_VIRTIO_ROOT_DEVICE_WAIT_TIMEOUT"));
         assert!(init_source.contains("PANE_VIRTIO_ROOT_MOUNT_FALLBACK"));
+        assert!(init_source.contains("attempt < 65536"));
+        assert!(!init_source.contains("usleep(100000)"));
         assert!(init_source.contains("supported_root_fs"));
         assert!(init_source.contains("MS_RELATIME | (root_readonly ? MS_RDONLY : 0)"));
         assert!(init_source.contains("pane.block_devices"));
         assert!(init_source.contains("pane.block_dma"));
-        assert!(init_source.contains("PANE_BLOCK_DMA_DISABLED_FOR_PORT_STREAM"));
-        assert!(init_source.contains("force the early Arch root-mount spike"));
+        assert!(init_source.contains("PANE_BLOCK_DMA_ENABLED_FOR_SHARED_BUFFER"));
+        assert!(init_source.contains("PANE_BLOCK_DMA_CONTRACT_INVALID"));
+        assert!(init_source.contains("strtoull(block_dma, &dma_separator, 0)"));
         assert!(init_source.contains("PANE_DISPLAY_CONTRACT_DISCOVERED"));
         assert!(init_source.contains("PANE_FRAMEBUFFER"));
         assert!(init_source.contains("PANE_INPUT_QUEUE"));
@@ -15791,6 +15812,9 @@ mod tests {
         assert!(block_driver.contains("shared_buffer_gpa"));
         assert!(block_driver.contains("pane_block_shared_buffer"));
         assert!(block_driver.contains("PANE_BLOCK_SHARED_BUFFER_OK"));
+        assert!(block_driver.contains("pane_block_serial_log(\"PANE_BLOCK_SHARED_BUFFER_OK\")"));
+        assert!(block_driver
+            .contains("pane_block_serial_log(\"PANE_BLOCK_SHARED_BUFFER_UNAVAILABLE\")"));
         assert!(block_driver.contains("trust_submit_completion"));
         assert!(block_driver.contains("module_param(trust_submit_completion, bool, 0444)"));
         assert!(block_driver.contains("static bool trust_submit_completion;"));
@@ -17454,6 +17478,23 @@ mod tests {
         let rendered = format_doctor_blockers("pane connect", &report);
         assert!(rendered.contains("XRDP is not active."));
         assert!(rendered.contains("Run pane launch again."));
+    }
+
+    #[test]
+    fn native_boot_trace_checkpoint_is_initialized_before_whp_execution() {
+        let paths = temp_runtime_paths("native-trace-checkpoint-init");
+        let checkpoint = paths.root.join("traces").join("native-boot.json");
+
+        super::initialize_native_boot_trace_checkpoint(&checkpoint, "pane-test").unwrap();
+
+        let value = read_json_file::<serde_json::Value>(&checkpoint).unwrap();
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["kind"], "pane-native-boot-trace-checkpoint");
+        assert_eq!(value["reason"], "requested");
+        assert_eq!(value["session_name"], "pane-test");
+        assert_eq!(value["status"], "pending");
+
+        let _ = std::fs::remove_dir_all(&paths.root);
     }
 
     #[test]

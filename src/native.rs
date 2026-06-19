@@ -1587,8 +1587,9 @@ mod windows_whp {
 
     use super::whp_bindings::{
         free_library as FreeLibrary, get_proc_address as GetProcAddress,
-        load_library as LoadLibraryA, WHV_CAPABILITY_CODE_HYPERVISOR_PRESENT,
-        WHV_MAP_GPA_RANGE_FLAG_EXECUTE, WHV_MAP_GPA_RANGE_FLAG_READ, WHV_MAP_GPA_RANGE_FLAG_WRITE,
+        load_library as LoadLibraryA, WhvInterruptControl, WhvTranslateGvaResult,
+        WHV_CAPABILITY_CODE_HYPERVISOR_PRESENT, WHV_MAP_GPA_RANGE_FLAG_EXECUTE,
+        WHV_MAP_GPA_RANGE_FLAG_READ, WHV_MAP_GPA_RANGE_FLAG_WRITE,
         WHV_PARTITION_PROPERTY_CODE_LOCAL_APIC_EMULATION_MODE,
         WHV_PARTITION_PROPERTY_CODE_PROCESSOR_COUNT, WHV_RUN_VP_EXIT_REASON_CANCELED,
         WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE, WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS,
@@ -1832,21 +1833,6 @@ mod windows_whp {
         reg64: u64,
         segment: WhvX64SegmentRegister,
         table: WhvX64TableRegister,
-    }
-
-    #[repr(C)]
-    #[derive(Copy, Clone)]
-    struct WhvInterruptControl {
-        control: u64,
-        destination: u32,
-        vector: u32,
-    }
-
-    #[repr(C)]
-    #[derive(Copy, Clone)]
-    struct WhvTranslateGvaResult {
-        result_code: u32,
-        reserved: u32,
     }
 
     #[repr(C)]
@@ -2419,8 +2405,8 @@ mod windows_whp {
             return E_UNEXPECTED;
         };
         let mut whp_result = WhvTranslateGvaResult {
-            result_code: WHV_TRANSLATE_GVA_RESULT_SUCCESS,
-            reserved: 0,
+            ResultCode: WHV_TRANSLATE_GVA_RESULT_SUCCESS as i32,
+            Reserved: 0,
         };
         let hresult = translate_gva(
             context.partition,
@@ -2431,12 +2417,12 @@ mod windows_whp {
             gpa,
         );
         if hresult_succeeded(hresult) {
-            *translation_result = whp_result.result_code;
+            *translation_result = whp_result.ResultCode as u32;
         }
         context.last_status = Some(if hresult_succeeded(hresult) {
             format!(
                 "translate-gva-result={} gva=0x{gva:016x} gpa=0x{:016x}",
-                whp_result.result_code, *gpa
+                whp_result.ResultCode, *gpa
             )
         } else {
             format!("translate-gva-failed:{}", format_hresult(hresult))
@@ -5338,14 +5324,14 @@ mod windows_whp {
         report: &mut NativePartitionSmokeReport,
     ) -> bool {
         let interrupt = WhvInterruptControl {
-            control: whv_x64_interrupt_control(
+            _bitfield: whv_x64_interrupt_control(
                 WHV_X64_INTERRUPT_TYPE_FIXED,
                 WHV_X64_INTERRUPT_DESTINATION_MODE_PHYSICAL,
                 WHV_X64_INTERRUPT_TRIGGER_MODE_EDGE,
                 0,
             ),
-            destination: 0,
-            vector: u32::from(vector),
+            Destination: 0,
+            Vector: u32::from(vector),
         };
         let hresult = unsafe {
             request_interrupt(
@@ -5384,14 +5370,14 @@ mod windows_whp {
         report: &mut NativePartitionSmokeReport,
     ) -> bool {
         let interrupt = WhvInterruptControl {
-            control: whv_x64_interrupt_control(
+            _bitfield: whv_x64_interrupt_control(
                 WHV_X64_INTERRUPT_TYPE_FIXED,
                 WHV_X64_INTERRUPT_DESTINATION_MODE_PHYSICAL,
                 WHV_X64_INTERRUPT_TRIGGER_MODE_EDGE,
                 0,
             ),
-            destination: 0,
-            vector: u32::from(vector),
+            Destination: 0,
+            Vector: u32::from(vector),
         };
         let hresult = unsafe {
             request_interrupt(
@@ -8190,7 +8176,7 @@ mod windows_whp {
             state.last_vp_index = vp_index;
             state.last_translate_flags = translate_flags;
             state.last_gva = gva;
-            (*translation_result).result_code = WHV_TRANSLATE_GVA_RESULT_SUCCESS;
+            (*translation_result).ResultCode = WHV_TRANSLATE_GVA_RESULT_SUCCESS as i32;
             *gpa = gva & !0xfff;
             S_OK
         }

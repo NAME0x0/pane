@@ -24,6 +24,9 @@ pub(crate) use windows_sys::Win32::System::Hypervisor::{
     WHV_X64_SEGMENT_REGISTER as OfficialX64SegmentRegister,
     WHV_X64_TABLE_REGISTER as OfficialX64TableRegister,
 };
+pub(crate) use windows_sys::Win32::System::Hypervisor::{
+    WHV_INTERRUPT_CONTROL as WhvInterruptControl, WHV_TRANSLATE_GVA_RESULT as WhvTranslateGvaResult,
+};
 use windows_sys::Win32::{
     Foundation::{FreeLibrary, HMODULE},
     System::LibraryLoader::{GetProcAddress, LoadLibraryA},

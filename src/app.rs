@@ -675,6 +675,16 @@ struct VirtioBlockBackendPlan {
     notes: Vec<String>,
 }
 
+impl VirtioBlockBackendPlan {
+    fn boot_contract_matches(&self, expected: &Self) -> bool {
+        let mut actual_contract = self.clone();
+        let mut expected_contract = expected.clone();
+        actual_contract.notes.clear();
+        expected_contract.notes.clear();
+        actual_contract == expected_contract
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct VirtioBlockDevicePlan {
     id: String,
@@ -10008,7 +10018,11 @@ fn build_runtime_artifact_report(paths: &RuntimePaths) -> RuntimeArtifactReport 
                 && layout
                     .storage
                     .as_ref()
-                    .map(|storage| storage.virtio_block == virtio_block_backend_plan(storage))
+                    .map(|storage| {
+                        storage
+                            .virtio_block
+                            .boot_contract_matches(&virtio_block_backend_plan(storage))
+                    })
                     .unwrap_or(true)
                 && layout.initramfs_driver
                     == layout
@@ -16623,6 +16637,18 @@ mod tests {
         let native_runtime =
             build_native_runtime_report(true, &artifacts, &test_native_host_report(true));
         assert!(native_runtime.ready_for_arch_boot_attempt);
+
+        let mut note_only_layout = layout.clone();
+        note_only_layout
+            .storage
+            .as_mut()
+            .unwrap()
+            .virtio_block
+            .notes
+            .push("Non-operative diagnostic wording changed.".to_string());
+        write_json_file(&paths.kernel_boot_layout, &note_only_layout).unwrap();
+        let artifacts = build_runtime_artifact_report(&paths);
+        assert!(artifacts.kernel_boot_layout_ready);
 
         let mut stale_layout = layout;
         stale_layout.storage.as_mut().unwrap().virtio_block = legacy_virtio_block_backend_plan();

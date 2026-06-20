@@ -8055,6 +8055,7 @@ mod windows_whp {
         };
         use crate::virtio::{PaneGuestMemory, PaneMmapGuestMemory};
         use std::ffi::c_void;
+        use vm_memory::{Bytes, GuestAddress, GuestMemory};
 
         struct TestWhpCallbackState {
             get_count: u32,
@@ -8577,8 +8578,10 @@ mod windows_whp {
 
         #[test]
         fn mapped_guest_memory_view_rejects_unmapped_or_cross_region_access() {
-            let first = PaneMmapGuestMemory::new(0x1000, 0x1000).expect("first region");
-            let second = PaneMmapGuestMemory::new(0x3000, 0x1000).expect("second region");
+            let shared = PaneMmapGuestMemory::from_ranges(&[(0x1000, 0x1000), (0x3000, 0x1000)])
+                .expect("shared guest memory");
+            let first = shared.view(0x1000, 0x1000).expect("first region");
+            let second = shared.view(0x3000, 0x1000).expect("second region");
             let mut regions = vec![
                 MappedGuestRegion {
                     label: "first".to_string(),
@@ -8599,6 +8602,15 @@ mod windows_whp {
             assert!(view.read(0x1ffc, &mut bytes).is_err());
             assert!(view.write(0x2000, &[1, 2, 3, 4]).is_err());
             assert!(view.read(0x3000, &mut bytes[..4]).is_ok());
+
+            let rust_vmm_memory = view
+                .rust_vmm_memory()
+                .expect("WHP view must expose rust-vmm guest memory");
+            assert_eq!(rust_vmm_memory.num_regions(), 2);
+            rust_vmm_memory
+                .read_slice(&mut bytes[..4], GuestAddress(0x3000))
+                .unwrap();
+            assert_eq!(&bytes[..4], &[0, 0, 0, 0]);
         }
 
         #[test]

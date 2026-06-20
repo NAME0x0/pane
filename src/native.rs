@@ -1577,7 +1577,6 @@ pub(crate) fn test_native_host_report(ready: bool) -> NativeHostPreflightReport 
 #[cfg(windows)]
 mod windows_whp {
     use std::{
-        alloc::{alloc_zeroed, dealloc, Layout},
         collections::{BTreeSet, HashMap, VecDeque},
         ffi::{c_void, CString},
         fs, mem,
@@ -1617,6 +1616,7 @@ mod windows_whp {
         NativeBlockIoPortState, NativeBlockOperation, PANE_BLOCK_IO_BLOCK_SIZE_BYTES,
         PANE_BLOCK_IO_STATUS_SERVICED,
     };
+    use crate::virtio::PaneMmapGuestMemory;
 
     const GUEST_PAGE_SIZE: usize = SERIAL_BOOT_TEST_IMAGE_SIZE;
     const LINUX_ENTRY_PROBE_EXIT_BUDGET: usize = 131072;
@@ -3160,14 +3160,14 @@ mod windows_whp {
         label: String,
         guest_gpa: u64,
         size: u64,
-        _memory: GuestMemory,
+        memory: PaneMmapGuestMemory,
     }
 
     fn pane_block_dma_window(mapped_regions: &mut [MappedGuestRegion]) -> Option<&mut [u8]> {
         mapped_regions
             .iter_mut()
             .find(|region| region.label == "pane-block-dma")
-            .map(|region| region._memory.as_mut_slice())
+            .map(|region| region.memory.as_mut_slice())
     }
 
     fn pane_block_dma_guest_enabled(serial_text: Option<&str>) -> bool {
@@ -3258,9 +3258,7 @@ mod windows_whp {
                 ));
             };
             let region = &self.regions[index];
-            let source = &region._memory.as_slice()[offset..offset + bytes.len()];
-            bytes.copy_from_slice(source);
-            Ok(())
+            region.memory.read(region.guest_gpa + offset as u64, bytes)
         }
 
         fn write(&mut self, gpa: u64, bytes: &[u8]) -> Result<(), String> {
@@ -3271,48 +3269,7 @@ mod windows_whp {
                 ));
             };
             let region = &mut self.regions[index];
-            let target = &mut region._memory.as_mut_slice()[offset..offset + bytes.len()];
-            target.copy_from_slice(bytes);
-            Ok(())
-        }
-    }
-
-    struct GuestMemory {
-        ptr: *mut u8,
-        layout: Layout,
-        size: usize,
-    }
-
-    impl GuestMemory {
-        fn new(size: usize) -> Option<Self> {
-            let size = page_aligned_len(size)?;
-            let layout = Layout::from_size_align(size, GUEST_PAGE_SIZE).ok()?;
-            let ptr = unsafe { alloc_zeroed(layout) };
-            if ptr.is_null() {
-                None
-            } else {
-                Some(Self { ptr, layout, size })
-            }
-        }
-
-        fn as_mut_ptr(&mut self) -> *mut u8 {
-            self.ptr
-        }
-
-        fn as_mut_slice(&mut self) -> &mut [u8] {
-            unsafe { std::slice::from_raw_parts_mut(self.ptr, self.size) }
-        }
-
-        fn as_slice(&self) -> &[u8] {
-            unsafe { std::slice::from_raw_parts(self.ptr, self.size) }
-        }
-    }
-
-    impl Drop for GuestMemory {
-        fn drop(&mut self) {
-            unsafe {
-                dealloc(self.ptr, self.layout);
-            }
+            region.memory.write(region.guest_gpa + offset as u64, bytes)
         }
     }
 
@@ -3371,7 +3328,15 @@ mod windows_whp {
         let mut mapped_regions = Vec::with_capacity(descriptors.len());
         let mut mapped_all = true;
         for descriptor in descriptors {
-            let Some(mut memory) = GuestMemory::new(descriptor.bytes.len()) else {
+            let Some(mapped_len) = page_aligned_len(descriptor.bytes.len()) else {
+                report.blocker = Some(format!(
+                    "Guest memory region `{}` has an invalid size.",
+                    descriptor.label
+                ));
+                mapped_all = false;
+                break;
+            };
+            let Ok(mut memory) = PaneMmapGuestMemory::new(descriptor.guest_gpa, mapped_len) else {
                 report.calls.push(NativeWhpCallReport {
                     name: "HostPageAllocation",
                     hresult: None,
@@ -3390,7 +3355,7 @@ mod windows_whp {
             };
 
             memory.as_mut_slice()[..descriptor.bytes.len()].copy_from_slice(&descriptor.bytes);
-            let size = memory.size as u64;
+            let size = memory.len() as u64;
             report.calls.push(NativeWhpCallReport {
                 name: "GuestMemoryRegion",
                 hresult: None,
@@ -3422,7 +3387,7 @@ mod windows_whp {
             let hresult = unsafe {
                 map_gpa_range(
                     partition,
-                    memory.as_mut_ptr().cast::<c_void>(),
+                    memory.host_address().cast::<c_void>(),
                     descriptor.guest_gpa,
                     size,
                     flags,
@@ -3451,7 +3416,7 @@ mod windows_whp {
                 label: descriptor.label,
                 guest_gpa: descriptor.guest_gpa,
                 size,
-                _memory: memory,
+                memory,
             });
         }
 
@@ -3510,7 +3475,7 @@ mod windows_whp {
         report: &mut NativePartitionSmokeReport,
     ) {
         for region in mapped_regions {
-            let bytes = region._memory.as_slice();
+            let bytes = region.memory.as_slice();
             if report.framebuffer_snapshot.is_none() {
                 if let Some(snapshot) =
                     framebuffer_snapshot_report(&region.label, region.guest_gpa, bytes)
@@ -8029,7 +7994,7 @@ mod windows_whp {
             whp_emulator_memory_callback, whp_emulator_set_registers_callback,
             whp_emulator_translate_gva_page_callback, whv_x64_interrupt_control,
             write_linux_entry_probe_checkpoint, xapic_state_vectors, Com1SerialState, DecodedExit,
-            GuestMemory, LegacyDeviceIoState, MappedGuestMemoryView, MappedGuestRegion,
+            LegacyDeviceIoState, MappedGuestMemoryView, MappedGuestRegion,
             NativeBlockIoTraceCollector, WhpEmulatorMmioCallbackContext, WhvEmulatorCallbacks,
             WhvEmulatorIoAccessInfo, WhvEmulatorMemoryAccessInfo, WhvRegisterValue,
             WhvTranslateGvaResult, ACPI_PM1_CONTROL_PORT, ACPI_PM1_ENABLE_PORT,
@@ -8076,7 +8041,7 @@ mod windows_whp {
             PANE_BLOCK_IO_STATUS_FAILED, PANE_BLOCK_IO_STATUS_SERVICED,
             PANE_BLOCK_IO_STATUS_SUBMITTED, SERIAL_BOOT_BANNER_TEXT,
         };
-        use crate::virtio::PaneGuestMemory;
+        use crate::virtio::{PaneGuestMemory, PaneMmapGuestMemory};
         use std::ffi::c_void;
 
         struct TestWhpCallbackState {
@@ -8579,13 +8544,13 @@ mod windows_whp {
 
         #[test]
         fn mapped_guest_memory_view_reads_and_writes_single_region() {
-            let mut memory = GuestMemory::new(0x1000).expect("guest memory");
+            let mut memory = PaneMmapGuestMemory::new(0x1000, 0x1000).expect("guest memory");
             memory.as_mut_slice()[0x20..0x24].copy_from_slice(&[1, 2, 3, 4]);
             let mut regions = vec![MappedGuestRegion {
                 label: "test".to_string(),
                 guest_gpa: 0x1000,
-                size: memory.size as u64,
-                _memory: memory,
+                size: memory.len() as u64,
+                memory,
             }];
             let mut view = MappedGuestMemoryView::new(&mut regions);
             let mut bytes = [0; 4];
@@ -8600,20 +8565,20 @@ mod windows_whp {
 
         #[test]
         fn mapped_guest_memory_view_rejects_unmapped_or_cross_region_access() {
-            let first = GuestMemory::new(0x1000).expect("first region");
-            let second = GuestMemory::new(0x1000).expect("second region");
+            let first = PaneMmapGuestMemory::new(0x1000, 0x1000).expect("first region");
+            let second = PaneMmapGuestMemory::new(0x3000, 0x1000).expect("second region");
             let mut regions = vec![
                 MappedGuestRegion {
                     label: "first".to_string(),
                     guest_gpa: 0x1000,
-                    size: first.size as u64,
-                    _memory: first,
+                    size: first.len() as u64,
+                    memory: first,
                 },
                 MappedGuestRegion {
                     label: "second".to_string(),
                     guest_gpa: 0x3000,
-                    size: second.size as u64,
-                    _memory: second,
+                    size: second.len() as u64,
+                    memory: second,
                 },
             ];
             let mut view = MappedGuestMemoryView::new(&mut regions);

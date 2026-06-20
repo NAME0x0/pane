@@ -1,4 +1,5 @@
 use serde::Serialize;
+use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
 pub(crate) const PANE_VIRTIO_MMIO_BASE_GPA: u64 = 0x0dfc_0000;
 pub(crate) const PANE_VIRTIO_MMIO_SIZE_BYTES: u64 = 0x0000_1000;
@@ -215,6 +216,53 @@ pub(crate) struct PaneVirtioMmioAccessOutcome {
 pub(crate) trait PaneGuestMemory {
     fn read(&self, gpa: u64, bytes: &mut [u8]) -> Result<(), String>;
     fn write(&mut self, gpa: u64, bytes: &[u8]) -> Result<(), String>;
+}
+
+pub(crate) struct PaneMmapGuestMemory {
+    memory: GuestMemoryMmap<()>,
+    base: GuestAddress,
+    len: usize,
+}
+
+impl PaneMmapGuestMemory {
+    pub(crate) fn new(base: u64, len: usize) -> Result<Self, String> {
+        let base = GuestAddress(base);
+        let memory = GuestMemoryMmap::from_ranges(&[(base, len)])
+            .map_err(|error| format!("failed to allocate guest memory: {error}"))?;
+        Ok(Self { memory, base, len })
+    }
+
+    pub(crate) fn host_address(&self) -> *mut u8 {
+        self.memory
+            .get_host_address(self.base)
+            .expect("Pane guest-memory base must remain mapped")
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.host_address(), self.len) }
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.host_address(), self.len) }
+    }
+}
+
+impl PaneGuestMemory for PaneMmapGuestMemory {
+    fn read(&self, gpa: u64, bytes: &mut [u8]) -> Result<(), String> {
+        self.memory
+            .read_slice(bytes, GuestAddress(gpa))
+            .map_err(|error| format!("guest memory read failed: {error}"))
+    }
+
+    fn write(&mut self, gpa: u64, bytes: &[u8]) -> Result<(), String> {
+        self.memory
+            .write_slice(bytes, GuestAddress(gpa))
+            .map_err(|error| format!("guest memory write failed: {error}"))
+    }
 }
 
 pub(crate) fn service_virtio_mmio_access<M, F>(
@@ -1001,7 +1049,8 @@ pub(crate) fn pane_virtio_mmio_kernel_arg() -> String {
 
 pub(crate) fn pane_virtio_mmio_service_smoke() -> PaneVirtioMmioServiceSmoke {
     let mut device = PaneVirtioMmioBlockDevice::new(8 * 1024 * 1024, true);
-    let mut memory = PaneSmokeGuestMemory::new(0x5000);
+    let mut memory = PaneMmapGuestMemory::new(0, 0x5000)
+        .expect("fixed virtio execution smoke memory must allocate");
     configure_smoke_queue(&mut device);
     let _ = device.write_u32(
         VIRTIO_MMIO_STATUS_OFFSET,
@@ -1072,7 +1121,8 @@ pub(crate) fn pane_virtio_mmio_service_smoke() -> PaneVirtioMmioServiceSmoke {
 
 pub(crate) fn pane_virtio_blk_execution_smoke() -> PaneVirtioBlkExecutionSmoke {
     let mut device = PaneVirtioMmioBlockDevice::new(8 * 1024 * 1024, true);
-    let mut memory = PaneSmokeGuestMemory::new(0x5000);
+    let mut memory = PaneMmapGuestMemory::new(0, 0x5000)
+        .expect("fixed virtio service smoke memory must allocate");
     configure_smoke_queue(&mut device);
 
     memory.write_u32(0x4000, VIRTIO_BLK_T_IN);
@@ -1159,17 +1209,7 @@ pub(crate) fn pane_virtio_mmio_handshake_smoke() -> PaneVirtioMmioHandshakeSmoke
     }
 }
 
-struct PaneSmokeGuestMemory {
-    bytes: Vec<u8>,
-}
-
-impl PaneSmokeGuestMemory {
-    fn new(size: usize) -> Self {
-        Self {
-            bytes: vec![0_u8; size],
-        }
-    }
-
+impl PaneMmapGuestMemory {
     fn write_u16(&mut self, gpa: u64, value: u16) {
         let _ = self.write(gpa, &value.to_le_bytes());
     }
@@ -1183,28 +1223,6 @@ impl PaneSmokeGuestMemory {
     }
 }
 
-impl PaneGuestMemory for PaneSmokeGuestMemory {
-    fn read(&self, gpa: u64, bytes: &mut [u8]) -> Result<(), String> {
-        let start = gpa as usize;
-        let end = start + bytes.len();
-        if end > self.bytes.len() {
-            return Err("smoke memory read out of bounds".to_string());
-        }
-        bytes.copy_from_slice(&self.bytes[start..end]);
-        Ok(())
-    }
-
-    fn write(&mut self, gpa: u64, bytes: &[u8]) -> Result<(), String> {
-        let start = gpa as usize;
-        let end = start + bytes.len();
-        if end > self.bytes.len() {
-            return Err("smoke memory write out of bounds".to_string());
-        }
-        self.bytes[start..end].copy_from_slice(bytes);
-        Ok(())
-    }
-}
-
 fn configure_smoke_queue(device: &mut PaneVirtioMmioBlockDevice) {
     let _ = device.write_u32(VIRTIO_MMIO_QUEUE_NUM_OFFSET, 8);
     let _ = device.write_u32(VIRTIO_MMIO_QUEUE_DESC_LOW_OFFSET, 0x1000);
@@ -1214,7 +1232,7 @@ fn configure_smoke_queue(device: &mut PaneVirtioMmioBlockDevice) {
 }
 
 fn write_smoke_descriptor(
-    memory: &mut PaneSmokeGuestMemory,
+    memory: &mut PaneMmapGuestMemory,
     index: u16,
     addr: u64,
     len: u32,
@@ -1441,7 +1459,7 @@ fn selected_feature_bank(select: u32, value: u32) -> Option<(u64, u64)> {
 mod tests {
     use super::{
         pane_virtio_mmio_contains_gpa, pane_virtio_mmio_kernel_arg, pane_virtio_mmio_offset,
-        pane_virtio_mmio_window, service_virtio_mmio_access, PaneGuestMemory,
+        pane_virtio_mmio_window, service_virtio_mmio_access, PaneGuestMemory, PaneMmapGuestMemory,
         PaneVirtioBlkRequestType, PaneVirtioMmioAccess, PaneVirtioMmioAccessKind,
         PaneVirtioMmioBlockDevice, PaneVirtioMmioWriteResult, PANE_VIRTIO_BLK_QUEUE_SIZE,
         PANE_VIRTIO_MMIO_BASE_GPA, PANE_VIRTIO_MMIO_SIZE_BYTES, VIRTIO_BLK_F_BLK_SIZE,
@@ -1509,6 +1527,21 @@ mod tests {
             self.bytes[start..end].copy_from_slice(bytes);
             Ok(())
         }
+    }
+
+    #[test]
+    fn mmap_guest_memory_honors_nonzero_guest_base_and_bounds() {
+        let mut memory = PaneMmapGuestMemory::new(0x2000, 0x1000).expect("mmap guest memory");
+
+        memory.write(0x2020, &[1, 2, 3, 4]).unwrap();
+        let mut bytes = [0; 4];
+        memory.read(0x2020, &mut bytes).unwrap();
+
+        assert_eq!(bytes, [1, 2, 3, 4]);
+        assert!(!memory.host_address().is_null());
+        assert_eq!(memory.len(), 0x1000);
+        assert!(memory.read(0x1fff, &mut [0]).is_err());
+        assert!(memory.write(0x3000, &[0]).is_err());
     }
 
     fn configure_queue(device: &mut PaneVirtioMmioBlockDevice) {

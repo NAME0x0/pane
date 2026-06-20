@@ -1,4 +1,6 @@
 use serde::Serialize;
+use std::sync::Arc;
+use virtio_queue::{Queue, QueueT};
 use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 pub(crate) const PANE_VIRTIO_MMIO_BASE_GPA: u64 = 0x0dfc_0000;
@@ -216,20 +218,55 @@ pub(crate) struct PaneVirtioMmioAccessOutcome {
 pub(crate) trait PaneGuestMemory {
     fn read(&self, gpa: u64, bytes: &mut [u8]) -> Result<(), String>;
     fn write(&mut self, gpa: u64, bytes: &[u8]) -> Result<(), String>;
+    fn rust_vmm_memory(&self) -> Option<&GuestMemoryMmap<()>> {
+        None
+    }
 }
 
 pub(crate) struct PaneMmapGuestMemory {
-    memory: GuestMemoryMmap<()>,
+    memory: Arc<GuestMemoryMmap<()>>,
     base: GuestAddress,
     len: usize,
 }
 
 impl PaneMmapGuestMemory {
     pub(crate) fn new(base: u64, len: usize) -> Result<Self, String> {
-        let base = GuestAddress(base);
-        let memory = GuestMemoryMmap::from_ranges(&[(base, len)])
+        Self::from_ranges(&[(base, len)])?.view(base, len)
+    }
+
+    pub(crate) fn from_ranges(ranges: &[(u64, usize)]) -> Result<Self, String> {
+        let mut ranges = ranges
+            .iter()
+            .map(|(base, len)| (GuestAddress(*base), *len))
+            .collect::<Vec<_>>();
+        ranges.sort_by_key(|(base, _)| base.0);
+        let memory = GuestMemoryMmap::from_ranges(&ranges)
             .map_err(|error| format!("failed to allocate guest memory: {error}"))?;
-        Ok(Self { memory, base, len })
+        let (base, len) = ranges
+            .first()
+            .copied()
+            .ok_or_else(|| "guest memory requires at least one range".to_string())?;
+        Ok(Self {
+            memory: Arc::new(memory),
+            base,
+            len,
+        })
+    }
+
+    pub(crate) fn view(&self, base: u64, len: usize) -> Result<Self, String> {
+        let base = GuestAddress(base);
+        if !self.memory.check_range(base, len) {
+            return Err("guest memory view is outside mapped ranges".to_string());
+        }
+        Ok(Self {
+            memory: Arc::clone(&self.memory),
+            base,
+            len,
+        })
+    }
+
+    pub(crate) fn rust_vmm_memory(&self) -> &GuestMemoryMmap<()> {
+        &self.memory
     }
 
     pub(crate) fn host_address(&self) -> *mut u8 {
@@ -262,6 +299,10 @@ impl PaneGuestMemory for PaneMmapGuestMemory {
         self.memory
             .write_slice(bytes, GuestAddress(gpa))
             .map_err(|error| format!("guest memory write failed: {error}"))
+    }
+
+    fn rust_vmm_memory(&self) -> Option<&GuestMemoryMmap<()>> {
+        Some(&self.memory)
     }
 }
 
@@ -1263,6 +1304,12 @@ fn read_available_head<M: PaneGuestMemory>(
     memory: &M,
     queue: &PaneVirtioQueueState,
 ) -> Result<Option<u16>, String> {
+    if let Some(memory) = memory.rust_vmm_memory() {
+        let mut queue = rust_vmm_queue(queue)?;
+        return Ok(queue
+            .pop_descriptor_chain(memory)
+            .map(|chain| chain.head_index()));
+    }
     if queue.avail_ring_gpa == 0 {
         return Ok(None);
     }
@@ -1279,6 +1326,25 @@ fn parse_virtio_blk_request<M: PaneGuestMemory>(
     queue: &PaneVirtioQueueState,
     head_index: u16,
 ) -> Result<PaneVirtioBlkRequest, String> {
+    if let Some(guest_memory) = memory.rust_vmm_memory() {
+        let mut rust_queue = rust_vmm_queue(queue)?;
+        let chain = rust_queue
+            .pop_descriptor_chain(guest_memory)
+            .ok_or_else(|| "available ring does not contain a new request".to_string())?;
+        if chain.head_index() != head_index {
+            return Err("virtio-queue returned a different descriptor head".to_string());
+        }
+        let descriptors = chain
+            .map(|descriptor| PaneVirtioDescriptor {
+                addr: descriptor.addr().0,
+                len: descriptor.len(),
+                flags: descriptor.flags(),
+                next: descriptor.next(),
+            })
+            .collect::<Vec<_>>();
+        return parse_virtio_blk_descriptors(memory, descriptors);
+    }
+
     if head_index >= queue.size {
         return Err(format!(
             "descriptor head index {head_index} exceeds queue size {}",
@@ -1317,6 +1383,13 @@ fn parse_virtio_blk_request<M: PaneGuestMemory>(
         return Err("virtio-blk descriptor chain is unterminated".to_string());
     }
 
+    parse_virtio_blk_descriptors(memory, descriptors)
+}
+
+fn parse_virtio_blk_descriptors<M: PaneGuestMemory>(
+    memory: &M,
+    descriptors: Vec<PaneVirtioDescriptor>,
+) -> Result<PaneVirtioBlkRequest, String> {
     if descriptors.len() < 2 {
         return Err("virtio-blk descriptor chain is too short".to_string());
     }
@@ -1410,6 +1483,12 @@ fn write_used_entry<M: PaneGuestMemory>(
     head_index: u16,
     len: u32,
 ) -> Result<(), String> {
+    if let Some(memory) = memory.rust_vmm_memory() {
+        let mut queue = rust_vmm_queue(queue)?;
+        return queue
+            .add_used(memory, head_index, len)
+            .map_err(|error| format!("virtio-queue could not publish used entry: {error}"));
+    }
     let ring_index = queue.used_index % queue.size;
     let used_elem = queue.used_ring_gpa + 4 + u64::from(ring_index) * 8;
     memory.write(used_elem, &u32::from(head_index).to_le_bytes())?;
@@ -1419,6 +1498,28 @@ fn write_used_entry<M: PaneGuestMemory>(
         &queue.used_index.wrapping_add(1).to_le_bytes(),
     )?;
     Ok(())
+}
+
+fn rust_vmm_queue(state: &PaneVirtioQueueState) -> Result<Queue, String> {
+    let mut queue = Queue::new(state.max_size)
+        .map_err(|error| format!("virtio-queue rejected max size: {error}"))?;
+    queue.set_size(state.size);
+    queue.set_ready(state.ready);
+    queue.set_desc_table_address(
+        Some(state.desc_table_gpa as u32),
+        Some((state.desc_table_gpa >> 32) as u32),
+    );
+    queue.set_avail_ring_address(
+        Some(state.avail_ring_gpa as u32),
+        Some((state.avail_ring_gpa >> 32) as u32),
+    );
+    queue.set_used_ring_address(
+        Some(state.used_ring_gpa as u32),
+        Some((state.used_ring_gpa >> 32) as u32),
+    );
+    queue.set_next_avail(state.next_avail_index);
+    queue.set_next_used(state.used_index);
+    Ok(queue)
 }
 
 fn read_u16<M: PaneGuestMemory>(memory: &M, gpa: u64) -> Result<u16, String> {

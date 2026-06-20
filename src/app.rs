@@ -987,8 +987,8 @@ fn virtio_block_backend_plan(storage: &KernelStorageAttachment) -> VirtioBlockBa
     VirtioBlockBackendPlan {
         schema_version: 1,
         backend_kind: "pane-virtio-blk-backend-plan-v1".to_string(),
-        source_crate: "rust-vmm/vm-virtio".to_string(),
-        candidate_crate_version: None,
+        source_crate: "rust-vmm/virtio-queue".to_string(),
+        candidate_crate_version: Some("0.17.0".to_string()),
         license: "Apache-2.0 AND BSD-3-Clause".to_string(),
         source_url: "https://github.com/rust-vmm/vm-virtio".to_string(),
         adoption_state: "live-whp-mmio-execution-and-irq-request-ready-guest-ack-pending"
@@ -998,7 +998,7 @@ fn virtio_block_backend_plan(storage: &KernelStorageAttachment) -> VirtioBlockBa
         mmio_size_bytes: default_virtio_mmio_size_bytes(),
         mmio_irq: default_virtio_mmio_irq(),
         linux_kernel_parameter: default_virtio_mmio_linux_kernel_parameter(),
-        queue_model: "linux-compatible-split-virtqueue-batch-drain-ready".to_string(),
+        queue_model: "rust-vmm-virtio-queue-split-ring-batch-drain-ready".to_string(),
         interrupt_model: "WHP interrupt injection through Pane device loop".to_string(),
         sector_size_bytes: 512,
         root_device_hint,
@@ -1034,7 +1034,7 @@ fn virtio_block_backend_plan(storage: &KernelStorageAttachment) -> VirtioBlockBa
             },
         ],
         notes: vec![
-            "This is the standard Linux block-device target for Pane-owned Arch boot; Pane now routes live WHP virtio-MMIO exits into the in-repo block model."
+            "This is the standard Linux block-device target for Pane-owned Arch boot; Pane routes live WHP virtio-MMIO exits through rust-vmm queue parsing into the Pane-owned block backend."
                 .to_string(),
             "Pane reserves a virtio-MMIO aperture, advertises it with Linux's virtio_mmio.device kernel parameter, executes WHP MMIO exits through WinHvEmulation.dll, negotiates Linux-compatible modern virtio-blk features, masks unsupported driver feature bits, refuses FEATURES_OK until negotiation is valid, blocks DRIVER_OK until FEATURES_OK is accepted, reports non-existent selected queues as absent, resets queue runtime state when QueueReady is cleared, ignores queue notifications until DRIVER_OK and QueueReady are both set, drains batched split-virtqueue notifications into the verified native block handler, consumes malformed descriptor chains with used-ring error completion, accepts empty kicks and guest-visible block errors without aborting WHP emulation, reports actual used-ring transfer lengths, denies read-only base-disk writes at the device boundary, records callback details, and requests the virtio IRQ after queue completion; guest IRQ acknowledgement and root-mount proof are the remaining storage milestone."
                 .to_string(),
@@ -16490,7 +16490,11 @@ mod tests {
             storage.virtio_block.backend_kind,
             "pane-virtio-blk-backend-plan-v1"
         );
-        assert_eq!(storage.virtio_block.source_crate, "rust-vmm/vm-virtio");
+        assert_eq!(storage.virtio_block.source_crate, "rust-vmm/virtio-queue");
+        assert_eq!(
+            storage.virtio_block.candidate_crate_version.as_deref(),
+            Some("0.17.0")
+        );
         assert_eq!(
             storage.virtio_block.adoption_state,
             "live-whp-mmio-execution-and-irq-request-ready-guest-ack-pending"
@@ -16508,7 +16512,7 @@ mod tests {
         );
         assert_eq!(
             storage.virtio_block.queue_model,
-            "linux-compatible-split-virtqueue-batch-drain-ready"
+            "rust-vmm-virtio-queue-split-ring-batch-drain-ready"
         );
         assert_eq!(storage.virtio_block.root_device_hint, "/dev/vda1");
         assert_eq!(storage.virtio_block.devices.len(), 2);

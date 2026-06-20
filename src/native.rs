@@ -3271,6 +3271,12 @@ mod windows_whp {
             let region = &mut self.regions[index];
             region.memory.write(region.guest_gpa + offset as u64, bytes)
         }
+
+        fn rust_vmm_memory(&self) -> Option<&vm_memory::GuestMemoryMmap<()>> {
+            self.regions
+                .first()
+                .map(|region| region.memory.rust_vmm_memory())
+        }
     }
 
     fn page_aligned_len(size: usize) -> Option<usize> {
@@ -3325,34 +3331,40 @@ mod windows_whp {
         });
         descriptors.extend(boot_image.extra_regions.iter().cloned());
 
-        let mut mapped_regions = Vec::with_capacity(descriptors.len());
-        let mut mapped_all = true;
+        let mut prepared = Vec::with_capacity(descriptors.len());
         for descriptor in descriptors {
             let Some(mapped_len) = page_aligned_len(descriptor.bytes.len()) else {
                 report.blocker = Some(format!(
                     "Guest memory region `{}` has an invalid size.",
                     descriptor.label
                 ));
-                mapped_all = false;
-                break;
+                return Vec::new();
             };
-            let Ok(mut memory) = PaneMmapGuestMemory::new(descriptor.guest_gpa, mapped_len) else {
-                report.calls.push(NativeWhpCallReport {
-                    name: "HostPageAllocation",
-                    hresult: None,
-                    ok: false,
-                    detail: format!(
-                        "Could not allocate page-aligned host memory for guest region `{}`.",
-                        descriptor.label
-                    ),
-                });
-                report.blocker = Some(format!(
-                    "Could not allocate page-aligned guest memory for `{}`.",
-                    descriptor.label
-                ));
-                mapped_all = false;
-                break;
-            };
+            prepared.push((descriptor, mapped_len));
+        }
+        let ranges = prepared
+            .iter()
+            .map(|(descriptor, mapped_len)| (descriptor.guest_gpa, *mapped_len))
+            .collect::<Vec<_>>();
+        let Ok(shared_memory) = PaneMmapGuestMemory::from_ranges(&ranges) else {
+            report.calls.push(NativeWhpCallReport {
+                name: "HostPageAllocation",
+                hresult: None,
+                ok: false,
+                detail: "Could not allocate the rust-vmm multi-region guest address space."
+                    .to_string(),
+            });
+            report.blocker =
+                Some("Could not allocate the rust-vmm guest address space.".to_string());
+            return Vec::new();
+        };
+
+        let mut mapped_regions = Vec::with_capacity(prepared.len());
+        let mut mapped_all = true;
+        for (descriptor, mapped_len) in prepared {
+            let mut memory = shared_memory
+                .view(descriptor.guest_gpa, mapped_len)
+                .expect("prepared guest range must have a shared-memory view");
 
             memory.as_mut_slice()[..descriptor.bytes.len()].copy_from_slice(&descriptor.bytes);
             let size = memory.len() as u64;

@@ -41,3 +41,13 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 - Pane modification: the `vm-memory` dependency is pinned to 0.17.1 with default features disabled so the upstream loader builds on Windows without Unix-only `rawfd` APIs
 
 The complete required license texts and original copyright notices are preserved in `third_party/linux-loader/LICENSE-APACHE`, `third_party/linux-loader/LICENSE-BSD-3-Clause`, and the upstream source headers.
+
+## virtio-queue 0.17.0
+
+- Source: https://github.com/rust-vmm/vm-virtio
+- License: Apache-2.0 AND BSD-3-Clause
+- Use: split virtqueue validation, descriptor-chain iteration, available-ring consumption, and used-ring publication
+- Local source: `third_party/virtio-queue`
+- Pane modification: the `vm-memory` dependency has default features disabled so the upstream queue builds on Windows without Unix-only `rawfd` APIs
+
+The complete required license texts and original copyright notices are preserved in `third_party/virtio-queue/LICENSE-APACHE`, `third_party/virtio-queue/LICENSE-BSD-3-Clause`, and the upstream source headers.

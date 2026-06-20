@@ -1,5 +1,5 @@
 use serde::Serialize;
-use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
+use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 pub(crate) const PANE_VIRTIO_MMIO_BASE_GPA: u64 = 0x0dfc_0000;
 pub(crate) const PANE_VIRTIO_MMIO_SIZE_BYTES: u64 = 0x0000_1000;

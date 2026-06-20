@@ -3,7 +3,7 @@
 use std::{
     env,
     fs::{self, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Cursor, Read, Seek, SeekFrom, Write},
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -15,7 +15,13 @@ use std::{
 use std::os::windows::process::CommandExt;
 
 use clap::Parser;
+use linux_loader::{
+    cmdline::Cmdline,
+    configurator::{linux::LinuxBootConfigurator, BootConfigurator, BootParams},
+    loader::{bootparam, bzimage::BzImage, load_cmdline, KernelLoader},
+};
 use serde::{Deserialize, Serialize};
+use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 use crate::{
     bootstrap::{render_bootstrap_script, render_update_script},
@@ -983,7 +989,7 @@ fn virtio_block_backend_plan(storage: &KernelStorageAttachment) -> VirtioBlockBa
         backend_kind: "pane-virtio-blk-backend-plan-v1".to_string(),
         source_crate: "rust-vmm/vm-virtio".to_string(),
         candidate_crate_version: None,
-        license: "Apache-2.0 OR BSD-3-Clause".to_string(),
+        license: "Apache-2.0 AND BSD-3-Clause".to_string(),
         source_url: "https://github.com/rust-vmm/vm-virtio".to_string(),
         adoption_state: "live-whp-mmio-execution-and-irq-request-ready-guest-ack-pending"
             .to_string(),
@@ -7784,8 +7790,7 @@ fn load_kernel_layout_boot_image_artifact(
         executable: false,
     });
 
-    let mut cmdline_bytes = layout.cmdline.as_bytes().to_vec();
-    cmdline_bytes.push(0);
+    let cmdline_bytes = linux_cmdline_bytes(&layout.cmdline)?;
     extra_regions.push(crate::native::NativeGuestMemoryRegion {
         label: "linux-kernel-cmdline".to_string(),
         guest_gpa: parse_guest_physical_address(&layout.cmdline_gpa)?,
@@ -7840,6 +7845,33 @@ fn load_kernel_layout_boot_image_artifact(
         }),
         extra_regions,
     })
+}
+
+fn linux_cmdline_bytes(value: &str) -> AppResult<Vec<u8>> {
+    let capacity = value
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| AppError::message("Linux kernel command line length overflowed."))?;
+    let mut cmdline = Cmdline::new(capacity)
+        .map_err(|error| AppError::message(format!("Invalid Linux command line: {error}")))?;
+    cmdline
+        .insert_str(value)
+        .map_err(|error| AppError::message(format!("Invalid Linux command line: {error}")))?;
+    let guest_address = GuestAddress(0x1000);
+    let memory =
+        GuestMemoryMmap::<()>::from_ranges(&[(guest_address, capacity)]).map_err(|error| {
+            AppError::message(format!("Could not allocate cmdline memory: {error}"))
+        })?;
+    load_cmdline(&memory, guest_address, &cmdline).map_err(|error| {
+        AppError::message(format!("Could not load Linux command line: {error}"))
+    })?;
+    let mut bytes = vec![0_u8; capacity];
+    memory
+        .read_slice(&mut bytes, guest_address)
+        .map_err(|error| {
+            AppError::message(format!("Could not read Linux command line: {error}"))
+        })?;
+    Ok(bytes)
 }
 
 fn kernel_layout_execution_image(
@@ -8240,70 +8272,91 @@ fn build_linux_boot_params_page(
     layout: &KernelBootLayout,
     kernel_bytes: Option<&[u8]>,
 ) -> AppResult<Vec<u8>> {
-    let mut boot_params = vec![0_u8; 4096];
-    if layout.kernel_format == "linux-bzimage" {
-        copy_linux_setup_header_to_boot_params(
-            &mut boot_params,
-            kernel_bytes.ok_or_else(|| {
-                AppError::message(
-                    "Linux boot params require the original bzImage setup header bytes.",
-                )
-            })?,
-        )?;
+    if layout.kernel_format != "linux-bzimage" {
+        return Ok(vec![0_u8; 4096]);
     }
+
+    let kernel_bytes = kernel_bytes.ok_or_else(|| {
+        AppError::message("Linux boot params require the original bzImage bytes.")
+    })?;
+    let kernel_load_gpa = parse_guest_physical_address(&layout.kernel_load_gpa)?;
+    let guest_memory = GuestMemoryMmap::<()>::from_ranges(&[(
+        GuestAddress(kernel_load_gpa),
+        kernel_bytes.len().max(4096),
+    )])
+    .map_err(|error| {
+        AppError::message(format!("Could not allocate Linux loader memory: {error}"))
+    })?;
+    let loader_result = BzImage::load(
+        &guest_memory,
+        Some(GuestAddress(kernel_load_gpa)),
+        &mut Cursor::new(kernel_bytes),
+        None,
+    )
+    .map_err(|error| AppError::message(format!("linux-loader rejected the bzImage: {error}")))?;
+    let setup_header = loader_result
+        .setup_header
+        .ok_or_else(|| AppError::message("linux-loader did not return a bzImage setup header."))?;
+    let mut params = bootparam::boot_params {
+        hdr: setup_header,
+        ..Default::default()
+    };
+
     let cmdline_gpa = checked_u32_gpa(&layout.cmdline_gpa, "kernel cmdline")?;
-    write_u16_le(&mut boot_params, 0x1fe, 0xaa55);
-    boot_params[0x202..0x206].copy_from_slice(b"HdrS");
-    let protocol = layout
+    params.hdr.boot_flag = 0xaa55;
+    params.hdr.header = 0x5372_6448;
+    params.hdr.version = layout
         .linux_boot_protocol
         .as_deref()
         .and_then(parse_hex_u16)
         .unwrap_or(0x020f);
-    write_u16_le(&mut boot_params, 0x206, protocol);
-    boot_params[0x210] = 0xff;
-    boot_params[0x211] |= 0x80;
-    write_u32_le(
-        &mut boot_params,
-        0x214,
-        checked_u32_gpa(&layout.kernel_load_gpa, "kernel entry")?,
-    );
-    write_u32_le(&mut boot_params, 0x228, cmdline_gpa);
-    write_u32_le(&mut boot_params, 0x22c, 0x7fff_ffff);
-    write_u32_le(
-        &mut boot_params,
-        0x238,
-        layout.cmdline.len().saturating_add(1) as u32,
-    );
+    params.hdr.type_of_loader = 0xff;
+    params.hdr.loadflags |= 0x80;
+    params.hdr.code32_start = checked_u32_gpa(&layout.kernel_load_gpa, "kernel entry")?;
+    params.hdr.cmd_line_ptr = cmdline_gpa;
+    params.hdr.initrd_addr_max = 0x7fff_ffff;
+    params.hdr.cmdline_size = layout.cmdline.len().saturating_add(1) as u32;
 
     if layout.initramfs_path.is_some() {
         let initramfs_gpa = layout
             .initramfs_load_gpa
             .as_deref()
             .ok_or_else(|| AppError::message("Initramfs layout is missing a load GPA."))?;
-        write_u32_le(
-            &mut boot_params,
-            0x218,
-            checked_u32_gpa(initramfs_gpa, "initramfs")?,
-        );
-        write_u32_le(
-            &mut boot_params,
-            0x21c,
-            layout
-                .initramfs_bytes
-                .ok_or_else(|| AppError::message("Initramfs layout is missing its byte length."))?
-                .try_into()
-                .map_err(|_| {
-                    AppError::message("Initramfs is too large for the 32-bit boot protocol field.")
-                })?,
-        );
+        params.hdr.ramdisk_image = checked_u32_gpa(initramfs_gpa, "initramfs")?;
+        params.hdr.ramdisk_size = layout
+            .initramfs_bytes
+            .ok_or_else(|| AppError::message("Initramfs layout is missing its byte length."))?
+            .try_into()
+            .map_err(|_| {
+                AppError::message("Initramfs is too large for the 32-bit boot protocol field.")
+            })?;
     }
 
     if let Some(framebuffer) = &layout.framebuffer {
-        write_linux_screen_info(&mut boot_params, framebuffer)?;
+        params.screen_info = linux_screen_info(framebuffer)?;
     }
-    write_linux_e820_table(&mut boot_params, &layout.guest_memory_map)?;
+    let e820_entries = linux_e820_entries(&layout.guest_memory_map)?;
+    params.e820_entries = e820_entries.len() as u8;
+    params.e820_table[..e820_entries.len()].copy_from_slice(&e820_entries);
 
-    Ok(boot_params)
+    let boot_params_gpa = parse_guest_physical_address(&layout.boot_params_gpa)?;
+    let boot_memory = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(boot_params_gpa), 8192)])
+        .map_err(|error| {
+            AppError::message(format!(
+                "Could not allocate Linux boot-params memory: {error}"
+            ))
+        })?;
+    let boot_params = BootParams::new(&params, GuestAddress(boot_params_gpa));
+    LinuxBootConfigurator::write_bootparams(&boot_params, &boot_memory).map_err(|error| {
+        AppError::message(format!("Could not write Linux boot parameters: {error}"))
+    })?;
+    let mut bytes = vec![0_u8; 4096];
+    boot_memory
+        .read_slice(&mut bytes, GuestAddress(boot_params_gpa))
+        .map_err(|error| {
+            AppError::message(format!("Could not read Linux boot parameters: {error}"))
+        })?;
+    Ok(bytes)
 }
 
 fn linux_loader_adapter_plan(
@@ -8318,7 +8371,12 @@ fn linux_loader_adapter_plan(
         candidate_crate_version: Some("0.13.2".to_string()),
         license: "Apache-2.0 OR BSD-3-Clause".to_string(),
         source_url: "https://github.com/rust-vmm/linux-loader".to_string(),
-        adoption_state: "adapter-boundary-not-yet-linked".to_string(),
+        adoption_state: if applicable {
+            "linked-linux-loader-0.13.2"
+        } else {
+            "not-applicable"
+        }
+        .to_string(),
         applicable,
         kernel_format: kernel_format.to_string(),
         linux_boot_protocol: linux_boot_protocol.map(ToOwned::to_owned),
@@ -8341,13 +8399,13 @@ fn linux_loader_adapter_plan(
         }
         .to_string(),
         guest_memory_backend: if applicable {
-            "Pane WHP guest memory, planned vm-memory compatibility"
+            "Pane vm-memory 0.17.1 adapter over WHP guest mappings"
         } else {
             "Pane controlled serial candidate memory"
         }
         .to_string(),
         notes: vec![
-            "This record is the narrow seam for replacing Pane's manual bzImage setup with rust-vmm/linux-loader primitives."
+            "Pane validates and loads bzImage payloads with BzImage, serializes generated boot_params through LinuxBootConfigurator, and materializes command lines with load_cmdline."
                 .to_string(),
             "Layouts without this current adapter record are stale and must be rematerialized before WHP execution."
                 .to_string(),
@@ -8378,46 +8436,7 @@ fn legacy_linux_loader_adapter_plan() -> LinuxLoaderAdapterPlan {
     }
 }
 
-fn copy_linux_setup_header_to_boot_params(
-    boot_params: &mut [u8],
-    kernel_bytes: &[u8],
-) -> AppResult<()> {
-    if kernel_bytes.len() < 0x264 {
-        return Err(AppError::message(
-            "Linux bzImage is too small to copy its setup header into boot params.",
-        ));
-    }
-    if read_u16_le_at(kernel_bytes, 0x1fe) != Some(0xaa55)
-        || kernel_bytes.get(0x202..0x206) != Some(b"HdrS")
-    {
-        return Err(AppError::message(
-            "Linux bzImage setup header cannot be copied because boot flag or HdrS magic is missing.",
-        ));
-    }
-
-    let header_end = linux_setup_header_end(kernel_bytes)?;
-    boot_params[0x1f1..header_end].copy_from_slice(&kernel_bytes[0x1f1..header_end]);
-    Ok(())
-}
-
-fn linux_setup_header_end(kernel_bytes: &[u8]) -> AppResult<usize> {
-    let advertised_end = kernel_bytes
-        .get(0x201)
-        .map(|header_len| 0x202 + usize::from(*header_len))
-        .ok_or_else(|| AppError::message("Linux bzImage is missing setup header length."))?;
-    let header_end = advertised_end.max(0x264);
-    if header_end > kernel_bytes.len() || header_end > 4096 {
-        return Err(AppError::message(format!(
-            "Linux bzImage setup header end offset 0x{header_end:x} is outside the boot params scaffold."
-        )));
-    }
-    Ok(header_end)
-}
-
-fn write_linux_screen_info(
-    boot_params: &mut [u8],
-    framebuffer: &FramebufferContract,
-) -> AppResult<()> {
+fn linux_screen_info(framebuffer: &FramebufferContract) -> AppResult<bootparam::screen_info> {
     if framebuffer.format != "x8r8g8b8" {
         return Err(AppError::message(format!(
             "Framebuffer format `{}` cannot be advertised through Linux screen_info yet.",
@@ -8445,33 +8464,29 @@ fn write_linux_screen_info(
         .try_into()
         .map_err(|_| AppError::message("Framebuffer size is too large for Linux screen_info."))?;
 
-    boot_params[0x0f] = 0x23;
-    write_u16_le(boot_params, 0x12, width);
-    write_u16_le(boot_params, 0x14, height);
-    write_u16_le(boot_params, 0x16, depth);
-    write_u32_le(
-        boot_params,
-        0x18,
-        checked_u32_gpa(&framebuffer.guest_gpa, "framebuffer")?,
-    );
-    write_u32_le(boot_params, 0x1c, lfb_size);
-    write_u16_le(boot_params, 0x24, stride);
-    boot_params[0x26] = 8;
-    boot_params[0x27] = 16;
-    boot_params[0x28] = 8;
-    boot_params[0x29] = 8;
-    boot_params[0x2a] = 8;
-    boot_params[0x2b] = 0;
-    boot_params[0x2c] = 8;
-    boot_params[0x2d] = 24;
-
-    Ok(())
+    Ok(bootparam::screen_info {
+        orig_video_isVGA: 0x23,
+        lfb_width: width,
+        lfb_height: height,
+        lfb_depth: depth,
+        lfb_base: checked_u32_gpa(&framebuffer.guest_gpa, "framebuffer")?,
+        lfb_size,
+        lfb_linelength: stride,
+        red_size: 8,
+        red_pos: 16,
+        green_size: 8,
+        green_pos: 8,
+        blue_size: 8,
+        blue_pos: 0,
+        rsvd_size: 8,
+        rsvd_pos: 24,
+        ..Default::default()
+    })
 }
 
-fn write_linux_e820_table(
-    boot_params: &mut [u8],
+fn linux_e820_entries(
     ranges: &[KernelGuestMemoryRange],
-) -> AppResult<()> {
+) -> AppResult<Vec<bootparam::boot_e820_entry>> {
     if ranges.len() > u8::MAX as usize {
         return Err(AppError::message(
             "Linux E820 table cannot contain more than 255 entries.",
@@ -8483,9 +8498,8 @@ fn write_linux_e820_table(
         ));
     }
 
-    boot_params[0x1e8] = ranges.len() as u8;
-    for (index, range) in ranges.iter().enumerate() {
-        let offset = 0x2d0 + index * 20;
+    let mut entries = Vec::with_capacity(ranges.len());
+    for range in ranges {
         let start = parse_guest_physical_address(&range.start_gpa)?;
         let region_type = match range.region_type.as_str() {
             "usable" => 1,
@@ -8498,12 +8512,13 @@ fn write_linux_e820_table(
                 )))
             }
         };
-        write_u64_le(boot_params, offset, start);
-        write_u64_le(boot_params, offset + 8, range.size_bytes);
-        write_u32_le(boot_params, offset + 16, region_type);
+        entries.push(bootparam::boot_e820_entry {
+            addr: start,
+            size: range.size_bytes,
+            type_: region_type,
+        });
     }
-
-    Ok(())
+    Ok(entries)
 }
 
 fn checked_u32_gpa(value: &str, label: &str) -> AppResult<u32> {
@@ -8514,18 +8529,6 @@ fn checked_u32_gpa(value: &str, label: &str) -> AppResult<u32> {
                 "{label} GPA must fit in 32 bits for this boot-params scaffold."
             ))
         })
-}
-
-fn write_u16_le(bytes: &mut [u8], offset: usize, value: u16) {
-    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
-}
-
-fn write_u32_le(bytes: &mut [u8], offset: usize, value: u32) {
-    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-}
-
-fn write_u64_le(bytes: &mut [u8], offset: usize, value: u64) {
-    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
 fn read_u16_le_at(bytes: &[u8], offset: usize) -> Option<u16> {
@@ -14555,7 +14558,7 @@ mod tests {
         );
         assert_eq!(
             layout.linux_loader.adoption_state,
-            "adapter-boundary-not-yet-linked"
+            "linked-linux-loader-0.13.2"
         );
         assert!(layout.linux_loader.applicable);
         assert_eq!(layout.boot_params_gpa, "0x00007000");

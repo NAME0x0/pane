@@ -16,7 +16,7 @@ The above copyright notice and this permission notice shall be included in all c
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-## vm-memory 0.18.0
+## vm-memory 0.17.1
 
 - Source: https://github.com/rust-vmm/vm-memory
 - License: Apache-2.0 OR BSD-3-Clause (Pane distributes it under the BSD-3-Clause option)
@@ -31,3 +31,13 @@ Redistribution and use in source and binary forms, with or without modification,
 - Neither the name of Google Inc. nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
 
 THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+## linux-loader 0.13.2
+
+- Source: https://github.com/rust-vmm/linux-loader
+- License: Apache-2.0 AND BSD-3-Clause
+- Use: bzImage validation/loading, generated Linux boot-parameter structures and serialization, and kernel command-line placement
+- Local source: `third_party/linux-loader`
+- Pane modification: the `vm-memory` dependency is pinned to 0.17.1 with default features disabled so the upstream loader builds on Windows without Unix-only `rawfd` APIs
+
+The complete required license texts and original copyright notices are preserved in `third_party/linux-loader/LICENSE-APACHE`, `third_party/linux-loader/LICENSE-BSD-3-Clause`, and the upstream source headers.

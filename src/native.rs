@@ -8120,13 +8120,13 @@ mod windows_whp {
         }
 
         struct TestGuestMemory {
-            bytes: Vec<u8>,
+            memory: PaneMmapGuestMemory,
         }
 
         impl TestGuestMemory {
             fn new(size: usize) -> Self {
                 Self {
-                    bytes: vec![0; size],
+                    memory: PaneMmapGuestMemory::new(0, size).expect("test guest memory"),
                 }
             }
 
@@ -8151,23 +8151,15 @@ mod windows_whp {
 
         impl crate::virtio::PaneGuestMemory for TestGuestMemory {
             fn read(&self, gpa: u64, bytes: &mut [u8]) -> Result<(), String> {
-                let start = gpa as usize;
-                let end = start + bytes.len();
-                if end > self.bytes.len() {
-                    return Err("guest read out of bounds".to_string());
-                }
-                bytes.copy_from_slice(&self.bytes[start..end]);
-                Ok(())
+                self.memory.read(gpa, bytes)
             }
 
             fn write(&mut self, gpa: u64, bytes: &[u8]) -> Result<(), String> {
-                let start = gpa as usize;
-                let end = start + bytes.len();
-                if end > self.bytes.len() {
-                    return Err("guest write out of bounds".to_string());
-                }
-                self.bytes[start..end].copy_from_slice(bytes);
-                Ok(())
+                self.memory.write(gpa, bytes)
+            }
+
+            fn rust_vmm_memory(&self) -> Option<&vm_memory::GuestMemoryMmap<()>> {
+                Some(self.memory.rust_vmm_memory())
             }
         }
 

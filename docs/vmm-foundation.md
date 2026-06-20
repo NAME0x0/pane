@@ -21,6 +21,7 @@ The product target is still a Pane-owned app that boots and renders Arch without
 | Microsoft `windows-sys` | Generated WHP ABI definitions and delayed Windows DLL loading primitives. | MIT OR Apache-2.0 |
 | rust-vmm/vm-memory | Page-backed guest-memory ownership, bounded guest-address access, and stable host mappings. | Apache-2.0 OR BSD-3-Clause |
 | rust-vmm/virtio-queue | Linked split-virtqueue validation, descriptor iteration, available-ring consumption, and used-ring publication. | Apache-2.0 AND BSD-3-Clause |
+| rust-vmm/virtio-bindings | Linked source of virtio-MMIO register offsets, virtio-blk request/status/feature constants, ring descriptor flags, and device IDs, replacing hand-transcribed magic numbers. | BSD-3-Clause OR Apache-2.0 |
 | rust-vmm/linux-loader | Linked adapter for bzImage loading, cmdline placement, and Linux boot params. | Apache-2.0 AND BSD-3-Clause |
 | rust-vmm/vm-virtio | Direct dependency candidate for virtio queues and device semantics. | Apache-2.0 OR BSD-3-Clause |
 | virtio-blk | Replacement target for Pane's custom block-port protocol and generated `pane-block.ko` boot dependency. | Linux-standard guest model via rust-vmm implementation |

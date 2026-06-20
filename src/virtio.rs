@@ -1,59 +1,65 @@
 use serde::Serialize;
 use std::sync::Arc;
+use virtio_bindings::{virtio_blk, virtio_config, virtio_ids, virtio_mmio, virtio_ring};
 use virtio_queue::{Queue, QueueT};
 use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 pub(crate) const PANE_VIRTIO_MMIO_BASE_GPA: u64 = 0x0dfc_0000;
 pub(crate) const PANE_VIRTIO_MMIO_SIZE_BYTES: u64 = 0x0000_1000;
 pub(crate) const PANE_VIRTIO_MMIO_IRQ: u32 = 5;
+// "virt" magic, little-endian. virtio-bindings reuses the `VIRTIO_MMIO_MAGIC_VALUE`
+// name for the register offset (0x000), so the magic number itself stays a literal.
 pub(crate) const VIRTIO_MMIO_MAGIC_VALUE: u32 = 0x7472_6976;
 pub(crate) const VIRTIO_MMIO_VERSION_MODERN: u32 = 2;
-pub(crate) const VIRTIO_DEVICE_ID_BLOCK: u32 = 2;
-pub(crate) const VIRTIO_DEVICE_ID_GPU: u32 = 16;
-pub(crate) const VIRTIO_DEVICE_ID_INPUT: u32 = 18;
+pub(crate) const VIRTIO_DEVICE_ID_BLOCK: u32 = virtio_ids::VIRTIO_ID_BLOCK;
+pub(crate) const VIRTIO_DEVICE_ID_GPU: u32 = virtio_ids::VIRTIO_ID_GPU;
+pub(crate) const VIRTIO_DEVICE_ID_INPUT: u32 = virtio_ids::VIRTIO_ID_INPUT;
 pub(crate) const VIRTIO_MMIO_CONFIG_OFFSET: u64 = 0x100;
 pub(crate) const VIRTIO_BLK_SECTOR_SIZE_BYTES: u64 = 512;
 pub(crate) const PANE_VIRTIO_BLK_QUEUE_SIZE: u16 = 256;
-pub(crate) const VIRTIO_BLK_STATUS_OK: u8 = 0;
-pub(crate) const VIRTIO_BLK_STATUS_IOERR: u8 = 1;
-pub(crate) const VIRTIO_BLK_STATUS_UNSUPP: u8 = 2;
-pub(crate) const VIRTIO_BLK_F_RO: u64 = 1 << 5;
-pub(crate) const VIRTIO_BLK_F_BLK_SIZE: u64 = 1 << 6;
-pub(crate) const VIRTIO_BLK_F_FLUSH: u64 = 1 << 9;
-pub(crate) const VIRTIO_F_VERSION_1: u64 = 1 << 32;
-pub(crate) const VIRTIO_CONFIG_S_DRIVER_OK: u32 = 4;
-pub(crate) const VIRTIO_CONFIG_S_FEATURES_OK: u32 = 8;
+pub(crate) const VIRTIO_BLK_STATUS_OK: u8 = virtio_blk::VIRTIO_BLK_S_OK as u8;
+pub(crate) const VIRTIO_BLK_STATUS_IOERR: u8 = virtio_blk::VIRTIO_BLK_S_IOERR as u8;
+pub(crate) const VIRTIO_BLK_STATUS_UNSUPP: u8 = virtio_blk::VIRTIO_BLK_S_UNSUPP as u8;
+// virtio-bindings exposes feature bit positions; Pane stores the negotiated masks.
+pub(crate) const VIRTIO_BLK_F_RO: u64 = 1 << virtio_blk::VIRTIO_BLK_F_RO;
+pub(crate) const VIRTIO_BLK_F_BLK_SIZE: u64 = 1 << virtio_blk::VIRTIO_BLK_F_BLK_SIZE;
+pub(crate) const VIRTIO_BLK_F_FLUSH: u64 = 1 << virtio_blk::VIRTIO_BLK_F_FLUSH;
+pub(crate) const VIRTIO_F_VERSION_1: u64 = 1 << virtio_config::VIRTIO_F_VERSION_1;
+pub(crate) const VIRTIO_CONFIG_S_DRIVER_OK: u32 = virtio_config::VIRTIO_CONFIG_S_DRIVER_OK;
+pub(crate) const VIRTIO_CONFIG_S_FEATURES_OK: u32 = virtio_config::VIRTIO_CONFIG_S_FEATURES_OK;
 
-const VIRTIO_MMIO_MAGIC_VALUE_OFFSET: u64 = 0x000;
-const VIRTIO_MMIO_VERSION_OFFSET: u64 = 0x004;
-const VIRTIO_MMIO_DEVICE_ID_OFFSET: u64 = 0x008;
-const VIRTIO_MMIO_VENDOR_ID_OFFSET: u64 = 0x00c;
-const VIRTIO_MMIO_DEVICE_FEATURES_OFFSET: u64 = 0x010;
-const VIRTIO_MMIO_DEVICE_FEATURES_SEL_OFFSET: u64 = 0x014;
-const VIRTIO_MMIO_DRIVER_FEATURES_OFFSET: u64 = 0x020;
-const VIRTIO_MMIO_DRIVER_FEATURES_SEL_OFFSET: u64 = 0x024;
-const VIRTIO_MMIO_QUEUE_SEL_OFFSET: u64 = 0x030;
-const VIRTIO_MMIO_QUEUE_NUM_MAX_OFFSET: u64 = 0x034;
-const VIRTIO_MMIO_QUEUE_NUM_OFFSET: u64 = 0x038;
-const VIRTIO_MMIO_QUEUE_READY_OFFSET: u64 = 0x044;
-const VIRTIO_MMIO_QUEUE_NOTIFY_OFFSET: u64 = 0x050;
-const VIRTIO_MMIO_INTERRUPT_STATUS_OFFSET: u64 = 0x060;
-const VIRTIO_MMIO_INTERRUPT_ACK_OFFSET: u64 = 0x064;
-const VIRTIO_MMIO_STATUS_OFFSET: u64 = 0x070;
-const VIRTIO_MMIO_QUEUE_DESC_LOW_OFFSET: u64 = 0x080;
-const VIRTIO_MMIO_QUEUE_DESC_HIGH_OFFSET: u64 = 0x084;
-const VIRTIO_MMIO_QUEUE_AVAIL_LOW_OFFSET: u64 = 0x090;
-const VIRTIO_MMIO_QUEUE_AVAIL_HIGH_OFFSET: u64 = 0x094;
-const VIRTIO_MMIO_QUEUE_USED_LOW_OFFSET: u64 = 0x0a0;
-const VIRTIO_MMIO_QUEUE_USED_HIGH_OFFSET: u64 = 0x0a4;
-const VIRTIO_MMIO_CONFIG_GENERATION_OFFSET: u64 = 0x0fc;
+const VIRTIO_MMIO_MAGIC_VALUE_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_MAGIC_VALUE as u64;
+const VIRTIO_MMIO_VERSION_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_VERSION as u64;
+const VIRTIO_MMIO_DEVICE_ID_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_DEVICE_ID as u64;
+const VIRTIO_MMIO_VENDOR_ID_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_VENDOR_ID as u64;
+const VIRTIO_MMIO_DEVICE_FEATURES_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_DEVICE_FEATURES as u64;
+const VIRTIO_MMIO_DEVICE_FEATURES_SEL_OFFSET: u64 =
+    virtio_mmio::VIRTIO_MMIO_DEVICE_FEATURES_SEL as u64;
+const VIRTIO_MMIO_DRIVER_FEATURES_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_DRIVER_FEATURES as u64;
+const VIRTIO_MMIO_DRIVER_FEATURES_SEL_OFFSET: u64 =
+    virtio_mmio::VIRTIO_MMIO_DRIVER_FEATURES_SEL as u64;
+const VIRTIO_MMIO_QUEUE_SEL_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_QUEUE_SEL as u64;
+const VIRTIO_MMIO_QUEUE_NUM_MAX_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_QUEUE_NUM_MAX as u64;
+const VIRTIO_MMIO_QUEUE_NUM_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_QUEUE_NUM as u64;
+const VIRTIO_MMIO_QUEUE_READY_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_QUEUE_READY as u64;
+const VIRTIO_MMIO_QUEUE_NOTIFY_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_QUEUE_NOTIFY as u64;
+const VIRTIO_MMIO_INTERRUPT_STATUS_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_INTERRUPT_STATUS as u64;
+const VIRTIO_MMIO_INTERRUPT_ACK_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_INTERRUPT_ACK as u64;
+const VIRTIO_MMIO_STATUS_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_STATUS as u64;
+const VIRTIO_MMIO_QUEUE_DESC_LOW_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_QUEUE_DESC_LOW as u64;
+const VIRTIO_MMIO_QUEUE_DESC_HIGH_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_QUEUE_DESC_HIGH as u64;
+const VIRTIO_MMIO_QUEUE_AVAIL_LOW_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_QUEUE_AVAIL_LOW as u64;
+const VIRTIO_MMIO_QUEUE_AVAIL_HIGH_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_QUEUE_AVAIL_HIGH as u64;
+const VIRTIO_MMIO_QUEUE_USED_LOW_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_QUEUE_USED_LOW as u64;
+const VIRTIO_MMIO_QUEUE_USED_HIGH_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_QUEUE_USED_HIGH as u64;
+const VIRTIO_MMIO_CONFIG_GENERATION_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_CONFIG_GENERATION as u64;
 const PANE_VENDOR_ID: u32 = 0x7061_6e65;
-const VIRTQ_DESC_F_NEXT: u16 = 1;
-const VIRTQ_DESC_F_WRITE: u16 = 2;
-const VIRTIO_BLK_T_IN: u32 = 0;
-const VIRTIO_BLK_T_OUT: u32 = 1;
-const VIRTIO_BLK_T_FLUSH: u32 = 4;
-const VIRTIO_BLK_T_GET_ID: u32 = 8;
+const VIRTQ_DESC_F_NEXT: u16 = virtio_ring::VRING_DESC_F_NEXT as u16;
+const VIRTQ_DESC_F_WRITE: u16 = virtio_ring::VRING_DESC_F_WRITE as u16;
+const VIRTIO_BLK_T_IN: u32 = virtio_blk::VIRTIO_BLK_T_IN;
+const VIRTIO_BLK_T_OUT: u32 = virtio_blk::VIRTIO_BLK_T_OUT;
+const VIRTIO_BLK_T_FLUSH: u32 = virtio_blk::VIRTIO_BLK_T_FLUSH;
+const VIRTIO_BLK_T_GET_ID: u32 = virtio_blk::VIRTIO_BLK_T_GET_ID;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct PaneVirtioMmioWindow {

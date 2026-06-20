@@ -221,6 +221,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "virtio-bindings",
  "virtio-queue",
  "vm-memory",
  "windows-sys 0.61.2",

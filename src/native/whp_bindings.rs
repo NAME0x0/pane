@@ -10,22 +10,14 @@ use windows_sys::Win32::System::Hypervisor::{
     WHvRunVpExitReasonX64IoPortAccess, WHvRunVpExitReasonX64MsrAccess,
     WHvX64LocalApicEmulationModeXApic,
 };
-#[cfg(test)]
 pub(crate) use windows_sys::Win32::System::Hypervisor::{
-    WHV_EMULATOR_CALLBACKS as OfficialEmulatorCallbacks,
-    WHV_EMULATOR_IO_ACCESS_INFO as OfficialEmulatorIoAccessInfo,
-    WHV_EMULATOR_MEMORY_ACCESS_INFO as OfficialEmulatorMemoryAccessInfo,
-    WHV_EMULATOR_STATUS as OfficialEmulatorStatus,
-    WHV_INTERRUPT_CONTROL as OfficialInterruptControl,
-    WHV_MEMORY_ACCESS_CONTEXT as OfficialMemoryAccessContext,
-    WHV_REGISTER_VALUE as OfficialRegisterValue,
-    WHV_TRANSLATE_GVA_RESULT as OfficialTranslateGvaResult,
-    WHV_VP_EXIT_CONTEXT as OfficialVpExitContext,
-    WHV_X64_SEGMENT_REGISTER as OfficialX64SegmentRegister,
-    WHV_X64_TABLE_REGISTER as OfficialX64TableRegister,
-};
-pub(crate) use windows_sys::Win32::System::Hypervisor::{
-    WHV_INTERRUPT_CONTROL as WhvInterruptControl, WHV_TRANSLATE_GVA_RESULT as WhvTranslateGvaResult,
+    WHV_EMULATOR_CALLBACKS as WhvEmulatorCallbacks,
+    WHV_EMULATOR_IO_ACCESS_INFO as WhvEmulatorIoAccessInfo,
+    WHV_EMULATOR_MEMORY_ACCESS_INFO as WhvEmulatorMemoryAccessInfo,
+    WHV_EMULATOR_STATUS as WhvEmulatorStatus, WHV_INTERRUPT_CONTROL as WhvInterruptControl,
+    WHV_MEMORY_ACCESS_CONTEXT as WhvMemoryAccessContext,
+    WHV_REGISTER_VALUE as OfficialWhvRegisterValue,
+    WHV_TRANSLATE_GVA_RESULT as WhvTranslateGvaResult, WHV_VP_EXIT_CONTEXT as WhvVpExitContext,
 };
 use windows_sys::Win32::{
     Foundation::{FreeLibrary, HMODULE},

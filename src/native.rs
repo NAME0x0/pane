@@ -1587,7 +1587,9 @@ mod windows_whp {
 
     use super::whp_bindings::{
         free_library as FreeLibrary, get_proc_address as GetProcAddress,
-        load_library as LoadLibraryA, WhvInterruptControl, WhvTranslateGvaResult,
+        load_library as LoadLibraryA, OfficialWhvRegisterValue, WhvEmulatorCallbacks,
+        WhvEmulatorIoAccessInfo, WhvEmulatorMemoryAccessInfo, WhvEmulatorStatus,
+        WhvInterruptControl, WhvMemoryAccessContext, WhvTranslateGvaResult, WhvVpExitContext,
         WHV_CAPABILITY_CODE_HYPERVISOR_PRESENT, WHV_MAP_GPA_RANGE_FLAG_EXECUTE,
         WHV_MAP_GPA_RANGE_FLAG_READ, WHV_MAP_GPA_RANGE_FLAG_WRITE,
         WHV_PARTITION_PROPERTY_CODE_LOCAL_APIC_EMULATION_MODE,
@@ -1827,77 +1829,13 @@ mod windows_whp {
         base: u64,
     }
 
+    // Live WHP register arrays require 16-byte register-slot alignment.
     #[repr(C, align(16))]
     #[derive(Copy, Clone)]
     union WhvRegisterValue {
         reg64: u64,
         segment: WhvX64SegmentRegister,
         table: WhvX64TableRegister,
-    }
-
-    #[repr(C)]
-    #[derive(Copy, Clone)]
-    struct WhvEmulatorMemoryAccessInfo {
-        gpa_address: u64,
-        direction: u8,
-        access_size: u8,
-        data: [u8; 8],
-    }
-
-    #[repr(C)]
-    #[derive(Copy, Clone)]
-    struct WhvEmulatorIoAccessInfo {
-        direction: u8,
-        port: u16,
-        access_size: u16,
-        data: u32,
-    }
-
-    #[repr(C)]
-    #[derive(Copy, Clone)]
-    struct WhvMemoryAccessContext {
-        instruction_byte_count: u8,
-        reserved: [u8; 3],
-        instruction_bytes: [u8; 16],
-        access_info: u32,
-        gpa: u64,
-        gva: u64,
-    }
-
-    #[repr(C)]
-    #[derive(Copy, Clone)]
-    struct WhvVpExitContext {
-        execution_state: u16,
-        instruction_length_and_cr8: u8,
-        reserved: u8,
-        cs: WhvX64SegmentRegister,
-        rip: u64,
-        rflags: u64,
-    }
-
-    #[repr(C)]
-    #[derive(Copy, Clone)]
-    struct WhvEmulatorStatus {
-        as_u32: u32,
-    }
-
-    #[repr(C)]
-    #[derive(Copy, Clone)]
-    struct WhvEmulatorCallbacks {
-        size: u32,
-        reserved: u32,
-        io_port_callback:
-            Option<unsafe extern "system" fn(*mut c_void, *mut WhvEmulatorIoAccessInfo) -> i32>,
-        memory_callback:
-            Option<unsafe extern "system" fn(*mut c_void, *mut WhvEmulatorMemoryAccessInfo) -> i32>,
-        get_virtual_processor_registers: Option<
-            unsafe extern "system" fn(*mut c_void, *const u32, u32, *mut WhvRegisterValue) -> i32,
-        >,
-        set_virtual_processor_registers: Option<
-            unsafe extern "system" fn(*mut c_void, *const u32, u32, *const WhvRegisterValue) -> i32,
-        >,
-        translate_gva_page:
-            Option<unsafe extern "system" fn(*mut c_void, u64, u32, *mut u32, *mut u64) -> i32>,
     }
 
     struct WhpEmulatorMmioCallbackContext<'a> {
@@ -2246,25 +2184,25 @@ mod windows_whp {
 
     fn whp_emulator_callbacks() -> WhvEmulatorCallbacks {
         WhvEmulatorCallbacks {
-            size: mem::size_of::<WhvEmulatorCallbacks>() as u32,
-            reserved: 0,
-            io_port_callback: Some(whp_emulator_io_port_callback),
-            memory_callback: Some(whp_emulator_memory_callback),
-            get_virtual_processor_registers: Some(whp_emulator_get_registers_callback),
-            set_virtual_processor_registers: Some(whp_emulator_set_registers_callback),
-            translate_gva_page: Some(whp_emulator_translate_gva_page_callback),
+            Size: mem::size_of::<WhvEmulatorCallbacks>() as u32,
+            Reserved: 0,
+            WHvEmulatorIoPortCallback: Some(whp_emulator_io_port_callback),
+            WHvEmulatorMemoryCallback: Some(whp_emulator_memory_callback),
+            WHvEmulatorGetVirtualProcessorRegisters: Some(whp_emulator_get_registers_callback),
+            WHvEmulatorSetVirtualProcessorRegisters: Some(whp_emulator_set_registers_callback),
+            WHvEmulatorTranslateGvaPage: Some(whp_emulator_translate_gva_page_callback),
         }
     }
 
     unsafe extern "system" fn whp_emulator_io_port_callback(
-        _context: *mut c_void,
+        _context: *const c_void,
         _io_access: *mut WhvEmulatorIoAccessInfo,
     ) -> i32 {
         E_UNEXPECTED
     }
 
     unsafe extern "system" fn whp_emulator_memory_callback(
-        context: *mut c_void,
+        context: *const c_void,
         memory_access: *mut WhvEmulatorMemoryAccessInfo,
     ) -> i32 {
         if context.is_null() || memory_access.is_null() {
@@ -2273,24 +2211,24 @@ mod windows_whp {
 
         let context = &mut *(context as *mut WhpEmulatorMmioCallbackContext<'_>);
         let memory_access = &mut *memory_access;
-        let access_size = usize::from(memory_access.access_size);
-        if access_size == 0 || access_size > memory_access.data.len() {
+        let access_size = usize::from(memory_access.AccessSize);
+        if access_size == 0 || access_size > memory_access.Data.len() {
             context.last_status = Some("invalid-access-size".to_string());
             context.last_detail = Some(format!(
                 "Invalid WHP emulator MMIO access size {access_size}; buffer_len={}.",
-                memory_access.data.len()
+                memory_access.Data.len()
             ));
             return E_UNEXPECTED;
         }
 
-        let kind = match memory_access.direction {
+        let kind = match memory_access.Direction {
             WHP_EMULATOR_MMIO_READ => crate::virtio::PaneVirtioMmioAccessKind::Read,
             WHP_EMULATOR_MMIO_WRITE => crate::virtio::PaneVirtioMmioAccessKind::Write,
             _ => {
                 context.last_status = Some("invalid-direction".to_string());
                 context.last_detail = Some(format!(
                     "Invalid WHP emulator MMIO direction {}.",
-                    memory_access.direction
+                    memory_access.Direction
                 ));
                 return E_UNEXPECTED;
             }
@@ -2298,12 +2236,12 @@ mod windows_whp {
         let data = match kind {
             crate::virtio::PaneVirtioMmioAccessKind::Read => vec![0; access_size],
             crate::virtio::PaneVirtioMmioAccessKind::Write => {
-                memory_access.data[..access_size].to_vec()
+                memory_access.Data[..access_size].to_vec()
             }
         };
         let outcome = (context.handler)(crate::virtio::PaneVirtioMmioAccess {
             kind,
-            gpa: memory_access.gpa_address,
+            gpa: memory_access.GpaAddress,
             data,
         });
 
@@ -2321,17 +2259,17 @@ mod windows_whp {
                 ));
                 return E_UNEXPECTED;
             }
-            memory_access.data[..access_size].copy_from_slice(&outcome.read_data[..access_size]);
+            memory_access.Data[..access_size].copy_from_slice(&outcome.read_data[..access_size]);
         }
 
         S_OK
     }
 
     unsafe extern "system" fn whp_emulator_get_registers_callback(
-        context: *mut c_void,
-        register_names: *const u32,
+        context: *const c_void,
+        register_names: *const i32,
         register_count: u32,
-        register_values: *mut WhvRegisterValue,
+        register_values: *mut OfficialWhvRegisterValue,
     ) -> i32 {
         if context.is_null()
             || (register_count > 0 && (register_names.is_null() || register_values.is_null()))
@@ -2343,13 +2281,21 @@ mod windows_whp {
             context.last_status = Some("get-registers-unavailable".to_string());
             return E_UNEXPECTED;
         };
+        let mut aligned_values = vec![whv_register64(0); register_count as usize];
         let hresult = get_virtual_processor_registers(
             context.partition,
             context.vp_index,
-            register_names,
+            register_names.cast::<u32>(),
             register_count,
-            register_values,
+            aligned_values.as_mut_ptr(),
         );
+        if hresult_succeeded(hresult) && register_count > 0 {
+            std::ptr::copy_nonoverlapping(
+                aligned_values.as_ptr().cast::<u8>(),
+                register_values.cast::<u8>(),
+                aligned_values.len() * mem::size_of::<WhvRegisterValue>(),
+            );
+        }
         context.last_status = Some(if hresult_succeeded(hresult) {
             "get-registers-ok".to_string()
         } else {
@@ -2359,10 +2305,10 @@ mod windows_whp {
     }
 
     unsafe extern "system" fn whp_emulator_set_registers_callback(
-        context: *mut c_void,
-        register_names: *const u32,
+        context: *const c_void,
+        register_names: *const i32,
         register_count: u32,
-        register_values: *const WhvRegisterValue,
+        register_values: *const OfficialWhvRegisterValue,
     ) -> i32 {
         if context.is_null()
             || (register_count > 0 && (register_names.is_null() || register_values.is_null()))
@@ -2374,12 +2320,20 @@ mod windows_whp {
             context.last_status = Some("set-registers-unavailable".to_string());
             return E_UNEXPECTED;
         };
+        let mut aligned_values = vec![whv_register64(0); register_count as usize];
+        if register_count > 0 {
+            std::ptr::copy_nonoverlapping(
+                register_values.cast::<u8>(),
+                aligned_values.as_mut_ptr().cast::<u8>(),
+                aligned_values.len() * mem::size_of::<WhvRegisterValue>(),
+            );
+        }
         let hresult = set_virtual_processor_registers(
             context.partition,
             context.vp_index,
-            register_names,
+            register_names.cast::<u32>(),
             register_count,
-            register_values,
+            aligned_values.as_ptr(),
         );
         context.last_status = Some(if hresult_succeeded(hresult) {
             "set-registers-ok".to_string()
@@ -2390,10 +2344,10 @@ mod windows_whp {
     }
 
     unsafe extern "system" fn whp_emulator_translate_gva_page_callback(
-        context: *mut c_void,
+        context: *const c_void,
         gva: u64,
-        translate_flags: u32,
-        translation_result: *mut u32,
+        translate_flags: i32,
+        translation_result: *mut i32,
         gpa: *mut u64,
     ) -> i32 {
         if context.is_null() || translation_result.is_null() || gpa.is_null() {
@@ -2412,12 +2366,12 @@ mod windows_whp {
             context.partition,
             context.vp_index,
             gva,
-            translate_flags,
+            translate_flags as u32,
             &mut whp_result,
             gpa,
         );
         if hresult_succeeded(hresult) {
-            *translation_result = whp_result.ResultCode as u32;
+            *translation_result = whp_result.ResultCode;
         }
         context.last_status = Some(if hresult_succeeded(hresult) {
             format!(
@@ -2532,7 +2486,7 @@ mod windows_whp {
             last_status: None,
             last_detail: None,
         };
-        let mut status = WhvEmulatorStatus { as_u32: 0 };
+        let mut status = WhvEmulatorStatus { AsUINT32: 0 };
         let hresult = unsafe {
             (emulator.try_mmio_emulation)(
                 emulator.handle,
@@ -2543,7 +2497,7 @@ mod windows_whp {
             )
         };
         let ok = hresult_succeeded(hresult)
-            && status.as_u32 & WHV_EMULATOR_STATUS_EMULATION_SUCCESSFUL != 0;
+            && unsafe { status.AsUINT32 } & WHV_EMULATOR_STATUS_EMULATION_SUCCESSFUL != 0;
         report.calls.push(hresult_call(
             "WHvEmulatorTryMmioEmulation(virtio-mmio)",
             hresult,
@@ -2559,7 +2513,7 @@ mod windows_whp {
             ok,
             detail: format!(
                 "status=0x{:08x}, callback_status={}, callback_detail={}.",
-                status.as_u32,
+                unsafe { status.AsUINT32 },
                 callback_context.last_status.as_deref().unwrap_or("none"),
                 callback_context.last_detail.as_deref().unwrap_or("none")
             ),
@@ -3624,18 +3578,8 @@ mod windows_whp {
     }
 
     fn serial_test_image_registers(entry_gpa: u64) -> (Vec<u32>, Vec<WhvRegisterValue>) {
-        let code_segment = WhvX64SegmentRegister {
-            base: entry_gpa,
-            limit: 0xffff,
-            selector: 0,
-            attributes: 0x009b,
-        };
-        let data_segment = WhvX64SegmentRegister {
-            base: entry_gpa,
-            limit: 0xffff,
-            selector: 0,
-            attributes: 0x0093,
-        };
+        let code_segment = whv_segment_register(entry_gpa, 0xffff, 0, 0x009b);
+        let data_segment = whv_segment_register(entry_gpa, 0xffff, 0, 0x0093);
         let register_names = vec![
             WHV_REGISTER_RAX,
             WHV_REGISTER_RDX,
@@ -3651,26 +3595,18 @@ mod windows_whp {
             WHV_REGISTER_CR4,
         ];
         let register_values = vec![
-            WhvRegisterValue { reg64: 0 },
-            WhvRegisterValue { reg64: 0 },
-            WhvRegisterValue { reg64: 0x800 },
-            WhvRegisterValue { reg64: 0 },
-            WhvRegisterValue { reg64: 0x0002 },
-            WhvRegisterValue {
-                segment: code_segment,
-            },
-            WhvRegisterValue {
-                segment: data_segment,
-            },
-            WhvRegisterValue {
-                segment: data_segment,
-            },
-            WhvRegisterValue {
-                segment: data_segment,
-            },
-            WhvRegisterValue { reg64: 0x0010 },
-            WhvRegisterValue { reg64: 0 },
-            WhvRegisterValue { reg64: 0 },
+            whv_register64(0),
+            whv_register64(0),
+            whv_register64(0x800),
+            whv_register64(0),
+            whv_register64(0x0002),
+            whv_segment_value(code_segment),
+            whv_segment_value(data_segment),
+            whv_segment_value(data_segment),
+            whv_segment_value(data_segment),
+            whv_register64(0x0010),
+            whv_register64(0),
+            whv_register64(0),
         ];
         (register_names, register_values)
     }
@@ -3679,28 +3615,12 @@ mod windows_whp {
         entry_gpa: u64,
         boot_params_gpa: u64,
     ) -> (Vec<u32>, Vec<WhvRegisterValue>) {
-        let code_segment = WhvX64SegmentRegister {
-            base: 0,
-            limit: 0xffff_ffff,
-            selector: LINUX_BOOT_CODE_SELECTOR,
-            attributes: 0x0000_cf9b,
-        };
-        let data_segment = WhvX64SegmentRegister {
-            base: 0,
-            limit: 0xffff_ffff,
-            selector: LINUX_BOOT_DATA_SELECTOR,
-            attributes: 0x0000_cf93,
-        };
-        let gdt = WhvX64TableRegister {
-            pad: [0; 3],
-            limit: 0x1f,
-            base: LINUX_BOOT_GDT_GPA,
-        };
-        let idt = WhvX64TableRegister {
-            pad: [0; 3],
-            limit: 0,
-            base: 0,
-        };
+        let code_segment =
+            whv_segment_register(0, 0xffff_ffff, LINUX_BOOT_CODE_SELECTOR, 0x0000_cf9b);
+        let data_segment =
+            whv_segment_register(0, 0xffff_ffff, LINUX_BOOT_DATA_SELECTOR, 0x0000_cf93);
+        let gdt = whv_table_register(0x1f, LINUX_BOOT_GDT_GPA);
+        let idt = whv_table_register(0, 0);
         let register_names = vec![
             WHV_REGISTER_RAX,
             WHV_REGISTER_RDX,
@@ -3722,38 +3642,60 @@ mod windows_whp {
             WHV_REGISTER_CR4,
         ];
         let register_values = vec![
-            WhvRegisterValue { reg64: 0 },
-            WhvRegisterValue { reg64: 0 },
-            WhvRegisterValue { reg64: 0 },
-            WhvRegisterValue {
-                reg64: LINUX_BOOT_STACK_GPA,
-            },
-            WhvRegisterValue { reg64: 0 },
-            WhvRegisterValue {
-                reg64: boot_params_gpa,
-            },
-            WhvRegisterValue { reg64: 0 },
-            WhvRegisterValue { reg64: entry_gpa },
-            WhvRegisterValue { reg64: 0x0002 },
-            WhvRegisterValue {
-                segment: code_segment,
-            },
-            WhvRegisterValue {
-                segment: data_segment,
-            },
-            WhvRegisterValue {
-                segment: data_segment,
-            },
-            WhvRegisterValue {
-                segment: data_segment,
-            },
-            WhvRegisterValue { table: gdt },
-            WhvRegisterValue { table: idt },
-            WhvRegisterValue { reg64: 0x0011 },
-            WhvRegisterValue { reg64: 0 },
-            WhvRegisterValue { reg64: 0 },
+            whv_register64(0),
+            whv_register64(0),
+            whv_register64(0),
+            whv_register64(LINUX_BOOT_STACK_GPA),
+            whv_register64(0),
+            whv_register64(boot_params_gpa),
+            whv_register64(0),
+            whv_register64(entry_gpa),
+            whv_register64(0x0002),
+            whv_segment_value(code_segment),
+            whv_segment_value(data_segment),
+            whv_segment_value(data_segment),
+            whv_segment_value(data_segment),
+            whv_table_value(gdt),
+            whv_table_value(idt),
+            whv_register64(0x0011),
+            whv_register64(0),
+            whv_register64(0),
         ];
         (register_names, register_values)
+    }
+
+    fn whv_segment_register(
+        base: u64,
+        limit: u32,
+        selector: u16,
+        attributes: u16,
+    ) -> WhvX64SegmentRegister {
+        WhvX64SegmentRegister {
+            base,
+            limit,
+            selector,
+            attributes,
+        }
+    }
+
+    fn whv_table_register(limit: u16, base: u64) -> WhvX64TableRegister {
+        WhvX64TableRegister {
+            pad: [0; 3],
+            limit,
+            base,
+        }
+    }
+
+    fn whv_register64(value: u64) -> WhvRegisterValue {
+        WhvRegisterValue { reg64: value }
+    }
+
+    fn whv_segment_value(value: WhvX64SegmentRegister) -> WhvRegisterValue {
+        WhvRegisterValue { segment: value }
+    }
+
+    fn whv_table_value(value: WhvX64TableRegister) -> WhvRegisterValue {
+        WhvRegisterValue { table: value }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3777,6 +3719,7 @@ mod windows_whp {
             NativeGuestEntryMode::RealModeSerial => run_serial_test_image(
                 partition,
                 run_virtual_processor,
+                cancel_run_virtual_processor,
                 set_virtual_processor_registers,
                 &boot_image.expected_serial_text,
                 report,
@@ -3803,25 +3746,36 @@ mod windows_whp {
     fn run_serial_test_image(
         partition: *mut c_void,
         run_virtual_processor: WhvRunVirtualProcessor,
+        cancel_run_virtual_processor: Option<WhvCancelRunVirtualProcessor>,
         set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
         expected_serial_text: &str,
         report: &mut NativePartitionSmokeReport,
     ) {
         report.serial_expected_text = Some(expected_serial_text.to_string());
+        let Some(cancel_run_virtual_processor) = cancel_run_virtual_processor else {
+            report.calls.push(NativeWhpCallReport {
+                name: "WHvCancelRunVirtualProcessor",
+                hresult: None,
+                ok: false,
+                detail: "WHvCancelRunVirtualProcessor is unavailable, so Pane refuses to run the serial fixture without a host-side escape hatch.".to_string(),
+            });
+            return;
+        };
+        let mut guarded_runner = LinuxEntryProbeGuardedRunner::start(
+            partition,
+            run_virtual_processor,
+            cancel_run_virtual_processor,
+        );
         let max_serial_boot_exits = expected_serial_text.len() + 2;
         report.guest_exit_budget = max_serial_boot_exits as u32;
 
         for exit_index in 0..max_serial_boot_exits {
             report.guest_exit_count = (exit_index + 1) as u32;
-            let mut exit_context = [0_u8; 1024];
-            let hresult = unsafe {
-                run_virtual_processor(
-                    partition,
-                    0,
-                    exit_context.as_mut_ptr().cast::<c_void>(),
-                    exit_context.len() as u32,
-                )
+            let Some(run_result) = guarded_runner.run(report) else {
+                break;
             };
+            let hresult = run_result.hresult;
+            let exit_context = run_result.exit_context;
             let run_ok = hresult_succeeded(hresult);
             report.virtual_processor_ran |= run_ok;
             report.calls.push(hresult_call(
@@ -3880,6 +3834,18 @@ mod windows_whp {
                     let next_rip = rip + u64::from(instruction_length);
                     if !set_guest_rip(partition, set_virtual_processor_registers, next_rip, report)
                     {
+                        break;
+                    }
+
+                    if report.serial_text.as_deref() == Some(expected_serial_text) {
+                        report.calls.push(NativeWhpCallReport {
+                            name: "SerialBootBannerBoundary",
+                            hresult: None,
+                            ok: true,
+                            detail: format!(
+                                "Serial boot image emitted the complete expected banner {expected_serial_text:?}; stopping before WHP blocks the halted vCPU."
+                            ),
+                        });
                         break;
                     }
                 }
@@ -5425,9 +5391,7 @@ mod windows_whp {
         report: &mut NativePartitionSmokeReport,
     ) -> bool {
         let register_names = [WHV_REGISTER_DELIVERABILITY_NOTIFICATIONS];
-        let register_values = [WhvRegisterValue {
-            reg64: WHV_DELIVERABILITY_NOTIFICATION_INTERRUPT,
-        }];
+        let register_values = [whv_register64(WHV_DELIVERABILITY_NOTIFICATION_INTERRUPT)];
         let hresult = unsafe {
             set_virtual_processor_registers(
                 partition,
@@ -5464,7 +5428,7 @@ mod windows_whp {
         report: &mut NativePartitionSmokeReport,
     ) -> bool {
         let register_names = [WHV_REGISTER_DELIVERABILITY_NOTIFICATIONS];
-        let register_values = [WhvRegisterValue { reg64: 0 }];
+        let register_values = [whv_register64(0)];
         let hresult = unsafe {
             set_virtual_processor_registers(
                 partition,
@@ -5976,7 +5940,7 @@ mod windows_whp {
         label: &'static str,
         report: &mut NativePartitionSmokeReport,
     ) -> Vec<Option<u64>> {
-        let mut register_values = vec![WhvRegisterValue { reg64: 0 }; register_names.len()];
+        let mut register_values = vec![whv_register64(0); register_names.len()];
         let hresult = unsafe {
             get_virtual_processor_registers(
                 partition,
@@ -6012,7 +5976,7 @@ mod windows_whp {
         register_names
             .iter()
             .map(|register_name| {
-                let mut value = WhvRegisterValue { reg64: 0 };
+                let mut value = whv_register64(0);
                 let hresult = unsafe {
                     get_virtual_processor_registers(partition, 0, register_name, 1, &mut value)
                 };
@@ -6399,7 +6363,7 @@ mod windows_whp {
         report: &mut NativePartitionSmokeReport,
     ) -> bool {
         let register_names = [WHV_REGISTER_RIP];
-        let register_values = [WhvRegisterValue { reg64: rip }];
+        let register_values = [whv_register64(rip)];
         let hresult = unsafe {
             set_virtual_processor_registers(
                 partition,
@@ -7078,10 +7042,8 @@ mod windows_whp {
     ) -> bool {
         let register_names = [WHV_REGISTER_RAX, WHV_REGISTER_RIP];
         let register_values = [
-            WhvRegisterValue {
-                reg64: (previous_rax & !0xff) | u64::from(value),
-            },
-            WhvRegisterValue { reg64: rip },
+            whv_register64((previous_rax & !0xff) | u64::from(value)),
+            whv_register64(rip),
         ];
         let hresult = unsafe {
             set_virtual_processor_registers(
@@ -7128,10 +7090,8 @@ mod windows_whp {
         };
         let register_names = [WHV_REGISTER_RAX, WHV_REGISTER_RIP];
         let register_values = [
-            WhvRegisterValue {
-                reg64: (previous_rax & !mask) | (u64::from(value) & mask),
-            },
-            WhvRegisterValue { reg64: rip },
+            whv_register64((previous_rax & !mask) | (u64::from(value) & mask)),
+            whv_register64(rip),
         ];
         let hresult = unsafe {
             set_virtual_processor_registers(
@@ -7179,13 +7139,11 @@ mod windows_whp {
             WHV_REGISTER_RIP,
         ];
         let register_values = [
-            WhvRegisterValue { reg64: result.rax },
-            WhvRegisterValue { reg64: result.rbx },
-            WhvRegisterValue { reg64: result.rcx },
-            WhvRegisterValue { reg64: result.rdx },
-            WhvRegisterValue {
-                reg64: result.next_rip,
-            },
+            whv_register64(result.rax),
+            whv_register64(result.rbx),
+            whv_register64(result.rcx),
+            whv_register64(result.rdx),
+            whv_register64(result.next_rip),
         ];
         let hresult = unsafe {
             set_virtual_processor_registers(
@@ -7278,13 +7236,9 @@ mod windows_whp {
         let value = *msr_state.get(&access.msr_number).unwrap_or(&0);
         let register_names = [WHV_REGISTER_RAX, WHV_REGISTER_RDX, WHV_REGISTER_RIP];
         let register_values = [
-            WhvRegisterValue {
-                reg64: value & 0xffff_ffff,
-            },
-            WhvRegisterValue { reg64: value >> 32 },
-            WhvRegisterValue {
-                reg64: access.next_rip,
-            },
+            whv_register64(value & 0xffff_ffff),
+            whv_register64(value >> 32),
+            whv_register64(access.next_rip),
         ];
         let hresult = unsafe {
             set_virtual_processor_registers(
@@ -7334,8 +7288,14 @@ mod windows_whp {
     }
 
     fn serial_contract_passed(report: &NativePartitionSmokeReport) -> bool {
-        report.halt_observed
-            && report.exit_reason == Some(WHV_RUN_VP_EXIT_REASON_X64_HALT)
+        let reached_completion_boundary = (report.halt_observed
+            && report.exit_reason == Some(WHV_RUN_VP_EXIT_REASON_X64_HALT))
+            || report
+                .calls
+                .iter()
+                .any(|call| call.name == "SerialBootBannerBoundary" && call.ok);
+
+        reached_completion_boundary
             && report.serial_port == Some(SERIAL_COM1_PORT)
             && report
                 .serial_expected_text
@@ -8117,7 +8077,7 @@ mod windows_whp {
             PANE_BLOCK_IO_STATUS_SUBMITTED, SERIAL_BOOT_BANNER_TEXT,
         };
         use crate::virtio::PaneGuestMemory;
-        use std::{ffi::c_void, mem};
+        use std::ffi::c_void;
 
         struct TestWhpCallbackState {
             get_count: u32,
@@ -8321,10 +8281,21 @@ mod windows_whp {
         }
 
         #[test]
-        fn whp_emulator_abi_layout_matches_windows_headers() {
+        fn official_whp_layouts_match_windows_sdk_abi_sizes() {
+            assert_eq!(std::mem::size_of::<super::WhvX64SegmentRegister>(), 16);
+            assert_eq!(std::mem::size_of::<super::WhvX64TableRegister>(), 16);
+            assert_eq!(std::mem::size_of::<WhvRegisterValue>(), 16);
+            assert_eq!(std::mem::align_of::<WhvRegisterValue>(), 16);
+            assert_eq!(std::mem::size_of::<super::OfficialWhvRegisterValue>(), 16);
+            assert_eq!(std::mem::align_of::<super::OfficialWhvRegisterValue>(), 8);
+            assert_eq!(std::mem::size_of::<super::WhvInterruptControl>(), 16);
+            assert_eq!(std::mem::size_of::<WhvTranslateGvaResult>(), 8);
             assert_eq!(std::mem::size_of::<WhvEmulatorMemoryAccessInfo>(), 24);
             assert_eq!(std::mem::align_of::<WhvEmulatorMemoryAccessInfo>(), 8);
             assert_eq!(std::mem::size_of::<WhvEmulatorIoAccessInfo>(), 12);
+            assert_eq!(std::mem::size_of::<super::WhvMemoryAccessContext>(), 40);
+            assert_eq!(std::mem::size_of::<super::WhvVpExitContext>(), 40);
+            assert_eq!(std::mem::size_of::<super::WhvEmulatorStatus>(), 4);
             assert_eq!(
                 std::mem::size_of::<WhvEmulatorCallbacks>(),
                 2 * std::mem::size_of::<u32>() + 5 * std::mem::size_of::<usize>()
@@ -8333,29 +8304,29 @@ mod windows_whp {
             let callbacks = whp_emulator_callbacks();
 
             assert_eq!(
-                callbacks.size,
+                callbacks.Size,
                 std::mem::size_of::<WhvEmulatorCallbacks>() as u32
             );
-            assert!(callbacks.io_port_callback.is_some());
-            assert!(callbacks.memory_callback.is_some());
-            assert!(callbacks.get_virtual_processor_registers.is_some());
-            assert!(callbacks.set_virtual_processor_registers.is_some());
-            assert!(callbacks.translate_gva_page.is_some());
+            assert!(callbacks.WHvEmulatorIoPortCallback.is_some());
+            assert!(callbacks.WHvEmulatorMemoryCallback.is_some());
+            assert!(callbacks.WHvEmulatorGetVirtualProcessorRegisters.is_some());
+            assert!(callbacks.WHvEmulatorSetVirtualProcessorRegisters.is_some());
+            assert!(callbacks.WHvEmulatorTranslateGvaPage.is_some());
         }
 
         #[test]
         fn whp_emulator_callbacks_fail_closed_until_live_context_is_wired() {
             let mut io_access = WhvEmulatorIoAccessInfo {
-                direction: 0,
-                port: 0,
-                access_size: 1,
-                data: 0,
+                Direction: 0,
+                Port: 0,
+                AccessSize: 1,
+                Data: 0,
             };
             let mut memory_access = WhvEmulatorMemoryAccessInfo {
-                gpa_address: crate::virtio::PANE_VIRTIO_MMIO_BASE_GPA,
-                direction: 0,
-                access_size: 4,
-                data: [0; 8],
+                GpaAddress: crate::virtio::PANE_VIRTIO_MMIO_BASE_GPA,
+                Direction: 0,
+                AccessSize: 4,
+                Data: [0; 8],
             };
 
             let io_result =
@@ -8400,12 +8371,12 @@ mod windows_whp {
                 last_detail: None,
             };
             let register_names = [WHV_REGISTER_RIP, WHV_REGISTER_RAX];
-            let mut register_values = [WhvRegisterValue { reg64: 0 }; 2];
+            let mut register_values = [super::OfficialWhvRegisterValue { Reg64: 0 }; 2];
 
             let get_result = unsafe {
                 whp_emulator_get_registers_callback(
                     (&mut context as *mut WhpEmulatorMmioCallbackContext<'_>).cast::<c_void>(),
-                    register_names.as_ptr(),
+                    register_names.as_ptr().cast::<i32>(),
                     register_names.len() as u32,
                     register_values.as_mut_ptr(),
                 )
@@ -8416,16 +8387,16 @@ mod windows_whp {
             assert_eq!(state.last_vp_index, 7);
             assert_eq!(state.last_register_name, WHV_REGISTER_RIP);
             assert_eq!(
-                unsafe { register_values[0].reg64 },
+                unsafe { register_values[0].Reg64 },
                 u64::from(WHV_REGISTER_RIP) + 0x1000
             );
             assert_eq!(context.last_status.as_deref(), Some("get-registers-ok"));
 
-            register_values[0] = WhvRegisterValue { reg64: 0xfeed_beef };
+            register_values[0] = super::OfficialWhvRegisterValue { Reg64: 0xfeed_beef };
             let set_result = unsafe {
                 whp_emulator_set_registers_callback(
                     (&mut context as *mut WhpEmulatorMmioCallbackContext<'_>).cast::<c_void>(),
-                    register_names.as_ptr(),
+                    register_names.as_ptr().cast::<i32>(),
                     1,
                     register_values.as_ptr(),
                 )
@@ -8471,7 +8442,7 @@ mod windows_whp {
                 last_status: None,
                 last_detail: None,
             };
-            let mut translation_result = u32::MAX;
+            let mut translation_result = i32::MAX;
             let mut gpa = 0;
 
             let result = unsafe {
@@ -8489,7 +8460,7 @@ mod windows_whp {
             assert_eq!(state.last_vp_index, 3);
             assert_eq!(state.last_translate_flags, 0x2);
             assert_eq!(state.last_gva, 0x1234_5678);
-            assert_eq!(translation_result, WHV_TRANSLATE_GVA_RESULT_SUCCESS);
+            assert_eq!(translation_result, WHV_TRANSLATE_GVA_RESULT_SUCCESS as i32);
             assert_eq!(gpa, 0x1234_5000);
             assert!(context
                 .last_status
@@ -8520,10 +8491,10 @@ mod windows_whp {
                 last_detail: None,
             };
             let mut memory_access = WhvEmulatorMemoryAccessInfo {
-                gpa_address: crate::virtio::PANE_VIRTIO_MMIO_BASE_GPA,
-                direction: WHP_EMULATOR_MMIO_READ,
-                access_size: 4,
-                data: [0; 8],
+                GpaAddress: crate::virtio::PANE_VIRTIO_MMIO_BASE_GPA,
+                Direction: WHP_EMULATOR_MMIO_READ,
+                AccessSize: 4,
+                Data: [0; 8],
             };
 
             let result = unsafe {
@@ -8535,7 +8506,7 @@ mod windows_whp {
 
             assert_eq!(result, S_OK);
             assert_eq!(
-                &memory_access.data[..4],
+                &memory_access.Data[..4],
                 &crate::virtio::VIRTIO_MMIO_MAGIC_VALUE.to_le_bytes()
             );
             assert_eq!(context.last_status.as_deref(), Some("register-read"));
@@ -8575,10 +8546,10 @@ mod windows_whp {
                 last_detail: None,
             };
             let mut memory_access = WhvEmulatorMemoryAccessInfo {
-                gpa_address: crate::virtio::PANE_VIRTIO_MMIO_BASE_GPA + 0x050,
-                direction: WHP_EMULATOR_MMIO_WRITE,
-                access_size: 4,
-                data: [0; 8],
+                GpaAddress: crate::virtio::PANE_VIRTIO_MMIO_BASE_GPA + 0x050,
+                Direction: WHP_EMULATOR_MMIO_WRITE,
+                AccessSize: 4,
+                Data: [0; 8],
             };
 
             let result = unsafe {
@@ -9564,15 +9535,19 @@ mod windows_whp {
         }
 
         #[test]
-        fn serial_contract_requires_expected_banner_and_halt() {
+        fn serial_contract_accepts_expected_banner_at_a_bounded_completion_boundary() {
             let mut report = base_report();
-            report.halt_observed = true;
-            report.exit_reason = Some(WHV_RUN_VP_EXIT_REASON_X64_HALT);
             report.serial_port = Some(0x03f8);
             report.serial_bytes = SERIAL_BOOT_BANNER_TEXT.as_bytes().to_vec();
             report.serial_io_exit_count = report.serial_bytes.len() as u32;
             report.serial_text = Some(SERIAL_BOOT_BANNER_TEXT.to_string());
             report.serial_expected_text = Some(SERIAL_BOOT_BANNER_TEXT.to_string());
+            report.calls.push(super::NativeWhpCallReport {
+                name: "SerialBootBannerBoundary",
+                hresult: None,
+                ok: true,
+                detail: "test boundary".to_string(),
+            });
 
             assert!(serial_contract_passed(&report));
             assert!(guest_contract_passed(
@@ -9582,6 +9557,20 @@ mod windows_whp {
 
             report.serial_text = Some("wrong".to_string());
             assert!(!serial_contract_passed(&report));
+        }
+
+        #[test]
+        fn serial_contract_still_accepts_an_observed_halt_after_the_banner() {
+            let mut report = base_report();
+            report.halt_observed = true;
+            report.exit_reason = Some(WHV_RUN_VP_EXIT_REASON_X64_HALT);
+            report.serial_port = Some(SERIAL_COM1_PORT);
+            report.serial_bytes = SERIAL_BOOT_BANNER_TEXT.as_bytes().to_vec();
+            report.serial_io_exit_count = report.serial_bytes.len() as u32;
+            report.serial_text = Some(SERIAL_BOOT_BANNER_TEXT.to_string());
+            report.serial_expected_text = Some(SERIAL_BOOT_BANNER_TEXT.to_string());
+
+            assert!(serial_contract_passed(&report));
         }
 
         #[test]
@@ -10051,61 +10040,6 @@ mod windows_whp {
             assert_eq!(
                 whv_x64_interrupt_control(0x1ff, 0x1f, 0x1f, 0x1ff),
                 0x00ff_ffff
-            );
-        }
-
-        #[test]
-        fn delayed_whp_compatibility_layouts_match_official_windows_bindings() {
-            use crate::native::whp_bindings::{
-                OfficialEmulatorCallbacks, OfficialEmulatorIoAccessInfo,
-                OfficialEmulatorMemoryAccessInfo, OfficialEmulatorStatus, OfficialInterruptControl,
-                OfficialMemoryAccessContext, OfficialRegisterValue, OfficialTranslateGvaResult,
-                OfficialVpExitContext, OfficialX64SegmentRegister, OfficialX64TableRegister,
-            };
-
-            assert_eq!(
-                mem::size_of::<super::WhvX64SegmentRegister>(),
-                mem::size_of::<OfficialX64SegmentRegister>()
-            );
-            assert_eq!(
-                mem::size_of::<super::WhvX64TableRegister>(),
-                mem::size_of::<OfficialX64TableRegister>()
-            );
-            assert_eq!(
-                mem::size_of::<WhvRegisterValue>(),
-                mem::size_of::<OfficialRegisterValue>()
-            );
-            assert_eq!(
-                mem::size_of::<super::WhvInterruptControl>(),
-                mem::size_of::<OfficialInterruptControl>()
-            );
-            assert_eq!(
-                mem::size_of::<WhvTranslateGvaResult>(),
-                mem::size_of::<OfficialTranslateGvaResult>()
-            );
-            assert_eq!(
-                mem::size_of::<WhvEmulatorMemoryAccessInfo>(),
-                mem::size_of::<OfficialEmulatorMemoryAccessInfo>()
-            );
-            assert_eq!(
-                mem::size_of::<WhvEmulatorIoAccessInfo>(),
-                mem::size_of::<OfficialEmulatorIoAccessInfo>()
-            );
-            assert_eq!(
-                mem::size_of::<super::WhvMemoryAccessContext>(),
-                mem::size_of::<OfficialMemoryAccessContext>()
-            );
-            assert_eq!(
-                mem::size_of::<super::WhvVpExitContext>(),
-                mem::size_of::<OfficialVpExitContext>()
-            );
-            assert_eq!(
-                mem::size_of::<super::WhvEmulatorStatus>(),
-                mem::size_of::<OfficialEmulatorStatus>()
-            );
-            assert_eq!(
-                mem::size_of::<WhvEmulatorCallbacks>(),
-                mem::size_of::<OfficialEmulatorCallbacks>()
             );
         }
 

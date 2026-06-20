@@ -315,6 +315,12 @@ pub struct RuntimeArgs {
     /// Expected SHA-256 digest for --register-pane-block-module. Without this, the module is recorded but not trusted.
     #[arg(long)]
     pub pane_block_module_expected_sha256: Option<String>,
+    /// Copy a stock virtio_mmio.ko (decompressed from the guest kernel modules tree) into the initramfs driver bundle so /init can load the virtio-mmio bus before mounting the virtio root.
+    #[arg(long)]
+    pub register_virtio_mmio_module: Option<PathBuf>,
+    /// Expected SHA-256 digest for --register-virtio-mmio-module. Required so Pane verifies the module before bundling it.
+    #[arg(long)]
+    pub virtio_mmio_module_expected_sha256: Option<String>,
     /// Create the Pane-owned user disk descriptor for packages, accounts, and customizations.
     #[arg(long)]
     pub create_user_disk: bool,

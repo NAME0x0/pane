@@ -515,6 +515,24 @@ struct PaneInitramfsDriverMetadata {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct VirtioMmioModuleMetadata {
+    schema_version: u32,
+    module_kind: String,
+    source_path: String,
+    stored_path: String,
+    bytes: u64,
+    sha256: String,
+    expected_sha256: Option<String>,
+    verified: bool,
+    #[serde(default)]
+    target_kernel_path: Option<String>,
+    #[serde(default)]
+    target_kernel_sha256: Option<String>,
+    registered_at_epoch_seconds: u64,
+    notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct PaneBlockModuleMetadata {
     schema_version: u32,
     module_kind: String,
@@ -2268,6 +2286,7 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
         || args.build_discovery_initramfs
         || args.build_pane_block_module
         || args.register_pane_block_module.is_some()
+        || args.register_virtio_mmio_module.is_some()
         || args.create_user_disk
         || args.snapshot_user_disk
         || args.restore_user_disk_snapshot.is_some()
@@ -2386,6 +2405,19 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
     } else if args.pane_block_module_expected_sha256.is_some() {
         return Err(AppError::message(
             "--pane-block-module-expected-sha256 requires --register-pane-block-module.",
+        ));
+    }
+
+    if let Some(module) = args.register_virtio_mmio_module.as_deref() {
+        register_virtio_mmio_module(
+            &paths,
+            module,
+            args.virtio_mmio_module_expected_sha256.as_deref(),
+            args.force,
+        )?;
+    } else if args.virtio_mmio_module_expected_sha256.is_some() {
+        return Err(AppError::message(
+            "--virtio-mmio-module-expected-sha256 requires --register-virtio-mmio-module.",
         ));
     }
 
@@ -4979,8 +5011,72 @@ fn pane_block_module_path(paths: &RuntimePaths) -> PathBuf {
     paths.initramfs_driver_dir.join("pane-block.ko")
 }
 
+fn virtio_mmio_module_path(paths: &RuntimePaths) -> PathBuf {
+    paths.initramfs_driver_dir.join("virtio_mmio.ko")
+}
+
+fn virtio_mmio_module_metadata_path(paths: &RuntimePaths) -> PathBuf {
+    paths.state.join("virtio-mmio-module.json")
+}
+
 fn pane_block_module_metadata_path(paths: &RuntimePaths) -> PathBuf {
     paths.state.join("pane-block-module.json")
+}
+
+fn register_virtio_mmio_module(
+    paths: &RuntimePaths,
+    source_module: &Path,
+    expected_sha256: Option<&str>,
+    force: bool,
+) -> AppResult<()> {
+    let kernel_metadata = read_json_file::<KernelBootMetadata>(&paths.kernel_boot_metadata)
+        .map_err(|error| {
+            AppError::message(format!(
+                "virtio_mmio module registration requires an existing verified kernel boot plan. Register the target Arch kernel first with `pane runtime --register-kernel ... --kernel-expected-sha256 ...`: {error}"
+            ))
+        })?;
+    if !kernel_metadata.kernel_verified {
+        return Err(AppError::message(
+            "virtio_mmio module registration requires a hash-verified target kernel. Re-register the kernel with --kernel-expected-sha256.",
+        ));
+    }
+    if expected_sha256.is_none() {
+        return Err(AppError::message(
+            "virtio_mmio module registration requires --virtio-mmio-module-expected-sha256 so Pane can verify the module before including it in the initramfs.",
+        ));
+    }
+    let destination = virtio_mmio_module_path(paths);
+    let registration = copy_verified_runtime_artifact(
+        source_module,
+        &destination,
+        expected_sha256,
+        "virtio_mmio module",
+        force,
+    )?;
+    if !registration.verified {
+        return Err(AppError::message(
+            "virtio_mmio module must be registered with --virtio-mmio-module-expected-sha256 before it can be included in a native boot initramfs.",
+        ));
+    }
+    let metadata = VirtioMmioModuleMetadata {
+        schema_version: 1,
+        module_kind: "linux-virtio-mmio-module".to_string(),
+        source_path: registration.source_path,
+        stored_path: registration.stored_path,
+        bytes: registration.bytes,
+        sha256: registration.sha256,
+        expected_sha256: registration.expected_sha256,
+        verified: registration.verified,
+        target_kernel_path: Some(kernel_metadata.kernel_stored_path),
+        target_kernel_sha256: Some(kernel_metadata.kernel_sha256),
+        registered_at_epoch_seconds: current_epoch_seconds(),
+        notes: vec![
+            "Stock Arch builds CONFIG_VIRTIO_MMIO=m, so the virtio-mmio bus driver must be loaded before /dev/vda appears.".to_string(),
+            "Pane copies this module into the discovery initramfs as /lib/modules/virtio_mmio.ko so /init loads it before waiting for the virtio root device.".to_string(),
+            "The module's vermagic must match the registered target kernel; a mismatched module will fail to insmod inside the guest.".to_string(),
+        ],
+    };
+    write_json_file(&virtio_mmio_module_metadata_path(paths), &metadata)
 }
 
 fn register_pane_block_module(
@@ -5565,6 +5661,68 @@ static int load_pane_block_module(const char *device_blocks, const char *root_of
 #endif
 }
 
+static int load_virtio_mmio_module(void) {
+    const char *module_path = "/lib/modules/virtio_mmio.ko";
+    int fd = open(module_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ENOENT) {
+            log_line("PANE_VIRTIO_MMIO_MODULE_NOT_PRESENT");
+            return 0;
+        }
+        char line[160];
+        snprintf(line, sizeof(line), "PANE_VIRTIO_MMIO_MODULE_OPEN_FAILED errno=%d", errno);
+        log_line(line);
+        return -1;
+    }
+
+    log_line("PANE_VIRTIO_MMIO_MODULE_LOAD_ATTEMPT");
+#ifdef SYS_finit_module
+    /* virtio_mmio is built CONFIG_VIRTIO_MMIO=m on stock Arch. Loading it makes the
+       module honor the virtio_mmio.device= directive already on the boot cmdline
+       (CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y), which registers the platform device so
+       the built-in virtio_blk driver can bind and create /dev/vda. Parameters are
+       empty: the kernel applies the boot-cmdline module params at load time. */
+    pid_t child = fork();
+    if (child == 0) {
+        int child_rc = syscall(SYS_finit_module, fd, "", 0);
+        _exit(child_rc == 0 ? 0 : (errno == EEXIST ? 17 : 1));
+    }
+    if (child < 0) {
+        char line[160];
+        snprintf(line, sizeof(line), "PANE_VIRTIO_MMIO_MODULE_FORK_FAILED errno=%d", errno);
+        log_line(line);
+        close(fd);
+        return -1;
+    }
+    int status = 0;
+    if (waitpid(child, &status, 0) != child) {
+        char line[160];
+        snprintf(line, sizeof(line), "PANE_VIRTIO_MMIO_MODULE_WAIT_FAILED errno=%d", errno);
+        log_line(line);
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        log_line("PANE_VIRTIO_MMIO_MODULE_LOAD_OK");
+        return 0;
+    }
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 17) {
+        log_line("PANE_VIRTIO_MMIO_MODULE_ALREADY_LOADED");
+        return 0;
+    }
+    char line[160];
+    snprintf(line, sizeof(line), "PANE_VIRTIO_MMIO_MODULE_LOAD_FAILED status=%d", status);
+    log_line(line);
+    return -1;
+#else
+    errno = ENOSYS;
+    log_line("PANE_VIRTIO_MMIO_MODULE_LOAD_FAILED");
+    close(fd);
+    return -1;
+#endif
+}
+
 static void drop_probe_caches_before_root_mount(void) {
     sync();
     int fd = open("/proc/sys/vm/drop_caches", O_WRONLY | O_CLOEXEC);
@@ -5785,6 +5943,7 @@ int main(void) {
 
     if (virtio_root_device[0] != '\0') {
         log_line("PANE_VIRTIO_ROOT_MOUNT_ATTEMPT");
+        load_virtio_mmio_module();
         if (wait_for_device(virtio_root_device) == 0) {
             if (try_mount_root(virtio_root_device, truthy_arg(root_readonly), root_fs) == 0) {
                 exec_real_init();
@@ -6883,6 +7042,15 @@ fn build_pane_discovery_initramfs_with_native_packager(
             "lib/modules/pane-block.ko",
             0o644,
             fs::read(module)?,
+        ));
+    }
+
+    let virtio_mmio_module = virtio_mmio_module_path(paths);
+    if virtio_mmio_module.is_file() {
+        entries.push(NewcCpioEntry::file(
+            "lib/modules/virtio_mmio.ko",
+            0o644,
+            fs::read(virtio_mmio_module)?,
         ));
     }
 
@@ -14023,18 +14191,20 @@ mod tests {
         register_base_os_image, register_boot_loader_image, register_kernel_boot_plan,
         register_native_boot_set_artifacts, register_native_boot_set_from_manifest,
         register_pane_block_module, register_pane_discovery_initramfs_artifact,
-        repair_user_disk_metadata, resize_user_disk, resolve_bundle_output_path,
+        register_virtio_mmio_module, repair_user_disk_metadata, resize_user_disk,
+        resolve_bundle_output_path,
         resolve_init_source, resolve_launch_target, resolve_managed_environment_for_reset,
         resolve_saved_launch, resolve_session_context, resolve_status_distro,
         restore_user_disk_snapshot, runtime_contract_guest_memory_ranges, runtime_storage_budget,
         sha256_file, status_port_for, user_disk_artifact_ready, validate_setup_password,
-        validate_setup_username, windows_transport_check, write_json_file,
-        write_native_boot_set_manifest_template, write_pane_initramfs_driver_bundle,
-        write_user_disk_block, AppLifecyclePhase, AppNextAction, BaseOsImageMetadata, CheckStatus,
+        validate_setup_username, virtio_mmio_module_metadata_path, virtio_mmio_module_path,
+        windows_transport_check, write_json_file, write_native_boot_set_manifest_template,
+        write_pane_initramfs_driver_bundle, write_user_disk_block, AppLifecyclePhase,
+        AppNextAction, BaseOsImageMetadata, CheckStatus,
         DistroHealth, DoctorCheck, DoctorReport, FramebufferContract, InitSource, KernelBootLayout,
         KernelBootMetadata, NativeRuntimeState, PaneBlockModuleMetadata,
         PaneInitramfsDriverMetadata, StatusReport, UserDiskExportManifest, UserDiskMetadata,
-        UserDiskSnapshotMetadata, WorkspaceHealth, WslInventory,
+        UserDiskSnapshotMetadata, VirtioMmioModuleMetadata, WorkspaceHealth, WslInventory,
         COMPATIBLE_PANE_BLOCK_DRIVER_SOURCE_SHA256_BY_ABI, EMBEDDED_APP_ASSETS,
         PANE_USER_DISK_EXPORT_DISK_FILENAME, PANE_USER_DISK_EXPORT_MANIFEST_FILENAME,
         PANE_USER_DISK_EXPORT_METADATA_FILENAME,
@@ -14126,6 +14296,8 @@ mod tests {
             kernel_build_dir: None,
             register_pane_block_module: None,
             pane_block_module_expected_sha256: None,
+            register_virtio_mmio_module: None,
+            virtio_mmio_module_expected_sha256: None,
             create_user_disk: false,
             snapshot_user_disk: false,
             restore_user_disk_snapshot: None,
@@ -15763,6 +15935,16 @@ mod tests {
         assert!(init_source.contains("PANE_VIRTIO_ROOT_MOUNT_ATTEMPT"));
         assert!(init_source.contains("PANE_VIRTIO_ROOT_DEVICE_WAIT_TIMEOUT"));
         assert!(init_source.contains("PANE_VIRTIO_ROOT_MOUNT_FALLBACK"));
+        assert!(init_source.contains("load_virtio_mmio_module"));
+        assert!(init_source.contains("/lib/modules/virtio_mmio.ko"));
+        assert!(init_source.contains("PANE_VIRTIO_MMIO_MODULE_LOAD_OK"));
+        assert!(init_source.contains("PANE_VIRTIO_MMIO_MODULE_NOT_PRESENT"));
+        // The bus driver must be loaded before the virtio root device wait, otherwise
+        // /dev/vda never appears on a stock Arch kernel (CONFIG_VIRTIO_MMIO=m).
+        assert!(
+            init_source.find("load_virtio_mmio_module();").unwrap()
+                < init_source.find("wait_for_device(virtio_root_device)").unwrap()
+        );
         assert!(init_source.contains("attempt < 65536"));
         assert!(!init_source.contains("usleep(100000)"));
         assert!(init_source.contains("supported_root_fs"));
@@ -16155,6 +16337,60 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("current verified kernel"));
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn registers_virtio_mmio_module_and_packs_it_into_initramfs() {
+        let paths = temp_runtime_paths("runtime-virtio-mmio-module");
+        super::prepare_runtime_paths(&paths).unwrap();
+        let kernel = paths.downloads.join("vmlinuz-linux");
+        std::fs::write(&kernel, fake_linux_bzimage()).unwrap();
+        let kernel_sha = sha256_file(&kernel).unwrap();
+        write_pane_initramfs_driver_bundle(&paths).unwrap();
+        register_kernel_boot_plan(
+            &paths,
+            Some(&kernel),
+            Some(&kernel_sha),
+            None,
+            None,
+            Some("console=ttyS0 root=/dev/pane0 rw"),
+            false,
+        )
+        .unwrap();
+
+        let source = paths.downloads.join("virtio_mmio.ko");
+        std::fs::write(&source, b"fake virtio_mmio kernel module").unwrap();
+        let sha256 = sha256_file(&source).unwrap();
+
+        // Registration without the expected SHA is rejected.
+        let error = register_virtio_mmio_module(&paths, &source, None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--virtio-mmio-module-expected-sha256"));
+
+        register_virtio_mmio_module(&paths, &source, Some(&sha256), false).unwrap();
+
+        let stored = virtio_mmio_module_path(&paths);
+        assert!(stored.is_file());
+        assert_eq!(sha256_file(&stored).unwrap(), sha256);
+        let metadata =
+            read_json_file::<VirtioMmioModuleMetadata>(&virtio_mmio_module_metadata_path(&paths))
+                .unwrap();
+        assert!(metadata.verified);
+        assert_eq!(metadata.sha256, sha256);
+        assert_eq!(
+            metadata.target_kernel_sha256.as_deref(),
+            Some(kernel_sha.as_str())
+        );
+
+        // Re-registering over an existing module requires --force.
+        let error = register_virtio_mmio_module(&paths, &source, Some(&sha256), false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--force"));
+        register_virtio_mmio_module(&paths, &source, Some(&sha256), true).unwrap();
 
         let _ = std::fs::remove_dir_all(&paths.root);
     }

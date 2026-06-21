@@ -2,6 +2,7 @@ mod app;
 mod bootstrap;
 mod cli;
 mod error;
+mod ioapic;
 mod model;
 mod native;
 mod plan;

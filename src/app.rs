@@ -5661,8 +5661,9 @@ static int load_pane_block_module(const char *device_blocks, const char *root_of
 #endif
 }
 
-static int load_virtio_mmio_module(void) {
+static int load_virtio_mmio_module(const char *device_spec) {
     const char *module_path = "/lib/modules/virtio_mmio.ko";
+    char params[160] = {0};
     int fd = open(module_path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         if (errno == ENOENT) {
@@ -5677,14 +5678,20 @@ static int load_virtio_mmio_module(void) {
 
     log_line("PANE_VIRTIO_MMIO_MODULE_LOAD_ATTEMPT");
 #ifdef SYS_finit_module
-    /* virtio_mmio is built CONFIG_VIRTIO_MMIO=m on stock Arch. Loading it makes the
-       module honor the virtio_mmio.device= directive already on the boot cmdline
-       (CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y), which registers the platform device so
-       the built-in virtio_blk driver can bind and create /dev/vda. Parameters are
-       empty: the kernel applies the boot-cmdline module params at load time. */
+    /* virtio_mmio is built CONFIG_VIRTIO_MMIO=m on stock Arch. The kernel does NOT
+       replay the boot-cmdline `virtio_mmio.device=` value to a module loaded from
+       userspace, so the device spec must be passed explicitly as the module's
+       `device=` parameter (CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y). That registers the
+       platform device so the built-in virtio_blk driver can bind and create /dev/vda. */
+    if (device_spec && device_spec[0] != '\0') {
+        snprintf(params, sizeof(params), "device=%s", device_spec);
+        log_line("PANE_VIRTIO_MMIO_MODULE_DEVICE_PARAM_SET");
+    } else {
+        log_line("PANE_VIRTIO_MMIO_MODULE_DEVICE_PARAM_MISSING");
+    }
     pid_t child = fork();
     if (child == 0) {
-        int child_rc = syscall(SYS_finit_module, fd, "", 0);
+        int child_rc = syscall(SYS_finit_module, fd, params, 0);
         _exit(child_rc == 0 ? 0 : (errno == EEXIST ? 17 : 1));
     }
     if (child < 0) {
@@ -5868,6 +5875,7 @@ int main(void) {
     char root_device[128] = {0};
     char user_device[128] = {0};
     char virtio_root_device[128] = {0};
+    char virtio_mmio_device[128] = {0};
     char root_readonly[32] = {0};
     char root_fs[32] = {0};
     char root_offset[128] = {0};
@@ -5889,6 +5897,7 @@ int main(void) {
     find_arg(cmdline, "pane.root", root_device, sizeof(root_device));
     find_arg(cmdline, "pane.user", user_device, sizeof(user_device));
     find_arg(cmdline, "pane.virtio_root", virtio_root_device, sizeof(virtio_root_device));
+    find_arg(cmdline, "virtio_mmio.device", virtio_mmio_device, sizeof(virtio_mmio_device));
     find_arg(cmdline, "pane.root_readonly", root_readonly, sizeof(root_readonly));
     find_arg(cmdline, "pane.root_fs", root_fs, sizeof(root_fs));
     find_arg(cmdline, "pane.root_offset", root_offset, sizeof(root_offset));
@@ -5943,7 +5952,7 @@ int main(void) {
 
     if (virtio_root_device[0] != '\0') {
         log_line("PANE_VIRTIO_ROOT_MOUNT_ATTEMPT");
-        load_virtio_mmio_module();
+        load_virtio_mmio_module(virtio_mmio_device);
         if (wait_for_device(virtio_root_device) == 0) {
             if (try_mount_root(virtio_root_device, truthy_arg(root_readonly), root_fs) == 0) {
                 exec_real_init();
@@ -15939,10 +15948,14 @@ mod tests {
         assert!(init_source.contains("/lib/modules/virtio_mmio.ko"));
         assert!(init_source.contains("PANE_VIRTIO_MMIO_MODULE_LOAD_OK"));
         assert!(init_source.contains("PANE_VIRTIO_MMIO_MODULE_NOT_PRESENT"));
+        // The device spec from the boot cmdline must be passed as the module's `device=`
+        // parameter; the kernel does not replay it to a userspace-loaded module.
+        assert!(init_source.contains("find_arg(cmdline, \"virtio_mmio.device\""));
+        assert!(init_source.contains("snprintf(params, sizeof(params), \"device=%s\""));
         // The bus driver must be loaded before the virtio root device wait, otherwise
         // /dev/vda never appears on a stock Arch kernel (CONFIG_VIRTIO_MMIO=m).
         assert!(
-            init_source.find("load_virtio_mmio_module();").unwrap()
+            init_source.find("load_virtio_mmio_module(virtio_mmio_device);").unwrap()
                 < init_source.find("wait_for_device(virtio_root_device)").unwrap()
         );
         assert!(init_source.contains("attempt < 65536"));

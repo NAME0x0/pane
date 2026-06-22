@@ -8857,10 +8857,10 @@ mod windows_whp {
                 context.last_status.as_deref(),
                 Some("queue-notify-executed")
             );
-            assert_eq!(
-                context.last_detail.as_deref(),
-                Some("Queue notify 0 executed 1 request(s).")
-            );
+            assert!(context
+                .last_detail
+                .as_deref()
+                .is_some_and(|detail| detail.starts_with("Queue notify 0 executed 1 request(s)")));
             drop(context);
             drop(handler);
 

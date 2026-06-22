@@ -459,7 +459,29 @@ where
                         queue_execution: execution,
                         queue_execution_count,
                         detail: format!(
-                            "Queue notify {queue_index} executed {queue_execution_count} request(s)."
+                            "Queue notify {queue_index} executed {queue_execution_count} request(s); next_avail={} used_index={} interrupt_status=0x{:x}; [{}]",
+                            device.queue.next_avail_index,
+                            device.queue.used_index,
+                            device.interrupt_status,
+                            executions
+                                .iter()
+                                .map(|execution| {
+                                    let (kind, sector) = execution
+                                        .request
+                                        .as_ref()
+                                        .map(|request| {
+                                            (format!("{:?}", request.request_type), request.sector)
+                                        })
+                                        .unwrap_or_else(|| ("none".to_string(), 0));
+                                    format!(
+                                        "{kind} sector={sector} head={} used_len={} status={}",
+                                        execution.used_head_index,
+                                        execution.used_len,
+                                        execution.status
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         ),
                     }
                 }

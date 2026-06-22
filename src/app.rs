@@ -8014,12 +8014,14 @@ fn load_kernel_layout_boot_image_artifact(
         boot_params_gpa: (layout.kernel_format == "linux-bzimage")
             .then(|| parse_guest_physical_address(&layout.boot_params_gpa))
             .transpose()?,
-        virtio_block_logical_size_bytes: layout.storage.as_ref().map(|storage| {
-            storage
-                .root_handoff
-                .partition_byte_length
-                .unwrap_or(storage.base_os_bytes)
-        }),
+        // The virtio-blk device exposes the whole base disk (vda); the root
+        // partition (vda1) lives at an offset within it. Sizing the disk to the
+        // partition length truncates vda1 beyond end-of-disk and breaks the ext4
+        // geometry, so the disk capacity must be the full base image.
+        virtio_block_logical_size_bytes: layout
+            .storage
+            .as_ref()
+            .map(|storage| storage.base_os_bytes),
         extra_regions,
     })
 }

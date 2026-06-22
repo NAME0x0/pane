@@ -8171,9 +8171,11 @@ fn linux_guest_mapped_regions(
                 }
                 _ => format!("linux-{}", range.label),
             };
+            let region_gpa = parse_guest_physical_address(&range.start_gpa)?;
             let bytes = match range.region_type.as_str() {
                 "bios-data" => linux_bios_data_area_page_bytes(size),
-                "bios-rom" | "legacy-rom" => vec![0_u8; size],
+                "bios-rom" => bios_rom_page_bytes_with_mptable(region_gpa, size),
+                "legacy-rom" => vec![0_u8; size],
                 "storage-contract" => layout
                     .storage
                     .as_ref()
@@ -8194,13 +8196,32 @@ fn linux_guest_mapped_regions(
             };
             Ok(crate::native::NativeGuestMemoryRegion {
                 label,
-                guest_gpa: parse_guest_physical_address(&range.start_gpa)?,
+                guest_gpa: region_gpa,
                 bytes,
                 writable: true,
                 executable: range.region_type == "usable",
             })
         })
         .collect()
+}
+
+/// Build the BIOS ROM region, embedding the MP table so the guest can discover
+/// the local APIC and I/O APIC by scanning the 0xF0000..0xFFFFF window.
+fn bios_rom_page_bytes_with_mptable(region_gpa: u64, size: usize) -> Vec<u8> {
+    let mut bytes = vec![0_u8; size];
+    let table = crate::mptable::build_pane_mptable();
+    for (gpa, blob) in [
+        (table.floating_pointer_gpa, &table.floating_pointer),
+        (table.config_table_gpa, &table.config_table),
+    ] {
+        if let Some(offset) = gpa.checked_sub(region_gpa) {
+            let offset = offset as usize;
+            if let Some(slot) = bytes.get_mut(offset..offset + blob.len()) {
+                slot.copy_from_slice(blob);
+            }
+        }
+    }
+    bytes
 }
 
 fn linux_bios_data_area_page_bytes(size: usize) -> Vec<u8> {

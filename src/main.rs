@@ -4,6 +4,7 @@ mod cli;
 mod error;
 mod ioapic;
 mod model;
+mod mptable;
 mod native;
 mod plan;
 mod rdp;

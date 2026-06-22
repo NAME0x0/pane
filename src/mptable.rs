@@ -45,12 +45,17 @@ const IRQ_TYPE_NMI: u8 = 1;
 const IRQ_TYPE_EXTINT: u8 = 3;
 
 // MP interrupt flag encodings: polarity in bits [1:0], trigger in bits [3:2].
+// All ISA IRQs (including the virtio-MMIO IRQ) conform to the bus default, which is
+// edge-triggered. virtio-MMIO interrupts are edge-triggered (crosvm wires them through
+// an edge IRQ event, `Transport::Mmio { irq_evt_edge }`); marking the line level forces
+// Linux into a mask/EOI/unmask cycle the device does not implement and stalls I/O.
 const IRQ_FLAG_DEFAULT: u16 = 0; // conforms to bus (ISA => edge, active high)
-const IRQ_FLAG_LEVEL_HIGH: u16 = 0b1101; // active-high (01) + level-triggered (11)
 
 const NUM_ISA_IRQS: u8 = 16;
 
 /// The virtio-MMIO device's ISA IRQ. Must match `crate::virtio::PANE_VIRTIO_MMIO_IRQ`.
+/// Routing is identity for all ISA IRQs, so this is only referenced by tests.
+#[cfg(test)]
 const VIRTIO_IRQ: u8 = 5;
 
 fn sum_checksum(bytes: &[u8]) -> u8 {
@@ -118,15 +123,10 @@ pub(crate) fn build_pane_mptable() -> PaneMptable {
     push_processor(&mut entries, 0, true);
     push_bus(&mut entries, 0, b"ISA   ");
     push_ioapic(&mut entries);
-    // Identity ISA IRQ -> I/O APIC pin routing. The virtio pin is level-triggered
-    // active-high so the guest programs a level RTE that Pane can resample on EOI.
+    // Identity ISA IRQ -> I/O APIC pin routing, edge-triggered (bus default). The
+    // virtio-MMIO IRQ (pin 5) and the timer (pin 0) are both edge-triggered.
     for irq in 0..NUM_ISA_IRQS {
-        let flag = if irq == VIRTIO_IRQ {
-            IRQ_FLAG_LEVEL_HIGH
-        } else {
-            IRQ_FLAG_DEFAULT
-        };
-        push_intsrc(&mut entries, flag, irq, irq);
+        push_intsrc(&mut entries, IRQ_FLAG_DEFAULT, irq, irq);
     }
     push_lintsrc(&mut entries, IRQ_TYPE_EXTINT, 0); // LINT0 = ExtINT
     push_lintsrc(&mut entries, IRQ_TYPE_NMI, 1); // LINT1 = NMI
@@ -242,7 +242,7 @@ mod tests {
     }
 
     #[test]
-    fn virtio_irq_is_routed_level_triggered() {
+    fn virtio_irq_is_routed_edge_triggered_to_its_own_pin() {
         let table = build_pane_mptable();
         let mut offset = 44;
         let mut virtio_flag = None;
@@ -264,6 +264,7 @@ mod tests {
             }
             offset += size;
         }
-        assert_eq!(virtio_flag, Some(IRQ_FLAG_LEVEL_HIGH));
+        // virtio-MMIO is edge-triggered (bus default), matching crosvm's edge IRQ wiring.
+        assert_eq!(virtio_flag, Some(IRQ_FLAG_DEFAULT));
     }
 }

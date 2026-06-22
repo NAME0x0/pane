@@ -4341,12 +4341,17 @@ mod windows_whp {
                             .pin_delivery_if_unmasked(crate::virtio::PANE_VIRTIO_MMIO_IRQ as usize),
                         request_interrupt,
                     ) {
-                        inject_fixed_interrupt(
-                            partition,
-                            request_interrupt,
-                            delivery.vector,
-                            delivery.level_triggered,
-                        );
+                        // Resampling only applies to a level line. virtio-MMIO is
+                        // edge-triggered, so its completion edge is injected once by the
+                        // completion handler and must not be periodically re-asserted.
+                        if delivery.level_triggered {
+                            inject_fixed_interrupt(
+                                partition,
+                                request_interrupt,
+                                delivery.vector,
+                                delivery.level_triggered,
+                            );
+                        }
                     }
                 }
                 last_timer_tick_at = Some(Instant::now());

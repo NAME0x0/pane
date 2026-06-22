@@ -308,7 +308,9 @@ mod tests {
         let ioapic = PaneIoapic::new();
         assert!(!ioapic.has_active_level_pin());
         for pin in 0..IOAPIC_NUM_PINS {
-            assert!(PaneIoapic::rte_is_masked(ioapic.redirection_entry(pin).unwrap()));
+            assert!(PaneIoapic::rte_is_masked(
+                ioapic.redirection_entry(pin).unwrap()
+            ));
         }
     }
 
@@ -339,7 +341,9 @@ mod tests {
         program_level_pin(&mut ioapic, 5, 0x33);
 
         // First assertion injects vector 0x33 and arms remote IRR.
-        let delivery = ioapic.service_irq(5, true).expect("first assertion injects");
+        let delivery = ioapic
+            .service_irq(5, true)
+            .expect("first assertion injects");
         assert_eq!(delivery.vector, 0x33);
         assert!(delivery.level_triggered);
         assert!(PaneIoapic::rte_remote_irr(

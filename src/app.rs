@@ -14222,15 +14222,14 @@ mod tests {
         register_native_boot_set_artifacts, register_native_boot_set_from_manifest,
         register_pane_block_module, register_pane_discovery_initramfs_artifact,
         register_virtio_mmio_module, repair_user_disk_metadata, resize_user_disk,
-        resolve_bundle_output_path,
-        resolve_init_source, resolve_launch_target, resolve_managed_environment_for_reset,
-        resolve_saved_launch, resolve_session_context, resolve_status_distro,
-        restore_user_disk_snapshot, runtime_contract_guest_memory_ranges, runtime_storage_budget,
-        sha256_file, status_port_for, user_disk_artifact_ready, validate_setup_password,
-        validate_setup_username, virtio_mmio_module_metadata_path, virtio_mmio_module_path,
-        windows_transport_check, write_json_file, write_native_boot_set_manifest_template,
-        write_pane_initramfs_driver_bundle, write_user_disk_block, AppLifecyclePhase,
-        AppNextAction, BaseOsImageMetadata, CheckStatus,
+        resolve_bundle_output_path, resolve_init_source, resolve_launch_target,
+        resolve_managed_environment_for_reset, resolve_saved_launch, resolve_session_context,
+        resolve_status_distro, restore_user_disk_snapshot, runtime_contract_guest_memory_ranges,
+        runtime_storage_budget, sha256_file, status_port_for, user_disk_artifact_ready,
+        validate_setup_password, validate_setup_username, virtio_mmio_module_metadata_path,
+        virtio_mmio_module_path, windows_transport_check, write_json_file,
+        write_native_boot_set_manifest_template, write_pane_initramfs_driver_bundle,
+        write_user_disk_block, AppLifecyclePhase, AppNextAction, BaseOsImageMetadata, CheckStatus,
         DistroHealth, DoctorCheck, DoctorReport, FramebufferContract, InitSource, KernelBootLayout,
         KernelBootMetadata, NativeRuntimeState, PaneBlockModuleMetadata,
         PaneInitramfsDriverMetadata, StatusReport, UserDiskExportManifest, UserDiskMetadata,
@@ -15976,8 +15975,12 @@ mod tests {
         // The bus driver must be loaded before the virtio root device wait, otherwise
         // /dev/vda never appears on a stock Arch kernel (CONFIG_VIRTIO_MMIO=m).
         assert!(
-            init_source.find("load_virtio_mmio_module(virtio_mmio_device);").unwrap()
-                < init_source.find("wait_for_device(virtio_root_device)").unwrap()
+            init_source
+                .find("load_virtio_mmio_module(virtio_mmio_device);")
+                .unwrap()
+                < init_source
+                    .find("wait_for_device(virtio_root_device)")
+                    .unwrap()
         );
         assert!(init_source.contains("attempt < 65536"));
         assert!(!init_source.contains("usleep(100000)"));

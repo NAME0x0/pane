@@ -26,3 +26,8 @@ Desktop.ini
 
 # Packaged release output
 /dist/
+
+# Native boot-spike trace artifacts (transient)
+check-*.json
+native-boot-*.json
+native-boot-*.log

@@ -218,16 +218,27 @@ mod tests {
                 other => panic!("unexpected MP entry type {other}"),
             };
             if entry_type == MP_IOAPIC {
-                let addr =
-                    u32::from_le_bytes(table.config_table[offset + 4..offset + 8].try_into().unwrap());
+                let addr = u32::from_le_bytes(
+                    table.config_table[offset + 4..offset + 8]
+                        .try_into()
+                        .unwrap(),
+                );
                 assert_eq!(addr, IO_APIC_ADDRESS);
-                assert_eq!(table.config_table[offset + 3], 1, "I/O APIC must be enabled");
+                assert_eq!(
+                    table.config_table[offset + 3],
+                    1,
+                    "I/O APIC must be enabled"
+                );
                 found_ioapic = true;
             }
             offset += size;
         }
         assert!(found_ioapic, "MP table must describe the I/O APIC");
-        assert_eq!(offset, table.config_table.len(), "entries must tile exactly");
+        assert_eq!(
+            offset,
+            table.config_table.len(),
+            "entries must tile exactly"
+        );
     }
 
     #[test]
@@ -240,7 +251,9 @@ mod tests {
             let size = if entry_type == MP_PROCESSOR { 20 } else { 8 };
             if entry_type == MP_INTSRC {
                 let flag = u16::from_le_bytes(
-                    table.config_table[offset + 2..offset + 4].try_into().unwrap(),
+                    table.config_table[offset + 2..offset + 4]
+                        .try_into()
+                        .unwrap(),
                 );
                 let src_irq = table.config_table[offset + 5];
                 let dst_irq = table.config_table[offset + 7];

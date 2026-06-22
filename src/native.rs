@@ -1746,6 +1746,7 @@ mod windows_whp {
     const WHV_X64_INTERRUPT_TYPE_FIXED: u64 = 0;
     const WHV_X64_INTERRUPT_DESTINATION_MODE_PHYSICAL: u64 = 0;
     const WHV_X64_INTERRUPT_TRIGGER_MODE_EDGE: u64 = 0;
+    const WHV_X64_INTERRUPT_TRIGGER_MODE_LEVEL: u64 = 1;
     const WHV_X64_REGISTER_APIC_TPR: u32 = 0x0000_3008;
     const WHV_X64_REGISTER_APIC_PPR: u32 = 0x0000_300a;
     const WHV_X64_REGISTER_APIC_ISR0: u32 = 0x0000_3010;
@@ -3979,7 +3980,7 @@ mod windows_whp {
                 DecodedExit::MsrAccess { .. } => break,
                 DecodedExit::Cpuid { .. } => break,
                 DecodedExit::InterruptWindow => break,
-                DecodedExit::ApicEoi => break,
+                DecodedExit::ApicEoi { .. } => break,
                 DecodedExit::Canceled => break,
                 DecodedExit::Other => break,
             }
@@ -4421,36 +4422,49 @@ mod windows_whp {
                     );
                     if emulated {
                         last_progress_at = Instant::now();
+                        // Drive the virtio device's interrupt line into the I/O APIC and
+                        // inject the guest-programmed vector as a level interrupt. The
+                        // I/O APIC coalesces while remote IRR is set and re-injects on the
+                        // EOI exit, which is what makes level-triggered delivery reliable.
+                        let irq = crate::virtio::PANE_VIRTIO_MMIO_IRQ as usize;
                         if interrupt_status_before == 0 && device.interrupt_status != 0 {
-                            let irq = crate::virtio::PANE_VIRTIO_MMIO_IRQ as u8;
-                            let vector = legacy_io_state.irq_vector(irq);
-                            let unmasked = legacy_io_state.irq_unmasked(irq);
-                            if let Some(request_interrupt) = request_interrupt {
-                                let _ = request_native_virtio_mmio_interrupt(
-                                    partition,
-                                    request_interrupt,
-                                    irq,
-                                    vector,
-                                    unmasked,
-                                    report,
-                                );
+                            if let Some(delivery) = ioapic.service_irq(irq, true) {
+                                if let Some(request_interrupt) = request_interrupt {
+                                    let _ = request_native_virtio_mmio_interrupt(
+                                        partition,
+                                        request_interrupt,
+                                        irq as u8,
+                                        delivery.vector,
+                                        delivery.level_triggered,
+                                        report,
+                                    );
+                                } else {
+                                    report.calls.push(NativeWhpCallReport {
+                                        name: "VirtioMmioInterruptRequested",
+                                        hresult: None,
+                                        ok: false,
+                                        detail: format!(
+                                            "Virtio-MMIO completion set interrupt_status=0x{:08x}, but WHvRequestInterrupt is unavailable.",
+                                            device.interrupt_status
+                                        ),
+                                    });
+                                }
                             } else {
                                 report.calls.push(NativeWhpCallReport {
-                                    name: "VirtioMmioInterruptRequested",
+                                    name: "VirtioMmioInterruptCoalesced",
                                     hresult: None,
-                                    ok: false,
-                                    detail: format!(
-                                        "Virtio-MMIO completion set interrupt_status=0x{:08x}, but WHvRequestInterrupt is unavailable; irq={irq}, vector=0x{vector:02x}, irq_unmasked={unmasked}.",
-                                        device.interrupt_status
-                                    ),
+                                    ok: true,
+                                    detail: "Virtio-MMIO line asserted but the I/O APIC coalesced it (masked, not yet programmed, or remote IRR still set).".to_string(),
                                 });
                             }
                         } else if interrupt_status_before != 0 && device.interrupt_status == 0 {
+                            // Guest cleared the device interrupt status: deassert the line.
+                            ioapic.service_irq(irq, false);
                             report.calls.push(NativeWhpCallReport {
                                 name: "VirtioMmioInterruptAcknowledged",
                                 hresult: None,
                                 ok: true,
-                                detail: "Guest acknowledged the pending virtio-MMIO interrupt through the interrupt-ack register.".to_string(),
+                                detail: "Guest acknowledged the virtio-MMIO interrupt; Pane deasserted the I/O APIC line.".to_string(),
                             });
                         }
                         if let Some(path) = checkpoint_path.as_deref() {
@@ -4975,20 +4989,36 @@ mod windows_whp {
                         });
                     }
                 }
-                DecodedExit::ApicEoi => {
+                DecodedExit::ApicEoi { vector } => {
                     if timer_interrupt_requested {
                         timer_interrupt_acknowledged = true;
                     }
                     if root_mount_timer_requested {
                         root_mount_timer_acknowledged = true;
                     }
+                    // Resample the level-triggered virtio line through the I/O APIC: the
+                    // guest just acknowledged `vector`, so clear remote IRR and, if the
+                    // device still holds the line asserted, re-inject so the next batch
+                    // of completions is delivered instead of stalling.
+                    if let Some(delivery) = ioapic.end_of_interrupt(vector as u8) {
+                        if let Some(request_interrupt) = request_interrupt {
+                            request_native_virtio_mmio_interrupt(
+                                partition,
+                                request_interrupt,
+                                crate::virtio::PANE_VIRTIO_MMIO_IRQ as u8,
+                                delivery.vector,
+                                delivery.level_triggered,
+                                report,
+                            );
+                        }
+                    }
                     report.calls.push(NativeWhpCallReport {
                         name: "ApicEoiObserved",
                         hresult: None,
                         ok: true,
-                        detail:
-                            "Guest reached an APIC EOI exit; Pane observed it and will resume the vCPU."
-                                .to_string(),
+                        detail: format!(
+                            "Guest acknowledged vector 0x{vector:02x}; Pane resampled the I/O APIC line and will resume the vCPU."
+                        ),
                     });
                 }
                 DecodedExit::Canceled => {
@@ -5438,14 +5468,22 @@ mod windows_whp {
         request_interrupt: WhvRequestInterrupt,
         irq: u8,
         vector: u8,
-        unmasked: bool,
+        level: bool,
         report: &mut NativePartitionSmokeReport,
     ) -> bool {
+        // Level-triggered delivery is required for the I/O APIC-routed virtio line:
+        // WHP raises an APIC EOI exit for level interrupts so Pane can resample the
+        // line through the I/O APIC. An edge interrupt would never produce that exit.
+        let trigger_mode = if level {
+            WHV_X64_INTERRUPT_TRIGGER_MODE_LEVEL
+        } else {
+            WHV_X64_INTERRUPT_TRIGGER_MODE_EDGE
+        };
         let interrupt = WhvInterruptControl {
             _bitfield: whv_x64_interrupt_control(
                 WHV_X64_INTERRUPT_TYPE_FIXED,
                 WHV_X64_INTERRUPT_DESTINATION_MODE_PHYSICAL,
-                WHV_X64_INTERRUPT_TRIGGER_MODE_EDGE,
+                trigger_mode,
                 0,
             ),
             Destination: 0,
@@ -5463,7 +5501,7 @@ mod windows_whp {
             "WHvRequestInterrupt(virtio-mmio)",
             hresult,
             if ok {
-                "Requested a fixed edge-triggered virtio-MMIO interrupt for vCPU 0."
+                "Requested an I/O APIC-routed virtio-MMIO interrupt for vCPU 0."
             } else {
                 "Could not request the virtio-MMIO interrupt through WHP."
             },
@@ -5473,7 +5511,8 @@ mod windows_whp {
             hresult: None,
             ok,
             detail: format!(
-                "Requested virtio-MMIO IRQ {irq} as vector 0x{vector:02x}; irq_unmasked={unmasked}."
+                "Requested virtio-MMIO IRQ {irq} as vector 0x{vector:02x}; trigger={}.",
+                if level { "level" } else { "edge" }
             ),
         });
         ok
@@ -6947,6 +6986,7 @@ mod windows_whp {
             self.pic1_mask & PIC_IRQ0_TIMER_BIT == 0
         }
 
+        #[cfg(test)]
         fn irq_vector(&self, irq: u8) -> u8 {
             if irq < 8 {
                 let base = if self.pic1_vector_offset < 0x10 {
@@ -6960,6 +7000,7 @@ mod windows_whp {
             }
         }
 
+        #[cfg(test)]
         fn irq_unmasked(&self, irq: u8) -> bool {
             if irq < 8 {
                 self.pic1_mask & (1_u8 << irq) == 0
@@ -7736,7 +7777,9 @@ mod windows_whp {
             default_rdx: u64,
         },
         InterruptWindow,
-        ApicEoi,
+        ApicEoi {
+            vector: u32,
+        },
         Canceled,
         Other,
     }
@@ -7853,11 +7896,11 @@ mod windows_whp {
                 handler: "timer-interrupt",
                 action: "inject-timer-if-policy-allows",
             },
-            DecodedExit::ApicEoi => NativeDeviceDispatchDecision {
+            DecodedExit::ApicEoi { .. } => NativeDeviceDispatchDecision {
                 exit_reason: "x64-apic-eoi",
                 selector: "apic-eoi".to_string(),
-                handler: "timer-interrupt",
-                action: "record-interrupt-ack-and-resume",
+                handler: "ioapic,timer-interrupt",
+                action: "resample-level-irq-and-resume",
             },
             DecodedExit::Canceled => NativeDeviceDispatchDecision {
                 exit_reason: "canceled",
@@ -8019,13 +8062,22 @@ mod windows_whp {
             });
             DecodedExit::InterruptWindow
         } else if exit_reason == WHV_RUN_VP_EXIT_REASON_X64_APIC_EOI {
+            // WHV_X64_APIC_EOI_CONTEXT { InterruptVector: u32 } sits at the exit
+            // context union offset. WHP raises this exit for level-triggered EOIs.
+            let vector = exit_context
+                .get(MEMORY_CONTEXT_OFFSET..MEMORY_CONTEXT_OFFSET + 4)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(u32::from_le_bytes)
+                .unwrap_or(0);
             report.calls.push(NativeWhpCallReport {
                 name: "DecodeX64ApicEoi",
                 hresult: None,
                 ok: true,
-                detail: "Guest reached an APIC end-of-interrupt exit.".to_string(),
+                detail: format!(
+                    "Guest reached an APIC end-of-interrupt exit for vector 0x{vector:02x}."
+                ),
             });
-            DecodedExit::ApicEoi
+            DecodedExit::ApicEoi { vector }
         } else if exit_reason == WHV_RUN_VP_EXIT_REASON_CANCELED {
             report.calls.push(NativeWhpCallReport {
                 name: "DecodeCanceled",
@@ -10242,10 +10294,12 @@ mod windows_whp {
 
             let mut eoi_context = [0_u8; 128];
             eoi_context[..4].copy_from_slice(&WHV_RUN_VP_EXIT_REASON_X64_APIC_EOI.to_le_bytes());
+            // WHV_X64_APIC_EOI_CONTEXT.InterruptVector at the union offset (48).
+            eoi_context[48..52].copy_from_slice(&0x33_u32.to_le_bytes());
             let mut eoi_report = base_report();
             assert!(matches!(
                 decode_exit_context(&eoi_context, &mut eoi_report),
-                DecodedExit::ApicEoi
+                DecodedExit::ApicEoi { vector: 0x33 }
             ));
             assert!(eoi_report
                 .calls

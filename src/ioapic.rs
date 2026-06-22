@@ -24,6 +24,12 @@ use serde::Serialize;
 pub(crate) const IOAPIC_BASE_GPA: u64 = 0xfec0_0000;
 pub(crate) const IOAPIC_MMIO_LENGTH_BYTES: u64 = 0x100;
 
+/// True if `gpa` falls inside the I/O APIC MMIO window. Pane leaves this window
+/// unmapped so guest accesses trap out to the device model below.
+pub(crate) fn ioapic_contains_gpa(gpa: u64) -> bool {
+    (IOAPIC_BASE_GPA..IOAPIC_BASE_GPA + IOAPIC_MMIO_LENGTH_BYTES).contains(&gpa)
+}
+
 /// Number of redirection-table pins. 24 is the conventional I/O APIC pin count.
 pub(crate) const IOAPIC_NUM_PINS: usize = 24;
 

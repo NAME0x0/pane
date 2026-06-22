@@ -2521,6 +2521,118 @@ mod windows_whp {
         ok
     }
 
+    /// Emulate a guest MMIO access to the I/O APIC window through the live WHP
+    /// instruction emulator, routing the decoded access into the Pane I/O APIC
+    /// device model. Returns true if WHP completed the emulation.
+    fn try_emulate_ioapic_mmio_exit(
+        deps: WhpMmioEmulationDeps<'_>,
+        exit_context: &[u8],
+        ioapic: &mut crate::ioapic::PaneIoapic,
+        report: &mut NativePartitionSmokeReport,
+    ) -> bool {
+        let Some(emulator) = deps.live_instruction_emulator else {
+            report.calls.push(NativeWhpCallReport {
+                name: "WHvEmulatorTryMmioEmulation(ioapic)",
+                hresult: None,
+                ok: false,
+                detail: "Live WHP instruction emulator is unavailable for the I/O APIC exit."
+                    .to_string(),
+            });
+            return false;
+        };
+        let (Some(get_virtual_processor_registers), Some(translate_gva)) =
+            (deps.get_virtual_processor_registers, deps.translate_gva)
+        else {
+            report.calls.push(NativeWhpCallReport {
+                name: "WHvEmulatorTryMmioEmulation(ioapic)",
+                hresult: None,
+                ok: false,
+                detail: "WHP register or GVA translation callbacks are unavailable for live I/O APIC emulation.".to_string(),
+            });
+            return false;
+        };
+        let (Some(vp_context), Some(memory_context)) = (
+            whp_exit_vp_context(exit_context),
+            whp_exit_memory_access_context(exit_context),
+        ) else {
+            report.calls.push(NativeWhpCallReport {
+                name: "WHvEmulatorTryMmioEmulation(ioapic)",
+                hresult: None,
+                ok: false,
+                detail: "WHP memory-access exit buffer was too small for the I/O APIC emulation contexts.".to_string(),
+            });
+            return false;
+        };
+
+        let mut handler = |access: crate::virtio::PaneVirtioMmioAccess| {
+            let offset = access.gpa.wrapping_sub(crate::ioapic::IOAPIC_BASE_GPA);
+            match access.kind {
+                crate::virtio::PaneVirtioMmioAccessKind::Write => {
+                    let mut bytes = [0_u8; 4];
+                    let len = access.data.len().min(4);
+                    bytes[..len].copy_from_slice(&access.data[..len]);
+                    ioapic.mmio_write(offset, u32::from_le_bytes(bytes));
+                    crate::virtio::PaneVirtioMmioAccessOutcome {
+                        accepted: true,
+                        status: "ioapic-write",
+                        offset: Some(offset),
+                        read_data: Vec::new(),
+                        write_result: None,
+                        queue_execution: None,
+                        queue_execution_count: 0,
+                        detail: format!("I/O APIC MMIO write at offset 0x{offset:03x}."),
+                    }
+                }
+                crate::virtio::PaneVirtioMmioAccessKind::Read => {
+                    let value = ioapic.mmio_read(offset);
+                    let width = access.data.len().clamp(1, 4);
+                    crate::virtio::PaneVirtioMmioAccessOutcome {
+                        accepted: true,
+                        status: "ioapic-read",
+                        offset: Some(offset),
+                        read_data: value.to_le_bytes()[..width].to_vec(),
+                        write_result: None,
+                        queue_execution: None,
+                        queue_execution_count: 0,
+                        detail: format!("I/O APIC MMIO read at offset 0x{offset:03x}."),
+                    }
+                }
+            }
+        };
+        let mut callback_context = WhpEmulatorMmioCallbackContext {
+            partition: deps.partition,
+            vp_index: 0,
+            get_virtual_processor_registers: Some(get_virtual_processor_registers),
+            set_virtual_processor_registers: Some(deps.set_virtual_processor_registers),
+            translate_gva: Some(translate_gva),
+            handler: &mut handler,
+            last_status: None,
+            last_detail: None,
+        };
+        let mut status = WhvEmulatorStatus { AsUINT32: 0 };
+        let hresult = unsafe {
+            (emulator.try_mmio_emulation)(
+                emulator.handle,
+                (&mut callback_context as *mut WhpEmulatorMmioCallbackContext<'_>).cast::<c_void>(),
+                &vp_context,
+                &memory_context,
+                &mut status,
+            )
+        };
+        let ok = hresult_succeeded(hresult)
+            && unsafe { status.AsUINT32 } & WHV_EMULATOR_STATUS_EMULATION_SUCCESSFUL != 0;
+        report.calls.push(hresult_call(
+            "WHvEmulatorTryMmioEmulation(ioapic)",
+            hresult,
+            if ok {
+                "WHP decoded and executed an I/O APIC instruction through Pane's device model."
+            } else {
+                "WHP could not complete I/O APIC instruction emulation through Pane's device model."
+            },
+        ));
+        ok
+    }
+
     pub(super) fn run_partition_smoke(
         run_fixture: bool,
         boot_image: Option<&NativeSerialBootImage>,
@@ -3932,6 +4044,7 @@ mod windows_whp {
         let mut legacy_io_state = LegacyDeviceIoState::default();
         let mut virtio_block_device = virtio_block_logical_size_bytes
             .map(|bytes| crate::virtio::PaneVirtioMmioBlockDevice::new(bytes, true));
+        let mut ioapic = crate::ioapic::PaneIoapic::new();
         let mut timer_interrupt_requested = false;
         let mut timer_interrupt_acknowledged = false;
         let mut root_mount_timer_requested = false;
@@ -4349,6 +4462,22 @@ mod windows_whp {
                             );
                             last_checkpoint_at = Instant::now();
                         }
+                        continue;
+                    }
+                    break;
+                }
+                DecodedExit::MemoryAccess { gpa, .. }
+                    if crate::ioapic::ioapic_contains_gpa(gpa) =>
+                {
+                    let deps = WhpMmioEmulationDeps {
+                        partition,
+                        get_virtual_processor_registers,
+                        set_virtual_processor_registers,
+                        translate_gva,
+                        live_instruction_emulator,
+                    };
+                    if try_emulate_ioapic_mmio_exit(deps, &exit_context, &mut ioapic, report) {
+                        last_progress_at = Instant::now();
                         continue;
                     }
                     break;

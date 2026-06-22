@@ -1629,6 +1629,9 @@ mod windows_whp {
     const LINUX_ENTRY_PROBE_MODULE_LOAD_BUDGET_SECONDS: u64 = 90;
     const LINUX_ENTRY_PROBE_ROOT_MOUNT_BUDGET_SECONDS: u64 = 120;
     const LINUX_ENTRY_PROBE_ROOT_MOUNT_TIMER_PULSE_SECONDS: u64 = 1;
+    /// Wall-clock cadence for the synthetic I/O APIC IRQ0 timer tick. ~1kHz keeps
+    /// guest jiffies advancing briskly through boot without flooding the exit loop.
+    const IOAPIC_TIMER_TICK_INTERVAL_MILLIS: u64 = 1;
     const LINUX_ENTRY_PROBE_ROOT_MOUNT_TIMER_MAX_PULSES: u32 = 16;
     const LINUX_ENTRY_PROBE_TRACE_HEAD: usize = 384;
     const LINUX_ENTRY_PROBE_TRACE_TAIL: usize = 384;
@@ -4046,6 +4049,8 @@ mod windows_whp {
         let mut virtio_block_device = virtio_block_logical_size_bytes
             .map(|bytes| crate::virtio::PaneVirtioMmioBlockDevice::new(bytes, true));
         let mut ioapic = crate::ioapic::PaneIoapic::new();
+        let mut last_timer_tick_at: Option<Instant> = None;
+        let mut ioapic_timer_tick_count: u64 = 0;
         let mut timer_interrupt_requested = false;
         let mut timer_interrupt_acknowledged = false;
         let mut root_mount_timer_requested = false;
@@ -4306,6 +4311,46 @@ mod windows_whp {
             }
 
             report.guest_exit_count = (exit_index + 1) as u32;
+            // Periodic I/O APIC timer tick. Linux freezes with jiffies stuck unless its
+            // IRQ0/pin0 timer line ticks (Pane has no 8254 PIT). Deliver on a wall-clock
+            // cadence; service_irq is a no-op until the guest unmasks pin 0, so this is
+            // self-gating until the kernel has programmed its timer.
+            let timer_tick_due = last_timer_tick_at
+                .map(|at| at.elapsed() >= Duration::from_millis(IOAPIC_TIMER_TICK_INTERVAL_MILLIS))
+                .unwrap_or(true);
+            if timer_tick_due {
+                if deliver_ioapic_timer_tick(
+                    &mut ioapic,
+                    partition,
+                    request_interrupt,
+                    ioapic_timer_tick_count,
+                    report,
+                ) {
+                    ioapic_timer_tick_count += 1;
+                }
+                // Resample the virtio block line: if the device still holds a pending
+                // completion the guest has not acknowledged, re-deliver its level
+                // interrupt so a lost or coalesced delivery cannot stall the root mount.
+                let virtio_pending = virtio_block_device
+                    .as_ref()
+                    .map(|device| device.interrupt_status != 0)
+                    .unwrap_or(false);
+                if virtio_pending {
+                    if let (Some(delivery), Some(request_interrupt)) = (
+                        ioapic
+                            .pin_delivery_if_unmasked(crate::virtio::PANE_VIRTIO_MMIO_IRQ as usize),
+                        request_interrupt,
+                    ) {
+                        inject_fixed_interrupt(
+                            partition,
+                            request_interrupt,
+                            delivery.vector,
+                            delivery.level_triggered,
+                        );
+                    }
+                }
+                last_timer_tick_at = Some(Instant::now());
+            }
             let root_mount_phase_active = report
                 .serial_text
                 .as_deref()
@@ -5463,6 +5508,39 @@ mod windows_whp {
         ok
     }
 
+    /// Inject a fixed interrupt of `vector` into vCPU 0 without logging, so periodic
+    /// resamples do not flood the report. `level` selects level vs edge trigger.
+    fn inject_fixed_interrupt(
+        partition: *mut c_void,
+        request_interrupt: WhvRequestInterrupt,
+        vector: u8,
+        level: bool,
+    ) -> bool {
+        let trigger_mode = if level {
+            WHV_X64_INTERRUPT_TRIGGER_MODE_LEVEL
+        } else {
+            WHV_X64_INTERRUPT_TRIGGER_MODE_EDGE
+        };
+        let interrupt = WhvInterruptControl {
+            _bitfield: whv_x64_interrupt_control(
+                WHV_X64_INTERRUPT_TYPE_FIXED,
+                WHV_X64_INTERRUPT_DESTINATION_MODE_PHYSICAL,
+                trigger_mode,
+                0,
+            ),
+            Destination: 0,
+            Vector: u32::from(vector),
+        };
+        let hresult = unsafe {
+            request_interrupt(
+                partition,
+                &interrupt,
+                mem::size_of::<WhvInterruptControl>() as u32,
+            )
+        };
+        hresult_succeeded(hresult)
+    }
+
     fn request_native_virtio_mmio_interrupt(
         partition: *mut c_void,
         request_interrupt: WhvRequestInterrupt,
@@ -5515,6 +5593,66 @@ mod windows_whp {
                 if level { "level" } else { "edge" }
             ),
         });
+        ok
+    }
+
+    /// Deliver one periodic timer tick through the I/O APIC IRQ0/pin0 path. Linux
+    /// (with acpi=off + IOAPIC) routes its boot timer there (`..TIMER: vector=0x30
+    /// apic1=0 pin1=0`) and freezes with jiffies stuck unless the line ticks. Pane
+    /// has no 8254 PIT, so it re-arms the edge and injects the guest-programmed pin-0
+    /// vector. Returns true if a tick was delivered (pin 0 is programmed and unmasked).
+    /// `tick_index` is used to keep report logging sparse.
+    fn deliver_ioapic_timer_tick(
+        ioapic: &mut crate::ioapic::PaneIoapic,
+        partition: *mut c_void,
+        request_interrupt: Option<WhvRequestInterrupt>,
+        tick_index: u64,
+        report: &mut NativePartitionSmokeReport,
+    ) -> bool {
+        // Edge-triggered IRQ0: deassert then assert to present a fresh edge each tick.
+        ioapic.service_irq(0, false);
+        let Some(delivery) = ioapic.service_irq(0, true) else {
+            return false;
+        };
+        let Some(request_interrupt) = request_interrupt else {
+            return false;
+        };
+        let trigger_mode = if delivery.level_triggered {
+            WHV_X64_INTERRUPT_TRIGGER_MODE_LEVEL
+        } else {
+            WHV_X64_INTERRUPT_TRIGGER_MODE_EDGE
+        };
+        let interrupt = WhvInterruptControl {
+            _bitfield: whv_x64_interrupt_control(
+                WHV_X64_INTERRUPT_TYPE_FIXED,
+                WHV_X64_INTERRUPT_DESTINATION_MODE_PHYSICAL,
+                trigger_mode,
+                0,
+            ),
+            Destination: 0,
+            Vector: u32::from(delivery.vector),
+        };
+        let hresult = unsafe {
+            request_interrupt(
+                partition,
+                &interrupt,
+                mem::size_of::<WhvInterruptControl>() as u32,
+            )
+        };
+        let ok = hresult_succeeded(hresult);
+        // Log only the first tick and then every 256th, so jiffies-rate ticks do not
+        // flood the report.
+        if tick_index == 0 || tick_index % 256 == 0 {
+            report.calls.push(NativeWhpCallReport {
+                name: "NativeIoapicTimerTick",
+                hresult: None,
+                ok,
+                detail: format!(
+                    "Delivered I/O APIC IRQ0 timer tick #{tick_index} as vector 0x{:02x}.",
+                    delivery.vector
+                ),
+            });
+        }
         ok
     }
 

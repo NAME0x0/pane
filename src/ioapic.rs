@@ -147,6 +147,17 @@ impl PaneIoapic {
         self.redirect_table.get(pin).copied()
     }
 
+    /// Delivery descriptor for a pin if it is programmed and unmasked, ignoring
+    /// remote IRR. Used to re-deliver (resample) a level interrupt whose device
+    /// still needs service, so a lost or coalesced delivery cannot stall I/O.
+    pub(crate) fn pin_delivery_if_unmasked(&self, pin: usize) -> Option<IoapicDelivery> {
+        let entry = *self.redirect_table.get(pin)?;
+        if Self::rte_is_masked(entry) {
+            return None;
+        }
+        Some(Self::delivery_for(entry))
+    }
+
     /// True if any pin is programmed level-triggered and unmasked. Indicates the
     /// guest has taken ownership of IOAPIC routing for a level device.
     pub(crate) fn has_active_level_pin(&self) -> bool {

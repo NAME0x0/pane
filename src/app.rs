@@ -3021,39 +3021,63 @@ fn install_desktop(args: InstallDesktopArgs) -> AppResult<()> {
         true,
     )?;
 
-    let commands: Vec<String> = [
-        // Clear any stale lock from an interrupted run.
-        "rm -f /var/lib/pacman/db.lck",
-        // A guaranteed-good mirror + DHCP networking so pacman can reach the repositories.
-        "echo 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch' > /etc/pacman.d/mirrorlist",
-        "printf '[Match]\\nName=en* eth*\\n\\n[Network]\\nDHCP=yes\\n' > /etc/systemd/network/20-pane-dhcp.network",
-        "systemctl enable --now systemd-networkd systemd-resolved",
-        "ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf",
-        "for i in $(seq 1 60); do getent hosts geo.mirror.pkgbuild.com >/dev/null 2>&1 && break; sleep 2; done",
+    // Grow the root overlay so a heavier desktop fits (the partition + fs are extended in
+    // the guest below). qemu-img resize only grows.
+    let disk_gib = args.disk_gib.unwrap_or_else(|| args.de.default_disk_gib());
+    if let Some(overlay) = config.root_overlay.as_ref() {
+        crate::qemu::resize_qcow2(overlay, disk_gib).map_err(AppError::message)?;
+    }
+
+    let packages = args.de.packages();
+    let display_manager = args.de.display_manager();
+    let commands: Vec<String> = vec![
+        "rm -f /var/lib/pacman/db.lck".to_string(),
+        // Extend partition 1 + the ext4 root to use the enlarged disk (best effort; the
+        // root is mounted, so update the kernel's partition view then resize online).
+        "echo ', +' | sfdisk --no-reread --force -N 1 /dev/vda || true".to_string(),
+        "partx -u /dev/vda 2>/dev/null || partprobe /dev/vda 2>/dev/null || true".to_string(),
+        "resize2fs /dev/vda1 || true".to_string(),
+        // Guaranteed-good mirror + DHCP networking so pacman can reach the repositories.
+        "echo 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch' > /etc/pacman.d/mirrorlist".to_string(),
+        "printf '[Match]\\nName=en* eth*\\n\\n[Network]\\nDHCP=yes\\n' > /etc/systemd/network/20-pane-dhcp.network".to_string(),
+        "systemctl enable --now systemd-networkd systemd-resolved".to_string(),
+        "ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf".to_string(),
+        "for i in $(seq 1 60); do getent hosts geo.mirror.pkgbuild.com >/dev/null 2>&1 && break; sleep 2; done".to_string(),
         // Initialize + populate the pacman keyring (base image ships it uninitialized);
         // virtio-rng supplies entropy so --init does not stall.
-        "pacman-key --init",
-        "pacman-key --populate archlinux",
-        "pacman -Sy --noconfirm --needed archlinux-keyring",
-        "pacman -S --noconfirm --needed xorg-server lightdm lightdm-gtk-greeter xfce4 xfce4-goodies",
-        "systemctl enable lightdm",
-    ]
-    .iter()
-    .map(|line| line.to_string())
-    .collect();
+        "pacman-key --init".to_string(),
+        "pacman-key --populate archlinux".to_string(),
+        "pacman -Sy --noconfirm --needed archlinux-keyring".to_string(),
+        // Desktop environment + display manager + browser (Firefox) + NetworkManager.
+        format!("pacman -S --noconfirm --needed {packages}"),
+        format!("systemctl enable {display_manager} NetworkManager"),
+        // Reclaim freed space over time (works with the disks' discard=unmap).
+        "systemctl enable fstrim.timer".to_string(),
+    ];
 
-    println!("Installing the XFCE desktop + LightDM into the guest image (persisted).");
     println!(
-        "Downloads ~1 GB; can take several minutes. Live log: {}",
+        "Installing the {:?} desktop (+ Firefox) into the guest image (persisted, root grown to {disk_gib} GiB).",
+        args.de
+    );
+    println!(
+        "Downloads can be large and slow over NAT. Live log: {}",
         serial_path.display()
     );
-    let timeout = std::time::Duration::from_secs(args.timeout_minutes.saturating_mul(60).max(300));
+    let minutes = if args.timeout_minutes == 0 {
+        match args.de {
+            crate::model::DesktopChoice::Xfce => 30,
+            _ => 90,
+        }
+    } else {
+        args.timeout_minutes
+    };
+    let timeout = std::time::Duration::from_secs(minutes.saturating_mul(60).max(300));
     crate::qemu::provision_via_serial(&config, &commands, timeout).map_err(AppError::message)?;
 
     println!("\nDesktop installed. Launch it with:");
     println!("  pane launch --runtime qemu-whpx --display gtk --persist-root");
-    println!("The window shows the LightDM greeter; log in as your user to reach XFCE.");
-    println!("(If you have not created a user yet, run `pane provision --username <name>` first.)");
+    println!("Log in at the {display_manager} greeter as your user to reach the desktop.");
+    println!("(Create a user first with `pane provision --username <name>` if you haven't.)");
     Ok(())
 }
 

@@ -249,6 +249,25 @@ fn push_machine_args(command: &mut Command, config: &QemuBootConfig) {
     command.args(["-append", &config.cmdline]);
 }
 
+/// Grow a qcow2 disk's virtual size to `gib` GiB (no-op if already that big or larger). The
+/// guest must then extend the partition + filesystem. Only grows; never shrinks.
+pub fn resize_qcow2(disk: &Path, gib: u64) -> Result<(), String> {
+    let qemu_img = locate_qemu_img().ok_or_else(|| "qemu-img not found".to_string())?;
+    let output = Command::new(&qemu_img)
+        .args(["resize", &disk.display().to_string(), &format!("{gib}G")])
+        .output()
+        .map_err(|error| format!("failed to run qemu-img resize: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Refusing to shrink is fine — the disk is already at least this large.
+        if stderr.contains("shrink") || stderr.contains("smaller") {
+            return Ok(());
+        }
+        return Err(format!("qemu-img resize failed: {}", stderr.trim()));
+    }
+    Ok(())
+}
+
 /// Create a persistent qcow2 overlay backed by `base_image` at `overlay` if absent. The
 /// overlay holds all guest root writes; the base image is the read-only backing file and is
 /// never modified. Lets a desktop / extra packages installed in the guest persist.

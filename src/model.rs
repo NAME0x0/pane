@@ -50,6 +50,51 @@ impl RuntimeMode {
     }
 }
 
+/// Desktop environment to install into the guest image.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum DesktopChoice {
+    /// Lightweight XFCE + LightDM (fast, ~1 GB).
+    #[default]
+    Xfce,
+    /// GNOME + GDM (~2.5 GB).
+    Gnome,
+    /// KDE Plasma + SDDM (~3 GB).
+    Kde,
+}
+
+impl DesktopChoice {
+    /// pacman packages to install (Xorg + display manager + desktop + a browser).
+    pub fn packages(self) -> &'static str {
+        match self {
+            Self::Xfce => {
+                "xorg-server lightdm lightdm-gtk-greeter xfce4 xfce4-goodies firefox networkmanager"
+            }
+            Self::Gnome => {
+                "xorg-server gdm gnome-shell gnome-control-center gnome-terminal nautilus firefox networkmanager"
+            }
+            Self::Kde => "xorg-server sddm plasma-meta konsole dolphin firefox networkmanager",
+        }
+    }
+
+    /// systemd display-manager unit to enable.
+    pub fn display_manager(self) -> &'static str {
+        match self {
+            Self::Xfce => "lightdm",
+            Self::Gnome => "gdm",
+            Self::Kde => "sddm",
+        }
+    }
+
+    /// Default root-disk size (GiB) to grow to before installing this desktop.
+    pub fn default_disk_gib(self) -> u64 {
+        match self {
+            Self::Xfce => 8,
+            Self::Gnome | Self::Kde => 24,
+        }
+    }
+}
+
 /// How the QEMU-WHPX engine presents the guest console.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]

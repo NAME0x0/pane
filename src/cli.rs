@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 
 use crate::{
-    model::{DesktopEnvironment, DisplayMode, RuntimeMode, SharedStorageMode},
+    model::{DesktopChoice, DesktopEnvironment, DisplayMode, RuntimeMode, SharedStorageMode},
     plan::DEFAULT_RUNTIME_CAPACITY_GIB,
 };
 
@@ -406,8 +406,15 @@ pub struct InstallDesktopArgs {
     /// Session slug for the Pane-owned runtime reservation.
     #[arg(long, default_value = "pane")]
     pub session_name: String,
-    /// Minutes to allow for the package download + install before giving up.
-    #[arg(long, default_value_t = 30)]
+    /// Desktop environment to install (xfce, gnome, or kde). Includes a browser (Firefox).
+    #[arg(long, value_enum, default_value_t = DesktopChoice::Xfce)]
+    pub de: DesktopChoice,
+    /// Grow the root disk to this many GiB before installing (default depends on the desktop:
+    /// 8 for XFCE, 24 for GNOME/KDE). The partition + filesystem are extended in the guest.
+    #[arg(long)]
+    pub disk_gib: Option<u64>,
+    /// Minutes to allow for the package download + install before giving up (0 = auto by DE).
+    #[arg(long, default_value_t = 0)]
     pub timeout_minutes: u64,
 }
 

@@ -1,0 +1,26 @@
+[    1.753226] /dev/root: Can't open blockdev
+[    1.755083] List of all bdev filesystems:
+[    1.756416]  ext3
+[    1.756418]  ext2
+[    1.757092]  ext4
+[    1.757808]  fuseblk
+[    1.758536]  btrfs
+[    1.759420] 
+[    1.761202] Kernel panic - not syncing: VFS: Unable to mount root fs on unknown-block(0,0)
+[    1.765551] CPU: 0 UID: 0 PID: 1 Comm: swapper/0 Not tainted 7.0.5-arch1-1 #1 PREEMPT(full)  0d14cfb831ca476fa1626a77865d3a9d65cdc3ba
+[    1.774264] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS rel-1.17.0-0-gb52ca86e094d-prebuilt.qemu.org 04/01/2014
+[    1.778650] Call Trace:
+[    1.779485]  <TASK>
+[    1.780239]  dump_stack_lvl+0x5d/0x80
+[    1.781531]  vpanic+0x20a/0x410
+[    1.782515]  panic+0x6b/0x70
+[    1.786236]  mount_root_generic+0x1d0/0x280
+[    1.787095]  prepare_namespace+0x1cb/0x260
+[    1.788004]  kernel_init_freeable+0x295/0x2c0
+[    1.788993]  ? __pfx_kernel_init+0x10/0x10
+[    1.789817]  kernel_init+0x1a/0x140
+[    1.790608]  ret_from_fork+0x2bc/0x350
+[    1.791474]  ? __pfx_kernel_init+0x10/0x10
+[    1.792382]  ret_from_fork_asm+0x1a/0x30
+[    1.793147]  </TASK>
+[    1.793746] Kernel Offset: 0x9800000 from 0xffffffff81000000 (relocation range: 0xffffffff80000000-0xffffffffbfffffff)

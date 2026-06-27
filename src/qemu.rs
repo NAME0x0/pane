@@ -15,6 +15,35 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
+#[cfg(windows)]
+fn host_memory_mb() -> u64 {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 {
+        status.ullTotalPhys / (1024 * 1024)
+    } else {
+        4096
+    }
+}
+
+#[cfg(not(windows))]
+fn host_memory_mb() -> u64 {
+    4096
+}
+
+/// vCPU count and guest RAM (MB) scaled to the host with sane caps, so Pane runs fast on
+/// big machines without over-subscribing small ones: vCPUs = logical cores clamped to
+/// [2, 8]; RAM = half of physical clamped to [2048, 8192] MB.
+pub fn host_resources() -> (u32, u64) {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(2);
+    let vcpus = cores.clamp(2, 8);
+    let ram_mb = (host_memory_mb() / 2).clamp(2048, 8192);
+    (vcpus, ram_mb)
+}
+
 /// Inputs for a QEMU-WHPX boot.
 #[derive(Debug, Clone)]
 pub struct QemuBootConfig {
@@ -30,6 +59,7 @@ pub struct QemuBootConfig {
     /// Optional writable Pane user disk, attached as a second virtio drive (/dev/vdb).
     pub user_disk: Option<PathBuf>,
     pub memory_mb: u32,
+    pub vcpus: u32,
     pub cmdline: String,
     pub serial_path: PathBuf,
     pub timeout: Duration,
@@ -150,11 +180,15 @@ pub fn ensure_qemu_available() -> Result<PathBuf, String> {
 }
 
 fn drive_arg(path: &Path, format: &str, snapshot: bool) -> String {
-    format!(
-        "file={},format={format},if=virtio,snapshot={}",
-        path.display(),
-        if snapshot { "on" } else { "off" }
-    )
+    // Performance: async-threads I/O always. Ephemeral (snapshot) drives use the fastest
+    // cache since writes are thrown away; persistent drives use writeback plus discard/unmap
+    // so files deleted in the guest reclaim host space via TRIM (fstrim / fstrim.timer).
+    let perf = if snapshot {
+        "snapshot=on,cache=unsafe,aio=threads"
+    } else {
+        "snapshot=off,cache=writeback,discard=unmap,detect-zeroes=unmap,aio=threads"
+    };
+    format!("file={},format={format},if=virtio,{perf}", path.display())
 }
 
 /// QEMU args for a graphical window. Uses the standard VGA adapter and disables host
@@ -176,10 +210,16 @@ fn push_machine_args(command: &mut Command, config: &QemuBootConfig) {
     command.args([
         "-accel",
         "whpx",
+        // Modern CPU model (AVX2/SSE4 etc.) for speed. WHPX rejects "host"/"max" (APX/MPX
+        // feature conflicts kill the guest before it boots); Skylake-Client is feature-rich
+        // and WHPX-compatible.
+        "-cpu",
+        "Skylake-Client",
         "-m",
         &config.memory_mb.to_string(),
+        // Scale vCPUs to the host so the desktop is responsive.
         "-smp",
-        "1",
+        &config.vcpus.to_string(),
         "-kernel",
         &config.kernel.display().to_string(),
         "-initrd",

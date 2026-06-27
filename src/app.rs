@@ -2876,13 +2876,15 @@ fn build_qemu_engine_config(
         cmdline.push_str(" systemd.mount-extra=/dev/vdb:/home:ext4:x-systemd.makefs");
     }
     let kernel = resolve_distro_kernel(runtime_paths)?;
+    let (vcpus, memory_mb) = crate::qemu::host_resources();
     Ok(crate::qemu::QemuBootConfig {
         kernel,
         initramfs,
         base_disk: runtime_paths.base_os_image.clone(),
         root_overlay,
         user_disk,
-        memory_mb: 2048,
+        memory_mb: memory_mb as u32,
+        vcpus,
         cmdline,
         serial_path,
         timeout,

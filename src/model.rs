@@ -34,6 +34,9 @@ pub enum RuntimeMode {
     #[default]
     WslBridge,
     PaneOwned,
+    QemuWhpx,
+    /// Pick QEMU+WHPX when QEMU and the native runtime artifacts are present, else WSL bridge.
+    Auto,
 }
 
 impl RuntimeMode {
@@ -41,6 +44,32 @@ impl RuntimeMode {
         match self {
             Self::WslBridge => "WSL2 + XRDP bridge",
             Self::PaneOwned => "Pane-owned OS runtime",
+            Self::QemuWhpx => "QEMU + WHPX accelerator",
+            Self::Auto => "auto-select",
+        }
+    }
+}
+
+/// How the QEMU-WHPX engine presents the guest console.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum DisplayMode {
+    /// Text serial console wired to this terminal (no window).
+    #[default]
+    Serial,
+    /// Graphical window via the GTK backend with a virtio-vga adapter.
+    Gtk,
+    /// Graphical window via the SDL backend with a virtio-vga adapter.
+    Sdl,
+}
+
+impl DisplayMode {
+    /// QEMU `-display` backend name, or None for the headless serial console.
+    pub fn backend(self) -> Option<&'static str> {
+        match self {
+            Self::Serial => None,
+            Self::Gtk => Some("gtk"),
+            Self::Sdl => Some("sdl"),
         }
     }
 }

@@ -440,6 +440,18 @@ where
                     let executions = device.execute_available_block_requests(memory, &mut service);
                     let execution = executions.last().cloned();
                     let queue_execution_count = executions.len();
+                    // Diagnostic: read the guest's avail-ring flags and read back the
+                    // used.idx we published. VRING_AVAIL_F_NO_INTERRUPT (avail flags bit 0)
+                    // set means the driver is polling the used ring rather than waiting on an
+                    // IRQ; comparing the read-back used.idx to our used_index confirms the
+                    // multi-entry used-ring write landed. This distinguishes a poll/visibility
+                    // problem from a dropped interrupt for batched (>=2 request) completions.
+                    let mut avail_flags_bytes = [0_u8; 2];
+                    let _ = memory.read(device.queue.avail_ring_gpa, &mut avail_flags_bytes);
+                    let mut used_idx_bytes = [0_u8; 2];
+                    let _ = memory.read(device.queue.used_ring_gpa + 2, &mut used_idx_bytes);
+                    let avail_flags = u16::from_le_bytes(avail_flags_bytes);
+                    let used_idx_readback = u16::from_le_bytes(used_idx_bytes);
                     let status = if queue_execution_count == 0 {
                         "queue-notify-empty"
                     } else if executions
@@ -459,7 +471,7 @@ where
                         queue_execution: execution,
                         queue_execution_count,
                         detail: format!(
-                            "Queue notify {queue_index} executed {queue_execution_count} request(s); next_avail={} used_index={} interrupt_status=0x{:x}; [{}]",
+                            "Queue notify {queue_index} executed {queue_execution_count} request(s); next_avail={} used_index={} interrupt_status=0x{:x} avail_flags=0x{avail_flags:04x} used_idx_readback={used_idx_readback}; [{}]",
                             device.queue.next_avail_index,
                             device.queue.used_index,
                             device.interrupt_status,

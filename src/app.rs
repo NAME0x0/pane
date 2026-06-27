@@ -1841,9 +1841,16 @@ fn configure_arch_user(
     })
 }
 
-fn launch(args: LaunchArgs) -> AppResult<()> {
+fn launch(mut args: LaunchArgs) -> AppResult<()> {
+    if args.runtime == RuntimeMode::Auto {
+        args.runtime = resolve_auto_runtime(&args);
+        println!("Auto-selected runtime: {}.", args.runtime.display_name());
+    }
     if args.runtime == RuntimeMode::PaneOwned {
         return launch_pane_owned_runtime(args);
+    }
+    if args.runtime == RuntimeMode::QemuWhpx {
+        return launch_qemu_whpx_runtime(args);
     }
 
     let inventory = probe_inventory();
@@ -1978,6 +1985,98 @@ fn launch(args: LaunchArgs) -> AppResult<()> {
         );
     }
 
+    Ok(())
+}
+
+/// Path of the pid file recording a detached QEMU-WHPX VM for a session.
+fn qemu_pid_file(runtime_paths: &crate::plan::RuntimePaths) -> PathBuf {
+    runtime_paths.state.join("qemu-whpx.pid")
+}
+
+/// Force-terminate a process by id (Windows taskkill). Returns whether it was killed.
+fn terminate_pid(pid: u32) -> bool {
+    std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F"])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+/// Start a detached QEMU-WHPX VM from `config`, record its pid, and report how to stop it.
+fn start_detached_qemu(
+    config: &crate::qemu::QemuBootConfig,
+    runtime_paths: &crate::plan::RuntimePaths,
+) -> AppResult<()> {
+    let pid = crate::qemu::boot_detached(config).map_err(AppError::message)?;
+    let pid_file = qemu_pid_file(runtime_paths);
+    if let Some(parent) = pid_file.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(&pid_file, pid.to_string());
+    println!("\nPane QEMU-WHPX VM started in the background (pid {pid}).");
+    println!("Stop it with `pane stop`.");
+    Ok(())
+}
+
+/// Resolve `--runtime auto`: prefer QEMU+WHPX when QEMU is installed and the native runtime
+/// artifacts (kernel + base image) are registered; otherwise fall back to the WSL bridge.
+fn resolve_auto_runtime(args: &LaunchArgs) -> RuntimeMode {
+    let session = crate::plan::sanitize_session_name(&args.session_name);
+    let runtime_paths = crate::plan::runtime_for(&session);
+    let qemu_available = crate::qemu::locate_qemu().is_some();
+    let artifacts_present =
+        runtime_paths.kernel_image.exists() && runtime_paths.base_os_image.exists();
+    if qemu_available && artifacts_present {
+        RuntimeMode::QemuWhpx
+    } else {
+        RuntimeMode::WslBridge
+    }
+}
+
+fn launch_qemu_whpx_runtime(args: LaunchArgs) -> AppResult<()> {
+    let session_name = crate::plan::sanitize_session_name(&args.session_name);
+    // Ensure the native runtime artifacts (kernel, base image, disks) exist before boot.
+    prepare_native_runtime_boundary(&session_name, DEFAULT_RUNTIME_CAPACITY_GIB)?;
+    let runtime_paths = crate::plan::runtime_for(&session_name);
+    let serial_path = runtime_paths.logs.join("qemu-whpx.serial");
+    let config = build_qemu_engine_config(
+        &runtime_paths,
+        None,
+        serial_path,
+        std::time::Duration::from_secs(120),
+        args.display,
+        args.persist_root,
+    )?;
+
+    println!("Pane Launch — {}", args.runtime.display_name());
+    println!("  Session     {session_name}");
+    println!("  Engine      qemu-system-x86_64 -accel whpx");
+    println!("  Kernel      {}", config.kernel.display());
+    println!("  Initramfs   {}", config.initramfs.display());
+    println!("  Root disk   {}", config.base_disk.display());
+    match config.user_disk.as_ref() {
+        Some(disk) => println!("  User disk   {} (vdb -> /mnt/pane-user)", disk.display()),
+        None => println!("  User disk   (none)"),
+    }
+
+    if args.dry_run {
+        println!("\nDry run: prepared the QEMU-WHPX engine boot plan; skipping launch.");
+        return Ok(());
+    }
+
+    if args.detach {
+        return start_detached_qemu(&config, &runtime_paths);
+    }
+
+    let hint = match config.display_backend.as_deref() {
+        Some(backend) => {
+            format!("graphical window ({backend}). Close the window or power off to end.")
+        }
+        None => "live serial console. Ctrl-A then X to quit.".to_string(),
+    };
+    println!("\nBooting Linux on QEMU-WHPX — {hint}\n");
+    let status = crate::qemu::boot_interactive(&config).map_err(AppError::message)?;
+    println!("\nPane session ended ({status}).");
     Ok(())
 }
 
@@ -2513,9 +2612,191 @@ fn native_preflight(args: NativePreflightArgs) -> AppResult<()> {
     Ok(())
 }
 
+/// Resolve the real distro initramfs (with virtio-blk) for the QEMU engine. An explicit
+/// `--qemu-initramfs` wins. Otherwise use the cached `engines/distro-initramfs.img`, and if
+/// that is absent, extract `/boot/initramfs-linux.img` straight out of the registered base
+/// image's ext4 root partition (no WSL/external tools) and cache it. This makes the QEMU
+/// engine self-contained: `--qemu-initramfs` becomes an override, not a requirement.
+fn resolve_distro_initramfs(
+    initramfs_override: Option<&Path>,
+    runtime_paths: &crate::plan::RuntimePaths,
+) -> AppResult<PathBuf> {
+    if let Some(explicit) = initramfs_override {
+        return Ok(explicit.to_path_buf());
+    }
+    let cache = runtime_paths.engines.join("distro-initramfs.img");
+    if cache.exists() {
+        return Ok(cache);
+    }
+    if !runtime_paths.base_os_image.exists() {
+        return Err(AppError::message(
+            "No --qemu-initramfs given and no registered base image to extract the distro initramfs from. Register the base image (pane runtime --prepare-runtime) or pass --qemu-initramfs.",
+        ));
+    }
+    let partition_offset = read_json_file::<BaseOsImageMetadata>(&runtime_paths.base_os_metadata)
+        .ok()
+        .and_then(|metadata| metadata.root_partition_hint)
+        .map(|partition| partition.byte_offset)
+        .unwrap_or(1_048_576);
+    let data = crate::ext4::extract_file(
+        &runtime_paths.base_os_image,
+        partition_offset,
+        "/boot/initramfs-linux.img",
+    )
+    .map_err(|error| {
+        AppError::message(format!(
+            "Could not extract the distro initramfs from the base image: {error}. Pass --qemu-initramfs <path> to override.",
+        ))
+    })?;
+    if let Some(parent) = cache.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&cache, &data)?;
+    println!(
+        "Pane extracted the distro initramfs ({} bytes) from the base image -> {}",
+        data.len(),
+        cache.display()
+    );
+    Ok(cache)
+}
+
+/// Build the QEMU-WHPX engine boot config shared by the boot-spike and the `pane launch`
+/// paths: resolve the distro initramfs, materialize a qcow2 user disk, and assemble the
+/// kernel cmdline. Root comes from the verified base image (copy-on-write, immutable).
+/// `fstab=0` makes systemd ignore the image's /etc/fstab entirely, so a stale swap UUID in
+/// it cannot stall the boot (no swap-mask hack, no base-image edit). The persistent user
+/// disk is formatted on first boot (x-systemd.makefs) and mounted at /home via mount-extra,
+/// so user data survives across boots without touching the base image.
+fn build_qemu_engine_config(
+    runtime_paths: &crate::plan::RuntimePaths,
+    initramfs_override: Option<&Path>,
+    serial_path: PathBuf,
+    timeout: std::time::Duration,
+    display: crate::model::DisplayMode,
+    persist_root: bool,
+) -> AppResult<crate::qemu::QemuBootConfig> {
+    let initramfs = resolve_distro_initramfs(initramfs_override, runtime_paths)?;
+    // Persistent root: a qcow2 overlay backed by the base image so guest changes (e.g. an
+    // installed desktop) survive reboots while the base image stays immutable.
+    let root_overlay = if persist_root {
+        let overlay = runtime_paths.disks.join("root-overlay.qcow2");
+        match crate::qemu::ensure_qcow2_overlay(&overlay, &runtime_paths.base_os_image) {
+            Ok(()) => Some(overlay),
+            Err(error) => {
+                eprintln!("warning: could not create the persistent root overlay: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // Pane's registered user disk is a sparse-format text descriptor, not a real block
+    // device. For the QEMU engine, materialize a QEMU-native qcow2 disk (sparse) the guest
+    // can format + mount. Attach it as the second virtio drive (/dev/vdb).
+    let budget = runtime_storage_budget(DEFAULT_RUNTIME_CAPACITY_GIB);
+    let user_disk_capacity_gib = budget.user_packages_and_customizations_gib.max(1);
+    let user_disk_qcow2 = runtime_paths.disks.join("user-data.qcow2");
+    let user_disk = match crate::qemu::ensure_qcow2_disk(&user_disk_qcow2, user_disk_capacity_gib) {
+        Ok(()) => Some(user_disk_qcow2),
+        Err(error) => {
+            eprintln!("warning: could not create the QEMU user disk: {error}");
+            None
+        }
+    };
+    if let Some(parent) = serial_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Graphical mode also drives the VGA console (tty0) so the window shows kernel output and
+    // a getty login; serial stays enabled for diagnostics.
+    let console = if display.backend().is_some() {
+        "console=tty0 console=ttyS0"
+    } else {
+        "console=ttyS0"
+    };
+    let mut cmdline = format!("{console} root=/dev/vda1 rw fstab=0");
+    if user_disk.is_some() {
+        cmdline.push_str(" systemd.mount-extra=/dev/vdb:/home:ext4:x-systemd.makefs");
+    }
+    Ok(crate::qemu::QemuBootConfig {
+        kernel: runtime_paths.kernel_image.clone(),
+        initramfs,
+        base_disk: runtime_paths.base_os_image.clone(),
+        root_overlay,
+        user_disk,
+        memory_mb: 2048,
+        cmdline,
+        serial_path,
+        timeout,
+        snapshot: true,
+        display_backend: display.backend().map(|backend| backend.to_string()),
+    })
+}
+
+fn native_boot_spike_qemu_whpx(
+    args: &NativeBootSpikeArgs,
+    runtime_paths: &crate::plan::RuntimePaths,
+) -> AppResult<()> {
+    let serial_path = args
+        .trace_checkpoint
+        .clone()
+        .map(|path| path.with_extension("serial"))
+        .unwrap_or_else(|| runtime_paths.logs.join("qemu-whpx.serial"));
+    let config = build_qemu_engine_config(
+        runtime_paths,
+        args.qemu_initramfs.as_deref(),
+        serial_path,
+        std::time::Duration::from_secs(120),
+        args.display,
+        args.persist_root,
+    )?;
+    if args.detach {
+        return start_detached_qemu(&config, runtime_paths);
+    }
+    if args.interactive {
+        let hint = match config.display_backend.as_deref() {
+            Some(backend) => format!("graphical window ({backend})."),
+            None => "live Linux serial console. Ctrl-A then X to quit.".to_string(),
+        };
+        println!("Pane QEMU-WHPX interactive boot — {hint}\n");
+        let status = crate::qemu::boot_interactive(&config).map_err(AppError::message)?;
+        println!("\nPane QEMU-WHPX session ended ({status}).");
+        return Ok(());
+    }
+    let report = crate::qemu::boot_via_qemu_whpx(&config);
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string())
+        );
+    } else {
+        println!("Pane QEMU-WHPX engine boot");
+        println!(
+            "  qemu              {}",
+            report.qemu_path.as_deref().unwrap_or("NOT FOUND")
+        );
+        println!("  launched          {}", report.launched);
+        println!("  milestones        {}", report.milestones.join(", "));
+        println!("  mounted /sysroot  {}", report.mounted_sysroot);
+        println!("  switch_root       {}", report.switch_root);
+        println!("  welcome           {}", report.reached_welcome);
+        println!("  reached login     {}", report.reached_login);
+        println!("  user disk (vdb)   {}", report.user_disk_visible);
+        println!("  user disk mounted {}", report.user_disk_mounted);
+        println!("  elapsed           {}s", report.elapsed_seconds);
+        println!("  detail            {}", report.detail);
+    }
+    Ok(())
+}
+
 fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
     let session_name = crate::plan::sanitize_session_name(&args.session_name);
     let runtime_paths = crate::plan::runtime_for(&session_name);
+    if args.qemu_whpx {
+        if args.prepare_runtime {
+            prepare_native_runtime_boundary(&session_name, DEFAULT_RUNTIME_CAPACITY_GIB)?;
+        }
+        return native_boot_spike_qemu_whpx(&args, &runtime_paths);
+    }
     let runtime_budget = runtime_storage_budget(DEFAULT_RUNTIME_CAPACITY_GIB);
     let run_guest_image = args.run_fixture || args.run_boot_loader || args.run_kernel_layout;
     if args.prepare_runtime {
@@ -3258,6 +3539,24 @@ fn terminal(args: TerminalArgs) -> AppResult<()> {
 }
 
 fn stop(args: StopArgs) -> AppResult<()> {
+    // A detached QEMU-WHPX VM (pane launch --runtime qemu-whpx --detach) is stopped here.
+    let qemu_runtime = crate::plan::runtime_for("pane");
+    let qemu_pid_file = qemu_pid_file(&qemu_runtime);
+    if qemu_pid_file.exists() {
+        let stopped = fs::read_to_string(&qemu_pid_file)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+            .map(terminate_pid)
+            .unwrap_or(false);
+        let _ = fs::remove_file(&qemu_pid_file);
+        if stopped {
+            println!("Stopped the QEMU-WHPX VM.");
+        } else {
+            println!("No running QEMU-WHPX VM found; cleared a stale pid file.");
+        }
+        return Ok(());
+    }
+
     let inventory = probe_inventory();
     let saved_state = load_state()?;
     let distro =
@@ -5756,60 +6055,80 @@ static int supported_root_fs(const char *value) {
            strcmp(value, "f2fs") == 0;
 }
 
+/* Disable block-device readahead before mounting the root filesystem.
+ *
+ * Linux otherwise submits a deep readahead batch (the default is 128 KiB == 32 of
+ * Pane's 4 KiB virtio blocks) in a single virtqueue notify. Pane's WHP host delivers
+ * the completion interrupt for a single in-flight request reliably, but the one
+ * completion interrupt for such a batch never reached the post-submit guest, stalling
+ * the ext4 root mount. Forcing single-block reads keeps every request on the proven
+ * one-completion-at-a-time path. `root_device` is like "/dev/vda1"; the request queue
+ * lives at "/sys/block/vda/queue/read_ahead_kb" (disk name, partition digits stripped). */
+static void disable_block_readahead(const char *root_device) {
+    const char *name = root_device;
+    if (strncmp(name, "/dev/", 5) == 0) {
+        name += 5;
+    }
+    char disk[32];
+    size_t i = 0;
+    while (name[i] != '\0' && !(name[i] >= '0' && name[i] <= '9') && i < sizeof(disk) - 1) {
+        disk[i] = name[i];
+        i++;
+    }
+    disk[i] = '\0';
+    if (disk[0] == '\0') {
+        return;
+    }
+    char path[96];
+    snprintf(path, sizeof(path), "/sys/block/%s/queue/read_ahead_kb", disk);
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0) {
+        char line[160];
+        snprintf(line, sizeof(line), "PANE_BLOCK_READAHEAD_DISABLE_OPEN_FAILED dev=%s errno=%d", disk, errno);
+        log_line(line);
+        return;
+    }
+    if (write(fd, "0\n", 2) == 2) {
+        char line[96];
+        snprintf(line, sizeof(line), "PANE_BLOCK_READAHEAD_DISABLED dev=%s", disk);
+        log_line(line);
+    }
+    close(fd);
+}
+
 #define PANE_ROOT_MOUNT_MAX_POLLS 65536U
 #define PANE_ROOT_MOUNT_WAIT_LOG_INTERVAL 4096U
 
 static int mount_root_with_fs(const char *root_device, const char *filesystem, int root_readonly) {
     unsigned long flags = MS_RELATIME | (root_readonly ? MS_RDONLY : 0);
+    /* ext4's default inode-table readahead (EXT4_DEF_INODE_READAHEAD_BLKS == 32)
+     * submits a 32-deep virtqueue batch whose single completion interrupt the WHP
+     * host could not deliver to the post-submit guest, stalling the mount. Force
+     * single-block inode reads so every request stays on the proven one-at-a-time
+     * completion path. */
+    const char *data = strcmp(filesystem, "ext4") == 0 ? "inode_readahead_blks=1" : "";
     char line[192];
     snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_TRY fs=%s readonly=%s", filesystem, root_readonly ? "true" : "false");
     log_line(line);
 
-    pid_t child = fork();
-    if (child == 0) {
-        int mount_rc = mount(root_device, "/newroot", filesystem, flags, "");
-        _exit(mount_rc == 0 ? 0 : (errno & 0xff));
-    }
-    if (child < 0) {
-        snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_FORK_FAILED fs=%s errno=%d", filesystem, errno);
+    /* Call mount() directly and let it block. The previous fork()+waitpid(WNOHANG)+
+     * sched_yield() busy-poll kept the single vCPU permanently runnable, so the guest
+     * never idled: the mount()'s own block-I/O waits and the ext4/jbd2 kernel threads
+     * were starved of CPU and jiffies, and the mount crawled to a halt. A blocking
+     * mount() lets the vCPU go idle while ext4 waits on I/O, so the kernel threads run
+     * and the host-side timer/halt-kick can wake the guest. The host enforces the
+     * overall root-mount time budget, so no guest-side poll timeout is needed. */
+    int mount_rc = mount(root_device, "/newroot", filesystem, flags, data);
+    if (mount_rc == 0) {
+        if (root_readonly) {
+            snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_OK fs=%s readonly=true", filesystem);
+        } else {
+            snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_OK fs=%s", filesystem);
+        }
         log_line(line);
-        return -1;
+        return 0;
     }
-
-    for (unsigned int attempt = 0; attempt < PANE_ROOT_MOUNT_MAX_POLLS; attempt++) {
-        int status = 0;
-        pid_t waited = waitpid(child, &status, WNOHANG);
-        if (waited == child) {
-            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-                if (root_readonly) {
-                    snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_OK fs=%s readonly=true", filesystem);
-                } else {
-                    snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_OK fs=%s", filesystem);
-                }
-                log_line(line);
-                return 0;
-            }
-            if (WIFEXITED(status)) {
-                snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_FAIL fs=%s errno=%d", filesystem, WEXITSTATUS(status));
-            } else {
-                snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_FAIL fs=%s status=%d", filesystem, status);
-            }
-            log_line(line);
-            return -1;
-        }
-        if (waited < 0) {
-            snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_WAIT_FAILED fs=%s errno=%d", filesystem, errno);
-            log_line(line);
-            return -1;
-        }
-        if ((attempt % PANE_ROOT_MOUNT_WAIT_LOG_INTERVAL) == (PANE_ROOT_MOUNT_WAIT_LOG_INTERVAL - 1U)) {
-            snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_WAITING fs=%s polls=%u", filesystem, attempt + 1U);
-            log_line(line);
-        }
-        sched_yield();
-    }
-    kill(child, SIGKILL);
-    snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_TIMEOUT fs=%s polls=%u", filesystem, PANE_ROOT_MOUNT_MAX_POLLS);
+    snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_FAIL fs=%s errno=%d", filesystem, errno);
     log_line(line);
     return -1;
 }
@@ -5950,10 +6269,27 @@ int main(void) {
     }
     write_native_storage_env(storage_contract, block_io, block_dma, root_device, user_device, virtio_root_device, root_readonly, root_fs, framebuffer, input_queue);
 
+    // Try the synchronous Pane block device (/dev/pane0) FIRST. It serves storage over
+    // port I/O with no completion interrupt (interrupt_model=none), so it mounts the root
+    // without depending on virtio interrupt delivery. This both proves the boot-and-own-
+    // disk milestone over the interrupt-free path and isolates whether a stall is the
+    // ext4/mount itself versus virtio interrupt delivery. virtio-blk is the fallback.
+    log_line("PANE_ROOT_MOUNT_ATTEMPT");
+    if (wait_for_device(root_device) == 0) {
+        disable_block_readahead(root_device);
+        if (try_mount_root(root_device, truthy_arg(root_readonly), root_fs) == 0) {
+            exec_real_init();
+        }
+        log_line("PANE_ROOT_MOUNT_FALLBACK");
+    } else {
+        log_line("PANE_ROOT_DEVICE_WAIT_TIMEOUT");
+    }
+
     if (virtio_root_device[0] != '\0') {
         log_line("PANE_VIRTIO_ROOT_MOUNT_ATTEMPT");
         load_virtio_mmio_module(virtio_mmio_device);
         if (wait_for_device(virtio_root_device) == 0) {
+            disable_block_readahead(virtio_root_device);
             if (try_mount_root(virtio_root_device, truthy_arg(root_readonly), root_fs) == 0) {
                 exec_real_init();
             }
@@ -5962,16 +6298,7 @@ int main(void) {
             log_line("PANE_VIRTIO_ROOT_DEVICE_WAIT_TIMEOUT");
         }
     }
-    log_line("PANE_ROOT_MOUNT_ATTEMPT");
-    if (wait_for_device(root_device) != 0) {
-        log_line("PANE_ROOT_DEVICE_WAIT_TIMEOUT");
-        wait_forever();
-    }
-    if (try_mount_root(root_device, truthy_arg(root_readonly), root_fs) != 0) {
-        log_line("PANE_ROOT_MOUNT_FAILED");
-        wait_forever();
-    }
-    exec_real_init();
+    log_line("PANE_ROOT_MOUNT_FAILED");
     wait_forever();
 }
 "#
@@ -15999,14 +16326,9 @@ mod tests {
         assert!(init_source.contains("PANE_ROOT_MOUNT_ATTEMPT"));
         assert!(init_source.contains("PANE_ROOT_MOUNT_TRY"));
         assert!(init_source.contains("PANE_ROOT_MOUNT_FAIL"));
-        assert!(init_source.contains("PANE_ROOT_MOUNT_TIMEOUT"));
-        assert!(init_source.contains("PANE_ROOT_MOUNT_WAITING"));
-        assert!(init_source.contains("kill(child, SIGKILL)"));
-        assert!(init_source.contains("#define PANE_ROOT_MOUNT_MAX_POLLS 65536U"));
-        assert!(init_source.contains("#define PANE_ROOT_MOUNT_WAIT_LOG_INTERVAL 4096U"));
-        assert!(init_source.contains("attempt < PANE_ROOT_MOUNT_MAX_POLLS"));
-        assert!(init_source.contains("PANE_ROOT_MOUNT_WAITING fs=%s polls=%u"));
-        assert!(init_source.contains("PANE_ROOT_MOUNT_TIMEOUT fs=%s polls=%u"));
+        // The root mount now calls mount() directly (blocking) rather than fork()+poll,
+        // so the guest can idle while ext4 waits on I/O and its kernel threads run.
+        assert!(init_source.contains("mount(root_device, \"/newroot\", filesystem, flags, data)"));
         assert!(init_source.contains("PANE_ROOT_MOUNT_OK"));
         assert!(init_source.contains("execl(\"/sbin/init\""));
         assert!(init_source.contains("#define COM1_PORT 0x3f8"));

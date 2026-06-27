@@ -147,6 +147,19 @@ impl PaneIoapic {
         self.redirect_table.get(pin).copied()
     }
 
+    /// Decoded diagnostic view of a pin: (vector, masked, level, remote_irr,
+    /// input_line_asserted). Used to inspect why a device line stopped delivering.
+    pub(crate) fn pin_debug(&self, pin: usize) -> Option<(u8, bool, bool, bool, bool)> {
+        let entry = *self.redirect_table.get(pin)?;
+        Some((
+            Self::rte_vector(entry),
+            Self::rte_is_masked(entry),
+            Self::rte_is_level(entry),
+            Self::rte_remote_irr(entry),
+            *self.interrupt_level.get(pin)?,
+        ))
+    }
+
     /// Delivery descriptor for a pin if it is programmed and unmasked, ignoring
     /// remote IRR. Used to re-deliver (resample) a level interrupt whose device
     /// still needs service, so a lost or coalesced delivery cannot stall I/O.

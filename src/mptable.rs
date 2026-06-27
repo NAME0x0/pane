@@ -45,18 +45,26 @@ const IRQ_TYPE_NMI: u8 = 1;
 const IRQ_TYPE_EXTINT: u8 = 3;
 
 // MP interrupt flag encodings: polarity in bits [1:0], trigger in bits [3:2].
-// All ISA IRQs (including the virtio-MMIO IRQ) conform to the bus default, which is
-// edge-triggered. virtio-MMIO interrupts are edge-triggered (crosvm wires them through
-// an edge IRQ event, `Transport::Mmio { irq_evt_edge }`); marking the line level forces
-// Linux into a mask/EOI/unmask cycle the device does not implement and stalls I/O.
+// All ISA IRQs conform to the bus default, which is edge-triggered, active high.
+// The virtio-MMIO line is routed edge to match crosvm's virtio-MMIO wiring and, more
+// importantly, to keep the guest's I/O APIC redirection-entry trigger mode consistent
+// with how Pane delivers the interrupt (WHvRequestInterrupt, edge): a guest RTE
+// programmed level while Pane injects edge desynchronizes the WHP local-APIC EOI/ISR
+// state, which stalled storage delivery after a few completions.
 const IRQ_FLAG_DEFAULT: u16 = 0; // conforms to bus (ISA => edge, active high)
 
 const NUM_ISA_IRQS: u8 = 16;
 
 /// The virtio-MMIO device's ISA IRQ. Must match `crate::virtio::PANE_VIRTIO_MMIO_IRQ`.
-/// Routing is identity for all ISA IRQs, so this is only referenced by tests.
-#[cfg(test)]
-const VIRTIO_IRQ: u8 = 5;
+const VIRTIO_IRQ: u8 = crate::virtio::PANE_VIRTIO_MMIO_IRQ as u8;
+
+/// MP interrupt flag for an ISA IRQ pin: bus-default edge for every line (the timer on
+/// pin 0 and the virtio-MMIO line alike), so the guest's redirection-entry trigger mode
+/// matches Pane's edge `WHvRequestInterrupt` delivery.
+fn isa_irq_flag(irq: u8) -> u16 {
+    let _ = irq;
+    IRQ_FLAG_DEFAULT
+}
 
 fn sum_checksum(bytes: &[u8]) -> u8 {
     bytes.iter().fold(0_u8, |acc, &b| acc.wrapping_add(b))
@@ -123,10 +131,11 @@ pub(crate) fn build_pane_mptable() -> PaneMptable {
     push_processor(&mut entries, 0, true);
     push_bus(&mut entries, 0, b"ISA   ");
     push_ioapic(&mut entries);
-    // Identity ISA IRQ -> I/O APIC pin routing, edge-triggered (bus default). The
-    // virtio-MMIO IRQ (pin 5) and the timer (pin 0) are both edge-triggered.
+    // Identity ISA IRQ -> I/O APIC pin routing. The timer (pin 0) and the other ISA
+    // lines are edge-triggered (bus default); the virtio-MMIO IRQ is level-triggered,
+    // active-high so its completion interrupts resample through the local-APIC EOI.
     for irq in 0..NUM_ISA_IRQS {
-        push_intsrc(&mut entries, IRQ_FLAG_DEFAULT, irq, irq);
+        push_intsrc(&mut entries, isa_irq_flag(irq), irq, irq);
     }
     push_lintsrc(&mut entries, IRQ_TYPE_EXTINT, 0); // LINT0 = ExtINT
     push_lintsrc(&mut entries, IRQ_TYPE_NMI, 1); // LINT1 = NMI
@@ -246,6 +255,7 @@ mod tests {
         let table = build_pane_mptable();
         let mut offset = 44;
         let mut virtio_flag = None;
+        let mut timer_flag = None;
         while offset < table.config_table.len() {
             let entry_type = table.config_table[offset];
             let size = if entry_type == MP_PROCESSOR { 20 } else { 8 };
@@ -261,10 +271,15 @@ mod tests {
                     assert_eq!(dst_irq, VIRTIO_IRQ, "virtio IRQ must route to its own pin");
                     virtio_flag = Some(flag);
                 }
+                if src_irq == 0 {
+                    timer_flag = Some(flag);
+                }
             }
             offset += size;
         }
-        // virtio-MMIO is edge-triggered (bus default), matching crosvm's edge IRQ wiring.
+        // virtio-MMIO and the pin-0 timer are both bus-default edge, so the guest's
+        // redirection-entry trigger mode matches Pane's edge WHvRequestInterrupt delivery.
         assert_eq!(virtio_flag, Some(IRQ_FLAG_DEFAULT));
+        assert_eq!(timer_flag, Some(IRQ_FLAG_DEFAULT));
     }
 }

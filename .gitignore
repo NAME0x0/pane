@@ -31,3 +31,10 @@ Desktop.ini
 check-*.json
 native-boot-*.json
 native-boot-*.log
+
+# QEMU engine boot artifacts (transient serial/console captures, extracted images)
+*.serial
+qemu-*.err
+qemu-*.log
+interactive-*.txt
+arch-initramfs.img

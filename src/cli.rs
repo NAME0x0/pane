@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 
 use crate::{
-    model::{DesktopEnvironment, RuntimeMode, SharedStorageMode},
+    model::{DesktopEnvironment, DisplayMode, RuntimeMode, SharedStorageMode},
     plan::DEFAULT_RUNTIME_CAPACITY_GIB,
 };
 
@@ -142,6 +142,18 @@ pub struct LaunchArgs {
     /// Runtime backend to use. wsl-bridge is current; pane-owned is the native runtime preflight path.
     #[arg(long, value_enum, default_value_t = RuntimeMode::WslBridge)]
     pub runtime: RuntimeMode,
+    /// For --runtime qemu-whpx: guest console — serial (text in this terminal) or a graphical
+    /// window (gtk/sdl with a virtio-vga adapter).
+    #[arg(long, value_enum, default_value_t = DisplayMode::Serial)]
+    pub display: DisplayMode,
+    /// For --runtime qemu-whpx: boot the root from a persistent qcow2 overlay backed by the
+    /// base image, so installed packages and a desktop survive reboots (base stays immutable).
+    #[arg(long)]
+    pub persist_root: bool,
+    /// For --runtime qemu-whpx: start the VM in the background and return immediately. Stop it
+    /// with `pane stop`. Pair with --display gtk for a standalone desktop window.
+    #[arg(long)]
+    pub detach: bool,
     /// Desktop environment to provision in the distro. MVP support is Arch + XFCE only.
     #[arg(long, value_enum, default_value_t = DesktopEnvironment::Xfce)]
     pub de: DesktopEnvironment,
@@ -389,6 +401,34 @@ pub struct NativeBootSpikeArgs {
     /// Map guest memory and run the materialized kernel-layout artifact under the serial/HALT contract.
     #[arg(long, conflicts_with_all = ["run_fixture", "run_boot_loader"])]
     pub run_kernel_layout: bool,
+    /// Boot the registered kernel/initramfs/base-disk through QEMU with the WHP accelerator
+    /// (qemu-system-x86_64 -accel whpx) instead of Pane's from-scratch WHP run loop. This is
+    /// the validated engine path: it boots the full distro (virtio root, switch_root, systemd,
+    /// login) where the from-scratch loop stalls on guest-timer throughput.
+    #[arg(long)]
+    pub qemu_whpx: bool,
+    /// Path to the real distro initramfs (with virtio-blk) for the QEMU engine path. The
+    /// registered Pane initramfs is the custom pane-block one, which QEMU cannot use. When
+    /// omitted, Pane extracts and caches it from the registered base image automatically.
+    #[arg(long)]
+    pub qemu_initramfs: Option<PathBuf>,
+    /// With --qemu-whpx, run an interactive session: the guest serial console is wired to
+    /// this terminal so you get a live Linux shell (Ctrl-A X to quit). Without this flag the
+    /// QEMU path runs a headless boot probe and reports milestones.
+    #[arg(long)]
+    pub interactive: bool,
+    /// Console for an interactive QEMU session: serial (text in this terminal) or a graphical
+    /// window (gtk/sdl with a virtio-vga adapter).
+    #[arg(long, value_enum, default_value_t = DisplayMode::Serial)]
+    pub display: DisplayMode,
+    /// Boot the QEMU root from a persistent qcow2 overlay backed by the base image, so guest
+    /// changes (installed packages, a desktop) survive reboots. The base image stays immutable.
+    #[arg(long)]
+    pub persist_root: bool,
+    /// Start the QEMU VM in the background and return immediately. The guest keeps running;
+    /// stop it with `pane stop`. Pair with --display gtk for a standalone desktop window.
+    #[arg(long)]
+    pub detach: bool,
     /// Write incremental native boot diagnostics to this JSON file while the WHP guest is running.
     #[arg(long)]
     pub trace_checkpoint: Option<PathBuf>,

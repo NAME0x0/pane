@@ -87,6 +87,10 @@ pub fn locate_qemu() -> Option<PathBuf> {
 /// clean ACPI shutdown. Single-session assumption; revisit if Pane runs concurrent VMs.
 const QMP_TCP_PORT: u16 = 44510;
 
+/// TCP port for the serial console during one-time provisioning (driving the autologin
+/// root shell). Separate from QMP; single-session assumption.
+const SERIAL_TCP_PORT: u16 = 44511;
+
 /// The QMP control port used for detached VMs.
 pub fn detached_qmp_port() -> u16 {
     QMP_TCP_PORT
@@ -481,6 +485,133 @@ pub fn boot_via_qemu_whpx(config: &QemuBootConfig) -> QemuBootReport {
     report.serial_tail = serial_tail(&serial, 2000);
     report.elapsed_seconds = started_at.elapsed().as_secs();
     report
+}
+
+/// Run one-time provisioning commands as root in the guest, then power off. The image
+/// autologins root on the serial console, so Pane connects QEMU's serial to a Windows named
+/// pipe and feeds the commands to that already-logged-in shell. No image edit, no firstboot,
+/// no ext4 write; changes persist when `config` uses a persistent root overlay. Reusable for
+/// any root-shell provisioning (credentials now, desktop install later).
+pub fn provision_via_serial(config: &QemuBootConfig, commands: &[String]) -> Result<(), String> {
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    let qemu = locate_qemu().ok_or_else(|| "qemu-system-x86_64 not found".to_string())?;
+    for required in [&config.kernel, &config.initramfs, &config.base_disk] {
+        if !required.exists() {
+            return Err(format!("Required artifact missing: {}", required.display()));
+        }
+    }
+    // Expose the guest serial console over a TCP socket. TCP avoids the Windows named-pipe
+    // open() blocking trap and works cleanly with std's networking.
+    let mut command = Command::new(&qemu);
+    push_machine_args(&mut command, config);
+    command.args([
+        "-display",
+        "none",
+        "-monitor",
+        "none",
+        "-serial",
+        &format!("tcp:127.0.0.1:{SERIAL_TCP_PORT},server,nowait"),
+    ]);
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Failed to launch QEMU: {error}"))?;
+
+    // Connect to QEMU's serial socket (retry until it is listening; connect fails fast when
+    // it is not, so the deadline is honored).
+    let connect_deadline = Instant::now() + Duration::from_secs(30);
+    let stream = loop {
+        match std::net::TcpStream::connect(("127.0.0.1", SERIAL_TCP_PORT)) {
+            Ok(stream) => break stream,
+            Err(_) if Instant::now() < connect_deadline => {
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                return Err(format!("Could not connect to the guest serial socket: {error}"));
+            }
+        }
+    };
+    let mut writer = stream
+        .try_clone()
+        .map_err(|error| format!("Could not duplicate the serial socket: {error}"))?;
+
+    // Drain guest output into a shared buffer so we can wait for the login prompt.
+    let buffer = Arc::new(Mutex::new(String::new()));
+    let buffer_reader = buffer.clone();
+    let mut reader = stream;
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 1024];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if let Ok(mut text) = buffer_reader.lock() {
+                        text.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let wait_for = |needle: &str, secs: u64| -> bool {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            if buffer.lock().map(|t| t.contains(needle)).unwrap_or(false) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    };
+
+    let mut send = |line: &str| -> Result<(), String> {
+        writer
+            .write_all(line.as_bytes())
+            .and_then(|_| writer.write_all(b"\n"))
+            .map_err(|error| format!("Could not write to the guest serial: {error}"))?;
+        let _ = writer.flush();
+        std::thread::sleep(Duration::from_millis(700));
+        Ok(())
+    };
+
+    // The serial getty autologins root; wait for that, then let the shell settle.
+    if !wait_for("automatic login", 120) && !wait_for("pane-arch", 5) {
+        let _ = child.kill();
+        return Err("Guest did not reach the autologin root shell in time.".to_string());
+    }
+    std::thread::sleep(Duration::from_secs(3));
+
+    for line in commands {
+        send(line)?;
+    }
+    send("sync")?;
+    let _ = send("poweroff -f");
+
+    // Wait for the guest to power off; force only if it overruns.
+    let exit_deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < exit_deadline => {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    Ok(())
 }
 
 fn read_serial(path: &Path) -> String {

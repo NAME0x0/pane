@@ -41,6 +41,8 @@ pub enum Commands {
     NativePreflight(NativePreflightArgs),
     /// Exercise the first non-persistent WHP partition/vCPU boot-spike host step.
     NativeBootSpike(NativeBootSpikeArgs),
+    /// Set login credentials in the QEMU guest (root password, optional first user).
+    Provision(ProvisionArgs),
     /// Validate and materialize the native kernel boot layout contract.
     NativeKernelPlan(NativeKernelPlanArgs),
     /// Show the crosvm/rust-vmm foundation plan for the Pane-owned runtime.
@@ -379,6 +381,22 @@ pub struct NativePreflightArgs {
     /// Emit structured JSON instead of a human-readable summary.
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ProvisionArgs {
+    /// Session slug for the Pane-owned runtime reservation.
+    #[arg(long, default_value = "pane")]
+    pub session_name: String,
+    /// Root password to set. If omitted, Pane generates a strong one and prints it.
+    #[arg(long)]
+    pub root_password: Option<String>,
+    /// Create this login user (added to the wheel group with sudo). Optional.
+    #[arg(long)]
+    pub username: Option<String>,
+    /// Password for --username. If omitted while --username is set, Pane generates one.
+    #[arg(long)]
+    pub password: Option<String>,
 }
 
 #[derive(Debug, Args)]

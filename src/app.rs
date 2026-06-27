@@ -28,7 +28,8 @@ use crate::{
     cli::{
         AppStatusArgs, BundleArgs, Cli, Commands, ConnectArgs, DoctorArgs, EnvironmentsArgs,
         InitArgs, LaunchArgs, LogsArgs, NativeBootSpikeArgs, NativeFoundationArgs,
-        NativeKernelPlanArgs, NativePreflightArgs, OnboardArgs, RelayArgs, RepairArgs, ResetArgs,
+        NativeKernelPlanArgs, NativePreflightArgs, OnboardArgs, ProvisionArgs, RelayArgs,
+        RepairArgs, ResetArgs,
         RuntimeArgs, SetupUserArgs, ShareArgs, StatusArgs, StopArgs, TerminalArgs, UpdateArgs,
     },
     error::{AppError, AppResult},
@@ -1383,6 +1384,7 @@ pub fn run() -> AppResult<()> {
         Commands::Runtime(args) => runtime(*args),
         Commands::NativePreflight(args) => native_preflight(args),
         Commands::NativeBootSpike(args) => native_boot_spike(args),
+        Commands::Provision(args) => provision(args),
         Commands::NativeKernelPlan(args) => native_kernel_plan(args),
         Commands::NativeFoundation(args) => native_foundation(args),
         Commands::Environments(args) => environments(args),
@@ -2886,6 +2888,111 @@ fn build_qemu_engine_config(
         snapshot: true,
         display_backend: display.backend().map(|backend| backend.to_string()),
     })
+}
+
+/// Generate a strong, shell-safe password (alphanumeric, no ambiguous characters), using a
+/// time/pid-seeded xorshift PRNG. Used for default credentials the user is shown and should
+/// change; not a cryptographic secret generator.
+fn generate_password(length: usize) -> String {
+    const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789";
+    let mut seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9e37_79b9_7f4a_7c15)
+        ^ ((std::process::id() as u64) << 32)
+        ^ 0xd1b5_4a32_d192_ed03;
+    let mut password = String::with_capacity(length);
+    for _ in 0..length {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        password.push(CHARSET[(seed as usize) % CHARSET.len()] as char);
+    }
+    password
+}
+
+/// A conservative Linux username check so the value is safe to inject into the guest shell.
+fn valid_username(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 32
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+/// `pane provision`: set guest login credentials (root password, optional first sudo user)
+/// once, persisted to the root overlay, by driving the serial autologin root shell. Prints
+/// the credentials and how to create more users.
+fn provision(args: ProvisionArgs) -> AppResult<()> {
+    let session_name = crate::plan::sanitize_session_name(&args.session_name);
+    prepare_native_runtime_boundary(&session_name, DEFAULT_RUNTIME_CAPACITY_GIB)?;
+    let runtime_paths = crate::plan::runtime_for(&session_name);
+    crate::qemu::ensure_qemu_available().map_err(AppError::message)?;
+    ensure_base_image(&runtime_paths)?;
+
+    if let Some(name) = args.username.as_deref() {
+        if !valid_username(name) {
+            return Err(AppError::message(
+                "Invalid --username. Use lowercase letters, digits, '-' or '_', starting with a letter or '_'.",
+            ));
+        }
+    }
+
+    let root_password = args
+        .root_password
+        .clone()
+        .unwrap_or_else(|| generate_password(16));
+    let user_password = args.username.as_ref().map(|_| {
+        args.password
+            .clone()
+            .unwrap_or_else(|| generate_password(16))
+    });
+
+    // Credentials must persist, so provision against the persistent root overlay.
+    let serial_path = runtime_paths.logs.join("qemu-provision.serial");
+    let config = build_qemu_engine_config(
+        &runtime_paths,
+        None,
+        serial_path,
+        std::time::Duration::from_secs(180),
+        crate::model::DisplayMode::Serial,
+        true,
+    )?;
+
+    // Build root-shell commands. Passwords are generated from a shell-safe charset, so
+    // single-quoting in the `chpasswd` here is sufficient.
+    let mut commands = vec![format!("echo 'root:{root_password}' | chpasswd")];
+    if let (Some(name), Some(password)) = (args.username.as_deref(), user_password.as_deref()) {
+        commands.push(format!(
+            "useradd -m -G wheel -s /usr/bin/bash {name} 2>/dev/null || true"
+        ));
+        commands.push(format!("echo '{name}:{password}' | chpasswd"));
+        commands.push("install -d -m 755 /etc/sudoers.d".to_string());
+        commands.push(
+            "printf '%%wheel ALL=(ALL:ALL) ALL\\n' > /etc/sudoers.d/wheel && chmod 440 /etc/sudoers.d/wheel"
+                .to_string(),
+        );
+    }
+
+    println!("Provisioning guest credentials (one-time, persisted)...");
+    crate::qemu::provision_via_serial(&config, &commands).map_err(AppError::message)?;
+
+    println!("\n==== Pane guest credentials ====");
+    println!("  root password:  {root_password}");
+    if let (Some(name), Some(password)) = (args.username.as_deref(), user_password.as_deref()) {
+        println!("  user:           {name}");
+        println!("  user password:  {password}");
+        println!("  ({name} is in the wheel group with sudo.)");
+    }
+    println!("================================");
+    println!("These persist on the root overlay. Log in at the GUI with `pane launch --runtime qemu-whpx --display gtk --persist-root`.");
+    println!("Change a password in the guest with `passwd`. Create more users with:");
+    println!("  useradd -m -G wheel -s /usr/bin/bash <name> && passwd <name>");
+    Ok(())
 }
 
 fn native_boot_spike_qemu_whpx(

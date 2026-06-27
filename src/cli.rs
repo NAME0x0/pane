@@ -43,6 +43,8 @@ pub enum Commands {
     NativeBootSpike(NativeBootSpikeArgs),
     /// Set login credentials in the QEMU guest (root password, optional first user).
     Provision(ProvisionArgs),
+    /// Install a graphical desktop (XFCE + LightDM) into the QEMU guest image.
+    InstallDesktop(InstallDesktopArgs),
     /// Validate and materialize the native kernel boot layout contract.
     NativeKernelPlan(NativeKernelPlanArgs),
     /// Show the crosvm/rust-vmm foundation plan for the Pane-owned runtime.
@@ -397,6 +399,16 @@ pub struct ProvisionArgs {
     /// Password for --username. If omitted while --username is set, Pane generates one.
     #[arg(long)]
     pub password: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct InstallDesktopArgs {
+    /// Session slug for the Pane-owned runtime reservation.
+    #[arg(long, default_value = "pane")]
+    pub session_name: String,
+    /// Minutes to allow for the package download + install before giving up.
+    #[arg(long, default_value_t = 30)]
+    pub timeout_minutes: u64,
 }
 
 #[derive(Debug, Args)]

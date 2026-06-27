@@ -28,8 +28,8 @@ use crate::{
     cli::{
         AppStatusArgs, BundleArgs, Cli, Commands, ConnectArgs, DoctorArgs, EnvironmentsArgs,
         InitArgs, LaunchArgs, LogsArgs, NativeBootSpikeArgs, NativeFoundationArgs,
-        NativeKernelPlanArgs, NativePreflightArgs, OnboardArgs, ProvisionArgs, RelayArgs,
-        RepairArgs, ResetArgs,
+        InstallDesktopArgs, NativeKernelPlanArgs, NativePreflightArgs, OnboardArgs, ProvisionArgs,
+        RelayArgs, RepairArgs, ResetArgs,
         RuntimeArgs, SetupUserArgs, ShareArgs, StatusArgs, StopArgs, TerminalArgs, UpdateArgs,
     },
     error::{AppError, AppResult},
@@ -1385,6 +1385,7 @@ pub fn run() -> AppResult<()> {
         Commands::NativePreflight(args) => native_preflight(args),
         Commands::NativeBootSpike(args) => native_boot_spike(args),
         Commands::Provision(args) => provision(args),
+        Commands::InstallDesktop(args) => install_desktop(args),
         Commands::NativeKernelPlan(args) => native_kernel_plan(args),
         Commands::NativeFoundation(args) => native_foundation(args),
         Commands::Environments(args) => environments(args),
@@ -2979,7 +2980,8 @@ fn provision(args: ProvisionArgs) -> AppResult<()> {
     }
 
     println!("Provisioning guest credentials (one-time, persisted)...");
-    crate::qemu::provision_via_serial(&config, &commands).map_err(AppError::message)?;
+    crate::qemu::provision_via_serial(&config, &commands, std::time::Duration::from_secs(120))
+        .map_err(AppError::message)?;
 
     println!("\n==== Pane guest credentials ====");
     println!("  root password:  {root_password}");
@@ -2992,6 +2994,64 @@ fn provision(args: ProvisionArgs) -> AppResult<()> {
     println!("These persist on the root overlay. Log in at the GUI with `pane launch --runtime qemu-whpx --display gtk --persist-root`.");
     println!("Change a password in the guest with `passwd`. Create more users with:");
     println!("  useradd -m -G wheel -s /usr/bin/bash <name> && passwd <name>");
+    Ok(())
+}
+
+/// `pane install-desktop`: install XFCE + LightDM into the guest image (persisted to the
+/// root overlay) by driving the serial autologin root shell: configure networking + a known
+/// mirror, then pacman the desktop and enable the display manager. After this, a graphical
+/// launch shows the LightDM greeter instead of a text console.
+fn install_desktop(args: InstallDesktopArgs) -> AppResult<()> {
+    let session_name = crate::plan::sanitize_session_name(&args.session_name);
+    prepare_native_runtime_boundary(&session_name, DEFAULT_RUNTIME_CAPACITY_GIB)?;
+    let runtime_paths = crate::plan::runtime_for(&session_name);
+    crate::qemu::ensure_qemu_available().map_err(AppError::message)?;
+    ensure_base_image(&runtime_paths)?;
+
+    let serial_path = runtime_paths.logs.join("qemu-install-desktop.serial");
+    // Persist to the root overlay so the installed desktop survives reboots.
+    let config = build_qemu_engine_config(
+        &runtime_paths,
+        None,
+        serial_path.clone(),
+        std::time::Duration::from_secs(180),
+        crate::model::DisplayMode::Serial,
+        true,
+    )?;
+
+    let commands: Vec<String> = [
+        // Clear any stale lock from an interrupted run.
+        "rm -f /var/lib/pacman/db.lck",
+        // A guaranteed-good mirror + DHCP networking so pacman can reach the repositories.
+        "echo 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch' > /etc/pacman.d/mirrorlist",
+        "printf '[Match]\\nName=en* eth*\\n\\n[Network]\\nDHCP=yes\\n' > /etc/systemd/network/20-pane-dhcp.network",
+        "systemctl enable --now systemd-networkd systemd-resolved",
+        "ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf",
+        "for i in $(seq 1 60); do getent hosts geo.mirror.pkgbuild.com >/dev/null 2>&1 && break; sleep 2; done",
+        // Initialize + populate the pacman keyring (base image ships it uninitialized);
+        // virtio-rng supplies entropy so --init does not stall.
+        "pacman-key --init",
+        "pacman-key --populate archlinux",
+        "pacman -Sy --noconfirm --needed archlinux-keyring",
+        "pacman -S --noconfirm --needed xorg-server lightdm lightdm-gtk-greeter xfce4 xfce4-goodies",
+        "systemctl enable lightdm",
+    ]
+    .iter()
+    .map(|line| line.to_string())
+    .collect();
+
+    println!("Installing the XFCE desktop + LightDM into the guest image (persisted).");
+    println!(
+        "Downloads ~1 GB; can take several minutes. Live log: {}",
+        serial_path.display()
+    );
+    let timeout = std::time::Duration::from_secs(args.timeout_minutes.saturating_mul(60).max(300));
+    crate::qemu::provision_via_serial(&config, &commands, timeout).map_err(AppError::message)?;
+
+    println!("\nDesktop installed. Launch it with:");
+    println!("  pane launch --runtime qemu-whpx --display gtk --persist-root");
+    println!("The window shows the LightDM greeter; log in as your user to reach XFCE.");
+    println!("(If you have not created a user yet, run `pane provision --username <name>` first.)");
     Ok(())
 }
 

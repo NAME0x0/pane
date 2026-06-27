@@ -1,0 +1,3 @@
+Installing the XFCE desktop + LightDM into the guest image (persisted).
+Downloads ~1 GB; can take several minutes. Live log: C:\Users\Afsah\AppData\Local\Pane\runtime\pane\logs\qemu-install-desktop.serial
+error: Provisioning did not confirm success within 1800s; see C:\Users\Afsah\AppData\Local\Pane\runtime\pane\logs\qemu-install-desktop.serial

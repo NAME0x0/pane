@@ -157,6 +157,18 @@ fn drive_arg(path: &Path, format: &str, snapshot: bool) -> String {
     )
 }
 
+/// QEMU args for a graphical window. Uses the standard VGA adapter and disables host
+/// OpenGL: the gtk backend defaults to GL with virtio-gpu, which crashes QEMU under WHPX
+/// when Xorg initializes the display. `-vga std` + `gl=off` is software-rendered and stable.
+fn graphical_display_args(backend: &str) -> Vec<String> {
+    vec![
+        "-vga".to_string(),
+        "std".to_string(),
+        "-display".to_string(),
+        format!("{backend},gl=off"),
+    ]
+}
+
 /// Push the machine definition shared by every boot mode: WHPX accel, memory, the kernel +
 /// distro initramfs, the base disk (virtio root) and optional user disk (virtio vdb), the
 /// kernel cmdline, and copy-on-write snapshot of the base image.
@@ -190,6 +202,9 @@ fn push_machine_args(command: &mut Command, config: &QemuBootConfig) {
         "user,id=net0",
         "-device",
         "virtio-net-pci,netdev=net0",
+        // Entropy source so key generation (pacman-key --init) and TLS do not stall.
+        "-device",
+        "virtio-rng-pci",
     ]);
     command.args(["-append", &config.cmdline]);
 }
@@ -252,16 +267,9 @@ pub fn boot_interactive(config: &QemuBootConfig) -> Result<std::process::ExitSta
                 .stderr(std::process::Stdio::inherit());
         }
         Some(backend) => {
-            // Graphical: virtio-vga adapter rendered in a QEMU window; the serial console is
-            // captured to a file for diagnostics. The window is the interactive surface.
-            command.args([
-                "-vga",
-                "virtio",
-                "-display",
-                backend,
-                "-serial",
-                &format!("file:{}", config.serial_path.display()),
-            ]);
+            // Graphical: standard VGA in a QEMU window; serial captured to a file.
+            command.args(graphical_display_args(backend));
+            command.args(["-serial", &format!("file:{}", config.serial_path.display())]);
         }
     }
     command
@@ -286,7 +294,7 @@ pub fn boot_detached(config: &QemuBootConfig) -> Result<u32, String> {
     push_machine_args(&mut command, config);
     match config.display_backend.as_deref() {
         Some(backend) => {
-            command.args(["-vga", "virtio", "-display", backend]);
+            command.args(graphical_display_args(backend));
         }
         None => {
             command.args(["-display", "none", "-monitor", "none"]);
@@ -300,11 +308,16 @@ pub fn boot_detached(config: &QemuBootConfig) -> Result<u32, String> {
         &format!("tcp:127.0.0.1:{QMP_TCP_PORT},server,nowait"),
     ]);
     // Detached: no inherited console. The child outlives this process (Child drop does not
-    // kill it on Windows), so it keeps running until stopped via its pid.
+    // kill it on Windows), so it keeps running until stopped via its pid. QEMU stderr is
+    // captured next to the serial log for diagnostics.
+    let stderr_path = config.serial_path.with_extension("stderr.log");
+    let stderr = std::fs::File::create(&stderr_path)
+        .map(std::process::Stdio::from)
+        .unwrap_or_else(|_| std::process::Stdio::null());
     command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(stderr);
     let child = command
         .spawn()
         .map_err(|error| format!("Failed to launch QEMU: {error}"))?;
@@ -492,7 +505,11 @@ pub fn boot_via_qemu_whpx(config: &QemuBootConfig) -> QemuBootReport {
 /// pipe and feeds the commands to that already-logged-in shell. No image edit, no firstboot,
 /// no ext4 write; changes persist when `config` uses a persistent root overlay. Reusable for
 /// any root-shell provisioning (credentials now, desktop install later).
-pub fn provision_via_serial(config: &QemuBootConfig, commands: &[String]) -> Result<(), String> {
+pub fn provision_via_serial(
+    config: &QemuBootConfig,
+    commands: &[String],
+    completion_timeout: Duration,
+) -> Result<(), String> {
     use std::io::{Read, Write};
     use std::sync::{Arc, Mutex};
 
@@ -544,15 +561,22 @@ pub fn provision_via_serial(config: &QemuBootConfig, commands: &[String]) -> Res
     // Drain guest output into a shared buffer so we can wait for the login prompt.
     let buffer = Arc::new(Mutex::new(String::new()));
     let buffer_reader = buffer.clone();
+    let log_path = config.serial_path.clone();
     let mut reader = stream;
     std::thread::spawn(move || {
         let mut chunk = [0u8; 1024];
+        let mut last_flush = Instant::now();
         loop {
             match reader.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(n) => {
                     if let Ok(mut text) = buffer_reader.lock() {
                         text.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                        // Flush the live transcript periodically so long installs are watchable.
+                        if last_flush.elapsed() >= Duration::from_secs(2) {
+                            let _ = std::fs::write(&log_path, text.as_bytes());
+                            last_flush = Instant::now();
+                        }
                     }
                 }
                 Err(_) => break,
@@ -593,7 +617,11 @@ pub fn provision_via_serial(config: &QemuBootConfig, commands: &[String]) -> Res
     for line in commands {
         send(line)?;
     }
-    send("sync")?;
+    // Confirm completion: the echoed input contains the literal "$?", but the command's
+    // output shows the expanded exit code, so "PANE_PROV_DONE_0" appears only on success.
+    send("echo PANE_PROV_DONE_$?")?;
+    let succeeded = wait_for("PANE_PROV_DONE_0", completion_timeout.as_secs());
+    let _ = send("sync");
     let _ = send("poweroff -f");
 
     // Wait for the guest to power off; force only if it overruns.
@@ -610,6 +638,17 @@ pub fn provision_via_serial(config: &QemuBootConfig, commands: &[String]) -> Res
             }
             Err(_) => break,
         }
+    }
+    // Save the transcript for diagnostics (provisioning uses a socket, not the serial file).
+    if let Ok(text) = buffer.lock() {
+        let _ = std::fs::write(&config.serial_path, text.as_bytes());
+    }
+    if !succeeded {
+        return Err(format!(
+            "Provisioning did not confirm success within {}s; see {}",
+            completion_timeout.as_secs(),
+            config.serial_path.display()
+        ));
     }
     Ok(())
 }

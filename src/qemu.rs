@@ -83,6 +83,34 @@ pub fn locate_qemu() -> Option<PathBuf> {
 
 /// Build a `-drive` spec. `snapshot=on` makes writes copy-on-write and discarded at exit
 /// (keeps the verified base image immutable); `snapshot=off` persists writes to the file.
+/// Ensure QEMU is available, installing it via winget on first use if absent. Returns the
+/// resolved qemu-system path. winget output is shown so the user sees install progress.
+pub fn ensure_qemu_available() -> Result<PathBuf, String> {
+    if let Some(qemu) = locate_qemu() {
+        return Ok(qemu);
+    }
+    println!("QEMU not found. Installing it via winget (SoftwareFreedomConservancy.QEMU)...");
+    let status = Command::new("winget")
+        .args([
+            "install",
+            "--id",
+            "SoftwareFreedomConservancy.QEMU",
+            "-e",
+            "--accept-source-agreements",
+            "--accept-package-agreements",
+        ])
+        .status()
+        .map_err(|error| {
+            format!("Could not run winget to install QEMU: {error}. Install it manually: winget install SoftwareFreedomConservancy.QEMU")
+        })?;
+    if !status.success() {
+        return Err("winget failed to install QEMU. Install it manually: winget install SoftwareFreedomConservancy.QEMU".to_string());
+    }
+    locate_qemu().ok_or_else(|| {
+        "QEMU was installed but could not be located. Open a new terminal and retry.".to_string()
+    })
+}
+
 fn drive_arg(path: &Path, format: &str, snapshot: bool) -> String {
     format!(
         "file={},format={format},if=virtio,snapshot={}",

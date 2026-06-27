@@ -245,4 +245,18 @@ mod tests {
             || data.starts_with(b"0707");
         assert!(magic_ok, "unexpected initramfs magic: {:02x?}", &data[..4]);
     }
+
+    #[test]
+    fn extracts_distro_kernel_bzimage_from_registered_base_image() {
+        // Validates the kernel auto-derive path: same reader pulls vmlinuz from the image.
+        let Some(image) = base_image() else {
+            eprintln!("skipping: base image not registered on this machine");
+            return;
+        };
+        let data =
+            extract_file(&image, 1_048_576, "/boot/vmlinuz-linux").expect("extract vmlinuz");
+        assert!(data.len() > 1_000_000, "kernel too small: {}", data.len());
+        // Linux bzImage carries the "HdrS" setup-header magic at offset 0x202.
+        assert_eq!(&data[0x202..0x206], b"HdrS", "not a Linux bzImage");
+    }
 }

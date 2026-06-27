@@ -2018,26 +2018,81 @@ fn start_detached_qemu(
     Ok(())
 }
 
-/// Resolve `--runtime auto`: prefer QEMU+WHPX when QEMU is installed and the native runtime
-/// artifacts (kernel + base image) are registered; otherwise fall back to the WSL bridge.
+/// Resolve `--runtime auto`: prefer QEMU+WHPX when QEMU is installed and the base image is
+/// registered (the kernel + initramfs are derived from it). Otherwise fall back to the WSL
+/// bridge. Detection must be side-effect free: it never installs QEMU or downloads the image
+/// (an explicit `--runtime qemu-whpx` does that via the preflight).
 fn resolve_auto_runtime(args: &LaunchArgs) -> RuntimeMode {
     let session = crate::plan::sanitize_session_name(&args.session_name);
     let runtime_paths = crate::plan::runtime_for(&session);
     let qemu_available = crate::qemu::locate_qemu().is_some();
-    let artifacts_present =
-        runtime_paths.kernel_image.exists() && runtime_paths.base_os_image.exists();
-    if qemu_available && artifacts_present {
+    if qemu_available && runtime_paths.base_os_image.exists() {
         RuntimeMode::QemuWhpx
     } else {
         RuntimeMode::WslBridge
     }
 }
 
+/// Pane-hosted base OS image for download-on-first-run. Empty until hosting is wired; when
+/// empty, Pane guides the user to import a base image instead of failing cryptically.
+const PANE_BASE_IMAGE_URL: &str = "";
+const PANE_BASE_IMAGE_SHA256: &str = "c589917dff159239bd8c1e8d5cd38413e15699192ef7236d3a24dbd7f1c9c931";
+
+/// Ensure a base OS image is registered for the QEMU engine, downloading it on first run
+/// (curl, SHA-verified, then registered) when a hosting URL is configured. When no URL is
+/// set, give an actionable import instruction instead of a cryptic failure.
+fn ensure_base_image(runtime_paths: &RuntimePaths) -> AppResult<()> {
+    if runtime_paths.base_os_image.exists() {
+        return Ok(());
+    }
+    if PANE_BASE_IMAGE_URL.is_empty() {
+        return Err(AppError::message(
+            "No base OS image is registered yet. Import one with `pane runtime --register-base-os <path> --base-os-expected-sha256 <sha>` (download-on-first-run activates once the Pane image URL is configured).",
+        ));
+    }
+    let download = runtime_paths.downloads.join("arch-base.download");
+    if let Some(parent) = download.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    println!("Downloading the Pane base OS image from {PANE_BASE_IMAGE_URL} (this is a one-time ~4 GiB fetch)...");
+    let status = std::process::Command::new("curl.exe")
+        .args([
+            "-L",
+            "--fail",
+            "-o",
+            &download.display().to_string(),
+            PANE_BASE_IMAGE_URL,
+        ])
+        .status()
+        .map_err(|error| {
+            AppError::message(format!("Could not run curl to download the base image: {error}"))
+        })?;
+    if !status.success() {
+        return Err(AppError::message(
+            "Base image download failed. Check your connection, or import the image manually with `pane runtime --register-base-os <path>`.",
+        ));
+    }
+    register_base_os_image(
+        runtime_paths,
+        &download,
+        Some(PANE_BASE_IMAGE_SHA256),
+        true,
+        false,
+    )?;
+    let _ = fs::remove_file(&download);
+    println!("Base OS image downloaded, verified, and registered.");
+    Ok(())
+}
+
 fn launch_qemu_whpx_runtime(args: LaunchArgs) -> AppResult<()> {
     let session_name = crate::plan::sanitize_session_name(&args.session_name);
-    // Ensure the native runtime artifacts (kernel, base image, disks) exist before boot.
+    // Ensure the runtime boundary (dirs, contracts, user-disk descriptor) exists.
     prepare_native_runtime_boundary(&session_name, DEFAULT_RUNTIME_CAPACITY_GIB)?;
     let runtime_paths = crate::plan::runtime_for(&session_name);
+    // Preflight so a single command works on a fresh machine: install QEMU if missing, and
+    // make sure a base image is registered (the kernel + initramfs are derived from it).
+    crate::qemu::ensure_qemu_available().map_err(AppError::message)?;
+    ensure_base_image(&runtime_paths)?;
     let serial_path = runtime_paths.logs.join("qemu-whpx.serial");
     let config = build_qemu_engine_config(
         &runtime_paths,
@@ -2617,6 +2672,52 @@ fn native_preflight(args: NativePreflightArgs) -> AppResult<()> {
 /// that is absent, extract `/boot/initramfs-linux.img` straight out of the registered base
 /// image's ext4 root partition (no WSL/external tools) and cache it. This makes the QEMU
 /// engine self-contained: `--qemu-initramfs` becomes an override, not a requirement.
+/// Byte offset of the ext4 root partition inside the base image, from its registered
+/// metadata (falls back to the conventional 1 MiB first-partition offset).
+fn base_image_partition_offset(runtime_paths: &crate::plan::RuntimePaths) -> u64 {
+    read_json_file::<BaseOsImageMetadata>(&runtime_paths.base_os_metadata)
+        .ok()
+        .and_then(|metadata| metadata.root_partition_hint)
+        .map(|partition| partition.byte_offset)
+        .unwrap_or(1_048_576)
+}
+
+/// Extract a file from the base image's ext4 root into a cache path (once), returning the
+/// cache path. Used to derive the distro kernel + initramfs from the single base-image
+/// artifact, so neither needs separate registration.
+fn extract_from_base_image(
+    runtime_paths: &crate::plan::RuntimePaths,
+    guest_path: &str,
+    cache: &Path,
+    label: &str,
+) -> AppResult<PathBuf> {
+    if cache.exists() {
+        return Ok(cache.to_path_buf());
+    }
+    if !runtime_paths.base_os_image.exists() {
+        return Err(AppError::message(format!(
+            "No registered base image to derive the {label} from. Run `pane launch` to fetch the base image, or import one.",
+        )));
+    }
+    let offset = base_image_partition_offset(runtime_paths);
+    let data = crate::ext4::extract_file(&runtime_paths.base_os_image, offset, guest_path)
+        .map_err(|error| {
+            AppError::message(format!(
+                "Could not extract the {label} ({guest_path}) from the base image: {error}.",
+            ))
+        })?;
+    if let Some(parent) = cache.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(cache, &data)?;
+    println!(
+        "Pane derived the {label} ({} bytes) from the base image -> {}",
+        data.len(),
+        cache.display()
+    );
+    Ok(cache.to_path_buf())
+}
+
 fn resolve_distro_initramfs(
     initramfs_override: Option<&Path>,
     runtime_paths: &crate::plan::RuntimePaths,
@@ -2625,39 +2726,22 @@ fn resolve_distro_initramfs(
         return Ok(explicit.to_path_buf());
     }
     let cache = runtime_paths.engines.join("distro-initramfs.img");
-    if cache.exists() {
-        return Ok(cache);
-    }
-    if !runtime_paths.base_os_image.exists() {
-        return Err(AppError::message(
-            "No --qemu-initramfs given and no registered base image to extract the distro initramfs from. Register the base image (pane runtime --prepare-runtime) or pass --qemu-initramfs.",
-        ));
-    }
-    let partition_offset = read_json_file::<BaseOsImageMetadata>(&runtime_paths.base_os_metadata)
-        .ok()
-        .and_then(|metadata| metadata.root_partition_hint)
-        .map(|partition| partition.byte_offset)
-        .unwrap_or(1_048_576);
-    let data = crate::ext4::extract_file(
-        &runtime_paths.base_os_image,
-        partition_offset,
+    extract_from_base_image(
+        runtime_paths,
         "/boot/initramfs-linux.img",
+        &cache,
+        "distro initramfs",
     )
-    .map_err(|error| {
-        AppError::message(format!(
-            "Could not extract the distro initramfs from the base image: {error}. Pass --qemu-initramfs <path> to override.",
-        ))
-    })?;
-    if let Some(parent) = cache.parent() {
-        fs::create_dir_all(parent)?;
+}
+
+/// Resolve the kernel for the QEMU engine: prefer an explicitly registered kernel artifact,
+/// otherwise derive vmlinuz from the base image (cached), so a single base image is enough.
+fn resolve_distro_kernel(runtime_paths: &crate::plan::RuntimePaths) -> AppResult<PathBuf> {
+    if runtime_paths.kernel_image.exists() {
+        return Ok(runtime_paths.kernel_image.clone());
     }
-    fs::write(&cache, &data)?;
-    println!(
-        "Pane extracted the distro initramfs ({} bytes) from the base image -> {}",
-        data.len(),
-        cache.display()
-    );
-    Ok(cache)
+    let cache = runtime_paths.engines.join("distro-kernel.img");
+    extract_from_base_image(runtime_paths, "/boot/vmlinuz-linux", &cache, "distro kernel")
 }
 
 /// Build the QEMU-WHPX engine boot config shared by the boot-spike and the `pane launch`
@@ -2717,8 +2801,9 @@ fn build_qemu_engine_config(
     if user_disk.is_some() {
         cmdline.push_str(" systemd.mount-extra=/dev/vdb:/home:ext4:x-systemd.makefs");
     }
+    let kernel = resolve_distro_kernel(runtime_paths)?;
     Ok(crate::qemu::QemuBootConfig {
-        kernel: runtime_paths.kernel_image.clone(),
+        kernel,
         initramfs,
         base_disk: runtime_paths.base_os_image.clone(),
         root_overlay,

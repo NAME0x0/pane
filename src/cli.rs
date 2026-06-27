@@ -140,7 +140,7 @@ pub struct LaunchArgs {
     #[arg(long)]
     pub distro: Option<String>,
     /// Runtime backend to use. wsl-bridge is current; pane-owned is the native runtime preflight path.
-    #[arg(long, value_enum, default_value_t = RuntimeMode::WslBridge)]
+    #[arg(long, value_enum, default_value_t = RuntimeMode::Auto)]
     pub runtime: RuntimeMode,
     /// For --runtime qemu-whpx: guest console — serial (text in this terminal) or a graphical
     /// window (gtk/sdl with a virtio-vga adapter).

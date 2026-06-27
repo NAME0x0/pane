@@ -419,9 +419,67 @@ pub fn boot_via_qemu_whpx(config: &QemuBootConfig) -> QemuBootReport {
 }
 
 fn read_serial(path: &Path) -> String {
-    std::fs::read(path)
+    let raw = std::fs::read(path)
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    strip_ansi(&raw)
+}
+
+/// Remove ANSI/VT escape sequences. systemd colorizes status lines and embeds highlight
+/// codes inside the message (e.g. "Mounted \e[..m/sysroot\e[0m."), which breaks plain
+/// substring milestone matching. Handles CSI, OSC, and DCS/SOS/PM/APC sequences.
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek().copied() {
+            Some('[') => {
+                // CSI: ends at a final byte in 0x40..=0x7E.
+                chars.next();
+                while let Some(n) = chars.next() {
+                    if ('@'..='~').contains(&n) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                // OSC: ends at BEL or ST (ESC \).
+                chars.next();
+                while let Some(n) = chars.next() {
+                    if n == '\u{7}' {
+                        break;
+                    }
+                    if n == '\u{1b}' {
+                        if chars.peek() == Some(&'\\') {
+                            chars.next();
+                        }
+                        break;
+                    }
+                }
+            }
+            Some('P') | Some('X') | Some('^') | Some('_') => {
+                // DCS/SOS/PM/APC: ends at ST (ESC \).
+                chars.next();
+                while let Some(n) = chars.next() {
+                    if n == '\u{1b}' {
+                        if chars.peek() == Some(&'\\') {
+                            chars.next();
+                        }
+                        break;
+                    }
+                }
+            }
+            Some(_) => {
+                chars.next();
+            }
+            None => {}
+        }
+    }
+    out
 }
 
 fn note(report: &mut QemuBootReport, flag: bool, marker: &str) -> bool {
@@ -462,6 +520,25 @@ fn update_milestones(report: &mut QemuBootReport, serial: &str) {
         serial.contains("Mounted /home") || serial.contains("Make File System on /dev/vdb"),
         "user-disk-mounted",
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_ansi_removes_systemd_highlight_codes() {
+        // systemd colorizes the unit name inside the message; plain matching must still work.
+        let line = "[  OK  ] Mounted \u{1b}[0;1;39m/sysroot\u{1b}[0m.";
+        assert_eq!(strip_ansi(line), "[  OK  ] Mounted /sysroot.");
+    }
+
+    #[test]
+    fn strip_ansi_removes_osc_boot_marker_and_keeps_plain_text() {
+        let osc = "before\u{1b}]3008;start=abc\u{7}after";
+        assert_eq!(strip_ansi(osc), "beforeafter");
+        assert_eq!(strip_ansi("Welcome to Arch Linux!"), "Welcome to Arch Linux!");
+    }
 }
 
 fn serial_tail(serial: &str, max_bytes: usize) -> String {

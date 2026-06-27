@@ -1988,9 +1988,16 @@ fn launch(mut args: LaunchArgs) -> AppResult<()> {
     Ok(())
 }
 
-/// Path of the pid file recording a detached QEMU-WHPX VM for a session.
-fn qemu_pid_file(runtime_paths: &crate::plan::RuntimePaths) -> PathBuf {
-    runtime_paths.state.join("qemu-whpx.pid")
+/// Recorded state of a detached QEMU-WHPX VM, used to stop/inspect it later.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct QemuVmState {
+    pid: u32,
+    qmp_port: u16,
+}
+
+/// Path of the state file recording a detached QEMU-WHPX VM for a session.
+fn qemu_state_file(runtime_paths: &crate::plan::RuntimePaths) -> PathBuf {
+    runtime_paths.state.join("qemu-whpx.json")
 }
 
 /// Force-terminate a process by id (Windows taskkill). Returns whether it was killed.
@@ -2002,20 +2009,67 @@ fn terminate_pid(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
-/// Start a detached QEMU-WHPX VM from `config`, record its pid, and report how to stop it.
+/// Whether a process id is still running (Windows tasklist).
+fn process_alive(pid: u32) -> bool {
+    std::process::Command::new("tasklist")
+        .args(["/NH", "/FI", &format!("PID eq {pid}")])
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).contains(&pid.to_string()))
+        .unwrap_or(false)
+}
+
+/// Start a detached QEMU-WHPX VM from `config`, record its pid + QMP port, and report how to
+/// stop it.
 fn start_detached_qemu(
     config: &crate::qemu::QemuBootConfig,
     runtime_paths: &crate::plan::RuntimePaths,
 ) -> AppResult<()> {
     let pid = crate::qemu::boot_detached(config).map_err(AppError::message)?;
-    let pid_file = qemu_pid_file(runtime_paths);
-    if let Some(parent) = pid_file.parent() {
+    let state = QemuVmState {
+        pid,
+        qmp_port: crate::qemu::detached_qmp_port(),
+    };
+    let state_path = qemu_state_file(runtime_paths);
+    if let Some(parent) = state_path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let _ = fs::write(&pid_file, pid.to_string());
+    write_json_file(&state_path, &state)?;
     println!("\nPane QEMU-WHPX VM started in the background (pid {pid}).");
-    println!("Stop it with `pane stop`.");
+    println!("Stop it with `pane stop`; check it with `pane status`.");
     Ok(())
+}
+
+/// Stop a detached QEMU-WHPX VM if one is recorded: request a clean ACPI shutdown over QMP,
+/// wait for it to exit, and hard-kill only as a fallback. Returns whether a VM was handled.
+fn stop_qemu_vm(runtime_paths: &crate::plan::RuntimePaths) -> bool {
+    let state_path = qemu_state_file(runtime_paths);
+    if !state_path.exists() {
+        return false;
+    }
+    if let Ok(state) = read_json_file::<QemuVmState>(&state_path) {
+        if process_alive(state.pid) {
+            println!("Shutting down the QEMU-WHPX VM (pid {})...", state.pid);
+            let _ = crate::qemu::graceful_shutdown(state.qmp_port);
+            let mut clean = false;
+            for _ in 0..30 {
+                if !process_alive(state.pid) {
+                    clean = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            if clean {
+                println!("QEMU-WHPX VM shut down cleanly.");
+            } else {
+                terminate_pid(state.pid);
+                println!("VM did not respond to ACPI shutdown within 15s; forced it.");
+            }
+        } else {
+            println!("No running QEMU-WHPX VM (cleared stale state).");
+        }
+    }
+    let _ = fs::remove_file(&state_path);
+    true
 }
 
 /// Resolve `--runtime auto`: prefer QEMU+WHPX when QEMU is installed and the base image is
@@ -2033,10 +2087,22 @@ fn resolve_auto_runtime(args: &LaunchArgs) -> RuntimeMode {
     }
 }
 
-/// Pane-hosted base OS image for download-on-first-run. Empty until hosting is wired; when
-/// empty, Pane guides the user to import a base image instead of failing cryptically.
+/// Built-in default Pane-hosted base OS image for download-on-first-run. Empty until hosting
+/// is wired; the env vars below override it without a rebuild so hosting can be pointed live.
 const PANE_BASE_IMAGE_URL: &str = "";
 const PANE_BASE_IMAGE_SHA256: &str = "c589917dff159239bd8c1e8d5cd38413e15699192ef7236d3a24dbd7f1c9c931";
+
+/// Resolve the base-image download source: `PANE_BASE_IMAGE_URL` env var overrides the
+/// built-in default; `PANE_BASE_IMAGE_SHA256` env var overrides the expected hash. Returns
+/// None when no URL is configured (Pane then guides the user to import an image).
+fn base_image_download_source() -> Option<(String, Option<String>)> {
+    let env_nonempty = |key: &str| std::env::var(key).ok().filter(|value| !value.trim().is_empty());
+    let url = env_nonempty("PANE_BASE_IMAGE_URL")
+        .or_else(|| (!PANE_BASE_IMAGE_URL.is_empty()).then(|| PANE_BASE_IMAGE_URL.to_string()))?;
+    let sha = env_nonempty("PANE_BASE_IMAGE_SHA256")
+        .or_else(|| (!PANE_BASE_IMAGE_SHA256.is_empty()).then(|| PANE_BASE_IMAGE_SHA256.to_string()));
+    Some((url, sha))
+}
 
 /// Ensure a base OS image is registered for the QEMU engine, downloading it on first run
 /// (curl, SHA-verified, then registered) when a hosting URL is configured. When no URL is
@@ -2045,24 +2111,18 @@ fn ensure_base_image(runtime_paths: &RuntimePaths) -> AppResult<()> {
     if runtime_paths.base_os_image.exists() {
         return Ok(());
     }
-    if PANE_BASE_IMAGE_URL.is_empty() {
+    let Some((url, expected_sha)) = base_image_download_source() else {
         return Err(AppError::message(
-            "No base OS image is registered yet. Import one with `pane runtime --register-base-os <path> --base-os-expected-sha256 <sha>` (download-on-first-run activates once the Pane image URL is configured).",
+            "No base OS image is registered yet. Import one with `pane runtime --register-base-os <path> --base-os-expected-sha256 <sha>`, or set PANE_BASE_IMAGE_URL to enable download-on-first-run.",
         ));
-    }
+    };
     let download = runtime_paths.downloads.join("arch-base.download");
     if let Some(parent) = download.parent() {
         fs::create_dir_all(parent)?;
     }
-    println!("Downloading the Pane base OS image from {PANE_BASE_IMAGE_URL} (this is a one-time ~4 GiB fetch)...");
+    println!("Downloading the Pane base OS image from {url} (one-time ~4 GiB fetch)...");
     let status = std::process::Command::new("curl.exe")
-        .args([
-            "-L",
-            "--fail",
-            "-o",
-            &download.display().to_string(),
-            PANE_BASE_IMAGE_URL,
-        ])
+        .args(["-L", "--fail", "-o", &download.display().to_string(), &url])
         .status()
         .map_err(|error| {
             AppError::message(format!("Could not run curl to download the base image: {error}"))
@@ -2072,13 +2132,7 @@ fn ensure_base_image(runtime_paths: &RuntimePaths) -> AppResult<()> {
             "Base image download failed. Check your connection, or import the image manually with `pane runtime --register-base-os <path>`.",
         ));
     }
-    register_base_os_image(
-        runtime_paths,
-        &download,
-        Some(PANE_BASE_IMAGE_SHA256),
-        true,
-        false,
-    )?;
+    register_base_os_image(runtime_paths, &download, expected_sha.as_deref(), true, false)?;
     let _ = fs::remove_file(&download);
     println!("Base OS image downloaded, verified, and registered.");
     Ok(())
@@ -2391,8 +2445,25 @@ fn status(args: StatusArgs) -> AppResult<()> {
         return Ok(());
     }
 
+    print_qemu_vm_status(&crate::plan::runtime_for("pane"));
     print_status_report(&report);
     Ok(())
+}
+
+/// Report whether a detached QEMU-WHPX VM is recorded and still running for this session.
+fn print_qemu_vm_status(runtime_paths: &crate::plan::RuntimePaths) {
+    let state_path = qemu_state_file(runtime_paths);
+    let Ok(state) = read_json_file::<QemuVmState>(&state_path) else {
+        return;
+    };
+    if process_alive(state.pid) {
+        println!(
+            "QEMU-WHPX VM: running (pid {}, qmp 127.0.0.1:{}). Stop with `pane stop`.",
+            state.pid, state.qmp_port
+        );
+    } else {
+        println!("QEMU-WHPX VM: not running (stale state; `pane stop` clears it).");
+    }
 }
 
 fn app_status(args: AppStatusArgs) -> AppResult<()> {
@@ -3624,21 +3695,9 @@ fn terminal(args: TerminalArgs) -> AppResult<()> {
 }
 
 fn stop(args: StopArgs) -> AppResult<()> {
-    // A detached QEMU-WHPX VM (pane launch --runtime qemu-whpx --detach) is stopped here.
-    let qemu_runtime = crate::plan::runtime_for("pane");
-    let qemu_pid_file = qemu_pid_file(&qemu_runtime);
-    if qemu_pid_file.exists() {
-        let stopped = fs::read_to_string(&qemu_pid_file)
-            .ok()
-            .and_then(|text| text.trim().parse::<u32>().ok())
-            .map(terminate_pid)
-            .unwrap_or(false);
-        let _ = fs::remove_file(&qemu_pid_file);
-        if stopped {
-            println!("Stopped the QEMU-WHPX VM.");
-        } else {
-            println!("No running QEMU-WHPX VM found; cleared a stale pid file.");
-        }
+    // A detached QEMU-WHPX VM (pane launch --runtime qemu-whpx --detach) is stopped here,
+    // preferring a clean ACPI shutdown over a hard kill.
+    if stop_qemu_vm(&crate::plan::runtime_for("pane")) {
         return Ok(());
     }
 

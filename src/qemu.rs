@@ -83,6 +83,40 @@ pub fn locate_qemu() -> Option<PathBuf> {
 
 /// Build a `-drive` spec. `snapshot=on` makes writes copy-on-write and discarded at exit
 /// (keeps the verified base image immutable); `snapshot=off` persists writes to the file.
+/// TCP port for the QMP control channel of a detached VM, so `pane stop` can request a
+/// clean ACPI shutdown. Single-session assumption; revisit if Pane runs concurrent VMs.
+const QMP_TCP_PORT: u16 = 44510;
+
+/// The QMP control port used for detached VMs.
+pub fn detached_qmp_port() -> u16 {
+    QMP_TCP_PORT
+}
+
+/// Request a clean ACPI shutdown of a detached VM over QMP (system_powerdown). The guest's
+/// init handles the power button and shuts down; the caller should wait for the process to
+/// exit and hard-kill only as a fallback.
+pub fn graceful_shutdown(qmp_port: u16) -> Result<(), String> {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", qmp_port))
+        .map_err(|error| format!("QMP connect failed on port {qmp_port}: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .ok();
+    stream.set_write_timeout(Some(Duration::from_secs(3))).ok();
+    let mut scratch = [0u8; 2048];
+    // Server greeting, then capabilities negotiation is required before other commands.
+    let _ = stream.read(&mut scratch);
+    stream
+        .write_all(b"{\"execute\":\"qmp_capabilities\"}\r\n")
+        .map_err(|error| format!("QMP handshake write failed: {error}"))?;
+    let _ = stream.read(&mut scratch);
+    stream
+        .write_all(b"{\"execute\":\"system_powerdown\"}\r\n")
+        .map_err(|error| format!("QMP system_powerdown failed: {error}"))?;
+    let _ = stream.read(&mut scratch);
+    Ok(())
+}
+
 /// Ensure QEMU is available, installing it via winget on first use if absent. Returns the
 /// resolved qemu-system path. winget output is shown so the user sees install progress.
 pub fn ensure_qemu_available() -> Result<PathBuf, String> {
@@ -257,6 +291,9 @@ pub fn boot_detached(config: &QemuBootConfig) -> Result<u32, String> {
     command.args([
         "-serial",
         &format!("file:{}", config.serial_path.display()),
+        // QMP control channel so `pane stop` can request a clean ACPI shutdown.
+        "-qmp",
+        &format!("tcp:127.0.0.1:{QMP_TCP_PORT},server,nowait"),
     ]);
     // Detached: no inherited console. The child outlives this process (Child drop does not
     // kill it on Windows), so it keeps running until stopped via its pid.

@@ -38,3 +38,6 @@ qemu-*.err
 qemu-*.log
 interactive-*.txt
 arch-initramfs.img
+
+# Stray command output captures
+*.out

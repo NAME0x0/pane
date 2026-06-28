@@ -90,8 +90,23 @@ pub struct QemuBootReport {
     pub detail: String,
 }
 
-/// Locate `qemu-system-x86_64.exe`: PATH first, then the standard winget/installer paths.
+/// Locate the QEMU engine: a bundled `pane-engine.exe` shipped next to pane.exe wins (so
+/// the process shows as Pane and works offline); then PATH; then the standard installer
+/// paths (winget fallback).
 pub fn locate_qemu() -> Option<PathBuf> {
+    // Bundled engine next to the running executable (and a couple of common layouts).
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for bundled in [
+                dir.join("pane-engine.exe"),
+                dir.join("engine").join("pane-engine.exe"),
+            ] {
+                if bundled.exists() {
+                    return Some(bundled);
+                }
+            }
+        }
+    }
     // PATH probe: a successful `--version` confirms it runs.
     if Command::new("qemu-system-x86_64")
         .arg("--version")
@@ -298,6 +313,35 @@ pub fn resize_qcow2(disk: &Path, gib: u64) -> Result<(), String> {
         }
         return Err(format!("qemu-img resize failed: {}", stderr.trim()));
     }
+    Ok(())
+}
+
+/// Compact a qcow2 by rewriting it (drops free space that TRIM/deletes freed). `backing`
+/// preserves the overlay's backing file so only live deltas are kept.
+pub fn compact_qcow2(disk: &Path, backing: Option<&Path>) -> Result<(), String> {
+    let qemu_img = locate_qemu_img().ok_or_else(|| "qemu-img not found".to_string())?;
+    let tmp = disk.with_extension("compact.tmp");
+    let _ = std::fs::remove_file(&tmp);
+    let mut command = Command::new(&qemu_img);
+    command.args(["convert", "-f", "qcow2", "-O", "qcow2"]);
+    if let Some(base) = backing {
+        command.args([
+            "-o",
+            &format!("backing_file={},backing_fmt=raw", base.display()),
+        ]);
+    }
+    command.arg(disk).arg(&tmp);
+    let output = command
+        .output()
+        .map_err(|error| format!("failed to run qemu-img convert: {error}"))?;
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!(
+            "qemu-img compact failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    std::fs::rename(&tmp, disk).map_err(|error| format!("replace disk after compact: {error}"))?;
     Ok(())
 }
 

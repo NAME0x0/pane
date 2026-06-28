@@ -45,6 +45,8 @@ pub enum Commands {
     Provision(ProvisionArgs),
     /// Install a graphical desktop (XFCE + LightDM) into the QEMU guest image.
     InstallDesktop(InstallDesktopArgs),
+    /// Manage the QEMU workspace disks: reset to a clean image or reclaim space.
+    Workspace(WorkspaceArgs),
     /// Validate and materialize the native kernel boot layout contract.
     NativeKernelPlan(NativeKernelPlanArgs),
     /// Show the crosvm/rust-vmm foundation plan for the Pane-owned runtime.
@@ -399,6 +401,22 @@ pub struct ProvisionArgs {
     /// Password for --username. If omitted while --username is set, Pane generates one.
     #[arg(long)]
     pub password: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct WorkspaceArgs {
+    /// Session slug for the Pane-owned runtime reservation.
+    #[arg(long, default_value = "pane")]
+    pub session_name: String,
+    /// Discard the persistent root overlay so the next launch starts fresh from the base.
+    #[arg(long)]
+    pub reset: bool,
+    /// With --reset, also delete the user disk (home/packages).
+    #[arg(long)]
+    pub purge: bool,
+    /// Reclaim free space in the workspace disks (qemu-img compaction).
+    #[arg(long)]
+    pub compact: bool,
 }
 
 #[derive(Debug, Args)]

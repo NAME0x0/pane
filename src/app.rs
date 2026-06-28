@@ -29,7 +29,7 @@ use crate::{
         AppStatusArgs, BundleArgs, Cli, Commands, ConnectArgs, DoctorArgs, EnvironmentsArgs,
         InitArgs, LaunchArgs, LogsArgs, NativeBootSpikeArgs, NativeFoundationArgs,
         InstallDesktopArgs, NativeKernelPlanArgs, NativePreflightArgs, OnboardArgs, ProvisionArgs,
-        RelayArgs, RepairArgs, ResetArgs,
+        RelayArgs, RepairArgs, ResetArgs, WorkspaceArgs,
         RuntimeArgs, SetupUserArgs, ShareArgs, StatusArgs, StopArgs, TerminalArgs, UpdateArgs,
     },
     error::{AppError, AppResult},
@@ -1386,6 +1386,7 @@ pub fn run() -> AppResult<()> {
         Commands::NativeBootSpike(args) => native_boot_spike(args),
         Commands::Provision(args) => provision(args),
         Commands::InstallDesktop(args) => install_desktop(args),
+        Commands::Workspace(args) => workspace(args),
         Commands::NativeKernelPlan(args) => native_kernel_plan(args),
         Commands::NativeFoundation(args) => native_foundation(args),
         Commands::Environments(args) => environments(args),
@@ -3003,6 +3004,45 @@ fn provision(args: ProvisionArgs) -> AppResult<()> {
 /// root overlay) by driving the serial autologin root shell: configure networking + a known
 /// mirror, then pacman the desktop and enable the display manager. After this, a graphical
 /// launch shows the LightDM greeter instead of a text console.
+fn workspace(args: WorkspaceArgs) -> AppResult<()> {
+    let session_name = crate::plan::sanitize_session_name(&args.session_name);
+    let runtime_paths = crate::plan::runtime_for(&session_name);
+    // Make sure nothing has the disks open.
+    let _ = stop_qemu_vm(&runtime_paths);
+    let overlay = runtime_paths.disks.join("root-overlay.qcow2");
+    let user_disk = runtime_paths.disks.join("user-data.qcow2");
+
+    if args.reset {
+        if overlay.exists() {
+            fs::remove_file(&overlay)?;
+            println!("Removed the root overlay; the next launch starts fresh from the base image.");
+        } else {
+            println!("No root overlay to remove (already clean).");
+        }
+        if args.purge && user_disk.exists() {
+            fs::remove_file(&user_disk)?;
+            println!("Removed the user disk (home/packages).");
+        }
+    }
+
+    if args.compact {
+        if overlay.exists() {
+            crate::qemu::compact_qcow2(&overlay, Some(&runtime_paths.base_os_image))
+                .map_err(AppError::message)?;
+            println!("Compacted the root overlay.");
+        }
+        if user_disk.exists() {
+            crate::qemu::compact_qcow2(&user_disk, None).map_err(AppError::message)?;
+            println!("Compacted the user disk.");
+        }
+    }
+
+    if !args.reset && !args.compact {
+        println!("Nothing to do. Use --reset (start fresh) or --compact (reclaim space).");
+    }
+    Ok(())
+}
+
 fn install_desktop(args: InstallDesktopArgs) -> AppResult<()> {
     let session_name = crate::plan::sanitize_session_name(&args.session_name);
     prepare_native_runtime_boundary(&session_name, DEFAULT_RUNTIME_CAPACITY_GIB)?;

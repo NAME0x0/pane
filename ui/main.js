@@ -127,7 +127,7 @@ $("btn-provision").onclick = () => {
 };
 
 $("btn-doctor").onclick = () => engine(["doctor"], "Running diagnostics…");
-$("btn-reset").onclick = () => log("Reset workspace: coming soon (will clear the root overlay).");
+$("btn-reset").onclick = () => engine(["workspace", "--reset"], "Resetting workspace (back to a clean image)…");
 $("btn-clear").onclick = () => (logEl.textContent = "");
 
 refresh();

@@ -99,6 +99,29 @@ body {
   border-radius: 8px;
 }
 
+#screen-view {
+  position: fixed;
+  inset: 0;
+  background: #14110d;
+  display: flex;
+  flex-direction: column;
+  z-index: 10;
+}
+.screen-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 14px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+}
+.screen {
+  flex: 1;
+  min-height: 0;
+  background: #000;
+  overflow: hidden;
+}
+
 .log {
   margin: 12px 0 0;
   background: #1b1813;

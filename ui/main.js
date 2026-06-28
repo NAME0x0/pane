@@ -1,7 +1,12 @@
-const invoke = window.__TAURI__.core.invoke;
+import RFB from "./novnc/core/rfb.js";
 
+const invoke = window.__TAURI__.core.invoke;
 const $ = (id) => document.getElementById(id);
 const logEl = $("log");
+const WS_URL = "ws://127.0.0.1:5700";
+
+let rfb = null;
+let retries = 0;
 
 function log(msg) {
   logEl.textContent += (logEl.textContent ? "\n" : "") + msg;
@@ -15,11 +20,11 @@ function setStatus(kind, text) {
 }
 
 function busy(on) {
-  document.querySelectorAll("button").forEach((b) => (b.disabled = on));
+  document.querySelectorAll("#control-actions button, .grid button").forEach((b) => (b.disabled = on));
   if (on) setStatus("pill-busy", "Working…");
 }
 
-async function run(args, label) {
+async function engine(args, label) {
   busy(true);
   if (label) log("» " + label);
   try {
@@ -38,31 +43,78 @@ async function run(args, label) {
 async function refresh() {
   try {
     const out = await invoke("engine_run", { args: ["status"] });
-    if (/QEMU-WHPX VM: running/.test(out)) {
-      setStatus("pill-run", "Running");
-      $("vm-detail").textContent = "Your Linux desktop is running. Use Stop to power it off.";
-    } else {
-      setStatus("pill-off", "Stopped");
-      $("vm-detail").textContent = "Click Launch to start your Arch Linux desktop.";
-    }
+    const running = /QEMU-WHPX VM: running/.test(out);
+    setStatus(running ? "pill-run" : "pill-off", running ? "Running" : "Stopped");
+    $("vm-detail").textContent = running
+      ? "Your Linux desktop is running."
+      : "Click Launch to start your Arch Linux desktop.";
+    return running;
   } catch (e) {
     setStatus("pill-off", "Stopped");
+    return false;
   }
 }
 
-$("btn-launch").onclick = () => {
-  const args = ["launch", "--runtime", "qemu-whpx", "--detach"];
+// ---- embedded display (noVNC) ----
+function showScreen(on) {
+  $("screen-view").hidden = !on;
+}
+
+function connectDisplay() {
+  disconnectDisplay();
+  try {
+    rfb = new RFB($("screen"), WS_URL, {});
+    rfb.scaleViewport = true;
+    rfb.resizeSession = false;
+    rfb.addEventListener("connect", () => {
+      retries = 0;
+      log("Display connected.");
+    });
+    rfb.addEventListener("disconnect", (e) => {
+      rfb = null;
+      // The VM may still be booting; retry a few times before giving up.
+      if (!$("screen-view").hidden && retries < 20) {
+        retries += 1;
+        setTimeout(connectDisplay, 1000);
+      }
+    });
+  } catch (e) {
+    log("display error: " + e);
+  }
+}
+
+function disconnectDisplay() {
+  if (rfb) {
+    try { rfb.disconnect(); } catch (e) {}
+    rfb = null;
+  }
+}
+
+// ---- actions ----
+$("btn-launch").onclick = async () => {
+  const args = ["launch", "--runtime", "qemu-whpx", "--display", "vnc", "--detach"];
   if ($("sel-mode").value === "persistent") args.push("--persist-root");
-  run(args, "Launching Linux desktop…");
+  await engine(args, "Launching Linux desktop…");
+  retries = 0;
+  showScreen(true);
+  setTimeout(connectDisplay, 1500);
 };
 
-$("btn-stop").onclick = () => run(["stop"], "Stopping…");
-$("btn-refresh").onclick = () => refresh();
+async function stopVm() {
+  disconnectDisplay();
+  showScreen(false);
+  await engine(["stop"], "Stopping…");
+}
+
+$("btn-stop").onclick = stopVm;
+$("btn-screen-stop").onclick = stopVm;
+$("btn-back").onclick = () => showScreen(false);
+$("btn-refresh").onclick = refresh;
 
 $("btn-install").onclick = () => {
   const de = $("sel-de").value;
-  log("» Installing " + de.toUpperCase() + " desktop — this downloads packages and can take a while…");
-  run(["install-desktop", "--de", de], null);
+  log("» Installing " + de.toUpperCase() + " desktop — downloads packages, can take a while…");
+  engine(["install-desktop", "--de", de], null);
 };
 
 $("btn-provision").onclick = () => {
@@ -71,10 +123,10 @@ $("btn-provision").onclick = () => {
   const pass = $("in-pass").value;
   if (user) args.push("--username", user);
   if (pass) args.push("--password", pass);
-  run(args, "Setting credentials…");
+  engine(args, "Setting credentials…");
 };
 
-$("btn-doctor").onclick = () => run(["doctor"], "Running diagnostics…");
+$("btn-doctor").onclick = () => engine(["doctor"], "Running diagnostics…");
 $("btn-reset").onclick = () => log("Reset workspace: coming soon (will clear the root overlay).");
 $("btn-clear").onclick = () => (logEl.textContent = "");
 

@@ -191,6 +191,16 @@ fn drive_arg(path: &Path, format: &str, snapshot: bool) -> String {
     format!("file={},format={format},if=virtio,{perf}", path.display())
 }
 
+/// VNC display number for the embedded view (TCP port 5900 + this) and the websocket port
+/// noVNC connects to. Single-session assumption.
+const VNC_DISPLAY: u16 = 0;
+const VNC_WS_PORT: u16 = 5700;
+
+/// The websocket port noVNC connects to for the embedded display.
+pub fn vnc_websocket_port() -> u16 {
+    VNC_WS_PORT
+}
+
 /// QEMU args for a graphical window. Uses the standard VGA adapter and disables host
 /// OpenGL: the gtk backend defaults to GL with virtio-gpu, which crashes QEMU under WHPX
 /// when Xorg initializes the display. `-vga std` + `gl=off` is software-rendered and stable.
@@ -201,6 +211,26 @@ fn graphical_display_args(backend: &str) -> Vec<String> {
         "-display".to_string(),
         format!("{backend},gl=off"),
     ]
+}
+
+/// Display args for a backend. "vnc" = headless VNC server + websocket (rendered by noVNC in
+/// the Pane window); anything else = a native gtk/sdl window.
+fn display_args_for(backend: &str) -> Vec<String> {
+    if backend == "vnc" {
+        vec![
+            // No local window/monitor; the VGA framebuffer is served over VNC + websocket.
+            "-display".to_string(),
+            "none".to_string(),
+            "-monitor".to_string(),
+            "none".to_string(),
+            "-vga".to_string(),
+            "std".to_string(),
+            "-vnc".to_string(),
+            format!("127.0.0.1:{VNC_DISPLAY},websocket={VNC_WS_PORT}"),
+        ]
+    } else {
+        graphical_display_args(backend)
+    }
 }
 
 /// Push the machine definition shared by every boot mode: WHPX accel, memory, the kernel +
@@ -329,8 +359,8 @@ pub fn boot_interactive(config: &QemuBootConfig) -> Result<std::process::ExitSta
                 .stderr(std::process::Stdio::inherit());
         }
         Some(backend) => {
-            // Graphical: standard VGA in a QEMU window; serial captured to a file.
-            command.args(graphical_display_args(backend));
+            // Graphical (native window) or headless VNC; serial captured to a file.
+            command.args(display_args_for(backend));
             command.args(["-serial", &format!("file:{}", config.serial_path.display())]);
         }
     }
@@ -356,7 +386,7 @@ pub fn boot_detached(config: &QemuBootConfig) -> Result<u32, String> {
     push_machine_args(&mut command, config);
     match config.display_backend.as_deref() {
         Some(backend) => {
-            command.args(graphical_display_args(backend));
+            command.args(display_args_for(backend));
         }
         None => {
             command.args(["-display", "none", "-monitor", "none"]);

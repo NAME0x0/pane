@@ -106,15 +106,18 @@ pub enum DisplayMode {
     Gtk,
     /// Graphical window via the SDL backend with a virtio-vga adapter.
     Sdl,
+    /// Headless VNC server with a websocket, rendered by noVNC inside the Pane app window.
+    Vnc,
 }
 
 impl DisplayMode {
-    /// QEMU `-display` backend name, or None for the headless serial console.
+    /// QEMU display backend name, or None for the headless serial console.
     pub fn backend(self) -> Option<&'static str> {
         match self {
             Self::Serial => None,
             Self::Gtk => Some("gtk"),
             Self::Sdl => Some("sdl"),
+            Self::Vnc => Some("vnc"),
         }
     }
 }

@@ -4,8 +4,11 @@
 
 /// Run a Pane CLI subcommand on this executable and return its combined output. This is how
 /// the GUI performs actions (launch/stop/provision/install-desktop/doctor/status).
+///
+/// `async` so Tauri runs it off the main thread: a long action (e.g. installing a desktop)
+/// blocks a worker, not the UI, so the window stays responsive.
 #[tauri::command]
-fn engine_run(args: Vec<String>) -> Result<String, String> {
+async fn engine_run(args: Vec<String>) -> Result<String, String> {
     let exe = std::env::current_exe().map_err(|error| error.to_string())?;
     let output = std::process::Command::new(exe)
         .args(&args)

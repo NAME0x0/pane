@@ -210,6 +210,9 @@ fn push_machine_args(command: &mut Command, config: &QemuBootConfig) {
     command.args([
         "-accel",
         "whpx",
+        // Brand the guest window/title as Pane (not "QEMU").
+        "-name",
+        "Pane",
         // Modern CPU model (AVX2/SSE4 etc.) for speed. WHPX rejects "host"/"max" (APX/MPX
         // feature conflicts kill the guest before it boots); Skylake-Client is feature-rich
         // and WHPX-compatible.

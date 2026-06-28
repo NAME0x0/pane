@@ -16,6 +16,7 @@ linux-loader = { version = "0.13.2", path = "third_party/linux-loader", default-
 vm-memory = { version = "=0.17.1", default-features = false, features = ["backend-mmap"] }
 virtio-queue = { version = "0.17.0", path = "third_party/virtio-queue" }
 virtio-bindings = { version = "0.2.7", default-features = false }
+tauri = "2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
@@ -27,3 +28,6 @@ windows-sys = { version = "0.61.2", features = [
 
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "3.0.6"
+
+[build-dependencies]
+tauri-build = "2"

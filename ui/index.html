@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Pane</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="bar">
+    <div class="brand"><span class="mark">▢</span> Pane</div>
+    <div id="status" class="pill pill-idle">Checking…</div>
+  </header>
+
+  <main class="grid">
+    <section class="card span2">
+      <div class="card-top">
+        <h2>Linux desktop</h2>
+        <span class="muted" id="engine-line">QEMU + WHPX</span>
+      </div>
+      <p class="muted" id="vm-detail">Click Launch to start your Arch Linux desktop.</p>
+      <div class="row">
+        <button id="btn-launch" class="btn btn-primary">Launch</button>
+        <button id="btn-stop" class="btn">Stop</button>
+        <button id="btn-refresh" class="btn btn-ghost">Refresh</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h3>Workspace</h3>
+      <label class="field">Desktop
+        <select id="sel-de">
+          <option value="xfce">XFCE (light, fast)</option>
+          <option value="gnome">GNOME</option>
+          <option value="kde">KDE Plasma</option>
+        </select>
+      </label>
+      <label class="field">Mode
+        <select id="sel-mode">
+          <option value="persistent">Persistent (keep changes)</option>
+          <option value="perishable">Perishable (reset each time)</option>
+        </select>
+      </label>
+      <button id="btn-install" class="btn">Install desktop</button>
+    </section>
+
+    <section class="card">
+      <h3>Login</h3>
+      <label class="field">Username <input id="in-user" type="text" placeholder="pane" /></label>
+      <label class="field">Password <input id="in-pass" type="password" placeholder="auto-generate" /></label>
+      <button id="btn-provision" class="btn">Set credentials</button>
+    </section>
+
+    <section class="card">
+      <h3>Maintenance</h3>
+      <div class="row">
+        <button id="btn-doctor" class="btn btn-ghost">Doctor</button>
+        <button id="btn-reset" class="btn btn-ghost">Reset</button>
+      </div>
+      <p class="muted small">Doctor checks readiness. Reset clears the workspace overlay.</p>
+    </section>
+
+    <section class="card span2">
+      <div class="card-top"><h3>Activity</h3><button id="btn-clear" class="btn btn-ghost small">Clear</button></div>
+      <pre id="log" class="log" aria-live="polite"></pre>
+    </section>
+  </main>
+
+  <script src="main.js"></script>
+</body>
+</html>

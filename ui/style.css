@@ -103,9 +103,12 @@ body {
   position: fixed;
   inset: 0;
   background: #14110d;
-  display: flex;
+  display: none;
   flex-direction: column;
   z-index: 10;
+}
+#screen-view.show {
+  display: flex;
 }
 .screen-bar {
   display: flex;

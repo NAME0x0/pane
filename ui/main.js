@@ -1,5 +1,3 @@
-import RFB from "./novnc/core/rfb.js";
-
 const invoke = window.__TAURI__.core.invoke;
 const $ = (id) => document.getElementById(id);
 const logEl = $("log");
@@ -20,7 +18,7 @@ function setStatus(kind, text) {
 }
 
 function busy(on) {
-  document.querySelectorAll("#control-actions button, .grid button").forEach((b) => (b.disabled = on));
+  document.querySelectorAll("button").forEach((b) => (b.disabled = on));
   if (on) setStatus("pill-busy", "Working…");
 }
 
@@ -55,14 +53,19 @@ async function refresh() {
   }
 }
 
-// ---- embedded display (noVNC) ----
+// ---- embedded display (noVNC, loaded lazily so a failure can't break the UI) ----
+function screenShown() {
+  return $("screen-view").classList.contains("show");
+}
 function showScreen(on) {
-  $("screen-view").hidden = !on;
+  $("screen-view").classList.toggle("show", on);
 }
 
-function connectDisplay() {
+async function connectDisplay() {
   disconnectDisplay();
   try {
+    const mod = await import("./novnc/core/rfb.js");
+    const RFB = mod.default;
     rfb = new RFB($("screen"), WS_URL, {});
     rfb.scaleViewport = true;
     rfb.resizeSession = false;
@@ -70,10 +73,9 @@ function connectDisplay() {
       retries = 0;
       log("Display connected.");
     });
-    rfb.addEventListener("disconnect", (e) => {
+    rfb.addEventListener("disconnect", () => {
       rfb = null;
-      // The VM may still be booting; retry a few times before giving up.
-      if (!$("screen-view").hidden && retries < 20) {
+      if (screenShown() && retries < 30) {
         retries += 1;
         setTimeout(connectDisplay, 1000);
       }
@@ -130,4 +132,5 @@ $("btn-doctor").onclick = () => engine(["doctor"], "Running diagnostics…");
 $("btn-reset").onclick = () => engine(["workspace", "--reset"], "Resetting workspace (back to a clean image)…");
 $("btn-clear").onclick = () => (logEl.textContent = "");
 
+log("Pane ready.");
 refresh();

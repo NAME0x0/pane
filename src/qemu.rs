@@ -233,13 +233,15 @@ fn graphical_display_args(backend: &str) -> Vec<String> {
 fn display_args_for(backend: &str) -> Vec<String> {
     if backend == "vnc" {
         vec![
-            // No local window/monitor; the VGA framebuffer is served over VNC + websocket.
+            // No local window/monitor; the framebuffer is served over VNC + websocket.
+            // virtio-gpu gives the guest a real KMS device so desktops render (software/
+            // llvmpipe, no host GL needed over VNC).
             "-display".to_string(),
             "none".to_string(),
             "-monitor".to_string(),
             "none".to_string(),
             "-vga".to_string(),
-            "std".to_string(),
+            "virtio".to_string(),
             "-vnc".to_string(),
             format!("127.0.0.1:{VNC_DISPLAY},websocket={VNC_WS_PORT}"),
         ]

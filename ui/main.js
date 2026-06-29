@@ -133,4 +133,13 @@ $("btn-reset").onclick = () => engine(["workspace", "--reset"], "Resetting works
 $("btn-clear").onclick = () => (logEl.textContent = "");
 
 log("Pane ready.");
-refresh();
+// On startup, if a VM is already running, attach its display automatically.
+(async () => {
+  const running = await refresh();
+  if (running) {
+    log("A VM is already running — attaching its display…");
+    retries = 0;
+    showScreen(true);
+    connectDisplay();
+  }
+})();

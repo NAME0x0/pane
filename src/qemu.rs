@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 #[cfg(windows)]
-fn host_memory_mb() -> u64 {
+pub fn host_memory_mb() -> u64 {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
@@ -28,7 +28,7 @@ fn host_memory_mb() -> u64 {
 }
 
 #[cfg(not(windows))]
-fn host_memory_mb() -> u64 {
+pub fn host_memory_mb() -> u64 {
     4096
 }
 
@@ -36,12 +36,16 @@ fn host_memory_mb() -> u64 {
 /// big machines without over-subscribing small ones: vCPUs = logical cores clamped to
 /// [2, 8]; RAM = half of physical clamped to [2048, 8192] MB.
 pub fn host_resources() -> (u32, u64) {
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get() as u32)
-        .unwrap_or(2);
+    let cores = host_logical_cores();
     let vcpus = cores.clamp(2, 8);
     let ram_mb = (host_memory_mb() / 2).clamp(2048, 8192);
     (vcpus, ram_mb)
+}
+
+pub fn host_logical_cores() -> u32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(2)
 }
 
 /// Inputs for a QEMU-WHPX boot.
@@ -68,6 +72,10 @@ pub struct QemuBootConfig {
     /// QEMU `-display` backend for an interactive boot (e.g. "gtk", "sdl"). None = headless
     /// serial console wired to this terminal (-nographic). Ignored by the probe path.
     pub display_backend: Option<String>,
+    /// Use VirGL-backed virtio-gpu for graphical desktops. False falls back to software VGA.
+    pub gpu_acceleration: bool,
+    /// Optional Linux display hint, passed as `video=Virtual-1:<width>x<height>`.
+    pub display_resolution: Option<(u32, u32)>,
 }
 
 /// Structured result of a QEMU-WHPX boot attempt.
@@ -215,10 +223,17 @@ pub fn vnc_websocket_port() -> u16 {
     VNC_WS_PORT
 }
 
-/// QEMU args for a graphical window. Uses the standard VGA adapter and disables host
-/// OpenGL: the gtk backend defaults to GL with virtio-gpu, which crashes QEMU under WHPX
-/// when Xorg initializes the display. `-vga std` + `gl=off` is software-rendered and stable.
-fn graphical_display_args(backend: &str) -> Vec<String> {
+/// QEMU args for a graphical window. GPU mode uses VirGL; compatibility mode keeps the
+/// old software-rendered stdvga path.
+fn graphical_display_args(backend: &str, gpu_acceleration: bool) -> Vec<String> {
+    if !gpu_acceleration {
+        return vec![
+            "-vga".to_string(),
+            "std".to_string(),
+            "-display".to_string(),
+            format!("{backend},gl=off"),
+        ];
+    }
     // GPU-accelerated: virtio-gpu-gl + gl=on translates guest OpenGL to the host GPU (VirGL),
     // so GNOME/KDE/XFCE render with hardware acceleration in the native window.
     vec![
@@ -231,8 +246,20 @@ fn graphical_display_args(backend: &str) -> Vec<String> {
 
 /// Display args for a backend. "vnc" = headless VNC server + websocket (rendered by noVNC in
 /// the Pane window); anything else = a native gtk/sdl window.
-fn display_args_for(backend: &str) -> Vec<String> {
+fn display_args_for(backend: &str, gpu_acceleration: bool) -> Vec<String> {
     if backend == "vnc" {
+        if !gpu_acceleration {
+            return vec![
+                "-monitor".to_string(),
+                "none".to_string(),
+                "-display".to_string(),
+                "none".to_string(),
+                "-vga".to_string(),
+                "std".to_string(),
+                "-vnc".to_string(),
+                format!("127.0.0.1:{VNC_DISPLAY},websocket={VNC_WS_PORT}"),
+            ];
+        }
         vec![
             // Headless, accelerated: egl-headless gives a host GL context and
             // virtio-gpu-gl translates guest OpenGL to the host GPU (VirGL), so GNOME/KDE
@@ -247,7 +274,7 @@ fn display_args_for(backend: &str) -> Vec<String> {
             format!("127.0.0.1:{VNC_DISPLAY},websocket={VNC_WS_PORT}"),
         ]
     } else {
-        graphical_display_args(backend)
+        graphical_display_args(backend, gpu_acceleration)
     }
 }
 
@@ -410,7 +437,7 @@ pub fn boot_interactive(config: &QemuBootConfig) -> Result<std::process::ExitSta
         }
         Some(backend) => {
             // Graphical (native window) or headless VNC; serial captured to a file.
-            command.args(display_args_for(backend));
+            command.args(display_args_for(backend, config.gpu_acceleration));
             command.args(["-serial", &format!("file:{}", config.serial_path.display())]);
         }
     }
@@ -436,7 +463,7 @@ pub fn boot_detached(config: &QemuBootConfig) -> Result<u32, String> {
     push_machine_args(&mut command, config);
     match config.display_backend.as_deref() {
         Some(backend) => {
-            command.args(display_args_for(backend));
+            command.args(display_args_for(backend, config.gpu_acceleration));
         }
         None => {
             command.args(["-display", "none", "-monitor", "none"]);

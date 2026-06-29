@@ -5,6 +5,7 @@ const WS_URL = "ws://127.0.0.1:5700";
 
 let rfb = null;
 let retries = 0;
+let specs = null;
 
 function log(msg) {
   logEl.textContent += (logEl.textContent ? "\n" : "") + msg;
@@ -20,6 +21,41 @@ function setStatus(kind, text) {
 function busy(on) {
   document.querySelectorAll("button").forEach((b) => (b.disabled = on));
   if (on) setStatus("pill-busy", "Working…");
+}
+
+function updateTuningLabels() {
+  $("out-vcpus").textContent = $("in-vcpus").value;
+  $("out-memory").textContent = $("in-memory").value + " MiB";
+  $("out-disk").textContent = $("in-disk").value + " GiB";
+}
+
+function applyRecommended() {
+  if (!specs) return;
+  $("in-vcpus").value = specs.recommended_vcpus;
+  $("in-memory").value = specs.recommended_memory_mb;
+  $("in-disk").value = specs.recommended_disk_gib;
+  $("in-resolution").value = specs.recommended_resolution;
+  $("in-gpu").checked = specs.gpu_acceleration_supported;
+  updateTuningLabels();
+}
+
+async function loadRecommendedSpecs() {
+  try {
+    specs = await invoke("recommended_specs");
+    $("host-summary").textContent =
+      `${specs.logical_cores} logical cores, ${Math.round(specs.total_memory_mb / 1024)} GiB RAM`;
+    $("gpu-summary").textContent = specs.gpu_name || "GPU detected by Windows";
+    $("disk-summary").textContent =
+      specs.free_disk_gib == null ? "Unknown" : `${specs.free_disk_gib} GiB free`;
+    applyRecommended();
+    log(`Recommended: ${specs.recommended_vcpus} vCPU, ${specs.recommended_memory_mb} MiB RAM, ${specs.recommended_disk_gib} GiB disk.`);
+  } catch (e) {
+    $("host-summary").textContent = "Could not detect host specs";
+    $("gpu-summary").textContent = "Unknown";
+    $("disk-summary").textContent = "Unknown";
+    log("spec detection error: " + e);
+    updateTuningLabels();
+  }
 }
 
 async function engine(args, label) {
@@ -95,10 +131,15 @@ function disconnectDisplay() {
 // ---- actions ----
 $("btn-launch").onclick = async () => {
   const persist = $("sel-mode").value === "persistent";
+  const vcpus = Number.parseInt($("in-vcpus").value, 10);
+  const memoryMb = Number.parseInt($("in-memory").value, 10);
+  const diskGib = Number.parseInt($("in-disk").value, 10);
+  const resolution = $("in-resolution").value.trim();
+  const gpuAcceleration = $("in-gpu").checked;
   busy(true);
-  log("» Opening your Linux desktop in a window (log in with your username/password)…");
+  log(`» Opening desktop: ${vcpus} vCPU, ${memoryMb} MiB RAM, ${diskGib} GiB disk, ${resolution || "default resolution"}, GPU ${gpuAcceleration ? "on" : "off"}…`);
   try {
-    await invoke("launch_vm", { persist });
+    await invoke("launch_vm", { persist, vcpus, memoryMb, diskGib, resolution, gpuAcceleration });
     log("Desktop window opening. It may take a moment to reach the login screen.");
   } catch (e) {
     log("error: " + e);
@@ -126,6 +167,10 @@ $("btn-stop").onclick = stopVm;
 $("btn-screen-stop").onclick = stopVm;
 $("btn-back").onclick = () => showScreen(false);
 $("btn-refresh").onclick = refresh;
+$("btn-recommended").onclick = applyRecommended;
+$("in-vcpus").oninput = updateTuningLabels;
+$("in-memory").oninput = updateTuningLabels;
+$("in-disk").oninput = updateTuningLabels;
 
 $("btn-install").onclick = () => {
   const de = $("sel-de").value;
@@ -149,6 +194,7 @@ $("btn-clear").onclick = () => (logEl.textContent = "");
 log("Pane ready.");
 // On startup, if a VM is already running, attach its display automatically.
 (async () => {
+  await loadRecommendedSpecs();
   const running = await refresh();
   if (running) log("A Linux VM is already running — its window is open. Use Stop to power it off.");
 })();

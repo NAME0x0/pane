@@ -160,6 +160,21 @@ pub struct LaunchArgs {
     /// with `pane stop`. Pair with --display gtk for a standalone desktop window.
     #[arg(long)]
     pub detach: bool,
+    /// For --runtime qemu-whpx: override the recommended vCPU count.
+    #[arg(long)]
+    pub vcpus: Option<u32>,
+    /// For --runtime qemu-whpx: override the recommended guest memory in MiB.
+    #[arg(long)]
+    pub memory_mb: Option<u32>,
+    /// For --runtime qemu-whpx: grow the persistent root overlay to this many GiB before launch.
+    #[arg(long)]
+    pub disk_gib: Option<u64>,
+    /// For --runtime qemu-whpx: request a guest display size such as 1920x1080.
+    #[arg(long)]
+    pub resolution: Option<String>,
+    /// For --runtime qemu-whpx: use software graphics instead of VirGL.
+    #[arg(long)]
+    pub no_gpu_acceleration: bool,
     /// Desktop environment to provision in the distro. MVP support is Arch + XFCE only.
     #[arg(long, value_enum, default_value_t = DesktopEnvironment::Xfce)]
     pub de: DesktopEnvironment,

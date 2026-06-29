@@ -26,6 +26,36 @@
       </div>
     </section>
 
+    <section class="card span2">
+      <div class="card-top">
+        <h3>Recommended setup</h3>
+        <button id="btn-recommended" class="btn btn-ghost small">Use recommended</button>
+      </div>
+      <div class="spec-grid">
+        <div><span class="label">Host</span><strong id="host-summary">Detecting…</strong></div>
+        <div><span class="label">GPU</span><strong id="gpu-summary">Detecting…</strong></div>
+        <div><span class="label">Free disk</span><strong id="disk-summary">Detecting…</strong></div>
+      </div>
+      <div class="tuning-grid">
+        <label class="field">vCPUs <output id="out-vcpus">4</output>
+          <input id="in-vcpus" type="range" min="1" max="16" value="4" />
+        </label>
+        <label class="field">Memory <output id="out-memory">4096 MiB</output>
+          <input id="in-memory" type="range" min="1024" max="32768" step="512" value="4096" />
+        </label>
+        <label class="field">Root disk <output id="out-disk">24 GiB</output>
+          <input id="in-disk" type="range" min="8" max="128" step="1" value="24" />
+        </label>
+        <label class="field">Resolution
+          <input id="in-resolution" type="text" value="1920x1080" />
+        </label>
+      </div>
+      <label class="check">
+        <input id="in-gpu" type="checkbox" checked />
+        <span>Use GPU acceleration with VirGL when launching the native desktop window</span>
+      </label>
+    </section>
+
     <section class="card">
       <h3>Workspace</h3>
       <label class="field">Desktop

@@ -1999,6 +1999,63 @@ struct QemuVmState {
     qmp_port: u16,
 }
 
+#[derive(Debug, Clone)]
+struct QemuLaunchTuning {
+    vcpus: Option<u32>,
+    memory_mb: Option<u32>,
+    disk_gib: Option<u64>,
+    resolution: Option<(u32, u32)>,
+    gpu_acceleration: bool,
+}
+
+impl Default for QemuLaunchTuning {
+    fn default() -> Self {
+        Self {
+            vcpus: None,
+            memory_mb: None,
+            disk_gib: None,
+            resolution: None,
+            gpu_acceleration: true,
+        }
+    }
+}
+
+impl QemuLaunchTuning {
+    fn from_launch_args(args: &LaunchArgs) -> AppResult<Self> {
+        Ok(Self {
+            vcpus: args.vcpus.map(|value| value.clamp(1, 16)),
+            memory_mb: args.memory_mb.map(|value| value.clamp(1024, 32_768)),
+            disk_gib: args.disk_gib,
+            resolution: args
+                .resolution
+                .as_deref()
+                .map(parse_display_resolution)
+                .transpose()?,
+            gpu_acceleration: !args.no_gpu_acceleration,
+        })
+    }
+}
+
+fn parse_display_resolution(value: &str) -> AppResult<(u32, u32)> {
+    let Some((width, height)) = value.trim().split_once('x') else {
+        return Err(AppError::message(
+            "--resolution must use WIDTHxHEIGHT, for example 1920x1080.",
+        ));
+    };
+    let width = width
+        .parse::<u32>()
+        .map_err(|_| AppError::message("--resolution width must be a positive integer."))?;
+    let height = height
+        .parse::<u32>()
+        .map_err(|_| AppError::message("--resolution height must be a positive integer."))?;
+    if !(800..=7680).contains(&width) || !(600..=4320).contains(&height) {
+        return Err(AppError::message(
+            "--resolution must be between 800x600 and 7680x4320.",
+        ));
+    }
+    Ok((width, height))
+}
+
 /// Path of the state file recording a detached QEMU-WHPX VM for a session.
 fn qemu_state_file(runtime_paths: &crate::plan::RuntimePaths) -> PathBuf {
     runtime_paths.state.join("qemu-whpx.json")
@@ -2173,6 +2230,7 @@ fn launch_qemu_whpx_runtime(args: LaunchArgs) -> AppResult<()> {
         std::time::Duration::from_secs(120),
         args.display,
         args.persist_root,
+        QemuLaunchTuning::from_launch_args(&args)?,
     )?;
 
     println!("Pane Launch — {}", args.runtime.display_name());
@@ -2181,8 +2239,21 @@ fn launch_qemu_whpx_runtime(args: LaunchArgs) -> AppResult<()> {
     println!("  Kernel      {}", config.kernel.display());
     println!("  Initramfs   {}", config.initramfs.display());
     println!("  Root disk   {}", config.base_disk.display());
+    println!("  vCPUs       {}", config.vcpus);
+    println!("  Memory      {} MiB", config.memory_mb);
+    println!(
+        "  GPU         {}",
+        if config.gpu_acceleration {
+            "VirGL acceleration"
+        } else {
+            "software compatibility"
+        }
+    );
+    if let Some((width, height)) = config.display_resolution {
+        println!("  Resolution  {width}x{height}");
+    }
     match config.user_disk.as_ref() {
-        Some(disk) => println!("  User disk   {} (vdb -> /mnt/pane-user)", disk.display()),
+        Some(disk) => println!("  User disk   {} (vdb -> /home)", disk.display()),
         None => println!("  User disk   (none)"),
     }
 
@@ -2854,6 +2925,7 @@ fn build_qemu_engine_config(
     timeout: std::time::Duration,
     display: crate::model::DisplayMode,
     persist_root: bool,
+    tuning: QemuLaunchTuning,
 ) -> AppResult<crate::qemu::QemuBootConfig> {
     let initramfs = resolve_distro_initramfs(initramfs_override, runtime_paths)?;
     // Persistent root: a qcow2 overlay backed by the base image so guest changes (e.g. an
@@ -2899,24 +2971,32 @@ fn build_qemu_engine_config(
     if display.backend().is_none() {
         cmdline.push_str(" systemd.unit=multi-user.target");
     }
+    if let Some((width, height)) = tuning.resolution {
+        cmdline.push_str(&format!(" video=Virtual-1:{width}x{height}"));
+    }
     if user_disk.is_some() {
         cmdline.push_str(" systemd.mount-extra=/dev/vdb:/home:ext4:x-systemd.makefs");
     }
     let kernel = resolve_distro_kernel(runtime_paths)?;
     let (vcpus, memory_mb) = crate::qemu::host_resources();
+    if let (Some(overlay), Some(disk_gib)) = (root_overlay.as_ref(), tuning.disk_gib) {
+        crate::qemu::resize_qcow2(overlay, disk_gib).map_err(AppError::message)?;
+    }
     Ok(crate::qemu::QemuBootConfig {
         kernel,
         initramfs,
         base_disk: runtime_paths.base_os_image.clone(),
         root_overlay,
         user_disk,
-        memory_mb: memory_mb as u32,
-        vcpus,
+        memory_mb: tuning.memory_mb.unwrap_or(memory_mb as u32),
+        vcpus: tuning.vcpus.unwrap_or(vcpus),
         cmdline,
         serial_path,
         timeout,
         snapshot: true,
         display_backend: display.backend().map(|backend| backend.to_string()),
+        gpu_acceleration: tuning.gpu_acceleration,
+        display_resolution: tuning.resolution,
     })
 }
 
@@ -2991,6 +3071,7 @@ fn provision(args: ProvisionArgs) -> AppResult<()> {
         std::time::Duration::from_secs(180),
         crate::model::DisplayMode::Serial,
         true,
+        QemuLaunchTuning::default(),
     )?;
 
     // Build root-shell commands. Passwords are generated from a shell-safe charset, so
@@ -3085,6 +3166,7 @@ fn install_desktop(args: InstallDesktopArgs) -> AppResult<()> {
         std::time::Duration::from_secs(180),
         crate::model::DisplayMode::Serial,
         true,
+        QemuLaunchTuning::default(),
     )?;
 
     // Grow the root overlay so a heavier desktop fits (the partition + fs are extended in
@@ -3171,6 +3253,7 @@ fn native_boot_spike_qemu_whpx(
         std::time::Duration::from_secs(120),
         args.display,
         args.persist_root,
+        QemuLaunchTuning::default(),
     )?;
     if args.detach {
         return start_detached_qemu(&config, runtime_paths);
@@ -14956,25 +15039,25 @@ mod tests {
         legacy_virtio_block_backend_plan, linux_guest_mapped_regions, linux_loader_adapter_plan,
         load_kernel_layout_boot_image_artifact, load_verified_pane_block_module_metadata,
         pane_block_device_blocks, pane_block_driver_abi_sha256,
-        pane_initramfs_expected_serial_milestones, parse_guest_physical_address,
-        preferred_transport, read_base_os_block, read_json_file, read_user_disk_block,
-        register_base_os_image, register_boot_loader_image, register_kernel_boot_plan,
-        register_native_boot_set_artifacts, register_native_boot_set_from_manifest,
-        register_pane_block_module, register_pane_discovery_initramfs_artifact,
-        register_virtio_mmio_module, repair_user_disk_metadata, resize_user_disk,
-        resolve_bundle_output_path, resolve_init_source, resolve_launch_target,
-        resolve_managed_environment_for_reset, resolve_saved_launch, resolve_session_context,
-        resolve_status_distro, restore_user_disk_snapshot, runtime_contract_guest_memory_ranges,
-        runtime_storage_budget, sha256_file, status_port_for, user_disk_artifact_ready,
-        validate_setup_password, validate_setup_username, virtio_mmio_module_metadata_path,
-        virtio_mmio_module_path, windows_transport_check, write_json_file,
-        write_native_boot_set_manifest_template, write_pane_initramfs_driver_bundle,
-        write_user_disk_block, AppLifecyclePhase, AppNextAction, BaseOsImageMetadata, CheckStatus,
-        DistroHealth, DoctorCheck, DoctorReport, FramebufferContract, InitSource, KernelBootLayout,
-        KernelBootMetadata, NativeRuntimeState, PaneBlockModuleMetadata,
-        PaneInitramfsDriverMetadata, StatusReport, UserDiskExportManifest, UserDiskMetadata,
-        UserDiskSnapshotMetadata, VirtioMmioModuleMetadata, WorkspaceHealth, WslInventory,
-        COMPATIBLE_PANE_BLOCK_DRIVER_SOURCE_SHA256_BY_ABI, EMBEDDED_APP_ASSETS,
+        pane_initramfs_expected_serial_milestones, parse_display_resolution,
+        parse_guest_physical_address, preferred_transport, read_base_os_block, read_json_file,
+        read_user_disk_block, register_base_os_image, register_boot_loader_image,
+        register_kernel_boot_plan, register_native_boot_set_artifacts,
+        register_native_boot_set_from_manifest, register_pane_block_module,
+        register_pane_discovery_initramfs_artifact, register_virtio_mmio_module,
+        repair_user_disk_metadata, resize_user_disk, resolve_bundle_output_path,
+        resolve_init_source, resolve_launch_target, resolve_managed_environment_for_reset,
+        resolve_saved_launch, resolve_session_context, resolve_status_distro,
+        restore_user_disk_snapshot, runtime_contract_guest_memory_ranges, runtime_storage_budget,
+        sha256_file, status_port_for, user_disk_artifact_ready, validate_setup_password,
+        validate_setup_username, virtio_mmio_module_metadata_path, virtio_mmio_module_path,
+        windows_transport_check, write_json_file, write_native_boot_set_manifest_template,
+        write_pane_initramfs_driver_bundle, write_user_disk_block, AppLifecyclePhase,
+        AppNextAction, BaseOsImageMetadata, CheckStatus, DistroHealth, DoctorCheck, DoctorReport,
+        FramebufferContract, InitSource, KernelBootLayout, KernelBootMetadata, NativeRuntimeState,
+        PaneBlockModuleMetadata, PaneInitramfsDriverMetadata, StatusReport, UserDiskExportManifest,
+        UserDiskMetadata, UserDiskSnapshotMetadata, VirtioMmioModuleMetadata, WorkspaceHealth,
+        WslInventory, COMPATIBLE_PANE_BLOCK_DRIVER_SOURCE_SHA256_BY_ABI, EMBEDDED_APP_ASSETS,
         PANE_USER_DISK_EXPORT_DISK_FILENAME, PANE_USER_DISK_EXPORT_MANIFEST_FILENAME,
         PANE_USER_DISK_EXPORT_METADATA_FILENAME,
     };
@@ -15240,6 +15323,18 @@ mod tests {
         assert_eq!(budget.base_os_budget_gib, 4);
         assert_eq!(budget.snapshot_budget_gib, 1);
         assert_eq!(budget.user_packages_and_customizations_gib, 3);
+    }
+
+    #[test]
+    fn display_resolution_parser_accepts_standard_size() {
+        assert_eq!(parse_display_resolution("1920x1080").unwrap(), (1920, 1080));
+    }
+
+    #[test]
+    fn display_resolution_parser_rejects_invalid_values() {
+        assert!(parse_display_resolution("1920").is_err());
+        assert!(parse_display_resolution("640x480").is_err());
+        assert!(parse_display_resolution("widextall").is_err());
     }
 
     #[test]

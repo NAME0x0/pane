@@ -1,8 +1,13 @@
 fn main() {
-    // Tauri codegen (reads tauri.conf.json); required for the GUI shell.
-    tauri_build::build();
     #[cfg(windows)]
-    embed_windows_resources();
+    {
+        // Tauri codegen (reads tauri.conf.json); required for the Windows GUI shell.
+        tauri_build::build();
+        embed_windows_resources();
+    }
+
+    #[cfg(not(windows))]
+    println!("cargo:rerun-if-changed=build.rs");
 }
 
 #[cfg(windows)]

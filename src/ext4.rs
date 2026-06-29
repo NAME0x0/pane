@@ -235,7 +235,11 @@ mod tests {
         };
         let data = extract_file(&image, 1_048_576, "/boot/initramfs-linux.img")
             .expect("extract initramfs");
-        assert!(data.len() > 1_000_000, "initramfs too small: {}", data.len());
+        assert!(
+            data.len() > 1_000_000,
+            "initramfs too small: {}",
+            data.len()
+        );
         // Arch initramfs is a (possibly compressed) cpio; first bytes are a known magic:
         // gzip 1f 8b, zstd 28 b5 2f fd, xz fd 37, lz4 04 22 4d 18, or raw newc cpio "0707".
         let magic_ok = data.starts_with(&[0x1f, 0x8b])
@@ -253,8 +257,7 @@ mod tests {
             eprintln!("skipping: base image not registered on this machine");
             return;
         };
-        let data =
-            extract_file(&image, 1_048_576, "/boot/vmlinuz-linux").expect("extract vmlinuz");
+        let data = extract_file(&image, 1_048_576, "/boot/vmlinuz-linux").expect("extract vmlinuz");
         assert!(data.len() > 1_000_000, "kernel too small: {}", data.len());
         // Linux bzImage carries the "HdrS" setup-header magic at offset 0x202.
         assert_eq!(&data[0x202..0x206], b"HdrS", "not a Linux bzImage");

@@ -3,6 +3,7 @@ mod bootstrap;
 mod cli;
 mod error;
 mod ext4;
+#[cfg(windows)]
 mod gui;
 mod ioapic;
 mod lapic;
@@ -24,6 +25,12 @@ fn main() -> ExitCode {
     // CLI. A subcommand is the first non-flag argument.
     let has_subcommand = std::env::args().skip(1).any(|arg| !arg.starts_with('-'));
     if !has_subcommand {
+        #[cfg(not(windows))]
+        {
+            eprintln!("Pane's GUI Control Center is currently Windows-only. Run a CLI subcommand instead.");
+            return ExitCode::from(1);
+        }
+        #[cfg(windows)]
         return match gui::run_gui() {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {

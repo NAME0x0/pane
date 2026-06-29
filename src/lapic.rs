@@ -417,7 +417,9 @@ mod tests {
     fn window_contains_base_and_registers() {
         assert!(lapic_contains_gpa(LAPIC_BASE_GPA));
         assert!(lapic_contains_gpa(LAPIC_BASE_GPA + REG_EOI));
-        assert!(!lapic_contains_gpa(LAPIC_BASE_GPA + LAPIC_MMIO_LENGTH_BYTES));
+        assert!(!lapic_contains_gpa(
+            LAPIC_BASE_GPA + LAPIC_MMIO_LENGTH_BYTES
+        ));
     }
 
     #[test]
@@ -446,7 +448,7 @@ mod tests {
         // 0x50 now in service (class 5); 0x30 (class 3) is blocked by PPR until EOI.
         assert_eq!(lapic.take_deliverable_vector(), None);
         assert_eq!(lapic.complete_eoi(), None); // edge vector, no I/O APIC notify
-        // After EOI, 0x30 can deliver.
+                                                // After EOI, 0x30 can deliver.
         assert_eq!(lapic.take_deliverable_vector(), Some(0x30));
     }
 
@@ -536,7 +538,10 @@ mod tests {
     #[test]
     fn eoi_write_signals_effect() {
         let mut lapic = enabled_lapic();
-        assert_eq!(lapic.mmio_write(REG_EOI, 0), LapicWriteEffect::EndOfInterrupt);
+        assert_eq!(
+            lapic.mmio_write(REG_EOI, 0),
+            LapicWriteEffect::EndOfInterrupt
+        );
     }
 
     #[test]

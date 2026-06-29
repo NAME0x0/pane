@@ -94,18 +94,32 @@ function disconnectDisplay() {
 
 // ---- actions ----
 $("btn-launch").onclick = async () => {
-  const args = ["launch", "--runtime", "qemu-whpx", "--display", "vnc", "--detach"];
-  if ($("sel-mode").value === "persistent") args.push("--persist-root");
-  await engine(args, "Launching Linux desktop…");
-  retries = 0;
-  showScreen(true);
-  setTimeout(connectDisplay, 1500);
+  const persist = $("sel-mode").value === "persistent";
+  busy(true);
+  log("» Opening your Linux desktop in a window (log in with your username/password)…");
+  try {
+    await invoke("launch_vm", { persist });
+    log("Desktop window opening. It may take a moment to reach the login screen.");
+  } catch (e) {
+    log("error: " + e);
+  } finally {
+    busy(false);
+    setTimeout(refresh, 5000);
+  }
 };
 
 async function stopVm() {
-  disconnectDisplay();
-  showScreen(false);
-  await engine(["stop"], "Stopping…");
+  busy(true);
+  log("» Stopping…");
+  try {
+    await invoke("stop_vm");
+    log("Stopped.");
+  } catch (e) {
+    log("error: " + e);
+  } finally {
+    busy(false);
+    await refresh();
+  }
 }
 
 $("btn-stop").onclick = stopVm;
@@ -136,10 +150,5 @@ log("Pane ready.");
 // On startup, if a VM is already running, attach its display automatically.
 (async () => {
   const running = await refresh();
-  if (running) {
-    log("A VM is already running — attaching its display…");
-    retries = 0;
-    showScreen(true);
-    connectDisplay();
-  }
+  if (running) log("A Linux VM is already running — its window is open. Use Stop to power it off.");
 })();

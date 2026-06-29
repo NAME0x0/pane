@@ -3090,9 +3090,17 @@ fn install_desktop(args: InstallDesktopArgs) -> AppResult<()> {
         "pacman -Sy --noconfirm --needed archlinux-keyring".to_string(),
         // Desktop environment + display manager + browser (Firefox) + NetworkManager.
         format!("pacman -S --noconfirm --needed {packages}"),
+        // Make the chosen display manager the active one and boot graphically.
+        format!(
+            "systemctl disable {} 2>/dev/null || true",
+            args.de.other_display_managers()
+        ),
         format!("systemctl enable {display_manager} NetworkManager"),
+        "systemctl set-default graphical.target".to_string(),
         // Reclaim freed space over time (works with the disks' discard=unmap).
         "systemctl enable fstrim.timer".to_string(),
+        // Confirm the desktop is wired in the boot transcript.
+        "echo PANE_DM_STATE enabled=$(systemctl is-enabled display-manager 2>/dev/null) default=$(systemctl get-default) dm=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null)".to_string(),
     ];
 
     println!(

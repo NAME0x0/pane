@@ -456,6 +456,13 @@ pub fn boot_detached(config: &QemuBootConfig) -> Result<u32, String> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(stderr);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB so a graphical window survives the
+        // launcher exiting (otherwise a job/console teardown closes it).
+        command.creation_flags(0x0000_0008 | 0x0100_0000);
+    }
     let child = command
         .spawn()
         .map_err(|error| format!("Failed to launch QEMU: {error}"))?;

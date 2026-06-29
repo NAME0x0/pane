@@ -66,14 +66,24 @@ pub enum DesktopChoice {
 impl DesktopChoice {
     /// pacman packages to install (Xorg + display manager + desktop + a browser).
     pub fn packages(self) -> &'static str {
+        // mesa provides the software (llvmpipe) + VirGL GL drivers so the desktop renders.
         match self {
             Self::Xfce => {
-                "xorg-server lightdm lightdm-gtk-greeter xfce4 xfce4-goodies firefox networkmanager"
+                "xorg-server lightdm lightdm-gtk-greeter xfce4 xfce4-goodies firefox networkmanager mesa"
             }
             Self::Gnome => {
-                "xorg-server gdm gnome-shell gnome-control-center gnome-terminal nautilus firefox networkmanager"
+                "xorg-server gdm gnome-shell gnome-control-center gnome-terminal nautilus firefox networkmanager mesa"
             }
-            Self::Kde => "xorg-server sddm plasma-meta konsole dolphin firefox networkmanager",
+            Self::Kde => "xorg-server sddm plasma-meta konsole dolphin firefox networkmanager mesa",
+        }
+    }
+
+    /// Display managers to disable so the chosen one wins display-manager.service.
+    pub fn other_display_managers(self) -> &'static str {
+        match self {
+            Self::Xfce => "gdm sddm",
+            Self::Gnome => "lightdm sddm",
+            Self::Kde => "lightdm gdm",
         }
     }
 

@@ -326,6 +326,14 @@ fn push_machine_args(command: &mut Command, config: &QemuBootConfig) {
         // Entropy source so key generation (pacman-key --init) and TLS do not stall.
         "-device",
         "virtio-rng-pci",
+        // Absolute pointer + USB keyboard for graphical desktops. Relying on the default
+        // PS/2 mouse through GTK/GL makes pointer capture feel laggy or stuck.
+        "-device",
+        "qemu-xhci,id=pane-usb",
+        "-device",
+        "usb-tablet,bus=pane-usb.0",
+        "-device",
+        "usb-kbd,bus=pane-usb.0",
     ]);
     command.args(["-append", &config.cmdline]);
 }
@@ -770,6 +778,20 @@ pub fn provision_via_serial(
             std::thread::sleep(Duration::from_millis(300));
         }
     };
+    let wait_for_provision_status = || -> Option<i32> {
+        let deadline = Instant::now() + completion_timeout;
+        loop {
+            if let Ok(text) = buffer.lock() {
+                if let Some(status) = parse_provision_status(&text) {
+                    return Some(status);
+                }
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    };
 
     let mut send = |line: &str| -> Result<(), String> {
         writer
@@ -788,13 +810,18 @@ pub fn provision_via_serial(
     }
     std::thread::sleep(Duration::from_secs(3));
 
+    // Execute provisioning as one fail-fast script. Sending commands one-by-one allowed a
+    // failed pacman/keyring step to be followed by later commands, making the UI report
+    // success even though the desktop was not actually installed.
+    send("cat > /tmp/pane-provision.sh <<'PANE_PROVISION_EOF'")?;
+    send("set -e")?;
     for line in commands {
         send(line)?;
     }
-    // Confirm completion: the echoed input contains the literal "$?", but the command's
-    // output shows the expanded exit code, so "PANE_PROV_DONE_0" appears only on success.
+    send("PANE_PROVISION_EOF")?;
+    send("bash /tmp/pane-provision.sh")?;
     send("echo PANE_PROV_DONE_$?")?;
-    let succeeded = wait_for("PANE_PROV_DONE_0", completion_timeout.as_secs());
+    let provision_status = wait_for_provision_status();
     let _ = send("sync");
     let _ = send("poweroff -f");
 
@@ -817,14 +844,36 @@ pub fn provision_via_serial(
     if let Ok(text) = buffer.lock() {
         let _ = std::fs::write(&config.serial_path, text.as_bytes());
     }
-    if !succeeded {
-        return Err(format!(
-            "Provisioning did not confirm success within {}s; see {}",
-            completion_timeout.as_secs(),
-            config.serial_path.display()
-        ));
+    match provision_status {
+        Some(0) => {}
+        Some(status) => {
+            return Err(format!(
+                "Provisioning failed with exit status {status}; see {}",
+                config.serial_path.display()
+            ));
+        }
+        None => {
+            return Err(format!(
+                "Provisioning did not confirm success within {}s; see {}",
+                completion_timeout.as_secs(),
+                config.serial_path.display()
+            ));
+        }
     }
     Ok(())
+}
+
+fn parse_provision_status(text: &str) -> Option<i32> {
+    let marker = "PANE_PROV_DONE_";
+    let start = text.rfind(marker)? + marker.len();
+    let digits: String = text[start..]
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 fn read_serial(path: &Path) -> String {
@@ -963,6 +1012,24 @@ mod tests {
             strip_ansi("Welcome to Arch Linux!"),
             "Welcome to Arch Linux!"
         );
+    }
+
+    #[test]
+    fn parses_provision_status_from_serial_transcript() {
+        assert_eq!(parse_provision_status("noise\nPANE_PROV_DONE_0\n"), Some(0));
+        assert_eq!(
+            parse_provision_status("PANE_PROV_DONE_0\nlater\nPANE_PROV_DONE_1\r\n"),
+            Some(1)
+        );
+        assert_eq!(parse_provision_status("PANE_PROV_DONE_\n"), None);
+        assert_eq!(parse_provision_status("no sentinel"), None);
+    }
+
+    #[test]
+    fn graphical_args_use_accelerated_gpu_when_enabled() {
+        let args = display_args_for("gtk", true);
+        assert!(args.contains(&"virtio-gpu-gl-pci".to_string()));
+        assert!(args.contains(&"gtk,gl=on".to_string()));
     }
 }
 

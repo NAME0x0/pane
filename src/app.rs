@@ -3178,8 +3178,12 @@ fn install_desktop(args: InstallDesktopArgs) -> AppResult<()> {
 
     let packages = args.de.packages();
     let display_manager = args.de.display_manager();
-    let commands: Vec<String> = vec![
+    let mut commands: Vec<String> = vec![
+        format!("echo PANE_DESKTOP_REQUEST de={:?} disk_gib={disk_gib}", args.de),
         "rm -f /var/lib/pacman/db.lck".to_string(),
+        // Recover from interrupted/partial sync downloads. A corrupt core.db previously
+        // made the GUI look like GNOME/KDE were installing while pacman had already failed.
+        "rm -f /var/lib/pacman/sync/*.db /var/lib/pacman/sync/*.db.sig".to_string(),
         // Extend partition 1 + the ext4 root to use the enlarged disk (best effort; the
         // root is mounted, so update the kernel's partition view then resize online).
         "echo ', +' | sfdisk --no-reread --force -N 1 /dev/vda || true".to_string(),
@@ -3195,9 +3199,19 @@ fn install_desktop(args: InstallDesktopArgs) -> AppResult<()> {
         // virtio-rng supplies entropy so --init does not stall.
         "pacman-key --init".to_string(),
         "pacman-key --populate archlinux".to_string(),
-        "pacman -Sy --noconfirm --needed archlinux-keyring".to_string(),
+        "pacman -Syy --noconfirm --needed archlinux-keyring".to_string(),
         // Desktop environment + display manager + browser (Firefox) + NetworkManager.
         format!("pacman -S --noconfirm --needed {packages}"),
+    ];
+    if args.de == crate::model::DesktopChoice::Gnome {
+        commands.extend([
+            // Prefer GNOME's normal Wayland session. Keeping custom.conf absent avoids
+            // pinning users to Xorg after switching away from XFCE.
+            "install -d -m 755 /etc/gdm".to_string(),
+            "rm -f /etc/gdm/custom.conf".to_string(),
+        ]);
+    }
+    commands.extend([
         // Make the chosen display manager the active one and boot graphically.
         format!(
             "systemctl disable {} 2>/dev/null || true",
@@ -3209,7 +3223,7 @@ fn install_desktop(args: InstallDesktopArgs) -> AppResult<()> {
         "systemctl enable fstrim.timer".to_string(),
         // Confirm the desktop is wired in the boot transcript.
         "echo PANE_DM_STATE enabled=$(systemctl is-enabled display-manager 2>/dev/null) default=$(systemctl get-default) dm=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null)".to_string(),
-    ];
+    ]);
 
     println!(
         "Installing the {:?} desktop (+ Firefox) into the guest image (persisted, root grown to {disk_gib} GiB).",

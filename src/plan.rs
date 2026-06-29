@@ -100,8 +100,9 @@ impl LaunchPlan {
 }
 
 pub fn app_root() -> PathBuf {
-    env::var_os("LOCALAPPDATA")
+    env::var_os("PANE_HOME")
         .map(PathBuf::from)
+        .or_else(|| env::var_os("LOCALAPPDATA").map(PathBuf::from))
         .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
         .join("Pane")
 }

@@ -23,10 +23,17 @@ struct RecommendedSpecs {
 /// `async` so Tauri runs it off the main thread: a long action (e.g. installing a desktop)
 /// blocks a worker, not the UI, so the window stays responsive.
 #[tauri::command]
-async fn engine_run(args: Vec<String>) -> Result<String, String> {
+async fn engine_run(args: Vec<String>, runtime_root: Option<String>) -> Result<String, String> {
     let exe = std::env::current_exe().map_err(|error| error.to_string())?;
-    let output = std::process::Command::new(exe)
-        .args(&args)
+    let mut command = std::process::Command::new(exe);
+    command.args(&args);
+    if let Some(root) = runtime_root
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        command.env("PANE_HOME", root.trim());
+    }
+    let output = command
         .output()
         .map_err(|error| format!("failed to run pane {}: {error}", args.join(" ")))?;
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -36,6 +43,9 @@ async fn engine_run(args: Vec<String>) -> Result<String, String> {
             text.push('\n');
         }
         text.push_str(&stderr);
+    }
+    if !output.status.success() {
+        return Err(text);
     }
     Ok(text)
 }
@@ -86,6 +96,7 @@ fn detect_free_disk_gib() -> Option<u64> {
 /// spawned `pane launch` (interactive) holds the window for its lifetime and is parented to
 /// this long-lived GUI, so the window survives while Pane is open without blocking the UI.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn launch_vm(
     persist: bool,
     vcpus: Option<u32>,
@@ -93,10 +104,29 @@ fn launch_vm(
     disk_gib: Option<u64>,
     resolution: Option<String>,
     gpu_acceleration: bool,
+    display_backend: Option<String>,
+    runtime_root: Option<String>,
 ) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|error| error.to_string())?;
     let mut command = std::process::Command::new(exe);
-    command.args(["launch", "--runtime", "qemu-whpx", "--display", "gtk"]);
+    let display_backend = match display_backend.as_deref().unwrap_or("sdl") {
+        "gtk" => "gtk",
+        "sdl" => "sdl",
+        _ => "sdl",
+    };
+    command.args([
+        "launch",
+        "--runtime",
+        "qemu-whpx",
+        "--display",
+        display_backend,
+    ]);
+    if let Some(root) = runtime_root
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        command.env("PANE_HOME", root.trim());
+    }
     if persist {
         command.arg("--persist-root");
     }

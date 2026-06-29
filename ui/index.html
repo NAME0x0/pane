@@ -71,6 +71,15 @@
           <option value="perishable">Perishable (reset each time)</option>
         </select>
       </label>
+      <label class="field">Window backend
+        <select id="sel-display">
+          <option value="sdl">SDL native window (recommended input)</option>
+          <option value="gtk">GTK native window</option>
+        </select>
+      </label>
+      <label class="field">Storage root
+        <input id="in-storage-root" type="text" placeholder="Default: %LOCALAPPDATA%\\Pane" />
+      </label>
       <button id="btn-install" class="btn">Install desktop</button>
     </section>
 

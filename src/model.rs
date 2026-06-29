@@ -71,9 +71,7 @@ impl DesktopChoice {
             Self::Xfce => {
                 "xorg-server lightdm lightdm-gtk-greeter xfce4 xfce4-goodies firefox networkmanager mesa"
             }
-            Self::Gnome => {
-                "xorg-server gdm gnome-shell gnome-control-center gnome-terminal nautilus firefox networkmanager mesa"
-            }
+            Self::Gnome => "xorg-server gdm gnome gnome-terminal firefox networkmanager mesa",
             Self::Kde => "xorg-server sddm plasma-meta konsole dolphin firefox networkmanager mesa",
         }
     }

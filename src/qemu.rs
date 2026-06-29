@@ -898,10 +898,7 @@ fn strip_ansi(input: &str) -> String {
             Some('[') => {
                 // CSI: ends at a final byte in 0x40..=0x7E.
                 chars.next();
-                loop {
-                    let Some(n) = chars.next() else {
-                        break;
-                    };
+                for n in chars.by_ref() {
                     if ('@'..='~').contains(&n) {
                         break;
                     }
@@ -910,33 +907,35 @@ fn strip_ansi(input: &str) -> String {
             Some(']') => {
                 // OSC: ends at BEL or ST (ESC \).
                 chars.next();
-                loop {
-                    let Some(n) = chars.next() else {
-                        break;
-                    };
+                let mut saw_escape = false;
+                for n in chars.by_ref() {
+                    if saw_escape {
+                        if n == '\\' {
+                            break;
+                        }
+                        saw_escape = false;
+                    }
                     if n == '\u{7}' {
                         break;
                     }
                     if n == '\u{1b}' {
-                        if chars.peek() == Some(&'\\') {
-                            chars.next();
-                        }
-                        break;
+                        saw_escape = true;
                     }
                 }
             }
             Some('P') | Some('X') | Some('^') | Some('_') => {
                 // DCS/SOS/PM/APC: ends at ST (ESC \).
                 chars.next();
-                loop {
-                    let Some(n) = chars.next() else {
-                        break;
-                    };
-                    if n == '\u{1b}' {
-                        if chars.peek() == Some(&'\\') {
-                            chars.next();
+                let mut saw_escape = false;
+                for n in chars.by_ref() {
+                    if saw_escape {
+                        if n == '\\' {
+                            break;
                         }
-                        break;
+                        saw_escape = false;
+                    }
+                    if n == '\u{1b}' {
+                        saw_escape = true;
                     }
                 }
             }

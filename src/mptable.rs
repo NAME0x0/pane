@@ -56,6 +56,7 @@ const IRQ_FLAG_DEFAULT: u16 = 0; // conforms to bus (ISA => edge, active high)
 const NUM_ISA_IRQS: u8 = 16;
 
 /// The virtio-MMIO device's ISA IRQ. Must match `crate::virtio::PANE_VIRTIO_MMIO_IRQ`.
+#[cfg(test)]
 const VIRTIO_IRQ: u8 = crate::virtio::PANE_VIRTIO_MMIO_IRQ as u8;
 
 /// MP interrupt flag for an ISA IRQ pin: bus-default edge for every line (the timer on

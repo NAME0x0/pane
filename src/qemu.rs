@@ -148,9 +148,7 @@ pub fn graceful_shutdown(qmp_port: u16) -> Result<(), String> {
     use std::io::{Read, Write};
     let mut stream = std::net::TcpStream::connect(("127.0.0.1", qmp_port))
         .map_err(|error| format!("QMP connect failed on port {qmp_port}: {error}"))?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .ok();
+    stream.set_read_timeout(Some(Duration::from_secs(3))).ok();
     stream.set_write_timeout(Some(Duration::from_secs(3))).ok();
     let mut scratch = [0u8; 2048];
     // Server greeting, then capabilities negotiation is required before other commands.
@@ -212,6 +210,7 @@ const VNC_DISPLAY: u16 = 0;
 const VNC_WS_PORT: u16 = 5700;
 
 /// The websocket port noVNC connects to for the embedded display.
+#[allow(dead_code)]
 pub fn vnc_websocket_port() -> u16 {
     VNC_WS_PORT
 }
@@ -220,11 +219,13 @@ pub fn vnc_websocket_port() -> u16 {
 /// OpenGL: the gtk backend defaults to GL with virtio-gpu, which crashes QEMU under WHPX
 /// when Xorg initializes the display. `-vga std` + `gl=off` is software-rendered and stable.
 fn graphical_display_args(backend: &str) -> Vec<String> {
+    // GPU-accelerated: virtio-gpu-gl + gl=on translates guest OpenGL to the host GPU (VirGL),
+    // so GNOME/KDE/XFCE render with hardware acceleration in the native window.
     vec![
-        "-vga".to_string(),
-        "std".to_string(),
+        "-device".to_string(),
+        "virtio-gpu-gl-pci".to_string(),
         "-display".to_string(),
-        format!("{backend},gl=off"),
+        format!("{backend},gl=on"),
     ]
 }
 
@@ -279,7 +280,10 @@ fn push_machine_args(command: &mut Command, config: &QemuBootConfig) {
         // Persistent root: qcow2 overlay backed by the base image; guest writes survive.
         Some(overlay) => command.args(["-drive", &drive_arg(overlay, "qcow2", false)]),
         // Ephemeral root: copy-on-write so the verified, SHA-pinned base image is untouched.
-        None => command.args(["-drive", &drive_arg(&config.base_disk, "raw", config.snapshot)]),
+        None => command.args([
+            "-drive",
+            &drive_arg(&config.base_disk, "raw", config.snapshot),
+        ]),
     };
     if let Some(user_disk) = config.user_disk.as_ref().filter(|p| p.exists()) {
         // User disk: persistent (snapshot=off) so packages/home survive across boots.
@@ -584,10 +588,7 @@ pub fn boot_via_qemu_whpx(config: &QemuBootConfig) -> QemuBootReport {
 
     // When a user disk is attached we want to observe it formatting + mounting, which can
     // lag the login prompt slightly (makefs runs during local-fs target).
-    let expect_user_disk = config
-        .user_disk
-        .as_ref()
-        .is_some_and(|path| path.exists());
+    let expect_user_disk = config.user_disk.as_ref().is_some_and(|path| path.exists());
     let mut welcome_at: Option<Instant> = None;
     loop {
         if started_at.elapsed() >= config.timeout {
@@ -602,8 +603,7 @@ pub fn boot_via_qemu_whpx(config: &QemuBootConfig) -> QemuBootReport {
         update_milestones(&mut report, &serial);
         if report.reached_login && (!expect_user_disk || report.user_disk_mounted) {
             report.detail = if report.user_disk_mounted {
-                "QEMU-WHPX booted the distro to login and mounted the Pane user disk."
-                    .to_string()
+                "QEMU-WHPX booted the distro to login and mounted the Pane user disk.".to_string()
             } else {
                 "QEMU-WHPX booted the distro all the way to the login prompt.".to_string()
             };
@@ -695,7 +695,9 @@ pub fn provision_via_serial(
             }
             Err(error) => {
                 let _ = child.kill();
-                return Err(format!("Could not connect to the guest serial socket: {error}"));
+                return Err(format!(
+                    "Could not connect to the guest serial socket: {error}"
+                ));
             }
         }
     };
@@ -820,7 +822,10 @@ fn strip_ansi(input: &str) -> String {
             Some('[') => {
                 // CSI: ends at a final byte in 0x40..=0x7E.
                 chars.next();
-                while let Some(n) = chars.next() {
+                loop {
+                    let Some(n) = chars.next() else {
+                        break;
+                    };
                     if ('@'..='~').contains(&n) {
                         break;
                     }
@@ -829,7 +834,10 @@ fn strip_ansi(input: &str) -> String {
             Some(']') => {
                 // OSC: ends at BEL or ST (ESC \).
                 chars.next();
-                while let Some(n) = chars.next() {
+                loop {
+                    let Some(n) = chars.next() else {
+                        break;
+                    };
                     if n == '\u{7}' {
                         break;
                     }
@@ -844,7 +852,10 @@ fn strip_ansi(input: &str) -> String {
             Some('P') | Some('X') | Some('^') | Some('_') => {
                 // DCS/SOS/PM/APC: ends at ST (ESC \).
                 chars.next();
-                while let Some(n) = chars.next() {
+                loop {
+                    let Some(n) = chars.next() else {
+                        break;
+                    };
                     if n == '\u{1b}' {
                         if chars.peek() == Some(&'\\') {
                             chars.next();
@@ -875,7 +886,11 @@ fn update_milestones(report: &mut QemuBootReport, serial: &str) {
         serial.contains("Booting initrd of") || serial.contains("Loading initial ramdisk"),
         "initrd",
     );
-    report.mounted_sysroot |= note(report, serial.contains("Mounted /sysroot"), "mounted-sysroot");
+    report.mounted_sysroot |= note(
+        report,
+        serial.contains("Mounted /sysroot"),
+        "mounted-sysroot",
+    );
     report.switch_root |= note(
         report,
         serial.contains("Switch Root") || serial.contains("switch_root"),
@@ -917,7 +932,10 @@ mod tests {
     fn strip_ansi_removes_osc_boot_marker_and_keeps_plain_text() {
         let osc = "before\u{1b}]3008;start=abc\u{7}after";
         assert_eq!(strip_ansi(osc), "beforeafter");
-        assert_eq!(strip_ansi("Welcome to Arch Linux!"), "Welcome to Arch Linux!");
+        assert_eq!(
+            strip_ansi("Welcome to Arch Linux!"),
+            "Welcome to Arch Linux!"
+        );
     }
 }
 

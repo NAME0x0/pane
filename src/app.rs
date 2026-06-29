@@ -27,10 +27,10 @@ use crate::{
     bootstrap::{render_bootstrap_script, render_update_script},
     cli::{
         AppStatusArgs, BundleArgs, Cli, Commands, ConnectArgs, DoctorArgs, EnvironmentsArgs,
-        InitArgs, LaunchArgs, LogsArgs, NativeBootSpikeArgs, NativeFoundationArgs,
-        InstallDesktopArgs, NativeKernelPlanArgs, NativePreflightArgs, OnboardArgs, ProvisionArgs,
-        RelayArgs, RepairArgs, ResetArgs, WorkspaceArgs,
-        RuntimeArgs, SetupUserArgs, ShareArgs, StatusArgs, StopArgs, TerminalArgs, UpdateArgs,
+        InitArgs, InstallDesktopArgs, LaunchArgs, LogsArgs, NativeBootSpikeArgs,
+        NativeFoundationArgs, NativeKernelPlanArgs, NativePreflightArgs, OnboardArgs,
+        ProvisionArgs, RelayArgs, RepairArgs, ResetArgs, RuntimeArgs, SetupUserArgs, ShareArgs,
+        StatusArgs, StopArgs, TerminalArgs, UpdateArgs, WorkspaceArgs,
     },
     error::{AppError, AppResult},
     model::{
@@ -2094,17 +2094,23 @@ fn resolve_auto_runtime(args: &LaunchArgs) -> RuntimeMode {
 /// Built-in default Pane-hosted base OS image for download-on-first-run. Empty until hosting
 /// is wired; the env vars below override it without a rebuild so hosting can be pointed live.
 const PANE_BASE_IMAGE_URL: &str = "";
-const PANE_BASE_IMAGE_SHA256: &str = "c589917dff159239bd8c1e8d5cd38413e15699192ef7236d3a24dbd7f1c9c931";
+const PANE_BASE_IMAGE_SHA256: &str =
+    "c589917dff159239bd8c1e8d5cd38413e15699192ef7236d3a24dbd7f1c9c931";
 
 /// Resolve the base-image download source: `PANE_BASE_IMAGE_URL` env var overrides the
 /// built-in default; `PANE_BASE_IMAGE_SHA256` env var overrides the expected hash. Returns
 /// None when no URL is configured (Pane then guides the user to import an image).
 fn base_image_download_source() -> Option<(String, Option<String>)> {
-    let env_nonempty = |key: &str| std::env::var(key).ok().filter(|value| !value.trim().is_empty());
-    let url = env_nonempty("PANE_BASE_IMAGE_URL")
-        .or_else(|| (!PANE_BASE_IMAGE_URL.is_empty()).then(|| PANE_BASE_IMAGE_URL.to_string()))?;
+    let env_nonempty = |key: &str| {
+        std::env::var(key)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    };
+    let built_in_nonempty = |value: &str| (!value.trim().is_empty()).then(|| value.to_string());
+    let url =
+        env_nonempty("PANE_BASE_IMAGE_URL").or_else(|| built_in_nonempty(PANE_BASE_IMAGE_URL))?;
     let sha = env_nonempty("PANE_BASE_IMAGE_SHA256")
-        .or_else(|| (!PANE_BASE_IMAGE_SHA256.is_empty()).then(|| PANE_BASE_IMAGE_SHA256.to_string()));
+        .or_else(|| built_in_nonempty(PANE_BASE_IMAGE_SHA256));
     Some((url, sha))
 }
 
@@ -2129,14 +2135,22 @@ fn ensure_base_image(runtime_paths: &RuntimePaths) -> AppResult<()> {
         .args(["-L", "--fail", "-o", &download.display().to_string(), &url])
         .status()
         .map_err(|error| {
-            AppError::message(format!("Could not run curl to download the base image: {error}"))
+            AppError::message(format!(
+                "Could not run curl to download the base image: {error}"
+            ))
         })?;
     if !status.success() {
         return Err(AppError::message(
             "Base image download failed. Check your connection, or import the image manually with `pane runtime --register-base-os <path>`.",
         ));
     }
-    register_base_os_image(runtime_paths, &download, expected_sha.as_deref(), true, false)?;
+    register_base_os_image(
+        runtime_paths,
+        &download,
+        expected_sha.as_deref(),
+        true,
+        false,
+    )?;
     let _ = fs::remove_file(&download);
     println!("Base OS image downloaded, verified, and registered.");
     Ok(())
@@ -2816,16 +2830,23 @@ fn resolve_distro_kernel(runtime_paths: &crate::plan::RuntimePaths) -> AppResult
         return Ok(runtime_paths.kernel_image.clone());
     }
     let cache = runtime_paths.engines.join("distro-kernel.img");
-    extract_from_base_image(runtime_paths, "/boot/vmlinuz-linux", &cache, "distro kernel")
+    extract_from_base_image(
+        runtime_paths,
+        "/boot/vmlinuz-linux",
+        &cache,
+        "distro kernel",
+    )
 }
 
 /// Build the QEMU-WHPX engine boot config shared by the boot-spike and the `pane launch`
 /// paths: resolve the distro initramfs, materialize a qcow2 user disk, and assemble the
 /// kernel cmdline. Root comes from the verified base image (copy-on-write, immutable).
 /// `fstab=0` makes systemd ignore the image's /etc/fstab entirely, so a stale swap UUID in
-/// it cannot stall the boot (no swap-mask hack, no base-image edit). The persistent user
-/// disk is formatted on first boot (x-systemd.makefs) and mounted at /home via mount-extra,
-/// so user data survives across boots without touching the base image.
+/// it cannot stall the boot (no swap-mask hack, no base-image edit). `fsck.repair=yes`
+/// keeps a persistent root overlay recoverable after forced host shutdowns instead of
+/// dropping into a locked-root emergency shell. The persistent user disk is formatted on
+/// first boot (x-systemd.makefs) and mounted at /home via mount-extra, so user data survives
+/// across boots without touching the base image.
 fn build_qemu_engine_config(
     runtime_paths: &crate::plan::RuntimePaths,
     initramfs_override: Option<&Path>,
@@ -2872,7 +2893,12 @@ fn build_qemu_engine_config(
     } else {
         "console=ttyS0"
     };
-    let mut cmdline = format!("{console} root=/dev/vda1 rw fstab=0");
+    let mut cmdline = format!("{console} root=/dev/vda1 rw fstab=0 fsck.repair=yes");
+    // Entry-point default: a graphical display boots the desktop; the serial/CLI path boots
+    // to a text console (multi-user) so `pane` in a terminal gives Linux as a terminal.
+    if display.backend().is_none() {
+        cmdline.push_str(" systemd.unit=multi-user.target");
+    }
     if user_disk.is_some() {
         cmdline.push_str(" systemd.mount-extra=/dev/vdb:/home:ext4:x-systemd.makefs");
     }

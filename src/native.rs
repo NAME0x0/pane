@@ -1756,6 +1756,7 @@ mod windows_whp {
     const WHV_X64_INTERRUPT_TYPE_FIXED: u64 = 0;
     const WHV_X64_INTERRUPT_DESTINATION_MODE_PHYSICAL: u64 = 0;
     const WHV_X64_INTERRUPT_TRIGGER_MODE_EDGE: u64 = 0;
+    #[allow(dead_code)]
     const WHV_X64_INTERRUPT_TRIGGER_MODE_LEVEL: u64 = 1;
     const WHV_X64_REGISTER_APIC_TPR: u32 = 0x0000_3008;
     const WHV_X64_REGISTER_APIC_PPR: u32 = 0x0000_300a;
@@ -4193,10 +4194,9 @@ mod windows_whp {
         // advancing while the guest is blocked (e.g. an ext4 mount waiting on kthreads),
         // independent of how often the exit loop reclaims the vCPU. Stopped after the run
         // loop, before the partition is torn down.
-        let mut timer_injector = request_interrupt
-            .map(|request_interrupt| {
-                AsyncTimerInjector::start(partition, request_interrupt, Duration::from_millis(1))
-            });
+        let timer_injector = request_interrupt.map(|request_interrupt| {
+            AsyncTimerInjector::start(partition, request_interrupt, Duration::from_millis(1))
+        });
         let mut last_timer_tick_at: Option<Instant> = None;
         let mut ioapic_timer_tick_count: u64 = 0;
         let mut virtio_irq_resample_count: u64 = 0;
@@ -4551,7 +4551,10 @@ mod windows_whp {
             //    its tick there instead of the LAPIC timer.
             let now = Instant::now();
             if lapic
-                .service_timer(now, Duration::from_millis(IOAPIC_TIMER_TICK_INTERVAL_MILLIS))
+                .service_timer(
+                    now,
+                    Duration::from_millis(IOAPIC_TIMER_TICK_INTERVAL_MILLIS),
+                )
                 .is_some()
             {
                 ioapic_timer_tick_count += 1;
@@ -4671,9 +4674,7 @@ mod windows_whp {
                         if !injected {
                             interrupt_window_notification_armed = true;
                         }
-                        if virtio_irq_resample_count == 0
-                            || virtio_irq_resample_count % 256 == 0
-                        {
+                        if virtio_irq_resample_count == 0 || virtio_irq_resample_count % 256 == 0 {
                             report.calls.push(NativeWhpCallReport {
                                 name: "VirtioMmioInterruptResampled",
                                 hresult: None,
@@ -4862,9 +4863,7 @@ mod windows_whp {
                     }
                     break;
                 }
-                DecodedExit::MemoryAccess { gpa, .. }
-                    if crate::lapic::lapic_contains_gpa(gpa) =>
-                {
+                DecodedExit::MemoryAccess { gpa, .. } if crate::lapic::lapic_contains_gpa(gpa) => {
                     let deps = WhpMmioEmulationDeps {
                         partition,
                         get_virtual_processor_registers,
@@ -5196,9 +5195,9 @@ mod windows_whp {
                         .map(|device| device.interrupt_status != 0)
                         .unwrap_or(false);
                     if virtio_pending_now {
-                        if let Some(delivery) = ioapic.pin_delivery_if_unmasked(
-                            crate::virtio::PANE_VIRTIO_MMIO_IRQ as usize,
-                        ) {
+                        if let Some(delivery) = ioapic
+                            .pin_delivery_if_unmasked(crate::virtio::PANE_VIRTIO_MMIO_IRQ as usize)
+                        {
                             // A halted vCPU is interruptible; deliver the completion vector
                             // through the WHP local APIC (WHvRequestInterrupt) so it wakes
                             // and runs the virtio ISR.
@@ -5355,9 +5354,9 @@ mod windows_whp {
                         .map(|device| device.interrupt_status != 0)
                         .unwrap_or(false);
                     if virtio_pending_now {
-                        if let Some(delivery) = ioapic.pin_delivery_if_unmasked(
-                            crate::virtio::PANE_VIRTIO_MMIO_IRQ as usize,
-                        ) {
+                        if let Some(delivery) = ioapic
+                            .pin_delivery_if_unmasked(crate::virtio::PANE_VIRTIO_MMIO_IRQ as usize)
+                        {
                             let injected = deliver_virtio_pending_interrupt(
                                 partition,
                                 request_interrupt,
@@ -5842,7 +5841,7 @@ mod windows_whp {
         });
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, unused_variables)]
     fn maybe_prime_root_mount_timer(
         partition: *mut c_void,
         get_virtual_processor_registers: Option<WhvGetVirtualProcessorRegisters>,
@@ -5978,6 +5977,7 @@ mod windows_whp {
     /// timer thread keeps jiffies advancing at a steady rate regardless of guest idle,
     /// the way real hypervisors deliver the periodic timer. It must be stopped before the
     /// partition is torn down, since it holds the partition handle.
+    #[allow(dead_code)]
     struct AsyncTimerInjector {
         shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
         vector: std::sync::Arc<std::sync::atomic::AtomicU32>,
@@ -5985,6 +5985,7 @@ mod windows_whp {
         handle: Option<std::thread::JoinHandle<()>>,
     }
 
+    #[allow(dead_code)]
     impl AsyncTimerInjector {
         fn start(
             partition: *mut c_void,
@@ -6268,7 +6269,13 @@ mod windows_whp {
         let names = [WHV_REGISTER_PENDING_INTERRUPTION];
         let values = [whv_register64(value)];
         let hresult = unsafe {
-            set_virtual_processor_registers(partition, 0, names.as_ptr(), names.len() as u32, values.as_ptr())
+            set_virtual_processor_registers(
+                partition,
+                0,
+                names.as_ptr(),
+                names.len() as u32,
+                values.as_ptr(),
+            )
         };
         hresult_succeeded(hresult)
     }
@@ -6288,6 +6295,7 @@ mod windows_whp {
     /// it can be re-armed every exit-loop cadence while a device interrupt is pending.
     /// The notification is one-shot; WHP auto-clears it once the vCPU runs, so reliable
     /// delivery to a busy guest requires re-arming each iteration rather than once.
+    #[allow(dead_code)]
     fn arm_interrupt_window_notification_quiet(
         partition: *mut c_void,
         set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
@@ -7061,7 +7069,9 @@ mod windows_whp {
             // Poll the worker often enough that a short timeslice cancels on time:
             // the poll interval must not exceed the timeslice, or a pending-interrupt
             // resample would be delayed to the next poll tick.
-            let poll_interval = timeslice.min(Duration::from_millis(25)).max(Duration::from_millis(1));
+            let poll_interval = timeslice
+                .min(Duration::from_millis(25))
+                .max(Duration::from_millis(1));
             loop {
                 match self.result_rx.recv_timeout(poll_interval) {
                     Ok(result) => return Some(result),

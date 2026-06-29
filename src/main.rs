@@ -21,6 +21,16 @@ mod wsl;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    if std::env::var_os("PANE_APP_HYDRATE_ONLY").is_some() {
+        return match app::run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("error: {error}");
+                ExitCode::from(1)
+            }
+        };
+    }
+
     // Bare `pane` (or a double-click) opens the GUI Control Center; any subcommand runs the
     // CLI. A subcommand is the first non-flag argument.
     let has_subcommand = std::env::args().skip(1).any(|arg| !arg.starts_with('-'));

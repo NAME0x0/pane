@@ -1,5 +1,17 @@
-#[cfg(windows)]
 fn main() {
+    #[cfg(windows)]
+    {
+        // Tauri codegen (reads tauri.conf.json); required for the Windows GUI shell.
+        tauri_build::build();
+        embed_windows_resources();
+    }
+
+    #[cfg(not(windows))]
+    println!("cargo:rerun-if-changed=build.rs");
+}
+
+#[cfg(windows)]
+fn embed_windows_resources() {
     use std::{env, fs, path::PathBuf};
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest dir"));
@@ -11,11 +23,10 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={}", icon_path.display());
 
-    let icon = icon_path.display().to_string().replace('\\', "\\\\");
+    // Note: the app icon and the Windows manifest are embedded by tauri-build; embedding
+    // them here too causes a duplicate-resource link error. Keep only the version info.
     let rc_contents = format!(
         r#"
-1 ICON "{icon}"
-
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION {major},{minor},{patch},{build}
  PRODUCTVERSION {major},{minor},{patch},{build}
@@ -48,7 +59,6 @@ BEGIN
   END
 END
 "#,
-        icon = icon,
         version = version,
         major = version_parts[0],
         minor = version_parts[1],
@@ -59,12 +69,9 @@ END
     let rc_path = out_dir.join("pane-version.rc");
     fs::write(&rc_path, rc_contents).expect("write rc");
     embed_resource::compile(rc_path, embed_resource::NONE)
-        .manifest_required()
+        .manifest_optional()
         .expect("compile Pane Windows resources");
 }
-
-#[cfg(not(windows))]
-fn main() {}
 
 #[cfg(windows)]
 fn parse_version(version: &str) -> [u16; 4] {

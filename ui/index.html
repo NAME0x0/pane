@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Pane</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="bar">
+    <div class="brand"><span class="mark">▢</span> Pane</div>
+    <div id="status" class="pill pill-idle">Checking…</div>
+  </header>
+
+  <main class="grid">
+    <section class="card span2">
+      <div class="card-top">
+        <h2>Linux desktop</h2>
+        <span class="muted" id="engine-line">QEMU + WHPX</span>
+      </div>
+      <p class="muted" id="vm-detail">Click Launch to start your Arch Linux desktop.</p>
+      <div class="row">
+        <button id="btn-launch" class="btn btn-primary">Launch</button>
+        <button id="btn-stop" class="btn">Stop</button>
+        <button id="btn-refresh" class="btn btn-ghost">Refresh</button>
+      </div>
+    </section>
+
+    <section class="card span2">
+      <div class="card-top">
+        <h3>Recommended setup</h3>
+        <button id="btn-recommended" class="btn btn-ghost small">Use recommended</button>
+      </div>
+      <div class="spec-grid">
+        <div><span class="label">Host</span><strong id="host-summary">Detecting…</strong></div>
+        <div><span class="label">GPU</span><strong id="gpu-summary">Detecting…</strong></div>
+        <div><span class="label">Free disk</span><strong id="disk-summary">Detecting…</strong></div>
+      </div>
+      <div class="tuning-grid">
+        <label class="field">vCPUs <output id="out-vcpus">4</output>
+          <input id="in-vcpus" type="range" min="1" max="16" value="4" />
+        </label>
+        <label class="field">Memory <output id="out-memory">4096 MiB</output>
+          <input id="in-memory" type="range" min="1024" max="32768" step="512" value="4096" />
+        </label>
+        <label class="field">Root disk <output id="out-disk">24 GiB</output>
+          <input id="in-disk" type="range" min="8" max="128" step="1" value="24" />
+        </label>
+        <label class="field">Resolution
+          <input id="in-resolution" type="text" value="1920x1080" />
+        </label>
+      </div>
+      <label class="check">
+        <input id="in-gpu" type="checkbox" checked />
+        <span>Use GPU acceleration with VirGL when launching the native desktop window</span>
+      </label>
+    </section>
+
+    <section class="card">
+      <h3>Workspace</h3>
+      <label class="field">Desktop
+        <select id="sel-de">
+          <option value="xfce">XFCE (light, fast)</option>
+          <option value="gnome">GNOME</option>
+          <option value="kde">KDE Plasma</option>
+        </select>
+      </label>
+      <label class="field">Mode
+        <select id="sel-mode">
+          <option value="persistent">Persistent (keep changes)</option>
+          <option value="perishable">Perishable (reset each time)</option>
+        </select>
+      </label>
+      <label class="field">Window backend
+        <select id="sel-display">
+          <option value="sdl">SDL native window (recommended input)</option>
+          <option value="gtk">GTK native window</option>
+        </select>
+      </label>
+      <label class="field">Storage root
+        <input id="in-storage-root" type="text" placeholder="Default: %LOCALAPPDATA%\\Pane" />
+      </label>
+      <button id="btn-install" class="btn">Install desktop</button>
+    </section>
+
+    <section class="card">
+      <h3>Login</h3>
+      <label class="field">Username <input id="in-user" type="text" placeholder="pane" /></label>
+      <label class="field">Password <input id="in-pass" type="password" placeholder="auto-generate" /></label>
+      <button id="btn-provision" class="btn">Set credentials</button>
+    </section>
+
+    <section class="card">
+      <h3>Maintenance</h3>
+      <div class="row">
+        <button id="btn-doctor" class="btn btn-ghost">Doctor</button>
+        <button id="btn-reset" class="btn btn-ghost">Reset</button>
+      </div>
+      <p class="muted small">Doctor checks readiness. Reset clears the workspace overlay.</p>
+    </section>
+
+    <section class="card span2">
+      <div class="card-top"><h3>Activity</h3><button id="btn-clear" class="btn btn-ghost small">Clear</button></div>
+      <pre id="log" class="log" aria-live="polite"></pre>
+    </section>
+  </main>
+
+  <section id="screen-view" hidden>
+    <div class="screen-bar">
+      <div class="brand"><span class="mark">▢</span> Pane</div>
+      <div class="row">
+        <button id="btn-back" class="btn btn-ghost small">Control Center</button>
+        <button id="btn-screen-stop" class="btn small">Stop</button>
+      </div>
+    </div>
+    <div id="screen" class="screen"></div>
+  </section>
+
+  <script type="module" src="main.js"></script>
+</body>
+</html>

@@ -1,59 +1,65 @@
 use serde::Serialize;
 use std::sync::Arc;
+use virtio_bindings::{virtio_blk, virtio_config, virtio_ids, virtio_mmio, virtio_ring};
 use virtio_queue::{Queue, QueueT};
 use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 pub(crate) const PANE_VIRTIO_MMIO_BASE_GPA: u64 = 0x0dfc_0000;
 pub(crate) const PANE_VIRTIO_MMIO_SIZE_BYTES: u64 = 0x0000_1000;
 pub(crate) const PANE_VIRTIO_MMIO_IRQ: u32 = 5;
+// "virt" magic, little-endian. virtio-bindings reuses the `VIRTIO_MMIO_MAGIC_VALUE`
+// name for the register offset (0x000), so the magic number itself stays a literal.
 pub(crate) const VIRTIO_MMIO_MAGIC_VALUE: u32 = 0x7472_6976;
 pub(crate) const VIRTIO_MMIO_VERSION_MODERN: u32 = 2;
-pub(crate) const VIRTIO_DEVICE_ID_BLOCK: u32 = 2;
-pub(crate) const VIRTIO_DEVICE_ID_GPU: u32 = 16;
-pub(crate) const VIRTIO_DEVICE_ID_INPUT: u32 = 18;
+pub(crate) const VIRTIO_DEVICE_ID_BLOCK: u32 = virtio_ids::VIRTIO_ID_BLOCK;
+pub(crate) const VIRTIO_DEVICE_ID_GPU: u32 = virtio_ids::VIRTIO_ID_GPU;
+pub(crate) const VIRTIO_DEVICE_ID_INPUT: u32 = virtio_ids::VIRTIO_ID_INPUT;
 pub(crate) const VIRTIO_MMIO_CONFIG_OFFSET: u64 = 0x100;
 pub(crate) const VIRTIO_BLK_SECTOR_SIZE_BYTES: u64 = 512;
 pub(crate) const PANE_VIRTIO_BLK_QUEUE_SIZE: u16 = 256;
-pub(crate) const VIRTIO_BLK_STATUS_OK: u8 = 0;
-pub(crate) const VIRTIO_BLK_STATUS_IOERR: u8 = 1;
-pub(crate) const VIRTIO_BLK_STATUS_UNSUPP: u8 = 2;
-pub(crate) const VIRTIO_BLK_F_RO: u64 = 1 << 5;
-pub(crate) const VIRTIO_BLK_F_BLK_SIZE: u64 = 1 << 6;
-pub(crate) const VIRTIO_BLK_F_FLUSH: u64 = 1 << 9;
-pub(crate) const VIRTIO_F_VERSION_1: u64 = 1 << 32;
-pub(crate) const VIRTIO_CONFIG_S_DRIVER_OK: u32 = 4;
-pub(crate) const VIRTIO_CONFIG_S_FEATURES_OK: u32 = 8;
+pub(crate) const VIRTIO_BLK_STATUS_OK: u8 = virtio_blk::VIRTIO_BLK_S_OK as u8;
+pub(crate) const VIRTIO_BLK_STATUS_IOERR: u8 = virtio_blk::VIRTIO_BLK_S_IOERR as u8;
+pub(crate) const VIRTIO_BLK_STATUS_UNSUPP: u8 = virtio_blk::VIRTIO_BLK_S_UNSUPP as u8;
+// virtio-bindings exposes feature bit positions; Pane stores the negotiated masks.
+pub(crate) const VIRTIO_BLK_F_RO: u64 = 1 << virtio_blk::VIRTIO_BLK_F_RO;
+pub(crate) const VIRTIO_BLK_F_BLK_SIZE: u64 = 1 << virtio_blk::VIRTIO_BLK_F_BLK_SIZE;
+pub(crate) const VIRTIO_BLK_F_FLUSH: u64 = 1 << virtio_blk::VIRTIO_BLK_F_FLUSH;
+pub(crate) const VIRTIO_F_VERSION_1: u64 = 1 << virtio_config::VIRTIO_F_VERSION_1;
+pub(crate) const VIRTIO_CONFIG_S_DRIVER_OK: u32 = virtio_config::VIRTIO_CONFIG_S_DRIVER_OK;
+pub(crate) const VIRTIO_CONFIG_S_FEATURES_OK: u32 = virtio_config::VIRTIO_CONFIG_S_FEATURES_OK;
 
-const VIRTIO_MMIO_MAGIC_VALUE_OFFSET: u64 = 0x000;
-const VIRTIO_MMIO_VERSION_OFFSET: u64 = 0x004;
-const VIRTIO_MMIO_DEVICE_ID_OFFSET: u64 = 0x008;
-const VIRTIO_MMIO_VENDOR_ID_OFFSET: u64 = 0x00c;
-const VIRTIO_MMIO_DEVICE_FEATURES_OFFSET: u64 = 0x010;
-const VIRTIO_MMIO_DEVICE_FEATURES_SEL_OFFSET: u64 = 0x014;
-const VIRTIO_MMIO_DRIVER_FEATURES_OFFSET: u64 = 0x020;
-const VIRTIO_MMIO_DRIVER_FEATURES_SEL_OFFSET: u64 = 0x024;
-const VIRTIO_MMIO_QUEUE_SEL_OFFSET: u64 = 0x030;
-const VIRTIO_MMIO_QUEUE_NUM_MAX_OFFSET: u64 = 0x034;
-const VIRTIO_MMIO_QUEUE_NUM_OFFSET: u64 = 0x038;
-const VIRTIO_MMIO_QUEUE_READY_OFFSET: u64 = 0x044;
-const VIRTIO_MMIO_QUEUE_NOTIFY_OFFSET: u64 = 0x050;
-const VIRTIO_MMIO_INTERRUPT_STATUS_OFFSET: u64 = 0x060;
-const VIRTIO_MMIO_INTERRUPT_ACK_OFFSET: u64 = 0x064;
-const VIRTIO_MMIO_STATUS_OFFSET: u64 = 0x070;
-const VIRTIO_MMIO_QUEUE_DESC_LOW_OFFSET: u64 = 0x080;
-const VIRTIO_MMIO_QUEUE_DESC_HIGH_OFFSET: u64 = 0x084;
-const VIRTIO_MMIO_QUEUE_AVAIL_LOW_OFFSET: u64 = 0x090;
-const VIRTIO_MMIO_QUEUE_AVAIL_HIGH_OFFSET: u64 = 0x094;
-const VIRTIO_MMIO_QUEUE_USED_LOW_OFFSET: u64 = 0x0a0;
-const VIRTIO_MMIO_QUEUE_USED_HIGH_OFFSET: u64 = 0x0a4;
-const VIRTIO_MMIO_CONFIG_GENERATION_OFFSET: u64 = 0x0fc;
+const VIRTIO_MMIO_MAGIC_VALUE_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_MAGIC_VALUE as u64;
+const VIRTIO_MMIO_VERSION_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_VERSION as u64;
+const VIRTIO_MMIO_DEVICE_ID_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_DEVICE_ID as u64;
+const VIRTIO_MMIO_VENDOR_ID_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_VENDOR_ID as u64;
+const VIRTIO_MMIO_DEVICE_FEATURES_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_DEVICE_FEATURES as u64;
+const VIRTIO_MMIO_DEVICE_FEATURES_SEL_OFFSET: u64 =
+    virtio_mmio::VIRTIO_MMIO_DEVICE_FEATURES_SEL as u64;
+const VIRTIO_MMIO_DRIVER_FEATURES_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_DRIVER_FEATURES as u64;
+const VIRTIO_MMIO_DRIVER_FEATURES_SEL_OFFSET: u64 =
+    virtio_mmio::VIRTIO_MMIO_DRIVER_FEATURES_SEL as u64;
+const VIRTIO_MMIO_QUEUE_SEL_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_QUEUE_SEL as u64;
+const VIRTIO_MMIO_QUEUE_NUM_MAX_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_QUEUE_NUM_MAX as u64;
+const VIRTIO_MMIO_QUEUE_NUM_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_QUEUE_NUM as u64;
+const VIRTIO_MMIO_QUEUE_READY_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_QUEUE_READY as u64;
+const VIRTIO_MMIO_QUEUE_NOTIFY_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_QUEUE_NOTIFY as u64;
+const VIRTIO_MMIO_INTERRUPT_STATUS_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_INTERRUPT_STATUS as u64;
+const VIRTIO_MMIO_INTERRUPT_ACK_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_INTERRUPT_ACK as u64;
+const VIRTIO_MMIO_STATUS_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_STATUS as u64;
+const VIRTIO_MMIO_QUEUE_DESC_LOW_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_QUEUE_DESC_LOW as u64;
+const VIRTIO_MMIO_QUEUE_DESC_HIGH_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_QUEUE_DESC_HIGH as u64;
+const VIRTIO_MMIO_QUEUE_AVAIL_LOW_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_QUEUE_AVAIL_LOW as u64;
+const VIRTIO_MMIO_QUEUE_AVAIL_HIGH_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_QUEUE_AVAIL_HIGH as u64;
+const VIRTIO_MMIO_QUEUE_USED_LOW_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_QUEUE_USED_LOW as u64;
+const VIRTIO_MMIO_QUEUE_USED_HIGH_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_QUEUE_USED_HIGH as u64;
+const VIRTIO_MMIO_CONFIG_GENERATION_OFFSET: u64 = virtio_mmio::VIRTIO_MMIO_CONFIG_GENERATION as u64;
 const PANE_VENDOR_ID: u32 = 0x7061_6e65;
-const VIRTQ_DESC_F_NEXT: u16 = 1;
-const VIRTQ_DESC_F_WRITE: u16 = 2;
-const VIRTIO_BLK_T_IN: u32 = 0;
-const VIRTIO_BLK_T_OUT: u32 = 1;
-const VIRTIO_BLK_T_FLUSH: u32 = 4;
-const VIRTIO_BLK_T_GET_ID: u32 = 8;
+const VIRTQ_DESC_F_NEXT: u16 = virtio_ring::VRING_DESC_F_NEXT as u16;
+const VIRTQ_DESC_F_WRITE: u16 = virtio_ring::VRING_DESC_F_WRITE as u16;
+const VIRTIO_BLK_T_IN: u32 = virtio_blk::VIRTIO_BLK_T_IN;
+const VIRTIO_BLK_T_OUT: u32 = virtio_blk::VIRTIO_BLK_T_OUT;
+const VIRTIO_BLK_T_FLUSH: u32 = virtio_blk::VIRTIO_BLK_T_FLUSH;
+const VIRTIO_BLK_T_GET_ID: u32 = virtio_blk::VIRTIO_BLK_T_GET_ID;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct PaneVirtioMmioWindow {
@@ -149,6 +155,11 @@ pub(crate) struct PaneVirtioBlkRequest {
     pub(crate) data_descriptors: Vec<PaneVirtioDescriptor>,
     pub(crate) status_addr: u64,
     pub(crate) status_len: u32,
+}
+
+struct PaneVirtioPoppedRequest {
+    head_index: u16,
+    request: Result<PaneVirtioBlkRequest, String>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize)]
@@ -429,6 +440,18 @@ where
                     let executions = device.execute_available_block_requests(memory, &mut service);
                     let execution = executions.last().cloned();
                     let queue_execution_count = executions.len();
+                    // Diagnostic: read the guest's avail-ring flags and read back the
+                    // used.idx we published. VRING_AVAIL_F_NO_INTERRUPT (avail flags bit 0)
+                    // set means the driver is polling the used ring rather than waiting on an
+                    // IRQ; comparing the read-back used.idx to our used_index confirms the
+                    // multi-entry used-ring write landed. This distinguishes a poll/visibility
+                    // problem from a dropped interrupt for batched (>=2 request) completions.
+                    let mut avail_flags_bytes = [0_u8; 2];
+                    let _ = memory.read(device.queue.avail_ring_gpa, &mut avail_flags_bytes);
+                    let mut used_idx_bytes = [0_u8; 2];
+                    let _ = memory.read(device.queue.used_ring_gpa + 2, &mut used_idx_bytes);
+                    let avail_flags = u16::from_le_bytes(avail_flags_bytes);
+                    let used_idx_readback = u16::from_le_bytes(used_idx_bytes);
                     let status = if queue_execution_count == 0 {
                         "queue-notify-empty"
                     } else if executions
@@ -448,7 +471,29 @@ where
                         queue_execution: execution,
                         queue_execution_count,
                         detail: format!(
-                            "Queue notify {queue_index} executed {queue_execution_count} request(s)."
+                            "Queue notify {queue_index} executed {queue_execution_count} request(s); next_avail={} used_index={} interrupt_status=0x{:x} avail_flags=0x{avail_flags:04x} used_idx_readback={used_idx_readback}; [{}]",
+                            device.queue.next_avail_index,
+                            device.queue.used_index,
+                            device.interrupt_status,
+                            executions
+                                .iter()
+                                .map(|execution| {
+                                    let (kind, sector) = execution
+                                        .request
+                                        .as_ref()
+                                        .map(|request| {
+                                            (format!("{:?}", request.request_type), request.sector)
+                                        })
+                                        .unwrap_or_else(|| ("none".to_string(), 0));
+                                    format!(
+                                        "{kind} sector={sector} head={} used_len={} status={}",
+                                        execution.used_head_index,
+                                        execution.used_len,
+                                        execution.status
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         ),
                     }
                 }
@@ -547,8 +592,8 @@ impl PaneVirtioMmioBlockDevice {
             };
         }
 
-        let head_index = match read_available_head(memory, &self.queue) {
-            Ok(Some(head_index)) => head_index,
+        let popped = match pop_virtio_blk_request(memory, &self.queue) {
+            Ok(Some(request)) => request,
             Ok(None) => {
                 return PaneVirtioBlkExecution {
                     request: None,
@@ -571,10 +616,11 @@ impl PaneVirtioMmioBlockDevice {
             }
         };
 
-        match parse_virtio_blk_request(memory, &self.queue, head_index) {
+        let head_index = popped.head_index;
+        match popped.request {
             Ok(request) => self.execute_parsed_block_request(memory, request, head_index, service),
             Err(error) => {
-                let _ = write_used_entry(memory, &self.queue, head_index, 0);
+                let _ = publish_used_entry(memory, &self.queue, head_index, 0);
                 self.queue.next_avail_index = self.queue.next_avail_index.wrapping_add(1);
                 self.queue.used_index = self.queue.used_index.wrapping_add(1);
                 self.interrupt_status |= 1;
@@ -630,7 +676,7 @@ impl PaneVirtioMmioBlockDevice {
     {
         if request.request_type == PaneVirtioBlkRequestType::Out && self.config.readonly {
             let _ = memory.write(request.status_addr, &[VIRTIO_BLK_STATUS_IOERR]);
-            let _ = write_used_entry(memory, &self.queue, head_index, 1);
+            let _ = publish_used_entry(memory, &self.queue, head_index, 1);
             self.queue.next_avail_index = self.queue.next_avail_index.wrapping_add(1);
             self.queue.used_index = self.queue.used_index.wrapping_add(1);
             self.interrupt_status |= 1;
@@ -649,7 +695,7 @@ impl PaneVirtioMmioBlockDevice {
                 Ok(payload) => Some(payload),
                 Err(error) => {
                     let _ = memory.write(request.status_addr, &[VIRTIO_BLK_STATUS_IOERR]);
-                    let _ = write_used_entry(memory, &self.queue, head_index, 1);
+                    let _ = publish_used_entry(memory, &self.queue, head_index, 1);
                     self.queue.next_avail_index = self.queue.next_avail_index.wrapping_add(1);
                     self.queue.used_index = self.queue.used_index.wrapping_add(1);
                     self.interrupt_status |= 1;
@@ -694,7 +740,7 @@ impl PaneVirtioMmioBlockDevice {
                 } else {
                     1
                 };
-                let _ = write_used_entry(memory, &self.queue, head_index, used_len);
+                let _ = publish_used_entry(memory, &self.queue, head_index, used_len);
                 self.queue.next_avail_index = self.queue.next_avail_index.wrapping_add(1);
                 self.queue.used_index = self.queue.used_index.wrapping_add(1);
                 self.interrupt_status |= 1;
@@ -718,7 +764,7 @@ impl PaneVirtioMmioBlockDevice {
                     VIRTIO_BLK_STATUS_IOERR
                 };
                 let _ = memory.write(request.status_addr, &[status]);
-                let _ = write_used_entry(memory, &self.queue, head_index, 1);
+                let _ = publish_used_entry(memory, &self.queue, head_index, 1);
                 self.queue.next_avail_index = self.queue.next_avail_index.wrapping_add(1);
                 self.queue.used_index = self.queue.used_index.wrapping_add(1);
                 self.interrupt_status |= 1;
@@ -1300,96 +1346,42 @@ pub(crate) fn format_guest_physical_address(gpa: u64) -> String {
     format!("0x{gpa:08x}")
 }
 
-fn read_available_head<M: PaneGuestMemory>(
+fn pop_virtio_blk_request<M: PaneGuestMemory>(
     memory: &M,
     queue: &PaneVirtioQueueState,
-) -> Result<Option<u16>, String> {
-    if let Some(memory) = memory.rust_vmm_memory() {
-        let mut queue = rust_vmm_queue(queue)?;
-        return Ok(queue
-            .pop_descriptor_chain(memory)
-            .map(|chain| chain.head_index()));
-    }
-    if queue.avail_ring_gpa == 0 {
+) -> Result<Option<PaneVirtioPoppedRequest>, String> {
+    let guest_memory = memory
+        .rust_vmm_memory()
+        .ok_or_else(|| "virtio-blk requires the rust-vmm guest-memory adapter".to_string())?;
+    let mut rust_queue = rust_vmm_queue(queue)?;
+    let Some(chain) = rust_queue.pop_descriptor_chain(guest_memory) else {
         return Ok(None);
-    }
-    let available_index = read_u16(memory, queue.avail_ring_gpa + 2)?;
-    if available_index == queue.next_avail_index {
-        return Ok(None);
-    }
-    let ring_index = queue.next_avail_index % queue.size;
-    read_u16(memory, queue.avail_ring_gpa + 4 + u64::from(ring_index) * 2).map(Some)
-}
-
-fn parse_virtio_blk_request<M: PaneGuestMemory>(
-    memory: &M,
-    queue: &PaneVirtioQueueState,
-    head_index: u16,
-) -> Result<PaneVirtioBlkRequest, String> {
-    if let Some(guest_memory) = memory.rust_vmm_memory() {
-        let mut rust_queue = rust_vmm_queue(queue)?;
-        let chain = rust_queue
-            .pop_descriptor_chain(guest_memory)
-            .ok_or_else(|| "available ring does not contain a new request".to_string())?;
-        if chain.head_index() != head_index {
-            return Err("virtio-queue returned a different descriptor head".to_string());
-        }
-        let descriptors = chain
-            .map(|descriptor| PaneVirtioDescriptor {
-                addr: descriptor.addr().0,
-                len: descriptor.len(),
-                flags: descriptor.flags(),
-                next: descriptor.next(),
-            })
-            .collect::<Vec<_>>();
-        return parse_virtio_blk_descriptors(memory, descriptors);
-    }
-
-    if head_index >= queue.size {
-        return Err(format!(
-            "descriptor head index {head_index} exceeds queue size {}",
-            queue.size
-        ));
-    }
-
-    let mut descriptors = Vec::new();
-    let mut seen_indexes = Vec::new();
-    let mut index = head_index;
-    for _ in 0..queue.size {
-        if seen_indexes.contains(&index) {
-            return Err(format!(
-                "virtio-blk descriptor chain contains a cycle at index {index}"
-            ));
-        }
-        seen_indexes.push(index);
-        let descriptor = read_descriptor(memory, queue, index)?;
-        let has_next = descriptor.has_next();
-        descriptors.push(descriptor);
-        if !has_next {
-            break;
-        }
-        index = descriptor.next;
-        if index >= queue.size {
-            return Err(format!(
-                "descriptor next index {index} exceeds queue size {}",
-                queue.size
-            ));
-        }
-    }
-    if descriptors
-        .last()
-        .is_some_and(|descriptor| descriptor.has_next())
-    {
-        return Err("virtio-blk descriptor chain is unterminated".to_string());
-    }
-
-    parse_virtio_blk_descriptors(memory, descriptors)
+    };
+    let head_index = chain.head_index();
+    let descriptors = chain
+        .map(|descriptor| PaneVirtioDescriptor {
+            addr: descriptor.addr().0,
+            len: descriptor.len(),
+            flags: descriptor.flags(),
+            next: descriptor.next(),
+        })
+        .collect::<Vec<_>>();
+    Ok(Some(PaneVirtioPoppedRequest {
+        head_index,
+        request: parse_virtio_blk_descriptors(memory, descriptors),
+    }))
 }
 
 fn parse_virtio_blk_descriptors<M: PaneGuestMemory>(
     memory: &M,
     descriptors: Vec<PaneVirtioDescriptor>,
 ) -> Result<PaneVirtioBlkRequest, String> {
+    if descriptors
+        .last()
+        .is_some_and(|descriptor| descriptor.has_next())
+    {
+        return Err("virtio-blk descriptor chain contains a cycle or is unterminated".to_string());
+    }
     if descriptors.len() < 2 {
         return Err("virtio-blk descriptor chain is too short".to_string());
     }
@@ -1421,20 +1413,6 @@ fn parse_virtio_blk_descriptors<M: PaneGuestMemory>(
         data_descriptors: descriptors[1..descriptors.len() - 1].to_vec(),
         status_addr: status.addr,
         status_len: status.len,
-    })
-}
-
-fn read_descriptor<M: PaneGuestMemory>(
-    memory: &M,
-    queue: &PaneVirtioQueueState,
-    index: u16,
-) -> Result<PaneVirtioDescriptor, String> {
-    let addr = queue.desc_table_gpa + u64::from(index) * 16;
-    Ok(PaneVirtioDescriptor {
-        addr: read_u64(memory, addr)?,
-        len: read_u32(memory, addr + 8)?,
-        flags: read_u16(memory, addr + 12)?,
-        next: read_u16(memory, addr + 14)?,
     })
 }
 
@@ -1477,27 +1455,19 @@ fn write_read_response<M: PaneGuestMemory>(
     (VIRTIO_BLK_STATUS_OK, cursor as u32)
 }
 
-fn write_used_entry<M: PaneGuestMemory>(
+fn publish_used_entry<M: PaneGuestMemory>(
     memory: &mut M,
     queue: &PaneVirtioQueueState,
     head_index: u16,
     len: u32,
 ) -> Result<(), String> {
-    if let Some(memory) = memory.rust_vmm_memory() {
-        let mut queue = rust_vmm_queue(queue)?;
-        return queue
-            .add_used(memory, head_index, len)
-            .map_err(|error| format!("virtio-queue could not publish used entry: {error}"));
-    }
-    let ring_index = queue.used_index % queue.size;
-    let used_elem = queue.used_ring_gpa + 4 + u64::from(ring_index) * 8;
-    memory.write(used_elem, &u32::from(head_index).to_le_bytes())?;
-    memory.write(used_elem + 4, &len.to_le_bytes())?;
-    memory.write(
-        queue.used_ring_gpa + 2,
-        &queue.used_index.wrapping_add(1).to_le_bytes(),
-    )?;
-    Ok(())
+    let memory = memory
+        .rust_vmm_memory()
+        .ok_or_else(|| "virtio-blk requires the rust-vmm guest-memory adapter".to_string())?;
+    let mut queue = rust_vmm_queue(queue)?;
+    queue
+        .add_used(memory, head_index, len)
+        .map_err(|error| format!("virtio-queue could not publish used entry: {error}"))
 }
 
 fn rust_vmm_queue(state: &PaneVirtioQueueState) -> Result<Queue, String> {
@@ -1520,12 +1490,6 @@ fn rust_vmm_queue(state: &PaneVirtioQueueState) -> Result<Queue, String> {
     queue.set_next_avail(state.next_avail_index);
     queue.set_next_used(state.used_index);
     Ok(queue)
-}
-
-fn read_u16<M: PaneGuestMemory>(memory: &M, gpa: u64) -> Result<u16, String> {
-    let mut bytes = [0_u8; 2];
-    memory.read(gpa, &mut bytes)?;
-    Ok(u16::from_le_bytes(bytes))
 }
 
 fn read_u32<M: PaneGuestMemory>(memory: &M, gpa: u64) -> Result<u32, String> {
@@ -1571,15 +1535,13 @@ mod tests {
     };
 
     struct TestGuestMemory {
-        base: u64,
-        bytes: Vec<u8>,
+        memory: PaneMmapGuestMemory,
     }
 
     impl TestGuestMemory {
         fn new(size: usize) -> Self {
             Self {
-                base: 0,
-                bytes: vec![0_u8; size],
+                memory: PaneMmapGuestMemory::new(0, size).expect("test guest memory"),
             }
         }
 
@@ -1604,29 +1566,15 @@ mod tests {
 
     impl PaneGuestMemory for TestGuestMemory {
         fn read(&self, gpa: u64, bytes: &mut [u8]) -> Result<(), String> {
-            let start = gpa
-                .checked_sub(self.base)
-                .ok_or_else(|| "guest read before memory base".to_string())?
-                as usize;
-            let end = start + bytes.len();
-            if end > self.bytes.len() {
-                return Err("guest read out of bounds".to_string());
-            }
-            bytes.copy_from_slice(&self.bytes[start..end]);
-            Ok(())
+            self.memory.read(gpa, bytes)
         }
 
         fn write(&mut self, gpa: u64, bytes: &[u8]) -> Result<(), String> {
-            let start = gpa
-                .checked_sub(self.base)
-                .ok_or_else(|| "guest write before memory base".to_string())?
-                as usize;
-            let end = start + bytes.len();
-            if end > self.bytes.len() {
-                return Err("guest write out of bounds".to_string());
-            }
-            self.bytes[start..end].copy_from_slice(bytes);
-            Ok(())
+            self.memory.write(gpa, bytes)
+        }
+
+        fn rust_vmm_memory(&self) -> Option<&vm_memory::GuestMemoryMmap<()>> {
+            Some(self.memory.rust_vmm_memory())
         }
     }
 

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 
 use crate::{
-    model::{DesktopEnvironment, RuntimeMode, SharedStorageMode},
+    model::{DesktopChoice, DesktopEnvironment, DisplayMode, RuntimeMode, SharedStorageMode},
     plan::DEFAULT_RUNTIME_CAPACITY_GIB,
 };
 
@@ -41,6 +41,12 @@ pub enum Commands {
     NativePreflight(NativePreflightArgs),
     /// Exercise the first non-persistent WHP partition/vCPU boot-spike host step.
     NativeBootSpike(NativeBootSpikeArgs),
+    /// Set login credentials in the QEMU guest (root password, optional first user).
+    Provision(ProvisionArgs),
+    /// Install a graphical desktop (XFCE + LightDM) into the QEMU guest image.
+    InstallDesktop(InstallDesktopArgs),
+    /// Manage the QEMU workspace disks: reset to a clean image or reclaim space.
+    Workspace(WorkspaceArgs),
     /// Validate and materialize the native kernel boot layout contract.
     NativeKernelPlan(NativeKernelPlanArgs),
     /// Show the crosvm/rust-vmm foundation plan for the Pane-owned runtime.
@@ -140,8 +146,35 @@ pub struct LaunchArgs {
     #[arg(long)]
     pub distro: Option<String>,
     /// Runtime backend to use. wsl-bridge is current; pane-owned is the native runtime preflight path.
-    #[arg(long, value_enum, default_value_t = RuntimeMode::WslBridge)]
+    #[arg(long, value_enum, default_value_t = RuntimeMode::Auto)]
     pub runtime: RuntimeMode,
+    /// For --runtime qemu-whpx: guest console — serial (text in this terminal) or a graphical
+    /// window (gtk/sdl with a virtio-vga adapter).
+    #[arg(long, value_enum, default_value_t = DisplayMode::Serial)]
+    pub display: DisplayMode,
+    /// For --runtime qemu-whpx: boot the root from a persistent qcow2 overlay backed by the
+    /// base image, so installed packages and a desktop survive reboots (base stays immutable).
+    #[arg(long)]
+    pub persist_root: bool,
+    /// For --runtime qemu-whpx: start the VM in the background and return immediately. Stop it
+    /// with `pane stop`. Pair with --display gtk for a standalone desktop window.
+    #[arg(long)]
+    pub detach: bool,
+    /// For --runtime qemu-whpx: override the recommended vCPU count.
+    #[arg(long)]
+    pub vcpus: Option<u32>,
+    /// For --runtime qemu-whpx: override the recommended guest memory in MiB.
+    #[arg(long)]
+    pub memory_mb: Option<u32>,
+    /// For --runtime qemu-whpx: grow the persistent root overlay to this many GiB before launch.
+    #[arg(long)]
+    pub disk_gib: Option<u64>,
+    /// For --runtime qemu-whpx: request a guest display size such as 1920x1080.
+    #[arg(long)]
+    pub resolution: Option<String>,
+    /// For --runtime qemu-whpx: use software graphics instead of VirGL.
+    #[arg(long)]
+    pub no_gpu_acceleration: bool,
     /// Desktop environment to provision in the distro. MVP support is Arch + XFCE only.
     #[arg(long, value_enum, default_value_t = DesktopEnvironment::Xfce)]
     pub de: DesktopEnvironment,
@@ -315,6 +348,12 @@ pub struct RuntimeArgs {
     /// Expected SHA-256 digest for --register-pane-block-module. Without this, the module is recorded but not trusted.
     #[arg(long)]
     pub pane_block_module_expected_sha256: Option<String>,
+    /// Copy a stock virtio_mmio.ko (decompressed from the guest kernel modules tree) into the initramfs driver bundle so /init can load the virtio-mmio bus before mounting the virtio root.
+    #[arg(long)]
+    pub register_virtio_mmio_module: Option<PathBuf>,
+    /// Expected SHA-256 digest for --register-virtio-mmio-module. Required so Pane verifies the module before bundling it.
+    #[arg(long)]
+    pub virtio_mmio_module_expected_sha256: Option<String>,
     /// Create the Pane-owned user disk descriptor for packages, accounts, and customizations.
     #[arg(long)]
     pub create_user_disk: bool,
@@ -364,6 +403,55 @@ pub struct NativePreflightArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct ProvisionArgs {
+    /// Session slug for the Pane-owned runtime reservation.
+    #[arg(long, default_value = "pane")]
+    pub session_name: String,
+    /// Root password to set. If omitted, Pane generates a strong one and prints it.
+    #[arg(long)]
+    pub root_password: Option<String>,
+    /// Create this login user (added to the wheel group with sudo). Optional.
+    #[arg(long)]
+    pub username: Option<String>,
+    /// Password for --username. If omitted while --username is set, Pane generates one.
+    #[arg(long)]
+    pub password: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct WorkspaceArgs {
+    /// Session slug for the Pane-owned runtime reservation.
+    #[arg(long, default_value = "pane")]
+    pub session_name: String,
+    /// Discard the persistent root overlay so the next launch starts fresh from the base.
+    #[arg(long)]
+    pub reset: bool,
+    /// With --reset, also delete the user disk (home/packages).
+    #[arg(long)]
+    pub purge: bool,
+    /// Reclaim free space in the workspace disks (qemu-img compaction).
+    #[arg(long)]
+    pub compact: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct InstallDesktopArgs {
+    /// Session slug for the Pane-owned runtime reservation.
+    #[arg(long, default_value = "pane")]
+    pub session_name: String,
+    /// Desktop environment to install (xfce, gnome, or kde). Includes a browser (Firefox).
+    #[arg(long, value_enum, default_value_t = DesktopChoice::Xfce)]
+    pub de: DesktopChoice,
+    /// Grow the root disk to this many GiB before installing (default depends on the desktop:
+    /// 8 for XFCE, 24 for GNOME/KDE). The partition + filesystem are extended in the guest.
+    #[arg(long)]
+    pub disk_gib: Option<u64>,
+    /// Minutes to allow for the package download + install before giving up (0 = auto by DE).
+    #[arg(long, default_value_t = 0)]
+    pub timeout_minutes: u64,
+}
+
+#[derive(Debug, Args)]
 pub struct NativeBootSpikeArgs {
     /// Session slug for the Pane-owned runtime reservation.
     #[arg(long, default_value = "pane")]
@@ -383,6 +471,34 @@ pub struct NativeBootSpikeArgs {
     /// Map guest memory and run the materialized kernel-layout artifact under the serial/HALT contract.
     #[arg(long, conflicts_with_all = ["run_fixture", "run_boot_loader"])]
     pub run_kernel_layout: bool,
+    /// Boot the registered kernel/initramfs/base-disk through QEMU with the WHP accelerator
+    /// (qemu-system-x86_64 -accel whpx) instead of Pane's from-scratch WHP run loop. This is
+    /// the validated engine path: it boots the full distro (virtio root, switch_root, systemd,
+    /// login) where the from-scratch loop stalls on guest-timer throughput.
+    #[arg(long)]
+    pub qemu_whpx: bool,
+    /// Path to the real distro initramfs (with virtio-blk) for the QEMU engine path. The
+    /// registered Pane initramfs is the custom pane-block one, which QEMU cannot use. When
+    /// omitted, Pane extracts and caches it from the registered base image automatically.
+    #[arg(long)]
+    pub qemu_initramfs: Option<PathBuf>,
+    /// With --qemu-whpx, run an interactive session: the guest serial console is wired to
+    /// this terminal so you get a live Linux shell (Ctrl-A X to quit). Without this flag the
+    /// QEMU path runs a headless boot probe and reports milestones.
+    #[arg(long)]
+    pub interactive: bool,
+    /// Console for an interactive QEMU session: serial (text in this terminal) or a graphical
+    /// window (gtk/sdl with a virtio-vga adapter).
+    #[arg(long, value_enum, default_value_t = DisplayMode::Serial)]
+    pub display: DisplayMode,
+    /// Boot the QEMU root from a persistent qcow2 overlay backed by the base image, so guest
+    /// changes (installed packages, a desktop) survive reboots. The base image stays immutable.
+    #[arg(long)]
+    pub persist_root: bool,
+    /// Start the QEMU VM in the background and return immediately. The guest keeps running;
+    /// stop it with `pane stop`. Pair with --display gtk for a standalone desktop window.
+    #[arg(long)]
+    pub detach: bool,
     /// Write incremental native boot diagnostics to this JSON file while the WHP guest is running.
     #[arg(long)]
     pub trace_checkpoint: Option<PathBuf>,

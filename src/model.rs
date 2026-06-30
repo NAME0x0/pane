@@ -34,6 +34,9 @@ pub enum RuntimeMode {
     #[default]
     WslBridge,
     PaneOwned,
+    QemuWhpx,
+    /// Pick QEMU+WHPX when QEMU and the native runtime artifacts are present, else WSL bridge.
+    Auto,
 }
 
 impl RuntimeMode {
@@ -41,6 +44,88 @@ impl RuntimeMode {
         match self {
             Self::WslBridge => "WSL2 + XRDP bridge",
             Self::PaneOwned => "Pane-owned OS runtime",
+            Self::QemuWhpx => "QEMU + WHPX accelerator",
+            Self::Auto => "auto-select",
+        }
+    }
+}
+
+/// Desktop environment to install into the guest image.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum DesktopChoice {
+    /// Lightweight XFCE + LightDM (fast, ~1 GB).
+    #[default]
+    Xfce,
+    /// GNOME + GDM (~2.5 GB).
+    Gnome,
+    /// KDE Plasma + SDDM (~3 GB).
+    Kde,
+}
+
+impl DesktopChoice {
+    /// pacman packages to install (Xorg + display manager + desktop + a browser).
+    pub fn packages(self) -> &'static str {
+        // mesa provides the software (llvmpipe) + VirGL GL drivers so the desktop renders.
+        match self {
+            Self::Xfce => {
+                "xorg-server lightdm lightdm-gtk-greeter xfce4 xfce4-goodies firefox networkmanager mesa"
+            }
+            Self::Gnome => "xorg-server gdm gnome gnome-terminal firefox networkmanager mesa",
+            Self::Kde => "xorg-server sddm plasma-meta konsole dolphin firefox networkmanager mesa",
+        }
+    }
+
+    /// Display managers to disable so the chosen one wins display-manager.service.
+    pub fn other_display_managers(self) -> &'static str {
+        match self {
+            Self::Xfce => "gdm sddm",
+            Self::Gnome => "lightdm sddm",
+            Self::Kde => "lightdm gdm",
+        }
+    }
+
+    /// systemd display-manager unit to enable.
+    pub fn display_manager(self) -> &'static str {
+        match self {
+            Self::Xfce => "lightdm",
+            Self::Gnome => "gdm",
+            Self::Kde => "sddm",
+        }
+    }
+
+    /// Default root-disk size (GiB) to grow to before installing this desktop.
+    pub fn default_disk_gib(self) -> u64 {
+        match self {
+            Self::Xfce => 8,
+            Self::Gnome | Self::Kde => 24,
+        }
+    }
+}
+
+/// How the QEMU-WHPX engine presents the guest console.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum DisplayMode {
+    /// Text serial console wired to this terminal (no window).
+    #[default]
+    Serial,
+    /// Graphical window via the GTK backend with a virtio-vga adapter.
+    Gtk,
+    /// Graphical window via the SDL backend with a virtio-vga adapter.
+    Sdl,
+    /// Headless VNC server with a websocket, rendered by noVNC inside the Pane app window.
+    Vnc,
+}
+
+impl DisplayMode {
+    /// QEMU display backend name, or None for the headless serial console.
+    pub fn backend(self) -> Option<&'static str> {
+        match self {
+            Self::Serial => None,
+            Self::Gtk => Some("gtk"),
+            Self::Sdl => Some("sdl"),
+            Self::Vnc => Some("vnc"),
         }
     }
 }

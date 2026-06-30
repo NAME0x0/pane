@@ -52,10 +52,13 @@ function Invoke-Capture {
         [scriptblock]$Body
     )
 
+    $label = Split-Path -Leaf $OutputPath
+    Write-Host "Running certification probe: $label"
     $output = & $Body 2>&1
     $exitCode = $LASTEXITCODE
     $raw = (($output | Out-String) -replace "`0", "").TrimEnd()
     Set-Content -Path $OutputPath -Value $raw -Encoding utf8
+    Write-Host "Finished certification probe: $label (exit $exitCode)"
     return @{ ExitCode = $exitCode; Output = $raw }
 }
 
@@ -386,13 +389,26 @@ try {
     Assert-Success -Result $terminal -Label "Open Pane Arch Terminal -PrintOnly"
     $checks.terminal = "pass"
 
-    $shortcuts = Invoke-Capture -OutputPath (Join-Path $artifactRoot "shortcuts.txt") -Body {
-        & powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File $shortcutScript -DesktopPath $shortcutDesktopRoot -StartMenuPath $shortcutStartMenuRoot
+    if ($Mode -eq "PackageOnly") {
+        $shortcuts = Invoke-Capture -OutputPath (Join-Path $artifactRoot "shortcuts.txt") -Body {
+            & powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File $shortcutScript -DesktopPath $shortcutDesktopRoot -StartMenuPath $shortcutStartMenuRoot -PrintOnly
+        }
+        Assert-Success -Result $shortcuts -Label "Install Pane Shortcuts -PrintOnly"
+        foreach ($shortcut in @("Pane.lnk", "Pane Arch.lnk", "Pane Shared Folder.lnk")) {
+            if ($shortcuts.Output -notmatch [regex]::Escape($shortcut)) {
+                throw "Shortcut print-only validation did not include expected shortcut: $shortcut"
+            }
+        }
     }
-    Assert-Success -Result $shortcuts -Label "Install Pane Shortcuts"
-    foreach ($shortcut in @("Pane.lnk", "Pane Arch.lnk", "Pane Shared Folder.lnk")) {
-        Assert-File -BasePath $shortcutDesktopRoot -RelativePath $shortcut
-        Assert-File -BasePath $shortcutStartMenuRoot -RelativePath $shortcut
+    else {
+        $shortcuts = Invoke-Capture -OutputPath (Join-Path $artifactRoot "shortcuts.txt") -Body {
+            & powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File $shortcutScript -DesktopPath $shortcutDesktopRoot -StartMenuPath $shortcutStartMenuRoot
+        }
+        Assert-Success -Result $shortcuts -Label "Install Pane Shortcuts"
+        foreach ($shortcut in @("Pane.lnk", "Pane Arch.lnk", "Pane Shared Folder.lnk")) {
+            Assert-File -BasePath $shortcutDesktopRoot -RelativePath $shortcut
+            Assert-File -BasePath $shortcutStartMenuRoot -RelativePath $shortcut
+        }
     }
     $checks.shortcuts = "pass"
 

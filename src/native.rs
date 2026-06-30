@@ -1597,7 +1597,8 @@ mod windows_whp {
         WHV_RUN_VP_EXIT_REASON_UNRECOVERABLE_EXCEPTION, WHV_RUN_VP_EXIT_REASON_X64_APIC_EOI,
         WHV_RUN_VP_EXIT_REASON_X64_CPUID, WHV_RUN_VP_EXIT_REASON_X64_HALT,
         WHV_RUN_VP_EXIT_REASON_X64_INTERRUPT_WINDOW, WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS,
-        WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS, WHV_X64_LOCAL_APIC_EMULATION_MODE_XAPIC,
+        WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS, WHV_X64_LOCAL_APIC_EMULATION_MODE_NONE,
+        WHV_X64_LOCAL_APIC_EMULATION_MODE_XAPIC,
     };
     use super::{
         base_emulator_export_checks, base_export_checks, NativeBlockIoHandler,
@@ -1622,13 +1623,22 @@ mod windows_whp {
     const LINUX_ENTRY_PROBE_EXIT_BUDGET: usize = 131072;
     const LINUX_ENTRY_PROBE_MINIMAL_EXIT_BUDGET: usize = 256;
     const LINUX_ENTRY_PROBE_TIMESLICE_MILLIS: u64 = 250;
+    /// Short time slice used while a device completion interrupt is pending. WHP may
+    /// drop a `WHvRequestInterrupt` delivery if the vCPU is briefly non-interruptible;
+    /// cancelling the run quickly lets the exit loop resample the line within a few
+    /// milliseconds instead of stalling the guest for a full default time slice, which
+    /// is what throttled virtio-blk storage I/O during the ext4 root mount.
+    const LINUX_ENTRY_PROBE_PENDING_IRQ_TIMESLICE_MILLIS: u64 = 4;
     const LINUX_ENTRY_PROBE_CANCEL_GRACE_SECONDS: u64 = 5;
-    const LINUX_ENTRY_PROBE_WALL_CLOCK_BUDGET_SECONDS: u64 = 90;
+    const LINUX_ENTRY_PROBE_WALL_CLOCK_BUDGET_SECONDS: u64 = 150;
     const LINUX_ENTRY_PROBE_TOTAL_BUDGET_SECONDS: u64 = 300;
-    const LINUX_ENTRY_PROBE_STORAGE_TOTAL_BUDGET_SECONDS: u64 = 1200;
+    const LINUX_ENTRY_PROBE_STORAGE_TOTAL_BUDGET_SECONDS: u64 = 900;
     const LINUX_ENTRY_PROBE_MODULE_LOAD_BUDGET_SECONDS: u64 = 90;
-    const LINUX_ENTRY_PROBE_ROOT_MOUNT_BUDGET_SECONDS: u64 = 120;
+    const LINUX_ENTRY_PROBE_ROOT_MOUNT_BUDGET_SECONDS: u64 = 600;
     const LINUX_ENTRY_PROBE_ROOT_MOUNT_TIMER_PULSE_SECONDS: u64 = 1;
+    /// Wall-clock cadence for the synthetic I/O APIC IRQ0 timer tick. ~1kHz keeps
+    /// guest jiffies advancing briskly through boot without flooding the exit loop.
+    const IOAPIC_TIMER_TICK_INTERVAL_MILLIS: u64 = 1;
     const LINUX_ENTRY_PROBE_ROOT_MOUNT_TIMER_MAX_PULSES: u32 = 16;
     const LINUX_ENTRY_PROBE_TRACE_HEAD: usize = 384;
     const LINUX_ENTRY_PROBE_TRACE_TAIL: usize = 384;
@@ -1746,6 +1756,8 @@ mod windows_whp {
     const WHV_X64_INTERRUPT_TYPE_FIXED: u64 = 0;
     const WHV_X64_INTERRUPT_DESTINATION_MODE_PHYSICAL: u64 = 0;
     const WHV_X64_INTERRUPT_TRIGGER_MODE_EDGE: u64 = 0;
+    #[allow(dead_code)]
+    const WHV_X64_INTERRUPT_TRIGGER_MODE_LEVEL: u64 = 1;
     const WHV_X64_REGISTER_APIC_TPR: u32 = 0x0000_3008;
     const WHV_X64_REGISTER_APIC_PPR: u32 = 0x0000_300a;
     const WHV_X64_REGISTER_APIC_ISR0: u32 = 0x0000_3010;
@@ -2521,6 +2533,237 @@ mod windows_whp {
         ok
     }
 
+    /// Emulate a guest MMIO access to the I/O APIC window through the live WHP
+    /// instruction emulator, routing the decoded access into the Pane I/O APIC
+    /// device model. Returns true if WHP completed the emulation.
+    fn try_emulate_ioapic_mmio_exit(
+        deps: WhpMmioEmulationDeps<'_>,
+        exit_context: &[u8],
+        ioapic: &mut crate::ioapic::PaneIoapic,
+        report: &mut NativePartitionSmokeReport,
+    ) -> bool {
+        let Some(emulator) = deps.live_instruction_emulator else {
+            report.calls.push(NativeWhpCallReport {
+                name: "WHvEmulatorTryMmioEmulation(ioapic)",
+                hresult: None,
+                ok: false,
+                detail: "Live WHP instruction emulator is unavailable for the I/O APIC exit."
+                    .to_string(),
+            });
+            return false;
+        };
+        let (Some(get_virtual_processor_registers), Some(translate_gva)) =
+            (deps.get_virtual_processor_registers, deps.translate_gva)
+        else {
+            report.calls.push(NativeWhpCallReport {
+                name: "WHvEmulatorTryMmioEmulation(ioapic)",
+                hresult: None,
+                ok: false,
+                detail: "WHP register or GVA translation callbacks are unavailable for live I/O APIC emulation.".to_string(),
+            });
+            return false;
+        };
+        let (Some(vp_context), Some(memory_context)) = (
+            whp_exit_vp_context(exit_context),
+            whp_exit_memory_access_context(exit_context),
+        ) else {
+            report.calls.push(NativeWhpCallReport {
+                name: "WHvEmulatorTryMmioEmulation(ioapic)",
+                hresult: None,
+                ok: false,
+                detail: "WHP memory-access exit buffer was too small for the I/O APIC emulation contexts.".to_string(),
+            });
+            return false;
+        };
+
+        let mut handler = |access: crate::virtio::PaneVirtioMmioAccess| {
+            let offset = access.gpa.wrapping_sub(crate::ioapic::IOAPIC_BASE_GPA);
+            match access.kind {
+                crate::virtio::PaneVirtioMmioAccessKind::Write => {
+                    let mut bytes = [0_u8; 4];
+                    let len = access.data.len().min(4);
+                    bytes[..len].copy_from_slice(&access.data[..len]);
+                    ioapic.mmio_write(offset, u32::from_le_bytes(bytes));
+                    crate::virtio::PaneVirtioMmioAccessOutcome {
+                        accepted: true,
+                        status: "ioapic-write",
+                        offset: Some(offset),
+                        read_data: Vec::new(),
+                        write_result: None,
+                        queue_execution: None,
+                        queue_execution_count: 0,
+                        detail: format!("I/O APIC MMIO write at offset 0x{offset:03x}."),
+                    }
+                }
+                crate::virtio::PaneVirtioMmioAccessKind::Read => {
+                    let value = ioapic.mmio_read(offset);
+                    let width = access.data.len().clamp(1, 4);
+                    crate::virtio::PaneVirtioMmioAccessOutcome {
+                        accepted: true,
+                        status: "ioapic-read",
+                        offset: Some(offset),
+                        read_data: value.to_le_bytes()[..width].to_vec(),
+                        write_result: None,
+                        queue_execution: None,
+                        queue_execution_count: 0,
+                        detail: format!("I/O APIC MMIO read at offset 0x{offset:03x}."),
+                    }
+                }
+            }
+        };
+        let mut callback_context = WhpEmulatorMmioCallbackContext {
+            partition: deps.partition,
+            vp_index: 0,
+            get_virtual_processor_registers: Some(get_virtual_processor_registers),
+            set_virtual_processor_registers: Some(deps.set_virtual_processor_registers),
+            translate_gva: Some(translate_gva),
+            handler: &mut handler,
+            last_status: None,
+            last_detail: None,
+        };
+        let mut status = WhvEmulatorStatus { AsUINT32: 0 };
+        let hresult = unsafe {
+            (emulator.try_mmio_emulation)(
+                emulator.handle,
+                (&mut callback_context as *mut WhpEmulatorMmioCallbackContext<'_>).cast::<c_void>(),
+                &vp_context,
+                &memory_context,
+                &mut status,
+            )
+        };
+        let ok = hresult_succeeded(hresult)
+            && unsafe { status.AsUINT32 } & WHV_EMULATOR_STATUS_EMULATION_SUCCESSFUL != 0;
+        report.calls.push(hresult_call(
+            "WHvEmulatorTryMmioEmulation(ioapic)",
+            hresult,
+            if ok {
+                "WHP decoded and executed an I/O APIC instruction through Pane's device model."
+            } else {
+                "WHP could not complete I/O APIC instruction emulation through Pane's device model."
+            },
+        ));
+        ok
+    }
+
+    /// Emulate a guest local-APIC MMIO access (0xFEE00xxx) through Pane's userspace
+    /// LAPIC. Mirrors `try_emulate_ioapic_mmio_exit`. Returns whether emulation succeeded
+    /// and the write side effect (EOI / self-IPI) the exit loop must act on.
+    fn try_emulate_lapic_mmio_exit(
+        deps: WhpMmioEmulationDeps<'_>,
+        exit_context: &[u8],
+        lapic: &mut crate::lapic::PaneLapic,
+        report: &mut NativePartitionSmokeReport,
+    ) -> (bool, crate::lapic::LapicWriteEffect) {
+        let none = crate::lapic::LapicWriteEffect::None;
+        let Some(emulator) = deps.live_instruction_emulator else {
+            report.calls.push(NativeWhpCallReport {
+                name: "WHvEmulatorTryMmioEmulation(lapic)",
+                hresult: None,
+                ok: false,
+                detail: "Live WHP instruction emulator is unavailable for the local-APIC exit."
+                    .to_string(),
+            });
+            return (false, none);
+        };
+        let (Some(get_virtual_processor_registers), Some(translate_gva)) =
+            (deps.get_virtual_processor_registers, deps.translate_gva)
+        else {
+            report.calls.push(NativeWhpCallReport {
+                name: "WHvEmulatorTryMmioEmulation(lapic)",
+                hresult: None,
+                ok: false,
+                detail: "WHP register or GVA translation callbacks are unavailable for live local-APIC emulation.".to_string(),
+            });
+            return (false, none);
+        };
+        let (Some(vp_context), Some(memory_context)) = (
+            whp_exit_vp_context(exit_context),
+            whp_exit_memory_access_context(exit_context),
+        ) else {
+            report.calls.push(NativeWhpCallReport {
+                name: "WHvEmulatorTryMmioEmulation(lapic)",
+                hresult: None,
+                ok: false,
+                detail: "WHP memory-access exit buffer was too small for the local-APIC emulation contexts.".to_string(),
+            });
+            return (false, none);
+        };
+
+        let mut write_effect = crate::lapic::LapicWriteEffect::None;
+        let mut handler = |access: crate::virtio::PaneVirtioMmioAccess| {
+            let offset = access.gpa.wrapping_sub(crate::lapic::LAPIC_BASE_GPA);
+            match access.kind {
+                crate::virtio::PaneVirtioMmioAccessKind::Write => {
+                    let mut bytes = [0_u8; 4];
+                    let len = access.data.len().min(4);
+                    bytes[..len].copy_from_slice(&access.data[..len]);
+                    let effect = lapic.mmio_write(offset, u32::from_le_bytes(bytes));
+                    if effect != crate::lapic::LapicWriteEffect::None {
+                        write_effect = effect;
+                    }
+                    crate::virtio::PaneVirtioMmioAccessOutcome {
+                        accepted: true,
+                        status: "lapic-write",
+                        offset: Some(offset),
+                        read_data: Vec::new(),
+                        write_result: None,
+                        queue_execution: None,
+                        queue_execution_count: 0,
+                        detail: format!("Local-APIC MMIO write at offset 0x{offset:03x}."),
+                    }
+                }
+                crate::virtio::PaneVirtioMmioAccessKind::Read => {
+                    let value = lapic.mmio_read(offset);
+                    let width = access.data.len().clamp(1, 4);
+                    crate::virtio::PaneVirtioMmioAccessOutcome {
+                        accepted: true,
+                        status: "lapic-read",
+                        offset: Some(offset),
+                        read_data: value.to_le_bytes()[..width].to_vec(),
+                        write_result: None,
+                        queue_execution: None,
+                        queue_execution_count: 0,
+                        detail: format!("Local-APIC MMIO read at offset 0x{offset:03x}."),
+                    }
+                }
+            }
+        };
+        let mut callback_context = WhpEmulatorMmioCallbackContext {
+            partition: deps.partition,
+            vp_index: 0,
+            get_virtual_processor_registers: Some(get_virtual_processor_registers),
+            set_virtual_processor_registers: Some(deps.set_virtual_processor_registers),
+            translate_gva: Some(translate_gva),
+            handler: &mut handler,
+            last_status: None,
+            last_detail: None,
+        };
+        let mut status = WhvEmulatorStatus { AsUINT32: 0 };
+        let hresult = unsafe {
+            (emulator.try_mmio_emulation)(
+                emulator.handle,
+                (&mut callback_context as *mut WhpEmulatorMmioCallbackContext<'_>).cast::<c_void>(),
+                &vp_context,
+                &memory_context,
+                &mut status,
+            )
+        };
+        let ok = hresult_succeeded(hresult)
+            && unsafe { status.AsUINT32 } & WHV_EMULATOR_STATUS_EMULATION_SUCCESSFUL != 0;
+        // LAPIC MMIO is extremely high-frequency (the guest polls TPR/EOI/etc constantly);
+        // logging every access grows the report into tens of thousands of entries and the
+        // incremental checkpoint writes that serialize it throttle the whole exit loop,
+        // starving the guest timer. Only record failures.
+        if !ok {
+            report.calls.push(hresult_call(
+                "WHvEmulatorTryMmioEmulation(lapic)",
+                hresult,
+                "WHP could not complete local-APIC instruction emulation through Pane's userspace LAPIC.",
+            ));
+        }
+        (ok, write_effect)
+    }
+
     pub(super) fn run_partition_smoke(
         run_fixture: bool,
         boot_image: Option<&NativeSerialBootImage>,
@@ -2854,7 +3097,13 @@ mod windows_whp {
             }
 
             if report.partition_created && report.processor_count_configured {
-                let apic_mode = WHV_X64_LOCAL_APIC_EMULATION_MODE_XAPIC;
+                // LocalApicEmulationMode=None: WHP does not emulate the local APIC, so the
+                // guest's 0xFEE00000 MMIO traps to Pane's userspace LAPIC, which owns
+                // interrupt priority, EOI, and the timer that drives jiffies. (WHP's XApic
+                // LAPIC would not deliver injected timer/virtio interrupts to a guest
+                // blocked during the ext4 mount; owning the LAPIC fixes that.)
+                let _ = WHV_X64_LOCAL_APIC_EMULATION_MODE_XAPIC;
+                let apic_mode = WHV_X64_LOCAL_APIC_EMULATION_MODE_NONE;
                 let hresult = set_partition_property(
                     partition,
                     WHV_PARTITION_PROPERTY_CODE_LOCAL_APIC_EMULATION_MODE,
@@ -2863,12 +3112,12 @@ mod windows_whp {
                 );
                 interrupt_controller_configured = hresult_succeeded(hresult);
                 report.calls.push(hresult_call(
-                    "WHvSetPartitionProperty(LocalApicEmulationMode=XApic)",
+                    "WHvSetPartitionProperty(LocalApicEmulationMode=None)",
                     hresult,
                     if interrupt_controller_configured {
-                        "Configured WHP xAPIC emulation so Pane can request native timer interrupts."
+                        "Disabled WHP's local APIC so Pane's userspace LAPIC owns interrupt delivery and the timer."
                     } else {
-                        "Could not configure WHP xAPIC emulation for native interrupt delivery."
+                        "Could not set LocalApicEmulationMode=None for the Pane userspace LAPIC."
                     },
                 ));
             }
@@ -3867,7 +4116,7 @@ mod windows_whp {
                 DecodedExit::MsrAccess { .. } => break,
                 DecodedExit::Cpuid { .. } => break,
                 DecodedExit::InterruptWindow => break,
-                DecodedExit::ApicEoi => break,
+                DecodedExit::ApicEoi { .. } => break,
                 DecodedExit::Canceled => break,
                 DecodedExit::Other => break,
             }
@@ -3925,6 +4174,10 @@ mod windows_whp {
             run_virtual_processor,
             cancel_run_virtual_processor,
         );
+        // Raise Windows timer resolution to 1 ms for the whole run so the exit loop is not
+        // throttled to ~14/sec by the default ~15.6 ms scheduler tick. The Pane userspace
+        // LAPIC injects interrupts from this loop, so loop rate sets the guest jiffy rate.
+        let _timer_resolution_guard = HighResolutionTimerGuard::acquire(1);
         let mut msr_state = default_linux_msr_state();
         let mut serial_state = Com1SerialState::default();
         let mut block_state = NativeBlockIoPortState::default();
@@ -3932,6 +4185,35 @@ mod windows_whp {
         let mut legacy_io_state = LegacyDeviceIoState::default();
         let mut virtio_block_device = virtio_block_logical_size_bytes
             .map(|bytes| crate::virtio::PaneVirtioMmioBlockDevice::new(bytes, true));
+        let mut ioapic = crate::ioapic::PaneIoapic::new();
+        // Pane-owned userspace local APIC (WHP runs with LocalApicEmulationMode=None, so
+        // the guest's 0xFEE00000 MMIO traps here). Owns interrupt priority, EOI, and the
+        // LAPIC timer that keeps guest jiffies advancing.
+        let mut lapic = crate::lapic::PaneLapic::new();
+        // Drive the guest timer asynchronously from a dedicated thread so jiffies keep
+        // advancing while the guest is blocked (e.g. an ext4 mount waiting on kthreads),
+        // independent of how often the exit loop reclaims the vCPU. Stopped after the run
+        // loop, before the partition is torn down.
+        let timer_injector = request_interrupt.map(|request_interrupt| {
+            AsyncTimerInjector::start(partition, request_interrupt, Duration::from_millis(1))
+        });
+        let mut last_timer_tick_at: Option<Instant> = None;
+        let mut ioapic_timer_tick_count: u64 = 0;
+        let mut virtio_irq_resample_count: u64 = 0;
+        // Cache of the most recent WHP exit context, so the top-of-loop resample can read
+        // the guest's interruptibility the way crosvm's whpx backend reads its cached
+        // `last_exit_context` instead of issuing an unreliable live register read.
+        let mut last_exit_context = [0_u8; 1024];
+        // Tally of decoded exit reasons, logged at the root-mount stall to diagnose why the
+        // exit loop throttles (e.g. whether the guest is exiting at all between completions).
+        let mut exit_reason_tally: std::collections::BTreeMap<&'static str, u64> =
+            std::collections::BTreeMap::new();
+        // Split of virtio resample outcomes: injected straight into the vCPU vs. deferred to
+        // an interrupt window because the cached exit context reported the guest not ready.
+        let mut virtio_resample_injected: u64 = 0;
+        let mut virtio_resample_armed: u64 = 0;
+        // Count of times the guest was found halt/idle-suspended and kicked awake.
+        let mut guest_halt_kick_count: u64 = 0;
         let mut timer_interrupt_requested = false;
         let mut timer_interrupt_acknowledged = false;
         let mut root_mount_timer_requested = false;
@@ -4123,6 +4405,68 @@ mod windows_whp {
                                 report,
                             );
                         }
+                        let virtio_pin = crate::virtio::PANE_VIRTIO_MMIO_IRQ as usize;
+                        let pin_state = ioapic.pin_debug(virtio_pin);
+                        let device_status = virtio_block_device
+                            .as_ref()
+                            .map(|device| device.interrupt_status)
+                            .unwrap_or(0);
+                        report.calls.push(NativeWhpCallReport {
+                            name: "VirtioMmioRootMountStallState",
+                            hresult: None,
+                            ok: false,
+                            detail: match pin_state {
+                                Some((vector, masked, level, remote_irr, asserted)) => format!(
+                                    "At root-mount stall: virtio I/O APIC pin {virtio_pin} vector=0x{vector:02x} masked={masked} level={level} remote_irr={remote_irr} line_asserted={asserted}; device interrupt_status=0x{device_status:08x}."
+                                ),
+                                None => format!(
+                                    "At root-mount stall: virtio I/O APIC pin {virtio_pin} has no redirection entry; device interrupt_status=0x{device_status:08x}."
+                                ),
+                            },
+                        });
+                        // Exit-loop diagnostics: how many iterations, how many cancels were
+                        // requested, how many virtio resamples fired, and the exit-reason mix.
+                        // This resolves whether the loop froze (few iterations / no cancels)
+                        // or pumped (many) during the stall.
+                        let tally = exit_reason_tally
+                            .iter()
+                            .map(|(name, count)| format!("{name}={count}"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        // Decode the cached exit context's interruptibility (same fields
+                        // deliver_virtio_pending_interrupt gates on), to see whether resamples
+                        // were deferred because InterruptionPending/InterruptShadow stuck set.
+                        let exec_state = read_u16(&last_exit_context, VP_CONTEXT_OFFSET);
+                        let last_ctx_rflags = read_u64(&last_exit_context, VP_CONTEXT_OFFSET + 32);
+                        let last_int_pending = (exec_state & (1 << 6)) != 0;
+                        let last_int_shadow = (exec_state & (1 << 12)) != 0;
+                        let last_if = (last_ctx_rflags & 0x200) != 0;
+                        report.calls.push(NativeWhpCallReport {
+                            name: "VirtioMmioRootMountLoopDiagnostics",
+                            hresult: None,
+                            ok: false,
+                            detail: format!(
+                                "exit_index={exit_index}, cancels_requested={}, virtio_resamples={virtio_irq_resample_count} (injected={virtio_resample_injected}, armed={virtio_resample_armed}), timer_ticks={ioapic_timer_tick_count}, halt_kicks={guest_halt_kick_count}; last_exit_ctx: interruption_pending={last_int_pending} interrupt_shadow={last_int_shadow} IF={last_if}; exit_reasons=[{tally}].",
+                                guarded_runner.cancel_request_count()
+                            ),
+                        });
+                        // Dump the guest local-APIC TPR/PPR/ISR/IRR at the stall. The timer
+                        // (vector 0x30, priority class 3) keeps delivering while the virtio
+                        // completion (0x23, class 2) does not, so capture whether 0x23 is
+                        // priority-blocked (TPR/PPR class >= 2) or stuck in-service (ISR bit
+                        // set without an EOI).
+                        if let Some(get_virtual_processor_registers) =
+                            get_virtual_processor_registers
+                        {
+                            capture_interrupt_delivery_snapshot(
+                                partition,
+                                get_virtual_processor_registers,
+                                interrupt_controller_state_readers,
+                                legacy_io_state.timer_interrupt_vector(),
+                                legacy_io_state.timer_interrupt_unmasked(),
+                                report,
+                            );
+                        }
                         report.calls.push(NativeWhpCallReport {
                             name: "LinuxEntryProbeRootMountBudget",
                             hresult: None,
@@ -4192,13 +4536,90 @@ mod windows_whp {
             }
 
             report.guest_exit_count = (exit_index + 1) as u32;
+            let _ = (
+                &mut last_timer_tick_at,
+                IOAPIC_TIMER_TICK_INTERVAL_MILLIS,
+                &timer_injector,
+                &mut virtio_resample_armed,
+                &mut interrupt_window_notification_armed,
+            );
+            // --- Pane userspace LAPIC service + delivery, run every exit-loop iteration ---
+            // 1) Drive the LAPIC timer (the guest's scheduler clock) at a fixed cadence so
+            //    jiffies advance even while the guest blocks. The adaptive short timeslice
+            //    keeps this loop running ~every few ms during the root mount, so the timer
+            //    keeps firing. Also pulse the I/O APIC pin-0 timer line if the guest routed
+            //    its tick there instead of the LAPIC timer.
+            let now = Instant::now();
+            if lapic
+                .service_timer(
+                    now,
+                    Duration::from_millis(IOAPIC_TIMER_TICK_INTERVAL_MILLIS),
+                )
+                .is_some()
+            {
+                ioapic_timer_tick_count += 1;
+            }
+            if let Some(delivery) = ioapic.pin_delivery_if_unmasked(0) {
+                // Edge IRQ0 tick: present a fresh edge to the I/O APIC each cadence and
+                // raise the guest-programmed vector into the LAPIC.
+                ioapic.service_irq(0, false);
+                if ioapic.service_irq(0, true).is_some() {
+                    lapic.raise_interrupt(delivery.vector, delivery.level_triggered);
+                }
+            }
+            // 2) Deliver the highest-priority pending vector to the vCPU when it can take
+            //    one. The Pane LAPIC chose the vector respecting TPR/PPR/ISR; inject it via
+            //    the pending-interruption register (the only path with LAPIC mode None).
+            if lapic.has_deliverable_vector()
+                && exit_context_ready_for_interrupt(&last_exit_context)
+            {
+                if let Some(vector) = lapic.take_deliverable_vector() {
+                    inject_pending_interruption_vector(
+                        partition,
+                        set_virtual_processor_registers,
+                        vector,
+                    );
+                    if virtio_resample_injected == 0 || virtio_resample_injected % 4096 == 0 {
+                        report.calls.push(NativeWhpCallReport {
+                            name: "PaneLapicVectorDelivered",
+                            hresult: None,
+                            ok: true,
+                            detail: format!(
+                                "Pane LAPIC injected vector 0x{vector:02x} via the pending-interruption register (delivery #{virtio_resample_injected})."
+                            ),
+                        });
+                    }
+                    virtio_resample_injected += 1;
+                }
+            }
             let root_mount_phase_active = report
                 .serial_text
                 .as_deref()
                 .map(linux_entry_probe_root_mount_active)
                 .unwrap_or(false);
+            // Run a short slice whenever a virtio completion is pending OR the guest is in
+            // the root-mount storage phase, so the exit loop reclaims control every few
+            // milliseconds and can pump the I/O APIC timer tick plus resample the virtio
+            // completion. Otherwise WHvRunVirtualProcessor only returns when the guest
+            // itself exits (~1/sec while it waits on storage I/O), which throttled the
+            // mount to roughly one block read per second.
+            let virtio_irq_pending = virtio_block_device
+                .as_ref()
+                .map(|device| device.interrupt_status != 0)
+                .unwrap_or(false);
+            let _ = (virtio_irq_pending, LINUX_ENTRY_PROBE_TIMESLICE_MILLIS);
+            // Always run a short slice. With the Pane userspace LAPIC, interrupts (timer,
+            // virtio, IPIs) are delivered from THIS loop via the pending-interruption
+            // register -- they cannot be injected asynchronously while the vCPU runs (that
+            // needs the WHP LAPIC we disabled). So the loop must reclaim the vCPU every few
+            // ms to keep the guest timer firing; otherwise jiffies advance only when the
+            // guest happens to exit (~14/sec), starving the ext4 mount. A short slice that
+            // the guest's own frequent MMIO/IO exits usually beat costs little during
+            // CPU-bound boot but keeps the timer alive when the guest blocks.
+            let run_timeslice =
+                Duration::from_millis(LINUX_ENTRY_PROBE_PENDING_IRQ_TIMESLICE_MILLIS);
             let cancel_count_before = guarded_runner.cancel_request_count();
-            let Some(run_result) = guarded_runner.run(report) else {
+            let Some(run_result) = guarded_runner.run_with_timeslice(report, run_timeslice) else {
                 if let Some(path) = checkpoint_path.as_deref() {
                     write_linux_entry_probe_checkpoint(
                         path,
@@ -4211,11 +4632,68 @@ mod windows_whp {
             };
             let hresult = run_result.hresult;
             let exit_context = run_result.exit_context;
+            last_exit_context = exit_context;
+            // Kick the guest out of any halt/idle suspend so it can take the pending timer
+            // or virtio interrupt. WHP runs HLT/MWAIT internally and WHvRequestInterrupt
+            // does not wake it, so without this the guest parks during the ext4 mount,
+            // jiffies stall, and the mount's kernel threads starve. (QEMU's whpx backend
+            // does the same.) Safe here: the vCPU is stopped between runs.
+            if let Some(get_virtual_processor_registers) = get_virtual_processor_registers {
+                if kick_guest_out_of_halt(
+                    partition,
+                    get_virtual_processor_registers,
+                    set_virtual_processor_registers,
+                ) {
+                    guest_halt_kick_count += 1;
+                }
+            }
             let run_ok = hresult_succeeded(hresult);
             let cancel_count_after = guarded_runner.cancel_request_count();
             let timeslice_cancelled = !run_ok && cancel_count_after > cancel_count_before;
             if timeslice_cancelled {
                 report.virtual_processor_ran = true;
+                // The guest was spinning (e.g. poll-idle waiting on a virtio completion)
+                // and Pane cancelled the run to regain control. If a virtio completion is
+                // still pending, deliver it now using this exit context's interruptibility:
+                // inject the vector straight into the vCPU when it is ready, otherwise arm
+                // an interrupt window. This is what lets a batched-readahead completion --
+                // which never yields its own exit -- reach the guest and unblock the mount.
+                let virtio_pending_on_cancel = virtio_block_device
+                    .as_ref()
+                    .map(|device| device.interrupt_status != 0)
+                    .unwrap_or(false);
+                if virtio_pending_on_cancel {
+                    if let Some(delivery) = ioapic
+                        .pin_delivery_if_unmasked(crate::virtio::PANE_VIRTIO_MMIO_IRQ as usize)
+                    {
+                        let injected = deliver_virtio_pending_interrupt(
+                            partition,
+                            request_interrupt,
+                            delivery.vector,
+                        );
+                        if !injected {
+                            interrupt_window_notification_armed = true;
+                        }
+                        if virtio_irq_resample_count == 0 || virtio_irq_resample_count % 256 == 0 {
+                            report.calls.push(NativeWhpCallReport {
+                                name: "VirtioMmioInterruptResampled",
+                                hresult: None,
+                                ok: true,
+                                detail: format!(
+                                    "Re-delivered pending virtio-MMIO vector 0x{:02x} on a time-slice cancel (resample #{}, {}); awaiting guest InterruptACK.",
+                                    delivery.vector,
+                                    virtio_irq_resample_count,
+                                    if injected {
+                                        "pending-interruption inject"
+                                    } else {
+                                        "interrupt-window armed"
+                                    }
+                                ),
+                            });
+                        }
+                        virtio_irq_resample_count += 1;
+                    }
+                }
                 report.calls.push(NativeWhpCallReport {
                     name: "LinuxEntryProbeTimeslice",
                     hresult: Some(format_hresult(hresult)),
@@ -4271,6 +4749,9 @@ mod windows_whp {
 
             let decoded_exit = decode_exit_context(&exit_context, report);
             trace_native_device_dispatch(&decoded_exit, report);
+            *exit_reason_tally
+                .entry(decoded_exit_kind(&decoded_exit))
+                .or_insert(0) += 1;
 
             match decoded_exit {
                 DecodedExit::MemoryAccess { gpa, .. }
@@ -4308,36 +4789,49 @@ mod windows_whp {
                     );
                     if emulated {
                         last_progress_at = Instant::now();
+                        // On the completion (interrupt_status 0 -> non-zero), deliver the
+                        // guest-programmed vector straight into the vCPU via the
+                        // pending-interruption register. Pane injects directly (crosvm/QEMU
+                        // WHPX strategy) rather than through the WHP local APIC, so the I/O
+                        // APIC remote-IRR coalescing must NOT gate delivery: a level line
+                        // whose remote IRR was never cleared (no EOI exit fires for a
+                        // directly-injected vector) would otherwise coalesce away the next
+                        // completion -- exactly what stalled a 32-deep inode-table readahead
+                        // batch during the ext4 root mount. Use pin_delivery_if_unmasked,
+                        // which returns the vector whenever the pin is programmed and
+                        // unmasked, ignoring remote IRR.
+                        let irq = crate::virtio::PANE_VIRTIO_MMIO_IRQ as usize;
                         if interrupt_status_before == 0 && device.interrupt_status != 0 {
-                            let irq = crate::virtio::PANE_VIRTIO_MMIO_IRQ as u8;
-                            let vector = legacy_io_state.irq_vector(irq);
-                            let unmasked = legacy_io_state.irq_unmasked(irq);
-                            if let Some(request_interrupt) = request_interrupt {
-                                let _ = request_native_virtio_mmio_interrupt(
-                                    partition,
-                                    request_interrupt,
-                                    irq,
-                                    vector,
-                                    unmasked,
-                                    report,
-                                );
-                            } else {
+                            // Completion: assert the I/O APIC line and raise the guest-
+                            // programmed vector into the Pane LAPIC. The exit-loop delivery
+                            // step injects it into the vCPU when the guest can take it.
+                            if let Some(delivery) = ioapic.service_irq(irq, true) {
+                                lapic.raise_interrupt(delivery.vector, delivery.level_triggered);
                                 report.calls.push(NativeWhpCallReport {
                                     name: "VirtioMmioInterruptRequested",
                                     hresult: None,
-                                    ok: false,
+                                    ok: true,
                                     detail: format!(
-                                        "Virtio-MMIO completion set interrupt_status=0x{:08x}, but WHvRequestInterrupt is unavailable; irq={irq}, vector=0x{vector:02x}, irq_unmasked={unmasked}.",
-                                        device.interrupt_status
+                                        "Virtio-MMIO completion raised vector 0x{:02x} into the Pane LAPIC (level={}).",
+                                        delivery.vector, delivery.level_triggered
                                     ),
+                                });
+                            } else {
+                                report.calls.push(NativeWhpCallReport {
+                                    name: "VirtioMmioInterruptCoalesced",
+                                    hresult: None,
+                                    ok: true,
+                                    detail: "Virtio-MMIO line asserted but its I/O APIC pin is masked, not programmed, or remote IRR is still set.".to_string(),
                                 });
                             }
                         } else if interrupt_status_before != 0 && device.interrupt_status == 0 {
+                            // Guest cleared the device interrupt status: deassert the line.
+                            ioapic.service_irq(irq, false);
                             report.calls.push(NativeWhpCallReport {
                                 name: "VirtioMmioInterruptAcknowledged",
                                 hresult: None,
                                 ok: true,
-                                detail: "Guest acknowledged the pending virtio-MMIO interrupt through the interrupt-ack register.".to_string(),
+                                detail: "Guest acknowledged the virtio-MMIO interrupt; Pane deasserted the I/O APIC line.".to_string(),
                             });
                         }
                         if let Some(path) = checkpoint_path.as_deref() {
@@ -4348,6 +4842,56 @@ mod windows_whp {
                                 probe_started_at,
                             );
                             last_checkpoint_at = Instant::now();
+                        }
+                        continue;
+                    }
+                    break;
+                }
+                DecodedExit::MemoryAccess { gpa, .. }
+                    if crate::ioapic::ioapic_contains_gpa(gpa) =>
+                {
+                    let deps = WhpMmioEmulationDeps {
+                        partition,
+                        get_virtual_processor_registers,
+                        set_virtual_processor_registers,
+                        translate_gva,
+                        live_instruction_emulator,
+                    };
+                    if try_emulate_ioapic_mmio_exit(deps, &exit_context, &mut ioapic, report) {
+                        last_progress_at = Instant::now();
+                        continue;
+                    }
+                    break;
+                }
+                DecodedExit::MemoryAccess { gpa, .. } if crate::lapic::lapic_contains_gpa(gpa) => {
+                    let deps = WhpMmioEmulationDeps {
+                        partition,
+                        get_virtual_processor_registers,
+                        set_virtual_processor_registers,
+                        translate_gva,
+                        live_instruction_emulator,
+                    };
+                    let (emulated, write_effect) =
+                        try_emulate_lapic_mmio_exit(deps, &exit_context, &mut lapic, report);
+                    if emulated {
+                        last_progress_at = Instant::now();
+                        match write_effect {
+                            crate::lapic::LapicWriteEffect::EndOfInterrupt => {
+                                // Guest acknowledged an interrupt. Clear the LAPIC ISR; if
+                                // it was a level line, resample it through the I/O APIC.
+                                if let Some(vector) = lapic.complete_eoi() {
+                                    if let Some(delivery) = ioapic.end_of_interrupt(vector) {
+                                        lapic.raise_interrupt(
+                                            delivery.vector,
+                                            delivery.level_triggered,
+                                        );
+                                    }
+                                }
+                            }
+                            crate::lapic::LapicWriteEffect::SelfIpi { vector } => {
+                                lapic.raise_interrupt(vector, false);
+                            }
+                            crate::lapic::LapicWriteEffect::None => {}
                         }
                         continue;
                     }
@@ -4640,7 +5184,53 @@ mod windows_whp {
                 }
                 DecodedExit::Halt => {
                     report.halt_observed = true;
-                    break;
+                    // The guest idle loop halts (HLT) waiting for an interrupt. A halted
+                    // vCPU has IF=1 and is parked waiting, so WHvRequestInterrupt wakes it
+                    // reliably -- unlike the parked MWAIT/poll state, where a fire-and-forget
+                    // request was dropped and stranded the batched-readahead completion
+                    // during the ext4 root mount. Inject any pending virtio completion and
+                    // pulse the I/O APIC timer, then resume instead of ending the probe.
+                    let virtio_pending_now = virtio_block_device
+                        .as_ref()
+                        .map(|device| device.interrupt_status != 0)
+                        .unwrap_or(false);
+                    if virtio_pending_now {
+                        if let Some(delivery) = ioapic
+                            .pin_delivery_if_unmasked(crate::virtio::PANE_VIRTIO_MMIO_IRQ as usize)
+                        {
+                            // A halted vCPU is interruptible; deliver the completion vector
+                            // through the WHP local APIC (WHvRequestInterrupt) so it wakes
+                            // and runs the virtio ISR.
+                            let injected = deliver_virtio_pending_interrupt(
+                                partition,
+                                request_interrupt,
+                                delivery.vector,
+                            );
+                            last_progress_at = Instant::now();
+                            report.calls.push(NativeWhpCallReport {
+                                name: "VirtioMmioHaltInterruptDelivered",
+                                hresult: None,
+                                ok: injected,
+                                detail: format!(
+                                    "Guest halted with a pending virtio-MMIO completion; delivered vector 0x{:02x} via WHvRequestInterrupt (ok={injected}).",
+                                    delivery.vector
+                                ),
+                            });
+                        }
+                    }
+                    // Pulse the I/O APIC timer so the guest's jiffies/scheduler advance and
+                    // a halted idle vCPU is woken even when no virtio completion is pending.
+                    if deliver_ioapic_timer_tick(
+                        &mut ioapic,
+                        partition,
+                        request_interrupt,
+                        ioapic_timer_tick_count,
+                        report,
+                    ) {
+                        ioapic_timer_tick_count += 1;
+                    }
+                    last_timer_tick_at = Some(Instant::now());
+                    continue;
                 }
                 DecodedExit::MemoryAccess {
                     access_type,
@@ -4689,6 +5279,18 @@ mod windows_whp {
                     }
 
                     let next_rip = rip + u64::from(instruction_length);
+                    // Mask MONITOR/MWAIT (CPUID.01H:ECX[3]) so the guest idle loop falls
+                    // back to HLT instead of mwait_idle. A vCPU parked in MWAIT does not
+                    // raise an interrupt-window exit and WHP does not deliver a
+                    // fire-and-forget WHvRequestInterrupt to it, which stranded the virtio
+                    // completion interrupt for batched readahead during the ext4 root mount.
+                    // A HLT idle gives Pane a halt exit on which to inject the pending
+                    // completion interrupt and resume.
+                    let result_rcx = if leaf == 1 {
+                        default_rcx & !(1 << 3)
+                    } else {
+                        default_rcx
+                    };
                     if !set_cpuid_result_and_advance_rip(
                         partition,
                         set_virtual_processor_registers,
@@ -4697,7 +5299,7 @@ mod windows_whp {
                             subleaf,
                             rax: default_rax,
                             rbx: default_rbx,
-                            rcx: default_rcx,
+                            rcx: result_rcx,
                             rdx: default_rdx,
                             next_rip,
                         },
@@ -4742,6 +5344,46 @@ mod windows_whp {
                     }
                 }
                 DecodedExit::InterruptWindow => {
+                    // Deliver a pending virtio completion first. An interrupt-window exit
+                    // means the guest can now take a maskable interrupt, so injecting the
+                    // vector directly into the vCPU via the pending-interruption register
+                    // lands reliably. pin_delivery_if_unmasked bypasses the (possibly
+                    // stuck) remote_irr coalesce; the guest's later local-APIC EOI clears it.
+                    let virtio_pending_now = virtio_block_device
+                        .as_ref()
+                        .map(|device| device.interrupt_status != 0)
+                        .unwrap_or(false);
+                    if virtio_pending_now {
+                        if let Some(delivery) = ioapic
+                            .pin_delivery_if_unmasked(crate::virtio::PANE_VIRTIO_MMIO_IRQ as usize)
+                        {
+                            let injected = deliver_virtio_pending_interrupt(
+                                partition,
+                                request_interrupt,
+                                delivery.vector,
+                            );
+                            if interrupt_window_notification_armed {
+                                interrupt_window_notification_armed =
+                                    !disarm_timer_interrupt_window_notification(
+                                        partition,
+                                        set_virtual_processor_registers,
+                                        "virtio-interrupt-window-delivered",
+                                        report,
+                                    );
+                            }
+                            report.calls.push(NativeWhpCallReport {
+                                name: "VirtioMmioInterruptWindowDelivered",
+                                hresult: None,
+                                ok: injected,
+                                detail: format!(
+                                    "Injected pending virtio-MMIO vector 0x{:02x} via the pending-interruption register on an interrupt-window exit (ok={injected}).",
+                                    delivery.vector
+                                ),
+                            });
+                            last_progress_at = Instant::now();
+                            continue;
+                        }
+                    }
                     if timer_interrupt_requested {
                         if interrupt_window_notification_armed {
                             interrupt_window_notification_armed =
@@ -4846,20 +5488,32 @@ mod windows_whp {
                         });
                     }
                 }
-                DecodedExit::ApicEoi => {
+                DecodedExit::ApicEoi { vector } => {
                     if timer_interrupt_requested {
                         timer_interrupt_acknowledged = true;
                     }
                     if root_mount_timer_requested {
                         root_mount_timer_acknowledged = true;
                     }
+                    // Resample the level-triggered virtio line through the I/O APIC: the
+                    // guest just acknowledged `vector`, so clear remote IRR and, if the
+                    // device still holds the line asserted, re-deliver so the next batch
+                    // of completions is delivered instead of stalling. Deliver through the
+                    // WHP local APIC via WHvRequestInterrupt (XApic-correct mechanism).
+                    if let Some(delivery) = ioapic.end_of_interrupt(vector as u8) {
+                        deliver_virtio_pending_interrupt(
+                            partition,
+                            request_interrupt,
+                            delivery.vector,
+                        );
+                    }
                     report.calls.push(NativeWhpCallReport {
                         name: "ApicEoiObserved",
                         hresult: None,
                         ok: true,
-                        detail:
-                            "Guest reached an APIC EOI exit; Pane observed it and will resume the vCPU."
-                                .to_string(),
+                        detail: format!(
+                            "Guest acknowledged vector 0x{vector:02x}; Pane resampled the I/O APIC line and will resume the vCPU."
+                        ),
                     });
                 }
                 DecodedExit::Canceled => {
@@ -5187,7 +5841,7 @@ mod windows_whp {
         });
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, unused_variables)]
     fn maybe_prime_root_mount_timer(
         partition: *mut c_void,
         get_virtual_processor_registers: Option<WhvGetVirtualProcessorRegisters>,
@@ -5198,6 +5852,14 @@ mod windows_whp {
         probe_started_at: Instant,
         pulse_number: u32,
     ) -> bool {
+        // Disabled: this primed the root-mount timer through WHvRequestInterrupt (the WHP
+        // local APIC). All interrupt delivery now uses the pending-interruption register
+        // (see deliver_ioapic_timer_tick / deliver_virtio_pending_interrupt); mixing a
+        // LAPIC-delivered timer pulse back in corrupts the LAPIC ISR/EOI state. The main
+        // exit loop already pumps the timer every iteration during the storage phase. The
+        // body below is retained (unreachable) so the parameters stay referenced.
+        return false;
+        #[allow(unreachable_code)]
         let root_mount_active = report
             .serial_text
             .as_deref()
@@ -5304,14 +5966,220 @@ mod windows_whp {
         ok
     }
 
-    fn request_native_virtio_mmio_interrupt(
+    /// Fires the guest timer interrupt asynchronously at a fixed rate from a dedicated
+    /// thread, decoupled from the WHP exit loop.
+    ///
+    /// The exit-loop-driven I/O APIC timer tick only fires when the loop reclaims the
+    /// vCPU. When the guest blocks (an ext4 mount waiting on jbd2/kthreads) it stops
+    /// generating exits, the loop iterates rarely, jiffies crawl, and the mount's kernel
+    /// threads starve -- which stalls the root mount regardless of the storage backend
+    /// (a synchronous, interrupt-free block device stalled identically). An independent
+    /// timer thread keeps jiffies advancing at a steady rate regardless of guest idle,
+    /// the way real hypervisors deliver the periodic timer. It must be stopped before the
+    /// partition is torn down, since it holds the partition handle.
+    #[allow(dead_code)]
+    struct AsyncTimerInjector {
+        shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        vector: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        ticks: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    #[allow(dead_code)]
+    impl AsyncTimerInjector {
+        fn start(
+            partition: *mut c_void,
+            request_interrupt: WhvRequestInterrupt,
+            interval: Duration,
+        ) -> Self {
+            use std::sync::atomic::Ordering;
+            let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let vector = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let ticks = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let partition_address = partition as usize;
+            let thread_shutdown = shutdown.clone();
+            let thread_vector = vector.clone();
+            let thread_ticks = ticks.clone();
+            let handle = std::thread::spawn(move || {
+                while !thread_shutdown.load(Ordering::Relaxed) {
+                    std::thread::sleep(interval);
+                    let vector = thread_vector.load(Ordering::Relaxed);
+                    if vector == 0 {
+                        continue;
+                    }
+                    let interrupt = WhvInterruptControl {
+                        _bitfield: whv_x64_interrupt_control(
+                            WHV_X64_INTERRUPT_TYPE_FIXED,
+                            WHV_X64_INTERRUPT_DESTINATION_MODE_PHYSICAL,
+                            WHV_X64_INTERRUPT_TRIGGER_MODE_EDGE,
+                            0,
+                        ),
+                        Destination: 0,
+                        Vector: vector,
+                    };
+                    let hresult = unsafe {
+                        request_interrupt(
+                            partition_address as *mut c_void,
+                            &interrupt,
+                            mem::size_of::<WhvInterruptControl>() as u32,
+                        )
+                    };
+                    if hresult_succeeded(hresult) {
+                        thread_ticks.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+            Self {
+                shutdown,
+                vector,
+                ticks,
+                handle: Some(handle),
+            }
+        }
+
+        /// Update the timer vector the thread injects (0 = the guest has not programmed
+        /// the I/O APIC timer pin yet, so the thread idles).
+        fn set_vector(&self, vector: u32) {
+            self.vector
+                .store(vector, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        fn tick_count(&self) -> u64 {
+            self.ticks.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        fn stop(&mut self) {
+            self.shutdown
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    impl Drop for AsyncTimerInjector {
+        fn drop(&mut self) {
+            self.stop();
+        }
+    }
+
+    /// Deliver one periodic timer tick through the I/O APIC IRQ0/pin0 path. Linux
+    /// (with acpi=off + IOAPIC) routes its boot timer there (`..TIMER: vector=0x30
+    /// apic1=0 pin1=0`) and freezes with jiffies stuck unless the line ticks. Pane
+    /// has no 8254 PIT, so it re-arms the edge and injects the guest-programmed pin-0
+    /// vector. Returns true if a tick was delivered (pin 0 is programmed and unmasked).
+    /// `tick_index` is used to keep report logging sparse.
+    fn deliver_ioapic_timer_tick(
+        ioapic: &mut crate::ioapic::PaneIoapic,
         partition: *mut c_void,
-        request_interrupt: WhvRequestInterrupt,
-        irq: u8,
-        vector: u8,
-        unmasked: bool,
+        request_interrupt: Option<WhvRequestInterrupt>,
+        tick_index: u64,
         report: &mut NativePartitionSmokeReport,
     ) -> bool {
+        // Edge-triggered IRQ0: deassert then assert to present a fresh edge each tick.
+        ioapic.service_irq(0, false);
+        let Some(delivery) = ioapic.service_irq(0, true) else {
+            return false;
+        };
+        // Deliver the timer vector through the WHP local APIC via WHvRequestInterrupt, the
+        // same path as the virtio completion. With LocalApicEmulationMode=XApic this is the
+        // correct mechanism; the LAPIC latches and delivers it.
+        let ok = deliver_virtio_pending_interrupt(partition, request_interrupt, delivery.vector);
+        // Log only the first tick and then every 256th, so jiffies-rate ticks do not
+        // flood the report.
+        if tick_index == 0 || tick_index % 256 == 0 {
+            report.calls.push(NativeWhpCallReport {
+                name: "NativeIoapicTimerTick",
+                hresult: None,
+                ok,
+                detail: format!(
+                    "Delivered I/O APIC IRQ0 timer tick #{tick_index} as vector 0x{:02x} via WHvRequestInterrupt.",
+                    delivery.vector
+                ),
+            });
+        }
+        ok
+    }
+
+    fn whv_x64_interrupt_control(
+        interrupt_type: u64,
+        destination_mode: u64,
+        trigger_mode: u64,
+        target_vtl: u64,
+    ) -> u64 {
+        (interrupt_type & 0xff)
+            | ((destination_mode & 0x0f) << 8)
+            | ((trigger_mode & 0x0f) << 12)
+            | ((target_vtl & 0xff) << 16)
+    }
+
+    /// Kick the guest out of a halt/idle suspend state so a pending interrupt (the timer
+    /// or a virtio completion) can be delivered. WHP services HLT/MWAIT internally without
+    /// returning an exit, and `WHvRequestInterrupt` does not reset that suspend state, so a
+    /// guest that blocks during the ext4 mount never wakes to take the timer -- jiffies
+    /// stall and the mount's kernel threads starve (the symptom seen with both the virtio
+    /// and the synchronous block backends). QEMU's whpx backend does the same kick
+    /// (`whpx_vcpu_kick_out_of_hlt`): read WHV_REGISTER_INTERNAL_ACTIVITY_STATE and clear
+    /// the Halt/Idle suspend bits. Must be called with the vCPU stopped (between
+    /// WHvRunVirtualProcessor calls). Returns true if the guest was suspended and kicked.
+    fn kick_guest_out_of_halt(
+        partition: *mut c_void,
+        get_virtual_processor_registers: WhvGetVirtualProcessorRegisters,
+        set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
+    ) -> bool {
+        let names = [WHV_REGISTER_INTERNAL_ACTIVITY_STATE];
+        let mut values = [whv_register64(0)];
+        let hresult = unsafe {
+            get_virtual_processor_registers(
+                partition,
+                0,
+                names.as_ptr(),
+                names.len() as u32,
+                values.as_mut_ptr(),
+            )
+        };
+        if !hresult_succeeded(hresult) {
+            return false;
+        }
+        let state = unsafe { values[0].reg64 };
+        // WHV_INTERNAL_ACTIVITY_REGISTER: bit0 StartupSuspend, bit1 HaltSuspend,
+        // bit2 IdleSuspend. Clear Halt+Idle so the guest resumes and can take a pending
+        // interrupt; leave StartupSuspend (AP startup) untouched.
+        const SUSPEND_MASK: u64 = 0b110;
+        if state & SUSPEND_MASK == 0 {
+            return false;
+        }
+        let cleared = state & !SUSPEND_MASK;
+        let write_values = [whv_register64(cleared)];
+        let hresult = unsafe {
+            set_virtual_processor_registers(
+                partition,
+                0,
+                names.as_ptr(),
+                names.len() as u32,
+                write_values.as_ptr(),
+            )
+        };
+        hresult_succeeded(hresult)
+    }
+
+    /// Deliver `vector` to the guest through the WHP in-platform local APIC via
+    /// `WHvRequestInterrupt` (fixed, edge-triggered, physical destination 0). This is the
+    /// correct mechanism when `LocalApicEmulationMode=XApic` (QEMU's whpx XApic path and
+    /// the way the working timer is delivered): the LAPIC latches the request in its IRR
+    /// and delivers it when the guest is interruptible and priority allows, so no
+    /// readiness check or interrupt-window dance is required. (The pending-interruption
+    /// register is only correct with `LocalApicEmulationMode=None` + a userspace APIC;
+    /// mixing it with WHP's XApic LAPIC corrupts the LAPIC ISR/EOI state after a few
+    /// interrupts.) Returns true if WHP accepted the request.
+    fn deliver_virtio_pending_interrupt(
+        partition: *mut c_void,
+        request_interrupt: Option<WhvRequestInterrupt>,
+        vector: u8,
+    ) -> bool {
+        let Some(request_interrupt) = request_interrupt else {
+            return false;
+        };
         let interrupt = WhvInterruptControl {
             _bitfield: whv_x64_interrupt_control(
                 WHV_X64_INTERRUPT_TYPE_FIXED,
@@ -5329,37 +6197,121 @@ mod windows_whp {
                 mem::size_of::<WhvInterruptControl>() as u32,
             )
         };
-        let ok = hresult_succeeded(hresult);
-        report.calls.push(hresult_call(
-            "WHvRequestInterrupt(virtio-mmio)",
-            hresult,
-            if ok {
-                "Requested a fixed edge-triggered virtio-MMIO interrupt for vCPU 0."
-            } else {
-                "Could not request the virtio-MMIO interrupt through WHP."
-            },
-        ));
-        report.calls.push(NativeWhpCallReport {
-            name: "VirtioMmioInterruptRequested",
-            hresult: None,
-            ok,
-            detail: format!(
-                "Requested virtio-MMIO IRQ {irq} as vector 0x{vector:02x}; irq_unmasked={unmasked}."
-            ),
-        });
-        ok
+        hresult_succeeded(hresult)
     }
 
-    fn whv_x64_interrupt_control(
-        interrupt_type: u64,
-        destination_mode: u64,
-        trigger_mode: u64,
-        target_vtl: u64,
-    ) -> u64 {
-        (interrupt_type & 0xff)
-            | ((destination_mode & 0x0f) << 8)
-            | ((trigger_mode & 0x0f) << 12)
-            | ((target_vtl & 0xff) << 16)
+    /// Raises the Windows multimedia timer resolution to `period` ms for its lifetime
+    /// (timeBeginPeriod / timeEndPeriod via winmm.dll). Without this, Windows' default
+    /// ~15.6 ms scheduler tick quantizes `recv_timeout`, thread wakeups, and the guarded
+    /// runner's main<->worker handoff, capping the exit loop near ~14 iterations/second --
+    /// far too slow to deliver the guest timer (the Pane LAPIC injects from this loop, so
+    /// loop rate == jiffy rate). At 1 ms resolution the loop runs hundreds of times per
+    /// second, so jiffies advance and the ext4 mount can make progress.
+    struct HighResolutionTimerGuard {
+        time_end_period: Option<unsafe extern "system" fn(u32) -> u32>,
+        period: u32,
+        acquired: bool,
+    }
+
+    impl HighResolutionTimerGuard {
+        fn acquire(period: u32) -> Self {
+            let module = unsafe { LoadLibraryA(b"winmm.dll\0".as_ptr().cast()) };
+            if module.is_null() {
+                return Self {
+                    time_end_period: None,
+                    period,
+                    acquired: false,
+                };
+            }
+            let begin = unsafe { GetProcAddress(module, b"timeBeginPeriod\0".as_ptr().cast()) };
+            let end = unsafe { GetProcAddress(module, b"timeEndPeriod\0".as_ptr().cast()) };
+            if begin.is_null() || end.is_null() {
+                return Self {
+                    time_end_period: None,
+                    period,
+                    acquired: false,
+                };
+            }
+            let begin: unsafe extern "system" fn(u32) -> u32 = unsafe { mem::transmute(begin) };
+            let end: unsafe extern "system" fn(u32) -> u32 = unsafe { mem::transmute(end) };
+            let acquired = unsafe { begin(period) } == 0; // TIMERR_NOERROR == 0
+            Self {
+                time_end_period: Some(end),
+                period,
+                acquired,
+            }
+        }
+    }
+
+    impl Drop for HighResolutionTimerGuard {
+        fn drop(&mut self) {
+            if self.acquired {
+                if let Some(end) = self.time_end_period {
+                    unsafe { end(self.period) };
+                }
+            }
+        }
+    }
+
+    /// Inject `vector` straight into the vCPU via the pending-interruption register. With
+    /// `LocalApicEmulationMode=None` there is no WHP LAPIC, so `WHvRequestInterrupt` has
+    /// nothing to route through; the pending-interruption register is the only injection
+    /// path. The Pane userspace LAPIC computes which vector is deliverable; this hands it
+    /// to the vCPU.
+    fn inject_pending_interruption_vector(
+        partition: *mut c_void,
+        set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
+        vector: u8,
+    ) -> bool {
+        // WHV_X64_PENDING_INTERRUPTION_REGISTER: bit0 InterruptionPending, bits1..=3
+        // InterruptionType (0 = interrupt), bits16..=31 InterruptionVector.
+        let value = 0x1_u64 | (u64::from(vector) << 16);
+        let names = [WHV_REGISTER_PENDING_INTERRUPTION];
+        let values = [whv_register64(value)];
+        let hresult = unsafe {
+            set_virtual_processor_registers(
+                partition,
+                0,
+                names.as_ptr(),
+                names.len() as u32,
+                values.as_ptr(),
+            )
+        };
+        hresult_succeeded(hresult)
+    }
+
+    /// True if the guest can take a maskable interrupt, read from the cached exit context
+    /// (ExecutionState InterruptionPending bit6 / InterruptShadow bit12 at
+    /// `VP_CONTEXT_OFFSET`, RFLAGS.IF bit9 at +32).
+    fn exit_context_ready_for_interrupt(exit_context: &[u8]) -> bool {
+        let execution_state = read_u16(exit_context, VP_CONTEXT_OFFSET);
+        let rflags = read_u64(exit_context, VP_CONTEXT_OFFSET + 32);
+        (execution_state & (1 << 6)) == 0
+            && (execution_state & (1 << 12)) == 0
+            && (rflags & 0x200) != 0
+    }
+
+    /// Arm the WHP interrupt-window (deliverability) notification without logging, so
+    /// it can be re-armed every exit-loop cadence while a device interrupt is pending.
+    /// The notification is one-shot; WHP auto-clears it once the vCPU runs, so reliable
+    /// delivery to a busy guest requires re-arming each iteration rather than once.
+    #[allow(dead_code)]
+    fn arm_interrupt_window_notification_quiet(
+        partition: *mut c_void,
+        set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
+    ) -> bool {
+        let register_names = [WHV_REGISTER_DELIVERABILITY_NOTIFICATIONS];
+        let register_values = [whv_register64(WHV_DELIVERABILITY_NOTIFICATION_INTERRUPT)];
+        let hresult = unsafe {
+            set_virtual_processor_registers(
+                partition,
+                0,
+                register_names.as_ptr(),
+                register_names.len() as u32,
+                register_values.as_ptr(),
+            )
+        };
+        hresult_succeeded(hresult)
     }
 
     fn arm_timer_interrupt_window_notification(
@@ -6083,6 +7035,21 @@ mod windows_whp {
             &mut self,
             report: &mut NativePartitionSmokeReport,
         ) -> Option<LinuxEntryProbeRunResult> {
+            self.run_with_timeslice(
+                report,
+                Duration::from_millis(LINUX_ENTRY_PROBE_TIMESLICE_MILLIS),
+            )
+        }
+
+        /// Run the guest for up to `timeslice` before asynchronously cancelling to
+        /// regain host control. A short `timeslice` is used while a device interrupt
+        /// is pending so a delivery WHP did not take is resampled within a few
+        /// milliseconds instead of stalling the guest for a full default time slice.
+        fn run_with_timeslice(
+            &mut self,
+            report: &mut NativePartitionSmokeReport,
+            timeslice: Duration,
+        ) -> Option<LinuxEntryProbeRunResult> {
             if self.request_tx.send(()).is_err() {
                 report.calls.push(NativeWhpCallReport {
                     name: "LinuxEntryProbeRunWorker",
@@ -6096,11 +7063,17 @@ mod windows_whp {
             }
 
             let run_started_at = Instant::now();
-            let mut next_cancel_at = Duration::from_millis(LINUX_ENTRY_PROBE_TIMESLICE_MILLIS);
+            let mut next_cancel_at = timeslice;
             let mut first_cancel_at = None;
 
+            // Poll the worker often enough that a short timeslice cancels on time:
+            // the poll interval must not exceed the timeslice, or a pending-interrupt
+            // resample would be delayed to the next poll tick.
+            let poll_interval = timeslice
+                .min(Duration::from_millis(25))
+                .max(Duration::from_millis(1));
             loop {
-                match self.result_rx.recv_timeout(Duration::from_millis(25)) {
+                match self.result_rx.recv_timeout(poll_interval) {
                     Ok(result) => return Some(result),
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                         let elapsed = run_started_at.elapsed();
@@ -6115,7 +7088,7 @@ mod windows_whp {
                         });
                         self.cancel_requests = self.cancel_requests.saturating_add(1);
                         first_cancel_at.get_or_insert_with(Instant::now);
-                        next_cancel_at += Duration::from_millis(LINUX_ENTRY_PROBE_TIMESLICE_MILLIS);
+                        next_cancel_at += timeslice;
 
                         if first_cancel_at
                             .map(|first| {
@@ -6818,6 +7791,7 @@ mod windows_whp {
             self.pic1_mask & PIC_IRQ0_TIMER_BIT == 0
         }
 
+        #[cfg(test)]
         fn irq_vector(&self, irq: u8) -> u8 {
             if irq < 8 {
                 let base = if self.pic1_vector_offset < 0x10 {
@@ -6831,6 +7805,7 @@ mod windows_whp {
             }
         }
 
+        #[cfg(test)]
         fn irq_unmasked(&self, irq: u8) -> bool {
             if irq < 8 {
                 self.pic1_mask & (1_u8 << irq) == 0
@@ -7607,9 +8582,26 @@ mod windows_whp {
             default_rdx: u64,
         },
         InterruptWindow,
-        ApicEoi,
+        ApicEoi {
+            vector: u32,
+        },
         Canceled,
         Other,
+    }
+
+    /// Short stable label for an exit, for the exit-reason tally used in stall diagnostics.
+    fn decoded_exit_kind(exit: &DecodedExit) -> &'static str {
+        match exit {
+            DecodedExit::MemoryAccess { .. } => "memory-access",
+            DecodedExit::IoPort { .. } => "io-port",
+            DecodedExit::Halt => "halt",
+            DecodedExit::MsrAccess { .. } => "msr",
+            DecodedExit::Cpuid { .. } => "cpuid",
+            DecodedExit::InterruptWindow => "interrupt-window",
+            DecodedExit::ApicEoi { .. } => "apic-eoi",
+            DecodedExit::Canceled => "canceled",
+            DecodedExit::Other => "other",
+        }
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7724,11 +8716,11 @@ mod windows_whp {
                 handler: "timer-interrupt",
                 action: "inject-timer-if-policy-allows",
             },
-            DecodedExit::ApicEoi => NativeDeviceDispatchDecision {
+            DecodedExit::ApicEoi { .. } => NativeDeviceDispatchDecision {
                 exit_reason: "x64-apic-eoi",
                 selector: "apic-eoi".to_string(),
-                handler: "timer-interrupt",
-                action: "record-interrupt-ack-and-resume",
+                handler: "ioapic,timer-interrupt",
+                action: "resample-level-irq-and-resume",
             },
             DecodedExit::Canceled => NativeDeviceDispatchDecision {
                 exit_reason: "canceled",
@@ -7890,13 +8882,22 @@ mod windows_whp {
             });
             DecodedExit::InterruptWindow
         } else if exit_reason == WHV_RUN_VP_EXIT_REASON_X64_APIC_EOI {
+            // WHV_X64_APIC_EOI_CONTEXT { InterruptVector: u32 } sits at the exit
+            // context union offset. WHP raises this exit for level-triggered EOIs.
+            let vector = exit_context
+                .get(MEMORY_CONTEXT_OFFSET..MEMORY_CONTEXT_OFFSET + 4)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(u32::from_le_bytes)
+                .unwrap_or(0);
             report.calls.push(NativeWhpCallReport {
                 name: "DecodeX64ApicEoi",
                 hresult: None,
                 ok: true,
-                detail: "Guest reached an APIC end-of-interrupt exit.".to_string(),
+                detail: format!(
+                    "Guest reached an APIC end-of-interrupt exit for vector 0x{vector:02x}."
+                ),
             });
-            DecodedExit::ApicEoi
+            DecodedExit::ApicEoi { vector }
         } else if exit_reason == WHV_RUN_VP_EXIT_REASON_CANCELED {
             report.calls.push(NativeWhpCallReport {
                 name: "DecodeCanceled",
@@ -8055,6 +9056,7 @@ mod windows_whp {
         };
         use crate::virtio::{PaneGuestMemory, PaneMmapGuestMemory};
         use std::ffi::c_void;
+        use vm_memory::{Bytes, GuestAddress, GuestMemory};
 
         struct TestWhpCallbackState {
             get_count: u32,
@@ -8119,13 +9121,13 @@ mod windows_whp {
         }
 
         struct TestGuestMemory {
-            bytes: Vec<u8>,
+            memory: PaneMmapGuestMemory,
         }
 
         impl TestGuestMemory {
             fn new(size: usize) -> Self {
                 Self {
-                    bytes: vec![0; size],
+                    memory: PaneMmapGuestMemory::new(0, size).expect("test guest memory"),
                 }
             }
 
@@ -8150,23 +9152,15 @@ mod windows_whp {
 
         impl crate::virtio::PaneGuestMemory for TestGuestMemory {
             fn read(&self, gpa: u64, bytes: &mut [u8]) -> Result<(), String> {
-                let start = gpa as usize;
-                let end = start + bytes.len();
-                if end > self.bytes.len() {
-                    return Err("guest read out of bounds".to_string());
-                }
-                bytes.copy_from_slice(&self.bytes[start..end]);
-                Ok(())
+                self.memory.read(gpa, bytes)
             }
 
             fn write(&mut self, gpa: u64, bytes: &[u8]) -> Result<(), String> {
-                let start = gpa as usize;
-                let end = start + bytes.len();
-                if end > self.bytes.len() {
-                    return Err("guest write out of bounds".to_string());
-                }
-                self.bytes[start..end].copy_from_slice(bytes);
-                Ok(())
+                self.memory.write(gpa, bytes)
+            }
+
+            fn rust_vmm_memory(&self) -> Option<&vm_memory::GuestMemoryMmap<()>> {
+                Some(self.memory.rust_vmm_memory())
             }
         }
 
@@ -8540,10 +9534,10 @@ mod windows_whp {
                 context.last_status.as_deref(),
                 Some("queue-notify-executed")
             );
-            assert_eq!(
-                context.last_detail.as_deref(),
-                Some("Queue notify 0 executed 1 request(s).")
-            );
+            assert!(context
+                .last_detail
+                .as_deref()
+                .is_some_and(|detail| detail.starts_with("Queue notify 0 executed 1 request(s)")));
             drop(context);
             drop(handler);
 
@@ -8577,8 +9571,10 @@ mod windows_whp {
 
         #[test]
         fn mapped_guest_memory_view_rejects_unmapped_or_cross_region_access() {
-            let first = PaneMmapGuestMemory::new(0x1000, 0x1000).expect("first region");
-            let second = PaneMmapGuestMemory::new(0x3000, 0x1000).expect("second region");
+            let shared = PaneMmapGuestMemory::from_ranges(&[(0x1000, 0x1000), (0x3000, 0x1000)])
+                .expect("shared guest memory");
+            let first = shared.view(0x1000, 0x1000).expect("first region");
+            let second = shared.view(0x3000, 0x1000).expect("second region");
             let mut regions = vec![
                 MappedGuestRegion {
                     label: "first".to_string(),
@@ -8599,6 +9595,15 @@ mod windows_whp {
             assert!(view.read(0x1ffc, &mut bytes).is_err());
             assert!(view.write(0x2000, &[1, 2, 3, 4]).is_err());
             assert!(view.read(0x3000, &mut bytes[..4]).is_ok());
+
+            let rust_vmm_memory = view
+                .rust_vmm_memory()
+                .expect("WHP view must expose rust-vmm guest memory");
+            assert_eq!(rust_vmm_memory.num_regions(), 2);
+            rust_vmm_memory
+                .read_slice(&mut bytes[..4], GuestAddress(0x3000))
+                .unwrap();
+            assert_eq!(&bytes[..4], &[0, 0, 0, 0]);
         }
 
         #[test]
@@ -10109,10 +11114,12 @@ mod windows_whp {
 
             let mut eoi_context = [0_u8; 128];
             eoi_context[..4].copy_from_slice(&WHV_RUN_VP_EXIT_REASON_X64_APIC_EOI.to_le_bytes());
+            // WHV_X64_APIC_EOI_CONTEXT.InterruptVector at the union offset (48).
+            eoi_context[48..52].copy_from_slice(&0x33_u32.to_le_bytes());
             let mut eoi_report = base_report();
             assert!(matches!(
                 decode_exit_context(&eoi_context, &mut eoi_report),
-                DecodedExit::ApicEoi
+                DecodedExit::ApicEoi { vector: 0x33 }
             ));
             assert!(eoi_report
                 .calls

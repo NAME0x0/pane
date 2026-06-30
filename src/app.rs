@@ -27,9 +27,10 @@ use crate::{
     bootstrap::{render_bootstrap_script, render_update_script},
     cli::{
         AppStatusArgs, BundleArgs, Cli, Commands, ConnectArgs, DoctorArgs, EnvironmentsArgs,
-        InitArgs, LaunchArgs, LogsArgs, NativeBootSpikeArgs, NativeFoundationArgs,
-        NativeKernelPlanArgs, NativePreflightArgs, OnboardArgs, RelayArgs, RepairArgs, ResetArgs,
-        RuntimeArgs, SetupUserArgs, ShareArgs, StatusArgs, StopArgs, TerminalArgs, UpdateArgs,
+        InitArgs, InstallDesktopArgs, LaunchArgs, LogsArgs, NativeBootSpikeArgs,
+        NativeFoundationArgs, NativeKernelPlanArgs, NativePreflightArgs, OnboardArgs,
+        ProvisionArgs, RelayArgs, RepairArgs, ResetArgs, RuntimeArgs, SetupUserArgs, ShareArgs,
+        StatusArgs, StopArgs, TerminalArgs, UpdateArgs, WorkspaceArgs,
     },
     error::{AppError, AppResult},
     model::{
@@ -511,6 +512,24 @@ struct PaneInitramfsDriverMetadata {
     block_io_data_port_offset: u16,
     block_io_block_size_bytes: u64,
     generated_at_epoch_seconds: u64,
+    notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct VirtioMmioModuleMetadata {
+    schema_version: u32,
+    module_kind: String,
+    source_path: String,
+    stored_path: String,
+    bytes: u64,
+    sha256: String,
+    expected_sha256: Option<String>,
+    verified: bool,
+    #[serde(default)]
+    target_kernel_path: Option<String>,
+    #[serde(default)]
+    target_kernel_sha256: Option<String>,
+    registered_at_epoch_seconds: u64,
     notes: Vec<String>,
 }
 
@@ -1365,6 +1384,9 @@ pub fn run() -> AppResult<()> {
         Commands::Runtime(args) => runtime(*args),
         Commands::NativePreflight(args) => native_preflight(args),
         Commands::NativeBootSpike(args) => native_boot_spike(args),
+        Commands::Provision(args) => provision(args),
+        Commands::InstallDesktop(args) => install_desktop(args),
+        Commands::Workspace(args) => workspace(args),
         Commands::NativeKernelPlan(args) => native_kernel_plan(args),
         Commands::NativeFoundation(args) => native_foundation(args),
         Commands::Environments(args) => environments(args),
@@ -1823,9 +1845,16 @@ fn configure_arch_user(
     })
 }
 
-fn launch(args: LaunchArgs) -> AppResult<()> {
+fn launch(mut args: LaunchArgs) -> AppResult<()> {
+    if args.runtime == RuntimeMode::Auto {
+        args.runtime = resolve_auto_runtime(&args);
+        println!("Auto-selected runtime: {}.", args.runtime.display_name());
+    }
     if args.runtime == RuntimeMode::PaneOwned {
         return launch_pane_owned_runtime(args);
+    }
+    if args.runtime == RuntimeMode::QemuWhpx {
+        return launch_qemu_whpx_runtime(args);
     }
 
     let inventory = probe_inventory();
@@ -1960,6 +1989,292 @@ fn launch(args: LaunchArgs) -> AppResult<()> {
         );
     }
 
+    Ok(())
+}
+
+/// Recorded state of a detached QEMU-WHPX VM, used to stop/inspect it later.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct QemuVmState {
+    pid: u32,
+    qmp_port: u16,
+}
+
+#[derive(Debug, Clone)]
+struct QemuLaunchTuning {
+    vcpus: Option<u32>,
+    memory_mb: Option<u32>,
+    disk_gib: Option<u64>,
+    resolution: Option<(u32, u32)>,
+    gpu_acceleration: bool,
+}
+
+impl Default for QemuLaunchTuning {
+    fn default() -> Self {
+        Self {
+            vcpus: None,
+            memory_mb: None,
+            disk_gib: None,
+            resolution: None,
+            gpu_acceleration: true,
+        }
+    }
+}
+
+impl QemuLaunchTuning {
+    fn from_launch_args(args: &LaunchArgs) -> AppResult<Self> {
+        Ok(Self {
+            vcpus: args.vcpus.map(|value| value.clamp(1, 16)),
+            memory_mb: args.memory_mb.map(|value| value.clamp(1024, 32_768)),
+            disk_gib: args.disk_gib,
+            resolution: args
+                .resolution
+                .as_deref()
+                .map(parse_display_resolution)
+                .transpose()?,
+            gpu_acceleration: !args.no_gpu_acceleration,
+        })
+    }
+}
+
+fn parse_display_resolution(value: &str) -> AppResult<(u32, u32)> {
+    let Some((width, height)) = value.trim().split_once('x') else {
+        return Err(AppError::message(
+            "--resolution must use WIDTHxHEIGHT, for example 1920x1080.",
+        ));
+    };
+    let width = width
+        .parse::<u32>()
+        .map_err(|_| AppError::message("--resolution width must be a positive integer."))?;
+    let height = height
+        .parse::<u32>()
+        .map_err(|_| AppError::message("--resolution height must be a positive integer."))?;
+    if !(800..=7680).contains(&width) || !(600..=4320).contains(&height) {
+        return Err(AppError::message(
+            "--resolution must be between 800x600 and 7680x4320.",
+        ));
+    }
+    Ok((width, height))
+}
+
+/// Path of the state file recording a detached QEMU-WHPX VM for a session.
+fn qemu_state_file(runtime_paths: &crate::plan::RuntimePaths) -> PathBuf {
+    runtime_paths.state.join("qemu-whpx.json")
+}
+
+/// Force-terminate a process by id (Windows taskkill). Returns whether it was killed.
+fn terminate_pid(pid: u32) -> bool {
+    std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F"])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+/// Whether a process id is still running (Windows tasklist).
+fn process_alive(pid: u32) -> bool {
+    std::process::Command::new("tasklist")
+        .args(["/NH", "/FI", &format!("PID eq {pid}")])
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).contains(&pid.to_string()))
+        .unwrap_or(false)
+}
+
+/// Start a detached QEMU-WHPX VM from `config`, record its pid + QMP port, and report how to
+/// stop it.
+fn start_detached_qemu(
+    config: &crate::qemu::QemuBootConfig,
+    runtime_paths: &crate::plan::RuntimePaths,
+) -> AppResult<()> {
+    let pid = crate::qemu::boot_detached(config).map_err(AppError::message)?;
+    let state = QemuVmState {
+        pid,
+        qmp_port: crate::qemu::detached_qmp_port(),
+    };
+    let state_path = qemu_state_file(runtime_paths);
+    if let Some(parent) = state_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    write_json_file(&state_path, &state)?;
+    println!("\nPane QEMU-WHPX VM started in the background (pid {pid}).");
+    println!("Stop it with `pane stop`; check it with `pane status`.");
+    Ok(())
+}
+
+/// Stop a detached QEMU-WHPX VM if one is recorded: request a clean ACPI shutdown over QMP,
+/// wait for it to exit, and hard-kill only as a fallback. Returns whether a VM was handled.
+fn stop_qemu_vm(runtime_paths: &crate::plan::RuntimePaths) -> bool {
+    let state_path = qemu_state_file(runtime_paths);
+    if !state_path.exists() {
+        return false;
+    }
+    if let Ok(state) = read_json_file::<QemuVmState>(&state_path) {
+        if process_alive(state.pid) {
+            println!("Shutting down the QEMU-WHPX VM (pid {})...", state.pid);
+            let _ = crate::qemu::graceful_shutdown(state.qmp_port);
+            let mut clean = false;
+            for _ in 0..30 {
+                if !process_alive(state.pid) {
+                    clean = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            if clean {
+                println!("QEMU-WHPX VM shut down cleanly.");
+            } else {
+                terminate_pid(state.pid);
+                println!("VM did not respond to ACPI shutdown within 15s; forced it.");
+            }
+        } else {
+            println!("No running QEMU-WHPX VM (cleared stale state).");
+        }
+    }
+    let _ = fs::remove_file(&state_path);
+    true
+}
+
+/// Resolve `--runtime auto`: prefer QEMU+WHPX when QEMU is installed and the base image is
+/// registered (the kernel + initramfs are derived from it). Otherwise fall back to the WSL
+/// bridge. Detection must be side-effect free: it never installs QEMU or downloads the image
+/// (an explicit `--runtime qemu-whpx` does that via the preflight).
+fn resolve_auto_runtime(args: &LaunchArgs) -> RuntimeMode {
+    let session = crate::plan::sanitize_session_name(&args.session_name);
+    let runtime_paths = crate::plan::runtime_for(&session);
+    let qemu_available = crate::qemu::locate_qemu().is_some();
+    if qemu_available && runtime_paths.base_os_image.exists() {
+        RuntimeMode::QemuWhpx
+    } else {
+        RuntimeMode::WslBridge
+    }
+}
+
+/// Built-in default Pane-hosted base OS image for download-on-first-run. Empty until hosting
+/// is wired; the env vars below override it without a rebuild so hosting can be pointed live.
+const PANE_BASE_IMAGE_URL: &str = "";
+const PANE_BASE_IMAGE_SHA256: &str =
+    "c589917dff159239bd8c1e8d5cd38413e15699192ef7236d3a24dbd7f1c9c931";
+
+/// Resolve the base-image download source: `PANE_BASE_IMAGE_URL` env var overrides the
+/// built-in default; `PANE_BASE_IMAGE_SHA256` env var overrides the expected hash. Returns
+/// None when no URL is configured (Pane then guides the user to import an image).
+fn base_image_download_source() -> Option<(String, Option<String>)> {
+    let env_nonempty = |key: &str| {
+        std::env::var(key)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    };
+    let built_in_nonempty = |value: &str| (!value.trim().is_empty()).then(|| value.to_string());
+    let url =
+        env_nonempty("PANE_BASE_IMAGE_URL").or_else(|| built_in_nonempty(PANE_BASE_IMAGE_URL))?;
+    let sha = env_nonempty("PANE_BASE_IMAGE_SHA256")
+        .or_else(|| built_in_nonempty(PANE_BASE_IMAGE_SHA256));
+    Some((url, sha))
+}
+
+/// Ensure a base OS image is registered for the QEMU engine, downloading it on first run
+/// (curl, SHA-verified, then registered) when a hosting URL is configured. When no URL is
+/// set, give an actionable import instruction instead of a cryptic failure.
+fn ensure_base_image(runtime_paths: &RuntimePaths) -> AppResult<()> {
+    if runtime_paths.base_os_image.exists() {
+        return Ok(());
+    }
+    let Some((url, expected_sha)) = base_image_download_source() else {
+        return Err(AppError::message(
+            "No base OS image is registered yet. Import one with `pane runtime --register-base-os <path> --base-os-expected-sha256 <sha>`, or set PANE_BASE_IMAGE_URL to enable download-on-first-run.",
+        ));
+    };
+    let download = runtime_paths.downloads.join("arch-base.download");
+    if let Some(parent) = download.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    println!("Downloading the Pane base OS image from {url} (one-time ~4 GiB fetch)...");
+    let status = std::process::Command::new("curl.exe")
+        .args(["-L", "--fail", "-o", &download.display().to_string(), &url])
+        .status()
+        .map_err(|error| {
+            AppError::message(format!(
+                "Could not run curl to download the base image: {error}"
+            ))
+        })?;
+    if !status.success() {
+        return Err(AppError::message(
+            "Base image download failed. Check your connection, or import the image manually with `pane runtime --register-base-os <path>`.",
+        ));
+    }
+    register_base_os_image(
+        runtime_paths,
+        &download,
+        expected_sha.as_deref(),
+        true,
+        false,
+    )?;
+    let _ = fs::remove_file(&download);
+    println!("Base OS image downloaded, verified, and registered.");
+    Ok(())
+}
+
+fn launch_qemu_whpx_runtime(args: LaunchArgs) -> AppResult<()> {
+    let session_name = crate::plan::sanitize_session_name(&args.session_name);
+    // Ensure the runtime boundary (dirs, contracts, user-disk descriptor) exists.
+    prepare_native_runtime_boundary(&session_name, DEFAULT_RUNTIME_CAPACITY_GIB)?;
+    let runtime_paths = crate::plan::runtime_for(&session_name);
+    // Preflight so a single command works on a fresh machine: install QEMU if missing, and
+    // make sure a base image is registered (the kernel + initramfs are derived from it).
+    crate::qemu::ensure_qemu_available().map_err(AppError::message)?;
+    ensure_base_image(&runtime_paths)?;
+    let serial_path = runtime_paths.logs.join("qemu-whpx.serial");
+    let config = build_qemu_engine_config(
+        &runtime_paths,
+        None,
+        serial_path,
+        std::time::Duration::from_secs(120),
+        args.display,
+        args.persist_root,
+        QemuLaunchTuning::from_launch_args(&args)?,
+    )?;
+
+    println!("Pane Launch — {}", args.runtime.display_name());
+    println!("  Session     {session_name}");
+    println!("  Engine      qemu-system-x86_64 -accel whpx");
+    println!("  Kernel      {}", config.kernel.display());
+    println!("  Initramfs   {}", config.initramfs.display());
+    println!("  Root disk   {}", config.base_disk.display());
+    println!("  vCPUs       {}", config.vcpus);
+    println!("  Memory      {} MiB", config.memory_mb);
+    println!(
+        "  GPU         {}",
+        if config.gpu_acceleration {
+            "VirGL acceleration"
+        } else {
+            "software compatibility"
+        }
+    );
+    if let Some((width, height)) = config.display_resolution {
+        println!("  Resolution  {width}x{height}");
+    }
+    match config.user_disk.as_ref() {
+        Some(disk) => println!("  User disk   {} (vdb -> /home)", disk.display()),
+        None => println!("  User disk   (none)"),
+    }
+
+    if args.dry_run {
+        println!("\nDry run: prepared the QEMU-WHPX engine boot plan; skipping launch.");
+        return Ok(());
+    }
+
+    if args.detach {
+        return start_detached_qemu(&config, &runtime_paths);
+    }
+
+    let hint = match config.display_backend.as_deref() {
+        Some(backend) => {
+            format!("graphical window ({backend}). Close the window or power off to end.")
+        }
+        None => "live serial console. Ctrl-A then X to quit.".to_string(),
+    };
+    println!("\nBooting Linux on QEMU-WHPX — {hint}\n");
+    let status = crate::qemu::boot_interactive(&config).map_err(AppError::message)?;
+    println!("\nPane session ended ({status}).");
     Ok(())
 }
 
@@ -2219,8 +2534,25 @@ fn status(args: StatusArgs) -> AppResult<()> {
         return Ok(());
     }
 
+    print_qemu_vm_status(&crate::plan::runtime_for("pane"));
     print_status_report(&report);
     Ok(())
+}
+
+/// Report whether a detached QEMU-WHPX VM is recorded and still running for this session.
+fn print_qemu_vm_status(runtime_paths: &crate::plan::RuntimePaths) {
+    let state_path = qemu_state_file(runtime_paths);
+    let Ok(state) = read_json_file::<QemuVmState>(&state_path) else {
+        return;
+    };
+    if process_alive(state.pid) {
+        println!(
+            "QEMU-WHPX VM: running (pid {}, qmp 127.0.0.1:{}). Stop with `pane stop`.",
+            state.pid, state.qmp_port
+        );
+    } else {
+        println!("QEMU-WHPX VM: not running (stale state; `pane stop` clears it).");
+    }
 }
 
 fn app_status(args: AppStatusArgs) -> AppResult<()> {
@@ -2268,6 +2600,7 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
         || args.build_discovery_initramfs
         || args.build_pane_block_module
         || args.register_pane_block_module.is_some()
+        || args.register_virtio_mmio_module.is_some()
         || args.create_user_disk
         || args.snapshot_user_disk
         || args.restore_user_disk_snapshot.is_some()
@@ -2389,6 +2722,19 @@ fn runtime(args: RuntimeArgs) -> AppResult<()> {
         ));
     }
 
+    if let Some(module) = args.register_virtio_mmio_module.as_deref() {
+        register_virtio_mmio_module(
+            &paths,
+            module,
+            args.virtio_mmio_module_expected_sha256.as_deref(),
+            args.force,
+        )?;
+    } else if args.virtio_mmio_module_expected_sha256.is_some() {
+        return Err(AppError::message(
+            "--virtio-mmio-module-expected-sha256 requires --register-virtio-mmio-module.",
+        ));
+    }
+
     if args.build_discovery_initramfs {
         build_and_register_pane_discovery_initramfs(
             &paths,
@@ -2481,9 +2827,496 @@ fn native_preflight(args: NativePreflightArgs) -> AppResult<()> {
     Ok(())
 }
 
+/// Resolve the real distro initramfs (with virtio-blk) for the QEMU engine. An explicit
+/// `--qemu-initramfs` wins. Otherwise use the cached `engines/distro-initramfs.img`, and if
+/// that is absent, extract `/boot/initramfs-linux.img` straight out of the registered base
+/// image's ext4 root partition (no WSL/external tools) and cache it. This makes the QEMU
+/// engine self-contained: `--qemu-initramfs` becomes an override, not a requirement.
+/// Byte offset of the ext4 root partition inside the base image, from its registered
+/// metadata (falls back to the conventional 1 MiB first-partition offset).
+fn base_image_partition_offset(runtime_paths: &crate::plan::RuntimePaths) -> u64 {
+    read_json_file::<BaseOsImageMetadata>(&runtime_paths.base_os_metadata)
+        .ok()
+        .and_then(|metadata| metadata.root_partition_hint)
+        .map(|partition| partition.byte_offset)
+        .unwrap_or(1_048_576)
+}
+
+/// Extract a file from the base image's ext4 root into a cache path (once), returning the
+/// cache path. Used to derive the distro kernel + initramfs from the single base-image
+/// artifact, so neither needs separate registration.
+fn extract_from_base_image(
+    runtime_paths: &crate::plan::RuntimePaths,
+    guest_path: &str,
+    cache: &Path,
+    label: &str,
+) -> AppResult<PathBuf> {
+    if cache.exists() {
+        return Ok(cache.to_path_buf());
+    }
+    if !runtime_paths.base_os_image.exists() {
+        return Err(AppError::message(format!(
+            "No registered base image to derive the {label} from. Run `pane launch` to fetch the base image, or import one.",
+        )));
+    }
+    let offset = base_image_partition_offset(runtime_paths);
+    let data = crate::ext4::extract_file(&runtime_paths.base_os_image, offset, guest_path)
+        .map_err(|error| {
+            AppError::message(format!(
+                "Could not extract the {label} ({guest_path}) from the base image: {error}.",
+            ))
+        })?;
+    if let Some(parent) = cache.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(cache, &data)?;
+    println!(
+        "Pane derived the {label} ({} bytes) from the base image -> {}",
+        data.len(),
+        cache.display()
+    );
+    Ok(cache.to_path_buf())
+}
+
+fn resolve_distro_initramfs(
+    initramfs_override: Option<&Path>,
+    runtime_paths: &crate::plan::RuntimePaths,
+) -> AppResult<PathBuf> {
+    if let Some(explicit) = initramfs_override {
+        return Ok(explicit.to_path_buf());
+    }
+    let cache = runtime_paths.engines.join("distro-initramfs.img");
+    extract_from_base_image(
+        runtime_paths,
+        "/boot/initramfs-linux.img",
+        &cache,
+        "distro initramfs",
+    )
+}
+
+/// Resolve the kernel for the QEMU engine: prefer an explicitly registered kernel artifact,
+/// otherwise derive vmlinuz from the base image (cached), so a single base image is enough.
+fn resolve_distro_kernel(runtime_paths: &crate::plan::RuntimePaths) -> AppResult<PathBuf> {
+    if runtime_paths.kernel_image.exists() {
+        return Ok(runtime_paths.kernel_image.clone());
+    }
+    let cache = runtime_paths.engines.join("distro-kernel.img");
+    extract_from_base_image(
+        runtime_paths,
+        "/boot/vmlinuz-linux",
+        &cache,
+        "distro kernel",
+    )
+}
+
+/// Build the QEMU-WHPX engine boot config shared by the boot-spike and the `pane launch`
+/// paths: resolve the distro initramfs, materialize a qcow2 user disk, and assemble the
+/// kernel cmdline. Root comes from the verified base image (copy-on-write, immutable).
+/// `fstab=0` makes systemd ignore the image's /etc/fstab entirely, so a stale swap UUID in
+/// it cannot stall the boot (no swap-mask hack, no base-image edit). `fsck.repair=yes`
+/// keeps a persistent root overlay recoverable after forced host shutdowns instead of
+/// dropping into a locked-root emergency shell. The persistent user disk is formatted on
+/// first boot (x-systemd.makefs) and mounted at /home via mount-extra, so user data survives
+/// across boots without touching the base image.
+fn build_qemu_engine_config(
+    runtime_paths: &crate::plan::RuntimePaths,
+    initramfs_override: Option<&Path>,
+    serial_path: PathBuf,
+    timeout: std::time::Duration,
+    display: crate::model::DisplayMode,
+    persist_root: bool,
+    tuning: QemuLaunchTuning,
+) -> AppResult<crate::qemu::QemuBootConfig> {
+    let initramfs = resolve_distro_initramfs(initramfs_override, runtime_paths)?;
+    // Persistent root: a qcow2 overlay backed by the base image so guest changes (e.g. an
+    // installed desktop) survive reboots while the base image stays immutable.
+    let root_overlay = if persist_root {
+        let overlay = runtime_paths.disks.join("root-overlay.qcow2");
+        match crate::qemu::ensure_qcow2_overlay(&overlay, &runtime_paths.base_os_image) {
+            Ok(()) => Some(overlay),
+            Err(error) => {
+                eprintln!("warning: could not create the persistent root overlay: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // Pane's registered user disk is a sparse-format text descriptor, not a real block
+    // device. For the QEMU engine, materialize a QEMU-native qcow2 disk (sparse) the guest
+    // can format + mount. Attach it as the second virtio drive (/dev/vdb).
+    let budget = runtime_storage_budget(DEFAULT_RUNTIME_CAPACITY_GIB);
+    let user_disk_capacity_gib = budget.user_packages_and_customizations_gib.max(1);
+    let user_disk_qcow2 = runtime_paths.disks.join("user-data.qcow2");
+    let user_disk = match crate::qemu::ensure_qcow2_disk(&user_disk_qcow2, user_disk_capacity_gib) {
+        Ok(()) => Some(user_disk_qcow2),
+        Err(error) => {
+            eprintln!("warning: could not create the QEMU user disk: {error}");
+            None
+        }
+    };
+    if let Some(parent) = serial_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Graphical mode also drives the VGA console (tty0) so the window shows kernel output and
+    // a getty login; serial stays enabled for diagnostics.
+    let console = if display.backend().is_some() {
+        "console=tty0 console=ttyS0"
+    } else {
+        "console=ttyS0"
+    };
+    let mut cmdline = format!("{console} root=/dev/vda1 rw fstab=0 fsck.repair=yes");
+    // Entry-point default: a graphical display boots the desktop; the serial/CLI path boots
+    // to a text console (multi-user) so `pane` in a terminal gives Linux as a terminal.
+    if display.backend().is_none() {
+        cmdline.push_str(" systemd.unit=multi-user.target");
+    }
+    if let Some((width, height)) = tuning.resolution {
+        cmdline.push_str(&format!(" video=Virtual-1:{width}x{height}"));
+    }
+    if user_disk.is_some() {
+        cmdline.push_str(" systemd.mount-extra=/dev/vdb:/home:ext4:x-systemd.makefs");
+    }
+    let kernel = resolve_distro_kernel(runtime_paths)?;
+    let (vcpus, memory_mb) = crate::qemu::host_resources();
+    if let (Some(overlay), Some(disk_gib)) = (root_overlay.as_ref(), tuning.disk_gib) {
+        crate::qemu::resize_qcow2(overlay, disk_gib).map_err(AppError::message)?;
+    }
+    Ok(crate::qemu::QemuBootConfig {
+        kernel,
+        initramfs,
+        base_disk: runtime_paths.base_os_image.clone(),
+        root_overlay,
+        user_disk,
+        memory_mb: tuning.memory_mb.unwrap_or(memory_mb as u32),
+        vcpus: tuning.vcpus.unwrap_or(vcpus),
+        cmdline,
+        serial_path,
+        timeout,
+        snapshot: true,
+        display_backend: display.backend().map(|backend| backend.to_string()),
+        gpu_acceleration: tuning.gpu_acceleration,
+        display_resolution: tuning.resolution,
+    })
+}
+
+/// Generate a strong, shell-safe password (alphanumeric, no ambiguous characters), using a
+/// time/pid-seeded xorshift PRNG. Used for default credentials the user is shown and should
+/// change; not a cryptographic secret generator.
+fn generate_password(length: usize) -> String {
+    const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789";
+    let mut seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9e37_79b9_7f4a_7c15)
+        ^ ((std::process::id() as u64) << 32)
+        ^ 0xd1b5_4a32_d192_ed03;
+    let mut password = String::with_capacity(length);
+    for _ in 0..length {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        password.push(CHARSET[(seed as usize) % CHARSET.len()] as char);
+    }
+    password
+}
+
+/// A conservative Linux username check so the value is safe to inject into the guest shell.
+fn valid_username(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 32
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+/// `pane provision`: set guest login credentials (root password, optional first sudo user)
+/// once, persisted to the root overlay, by driving the serial autologin root shell. Prints
+/// the credentials and how to create more users.
+fn provision(args: ProvisionArgs) -> AppResult<()> {
+    let session_name = crate::plan::sanitize_session_name(&args.session_name);
+    prepare_native_runtime_boundary(&session_name, DEFAULT_RUNTIME_CAPACITY_GIB)?;
+    let runtime_paths = crate::plan::runtime_for(&session_name);
+    crate::qemu::ensure_qemu_available().map_err(AppError::message)?;
+    ensure_base_image(&runtime_paths)?;
+
+    if let Some(name) = args.username.as_deref() {
+        if !valid_username(name) {
+            return Err(AppError::message(
+                "Invalid --username. Use lowercase letters, digits, '-' or '_', starting with a letter or '_'.",
+            ));
+        }
+    }
+
+    let root_password = args
+        .root_password
+        .clone()
+        .unwrap_or_else(|| generate_password(16));
+    let user_password = args.username.as_ref().map(|_| {
+        args.password
+            .clone()
+            .unwrap_or_else(|| generate_password(16))
+    });
+
+    // Credentials must persist, so provision against the persistent root overlay.
+    let serial_path = runtime_paths.logs.join("qemu-provision.serial");
+    let config = build_qemu_engine_config(
+        &runtime_paths,
+        None,
+        serial_path,
+        std::time::Duration::from_secs(180),
+        crate::model::DisplayMode::Serial,
+        true,
+        QemuLaunchTuning::default(),
+    )?;
+
+    // Build root-shell commands. Passwords are generated from a shell-safe charset, so
+    // single-quoting in the `chpasswd` here is sufficient.
+    let mut commands = vec![format!("echo 'root:{root_password}' | chpasswd")];
+    if let (Some(name), Some(password)) = (args.username.as_deref(), user_password.as_deref()) {
+        commands.push(format!(
+            "useradd -m -G wheel -s /usr/bin/bash {name} 2>/dev/null || true"
+        ));
+        commands.push(format!("echo '{name}:{password}' | chpasswd"));
+        commands.push("install -d -m 755 /etc/sudoers.d".to_string());
+        commands.push(
+            "printf '%%wheel ALL=(ALL:ALL) ALL\\n' > /etc/sudoers.d/wheel && chmod 440 /etc/sudoers.d/wheel"
+                .to_string(),
+        );
+    }
+
+    println!("Provisioning guest credentials (one-time, persisted)...");
+    crate::qemu::provision_via_serial(&config, &commands, std::time::Duration::from_secs(120))
+        .map_err(AppError::message)?;
+
+    println!("\n==== Pane guest credentials ====");
+    println!("  root password:  {root_password}");
+    if let (Some(name), Some(password)) = (args.username.as_deref(), user_password.as_deref()) {
+        println!("  user:           {name}");
+        println!("  user password:  {password}");
+        println!("  ({name} is in the wheel group with sudo.)");
+    }
+    println!("================================");
+    println!("These persist on the root overlay. Log in at the GUI with `pane launch --runtime qemu-whpx --display gtk --persist-root`.");
+    println!("Change a password in the guest with `passwd`. Create more users with:");
+    println!("  useradd -m -G wheel -s /usr/bin/bash <name> && passwd <name>");
+    Ok(())
+}
+
+/// `pane install-desktop`: install XFCE + LightDM into the guest image (persisted to the
+/// root overlay) by driving the serial autologin root shell: configure networking + a known
+/// mirror, then pacman the desktop and enable the display manager. After this, a graphical
+/// launch shows the LightDM greeter instead of a text console.
+fn workspace(args: WorkspaceArgs) -> AppResult<()> {
+    let session_name = crate::plan::sanitize_session_name(&args.session_name);
+    let runtime_paths = crate::plan::runtime_for(&session_name);
+    // Make sure nothing has the disks open.
+    let _ = stop_qemu_vm(&runtime_paths);
+    let overlay = runtime_paths.disks.join("root-overlay.qcow2");
+    let user_disk = runtime_paths.disks.join("user-data.qcow2");
+
+    if args.reset {
+        if overlay.exists() {
+            fs::remove_file(&overlay)?;
+            println!("Removed the root overlay; the next launch starts fresh from the base image.");
+        } else {
+            println!("No root overlay to remove (already clean).");
+        }
+        if args.purge && user_disk.exists() {
+            fs::remove_file(&user_disk)?;
+            println!("Removed the user disk (home/packages).");
+        }
+    }
+
+    if args.compact {
+        if overlay.exists() {
+            crate::qemu::compact_qcow2(&overlay, Some(&runtime_paths.base_os_image))
+                .map_err(AppError::message)?;
+            println!("Compacted the root overlay.");
+        }
+        if user_disk.exists() {
+            crate::qemu::compact_qcow2(&user_disk, None).map_err(AppError::message)?;
+            println!("Compacted the user disk.");
+        }
+    }
+
+    if !args.reset && !args.compact {
+        println!("Nothing to do. Use --reset (start fresh) or --compact (reclaim space).");
+    }
+    Ok(())
+}
+
+fn install_desktop(args: InstallDesktopArgs) -> AppResult<()> {
+    let session_name = crate::plan::sanitize_session_name(&args.session_name);
+    prepare_native_runtime_boundary(&session_name, DEFAULT_RUNTIME_CAPACITY_GIB)?;
+    let runtime_paths = crate::plan::runtime_for(&session_name);
+    crate::qemu::ensure_qemu_available().map_err(AppError::message)?;
+    ensure_base_image(&runtime_paths)?;
+
+    let serial_path = runtime_paths.logs.join("qemu-install-desktop.serial");
+    // Persist to the root overlay so the installed desktop survives reboots.
+    let config = build_qemu_engine_config(
+        &runtime_paths,
+        None,
+        serial_path.clone(),
+        std::time::Duration::from_secs(180),
+        crate::model::DisplayMode::Serial,
+        true,
+        QemuLaunchTuning::default(),
+    )?;
+
+    // Grow the root overlay so a heavier desktop fits (the partition + fs are extended in
+    // the guest below). qemu-img resize only grows.
+    let disk_gib = args.disk_gib.unwrap_or_else(|| args.de.default_disk_gib());
+    if let Some(overlay) = config.root_overlay.as_ref() {
+        crate::qemu::resize_qcow2(overlay, disk_gib).map_err(AppError::message)?;
+    }
+
+    let packages = args.de.packages();
+    let display_manager = args.de.display_manager();
+    let mut commands: Vec<String> = vec![
+        format!("echo PANE_DESKTOP_REQUEST de={:?} disk_gib={disk_gib}", args.de),
+        "rm -f /var/lib/pacman/db.lck".to_string(),
+        // Recover from interrupted/partial sync downloads. A corrupt core.db previously
+        // made the GUI look like GNOME/KDE were installing while pacman had already failed.
+        "rm -f /var/lib/pacman/sync/*.db /var/lib/pacman/sync/*.db.sig".to_string(),
+        // Extend partition 1 + the ext4 root to use the enlarged disk (best effort; the
+        // root is mounted, so update the kernel's partition view then resize online).
+        "echo ', +' | sfdisk --no-reread --force -N 1 /dev/vda || true".to_string(),
+        "partx -u /dev/vda 2>/dev/null || partprobe /dev/vda 2>/dev/null || true".to_string(),
+        "resize2fs /dev/vda1 || true".to_string(),
+        // Guaranteed-good mirror + DHCP networking so pacman can reach the repositories.
+        "echo 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch' > /etc/pacman.d/mirrorlist".to_string(),
+        "printf '[Match]\\nName=en* eth*\\n\\n[Network]\\nDHCP=yes\\n' > /etc/systemd/network/20-pane-dhcp.network".to_string(),
+        "systemctl enable --now systemd-networkd systemd-resolved".to_string(),
+        "ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf".to_string(),
+        "for i in $(seq 1 60); do getent hosts geo.mirror.pkgbuild.com >/dev/null 2>&1 && break; sleep 2; done".to_string(),
+        // Initialize + populate the pacman keyring (base image ships it uninitialized);
+        // virtio-rng supplies entropy so --init does not stall.
+        "pacman-key --init".to_string(),
+        "pacman-key --populate archlinux".to_string(),
+        "pacman -Syy --noconfirm --needed archlinux-keyring".to_string(),
+        // Desktop environment + display manager + browser (Firefox) + NetworkManager.
+        format!("pacman -S --noconfirm --needed {packages}"),
+    ];
+    if args.de == crate::model::DesktopChoice::Gnome {
+        commands.extend([
+            // Prefer GNOME's normal Wayland session. Keeping custom.conf absent avoids
+            // pinning users to Xorg after switching away from XFCE.
+            "install -d -m 755 /etc/gdm".to_string(),
+            "rm -f /etc/gdm/custom.conf".to_string(),
+        ]);
+    }
+    commands.extend([
+        // Make the chosen display manager the active one and boot graphically.
+        format!(
+            "systemctl disable {} 2>/dev/null || true",
+            args.de.other_display_managers()
+        ),
+        format!("systemctl enable {display_manager} NetworkManager"),
+        "systemctl set-default graphical.target".to_string(),
+        // Reclaim freed space over time (works with the disks' discard=unmap).
+        "systemctl enable fstrim.timer".to_string(),
+        // Confirm the desktop is wired in the boot transcript.
+        "echo PANE_DM_STATE enabled=$(systemctl is-enabled display-manager 2>/dev/null) default=$(systemctl get-default) dm=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null)".to_string(),
+    ]);
+
+    println!(
+        "Installing the {:?} desktop (+ Firefox) into the guest image (persisted, root grown to {disk_gib} GiB).",
+        args.de
+    );
+    println!(
+        "Downloads can be large and slow over NAT. Live log: {}",
+        serial_path.display()
+    );
+    let minutes = if args.timeout_minutes == 0 {
+        match args.de {
+            crate::model::DesktopChoice::Xfce => 30,
+            _ => 90,
+        }
+    } else {
+        args.timeout_minutes
+    };
+    let timeout = std::time::Duration::from_secs(minutes.saturating_mul(60).max(300));
+    crate::qemu::provision_via_serial(&config, &commands, timeout).map_err(AppError::message)?;
+
+    println!("\nDesktop installed. Launch it with:");
+    println!("  pane launch --runtime qemu-whpx --display gtk --persist-root");
+    println!("Log in at the {display_manager} greeter as your user to reach the desktop.");
+    println!("(Create a user first with `pane provision --username <name>` if you haven't.)");
+    Ok(())
+}
+
+fn native_boot_spike_qemu_whpx(
+    args: &NativeBootSpikeArgs,
+    runtime_paths: &crate::plan::RuntimePaths,
+) -> AppResult<()> {
+    let serial_path = args
+        .trace_checkpoint
+        .clone()
+        .map(|path| path.with_extension("serial"))
+        .unwrap_or_else(|| runtime_paths.logs.join("qemu-whpx.serial"));
+    let config = build_qemu_engine_config(
+        runtime_paths,
+        args.qemu_initramfs.as_deref(),
+        serial_path,
+        std::time::Duration::from_secs(120),
+        args.display,
+        args.persist_root,
+        QemuLaunchTuning::default(),
+    )?;
+    if args.detach {
+        return start_detached_qemu(&config, runtime_paths);
+    }
+    if args.interactive {
+        let hint = match config.display_backend.as_deref() {
+            Some(backend) => format!("graphical window ({backend})."),
+            None => "live Linux serial console. Ctrl-A then X to quit.".to_string(),
+        };
+        println!("Pane QEMU-WHPX interactive boot — {hint}\n");
+        let status = crate::qemu::boot_interactive(&config).map_err(AppError::message)?;
+        println!("\nPane QEMU-WHPX session ended ({status}).");
+        return Ok(());
+    }
+    let report = crate::qemu::boot_via_qemu_whpx(&config);
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string())
+        );
+    } else {
+        println!("Pane QEMU-WHPX engine boot");
+        println!(
+            "  qemu              {}",
+            report.qemu_path.as_deref().unwrap_or("NOT FOUND")
+        );
+        println!("  launched          {}", report.launched);
+        println!("  milestones        {}", report.milestones.join(", "));
+        println!("  mounted /sysroot  {}", report.mounted_sysroot);
+        println!("  switch_root       {}", report.switch_root);
+        println!("  welcome           {}", report.reached_welcome);
+        println!("  reached login     {}", report.reached_login);
+        println!("  user disk (vdb)   {}", report.user_disk_visible);
+        println!("  user disk mounted {}", report.user_disk_mounted);
+        println!("  elapsed           {}s", report.elapsed_seconds);
+        println!("  detail            {}", report.detail);
+    }
+    Ok(())
+}
+
 fn native_boot_spike(args: NativeBootSpikeArgs) -> AppResult<()> {
     let session_name = crate::plan::sanitize_session_name(&args.session_name);
     let runtime_paths = crate::plan::runtime_for(&session_name);
+    if args.qemu_whpx {
+        if args.prepare_runtime {
+            prepare_native_runtime_boundary(&session_name, DEFAULT_RUNTIME_CAPACITY_GIB)?;
+        }
+        return native_boot_spike_qemu_whpx(&args, &runtime_paths);
+    }
     let runtime_budget = runtime_storage_budget(DEFAULT_RUNTIME_CAPACITY_GIB);
     let run_guest_image = args.run_fixture || args.run_boot_loader || args.run_kernel_layout;
     if args.prepare_runtime {
@@ -3226,6 +4059,12 @@ fn terminal(args: TerminalArgs) -> AppResult<()> {
 }
 
 fn stop(args: StopArgs) -> AppResult<()> {
+    // A detached QEMU-WHPX VM (pane launch --runtime qemu-whpx --detach) is stopped here,
+    // preferring a clean ACPI shutdown over a hard kill.
+    if stop_qemu_vm(&crate::plan::runtime_for("pane")) {
+        return Ok(());
+    }
+
     let inventory = probe_inventory();
     let saved_state = load_state()?;
     let distro =
@@ -4979,8 +5818,72 @@ fn pane_block_module_path(paths: &RuntimePaths) -> PathBuf {
     paths.initramfs_driver_dir.join("pane-block.ko")
 }
 
+fn virtio_mmio_module_path(paths: &RuntimePaths) -> PathBuf {
+    paths.initramfs_driver_dir.join("virtio_mmio.ko")
+}
+
+fn virtio_mmio_module_metadata_path(paths: &RuntimePaths) -> PathBuf {
+    paths.state.join("virtio-mmio-module.json")
+}
+
 fn pane_block_module_metadata_path(paths: &RuntimePaths) -> PathBuf {
     paths.state.join("pane-block-module.json")
+}
+
+fn register_virtio_mmio_module(
+    paths: &RuntimePaths,
+    source_module: &Path,
+    expected_sha256: Option<&str>,
+    force: bool,
+) -> AppResult<()> {
+    let kernel_metadata = read_json_file::<KernelBootMetadata>(&paths.kernel_boot_metadata)
+        .map_err(|error| {
+            AppError::message(format!(
+                "virtio_mmio module registration requires an existing verified kernel boot plan. Register the target Arch kernel first with `pane runtime --register-kernel ... --kernel-expected-sha256 ...`: {error}"
+            ))
+        })?;
+    if !kernel_metadata.kernel_verified {
+        return Err(AppError::message(
+            "virtio_mmio module registration requires a hash-verified target kernel. Re-register the kernel with --kernel-expected-sha256.",
+        ));
+    }
+    if expected_sha256.is_none() {
+        return Err(AppError::message(
+            "virtio_mmio module registration requires --virtio-mmio-module-expected-sha256 so Pane can verify the module before including it in the initramfs.",
+        ));
+    }
+    let destination = virtio_mmio_module_path(paths);
+    let registration = copy_verified_runtime_artifact(
+        source_module,
+        &destination,
+        expected_sha256,
+        "virtio_mmio module",
+        force,
+    )?;
+    if !registration.verified {
+        return Err(AppError::message(
+            "virtio_mmio module must be registered with --virtio-mmio-module-expected-sha256 before it can be included in a native boot initramfs.",
+        ));
+    }
+    let metadata = VirtioMmioModuleMetadata {
+        schema_version: 1,
+        module_kind: "linux-virtio-mmio-module".to_string(),
+        source_path: registration.source_path,
+        stored_path: registration.stored_path,
+        bytes: registration.bytes,
+        sha256: registration.sha256,
+        expected_sha256: registration.expected_sha256,
+        verified: registration.verified,
+        target_kernel_path: Some(kernel_metadata.kernel_stored_path),
+        target_kernel_sha256: Some(kernel_metadata.kernel_sha256),
+        registered_at_epoch_seconds: current_epoch_seconds(),
+        notes: vec![
+            "Stock Arch builds CONFIG_VIRTIO_MMIO=m, so the virtio-mmio bus driver must be loaded before /dev/vda appears.".to_string(),
+            "Pane copies this module into the discovery initramfs as /lib/modules/virtio_mmio.ko so /init loads it before waiting for the virtio root device.".to_string(),
+            "The module's vermagic must match the registered target kernel; a mismatched module will fail to insmod inside the guest.".to_string(),
+        ],
+    };
+    write_json_file(&virtio_mmio_module_metadata_path(paths), &metadata)
 }
 
 fn register_pane_block_module(
@@ -5565,6 +6468,75 @@ static int load_pane_block_module(const char *device_blocks, const char *root_of
 #endif
 }
 
+static int load_virtio_mmio_module(const char *device_spec) {
+    const char *module_path = "/lib/modules/virtio_mmio.ko";
+    char params[160] = {0};
+    int fd = open(module_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ENOENT) {
+            log_line("PANE_VIRTIO_MMIO_MODULE_NOT_PRESENT");
+            return 0;
+        }
+        char line[160];
+        snprintf(line, sizeof(line), "PANE_VIRTIO_MMIO_MODULE_OPEN_FAILED errno=%d", errno);
+        log_line(line);
+        return -1;
+    }
+
+    log_line("PANE_VIRTIO_MMIO_MODULE_LOAD_ATTEMPT");
+#ifdef SYS_finit_module
+    /* virtio_mmio is built CONFIG_VIRTIO_MMIO=m on stock Arch. The kernel does NOT
+       replay the boot-cmdline `virtio_mmio.device=` value to a module loaded from
+       userspace, so the device spec must be passed explicitly as the module's
+       `device=` parameter (CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y). That registers the
+       platform device so the built-in virtio_blk driver can bind and create /dev/vda. */
+    if (device_spec && device_spec[0] != '\0') {
+        snprintf(params, sizeof(params), "device=%s", device_spec);
+        log_line("PANE_VIRTIO_MMIO_MODULE_DEVICE_PARAM_SET");
+    } else {
+        log_line("PANE_VIRTIO_MMIO_MODULE_DEVICE_PARAM_MISSING");
+    }
+    pid_t child = fork();
+    if (child == 0) {
+        int child_rc = syscall(SYS_finit_module, fd, params, 0);
+        _exit(child_rc == 0 ? 0 : (errno == EEXIST ? 17 : 1));
+    }
+    if (child < 0) {
+        char line[160];
+        snprintf(line, sizeof(line), "PANE_VIRTIO_MMIO_MODULE_FORK_FAILED errno=%d", errno);
+        log_line(line);
+        close(fd);
+        return -1;
+    }
+    int status = 0;
+    if (waitpid(child, &status, 0) != child) {
+        char line[160];
+        snprintf(line, sizeof(line), "PANE_VIRTIO_MMIO_MODULE_WAIT_FAILED errno=%d", errno);
+        log_line(line);
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        log_line("PANE_VIRTIO_MMIO_MODULE_LOAD_OK");
+        return 0;
+    }
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 17) {
+        log_line("PANE_VIRTIO_MMIO_MODULE_ALREADY_LOADED");
+        return 0;
+    }
+    char line[160];
+    snprintf(line, sizeof(line), "PANE_VIRTIO_MMIO_MODULE_LOAD_FAILED status=%d", status);
+    log_line(line);
+    return -1;
+#else
+    errno = ENOSYS;
+    log_line("PANE_VIRTIO_MMIO_MODULE_LOAD_FAILED");
+    close(fd);
+    return -1;
+#endif
+}
+
 static void drop_probe_caches_before_root_mount(void) {
     sync();
     int fd = open("/proc/sys/vm/drop_caches", O_WRONLY | O_CLOEXEC);
@@ -5591,60 +6563,80 @@ static int supported_root_fs(const char *value) {
            strcmp(value, "f2fs") == 0;
 }
 
+/* Disable block-device readahead before mounting the root filesystem.
+ *
+ * Linux otherwise submits a deep readahead batch (the default is 128 KiB == 32 of
+ * Pane's 4 KiB virtio blocks) in a single virtqueue notify. Pane's WHP host delivers
+ * the completion interrupt for a single in-flight request reliably, but the one
+ * completion interrupt for such a batch never reached the post-submit guest, stalling
+ * the ext4 root mount. Forcing single-block reads keeps every request on the proven
+ * one-completion-at-a-time path. `root_device` is like "/dev/vda1"; the request queue
+ * lives at "/sys/block/vda/queue/read_ahead_kb" (disk name, partition digits stripped). */
+static void disable_block_readahead(const char *root_device) {
+    const char *name = root_device;
+    if (strncmp(name, "/dev/", 5) == 0) {
+        name += 5;
+    }
+    char disk[32];
+    size_t i = 0;
+    while (name[i] != '\0' && !(name[i] >= '0' && name[i] <= '9') && i < sizeof(disk) - 1) {
+        disk[i] = name[i];
+        i++;
+    }
+    disk[i] = '\0';
+    if (disk[0] == '\0') {
+        return;
+    }
+    char path[96];
+    snprintf(path, sizeof(path), "/sys/block/%s/queue/read_ahead_kb", disk);
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0) {
+        char line[160];
+        snprintf(line, sizeof(line), "PANE_BLOCK_READAHEAD_DISABLE_OPEN_FAILED dev=%s errno=%d", disk, errno);
+        log_line(line);
+        return;
+    }
+    if (write(fd, "0\n", 2) == 2) {
+        char line[96];
+        snprintf(line, sizeof(line), "PANE_BLOCK_READAHEAD_DISABLED dev=%s", disk);
+        log_line(line);
+    }
+    close(fd);
+}
+
 #define PANE_ROOT_MOUNT_MAX_POLLS 65536U
 #define PANE_ROOT_MOUNT_WAIT_LOG_INTERVAL 4096U
 
 static int mount_root_with_fs(const char *root_device, const char *filesystem, int root_readonly) {
     unsigned long flags = MS_RELATIME | (root_readonly ? MS_RDONLY : 0);
+    /* ext4's default inode-table readahead (EXT4_DEF_INODE_READAHEAD_BLKS == 32)
+     * submits a 32-deep virtqueue batch whose single completion interrupt the WHP
+     * host could not deliver to the post-submit guest, stalling the mount. Force
+     * single-block inode reads so every request stays on the proven one-at-a-time
+     * completion path. */
+    const char *data = strcmp(filesystem, "ext4") == 0 ? "inode_readahead_blks=1" : "";
     char line[192];
     snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_TRY fs=%s readonly=%s", filesystem, root_readonly ? "true" : "false");
     log_line(line);
 
-    pid_t child = fork();
-    if (child == 0) {
-        int mount_rc = mount(root_device, "/newroot", filesystem, flags, "");
-        _exit(mount_rc == 0 ? 0 : (errno & 0xff));
-    }
-    if (child < 0) {
-        snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_FORK_FAILED fs=%s errno=%d", filesystem, errno);
+    /* Call mount() directly and let it block. The previous fork()+waitpid(WNOHANG)+
+     * sched_yield() busy-poll kept the single vCPU permanently runnable, so the guest
+     * never idled: the mount()'s own block-I/O waits and the ext4/jbd2 kernel threads
+     * were starved of CPU and jiffies, and the mount crawled to a halt. A blocking
+     * mount() lets the vCPU go idle while ext4 waits on I/O, so the kernel threads run
+     * and the host-side timer/halt-kick can wake the guest. The host enforces the
+     * overall root-mount time budget, so no guest-side poll timeout is needed. */
+    int mount_rc = mount(root_device, "/newroot", filesystem, flags, data);
+    if (mount_rc == 0) {
+        if (root_readonly) {
+            snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_OK fs=%s readonly=true", filesystem);
+        } else {
+            snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_OK fs=%s", filesystem);
+        }
         log_line(line);
-        return -1;
+        return 0;
     }
-
-    for (unsigned int attempt = 0; attempt < PANE_ROOT_MOUNT_MAX_POLLS; attempt++) {
-        int status = 0;
-        pid_t waited = waitpid(child, &status, WNOHANG);
-        if (waited == child) {
-            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-                if (root_readonly) {
-                    snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_OK fs=%s readonly=true", filesystem);
-                } else {
-                    snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_OK fs=%s", filesystem);
-                }
-                log_line(line);
-                return 0;
-            }
-            if (WIFEXITED(status)) {
-                snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_FAIL fs=%s errno=%d", filesystem, WEXITSTATUS(status));
-            } else {
-                snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_FAIL fs=%s status=%d", filesystem, status);
-            }
-            log_line(line);
-            return -1;
-        }
-        if (waited < 0) {
-            snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_WAIT_FAILED fs=%s errno=%d", filesystem, errno);
-            log_line(line);
-            return -1;
-        }
-        if ((attempt % PANE_ROOT_MOUNT_WAIT_LOG_INTERVAL) == (PANE_ROOT_MOUNT_WAIT_LOG_INTERVAL - 1U)) {
-            snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_WAITING fs=%s polls=%u", filesystem, attempt + 1U);
-            log_line(line);
-        }
-        sched_yield();
-    }
-    kill(child, SIGKILL);
-    snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_TIMEOUT fs=%s polls=%u", filesystem, PANE_ROOT_MOUNT_MAX_POLLS);
+    snprintf(line, sizeof(line), "PANE_ROOT_MOUNT_FAIL fs=%s errno=%d", filesystem, errno);
     log_line(line);
     return -1;
 }
@@ -5710,6 +6702,7 @@ int main(void) {
     char root_device[128] = {0};
     char user_device[128] = {0};
     char virtio_root_device[128] = {0};
+    char virtio_mmio_device[128] = {0};
     char root_readonly[32] = {0};
     char root_fs[32] = {0};
     char root_offset[128] = {0};
@@ -5731,6 +6724,7 @@ int main(void) {
     find_arg(cmdline, "pane.root", root_device, sizeof(root_device));
     find_arg(cmdline, "pane.user", user_device, sizeof(user_device));
     find_arg(cmdline, "pane.virtio_root", virtio_root_device, sizeof(virtio_root_device));
+    find_arg(cmdline, "virtio_mmio.device", virtio_mmio_device, sizeof(virtio_mmio_device));
     find_arg(cmdline, "pane.root_readonly", root_readonly, sizeof(root_readonly));
     find_arg(cmdline, "pane.root_fs", root_fs, sizeof(root_fs));
     find_arg(cmdline, "pane.root_offset", root_offset, sizeof(root_offset));
@@ -5783,9 +6777,27 @@ int main(void) {
     }
     write_native_storage_env(storage_contract, block_io, block_dma, root_device, user_device, virtio_root_device, root_readonly, root_fs, framebuffer, input_queue);
 
+    // Try the synchronous Pane block device (/dev/pane0) FIRST. It serves storage over
+    // port I/O with no completion interrupt (interrupt_model=none), so it mounts the root
+    // without depending on virtio interrupt delivery. This both proves the boot-and-own-
+    // disk milestone over the interrupt-free path and isolates whether a stall is the
+    // ext4/mount itself versus virtio interrupt delivery. virtio-blk is the fallback.
+    log_line("PANE_ROOT_MOUNT_ATTEMPT");
+    if (wait_for_device(root_device) == 0) {
+        disable_block_readahead(root_device);
+        if (try_mount_root(root_device, truthy_arg(root_readonly), root_fs) == 0) {
+            exec_real_init();
+        }
+        log_line("PANE_ROOT_MOUNT_FALLBACK");
+    } else {
+        log_line("PANE_ROOT_DEVICE_WAIT_TIMEOUT");
+    }
+
     if (virtio_root_device[0] != '\0') {
         log_line("PANE_VIRTIO_ROOT_MOUNT_ATTEMPT");
+        load_virtio_mmio_module(virtio_mmio_device);
         if (wait_for_device(virtio_root_device) == 0) {
+            disable_block_readahead(virtio_root_device);
             if (try_mount_root(virtio_root_device, truthy_arg(root_readonly), root_fs) == 0) {
                 exec_real_init();
             }
@@ -5794,16 +6806,7 @@ int main(void) {
             log_line("PANE_VIRTIO_ROOT_DEVICE_WAIT_TIMEOUT");
         }
     }
-    log_line("PANE_ROOT_MOUNT_ATTEMPT");
-    if (wait_for_device(root_device) != 0) {
-        log_line("PANE_ROOT_DEVICE_WAIT_TIMEOUT");
-        wait_forever();
-    }
-    if (try_mount_root(root_device, truthy_arg(root_readonly), root_fs) != 0) {
-        log_line("PANE_ROOT_MOUNT_FAILED");
-        wait_forever();
-    }
-    exec_real_init();
+    log_line("PANE_ROOT_MOUNT_FAILED");
     wait_forever();
 }
 "#
@@ -6886,6 +7889,15 @@ fn build_pane_discovery_initramfs_with_native_packager(
         ));
     }
 
+    let virtio_mmio_module = virtio_mmio_module_path(paths);
+    if virtio_mmio_module.is_file() {
+        entries.push(NewcCpioEntry::file(
+            "lib/modules/virtio_mmio.ko",
+            0o644,
+            fs::read(virtio_mmio_module)?,
+        ));
+    }
+
     write_newc_cpio_archive(output, &entries)?;
     Ok(DiscoveryInitramfsBuildOutput {
         init_binary_sha256,
@@ -7837,12 +8849,14 @@ fn load_kernel_layout_boot_image_artifact(
         boot_params_gpa: (layout.kernel_format == "linux-bzimage")
             .then(|| parse_guest_physical_address(&layout.boot_params_gpa))
             .transpose()?,
-        virtio_block_logical_size_bytes: layout.storage.as_ref().map(|storage| {
-            storage
-                .root_handoff
-                .partition_byte_length
-                .unwrap_or(storage.base_os_bytes)
-        }),
+        // The virtio-blk device exposes the whole base disk (vda); the root
+        // partition (vda1) lives at an offset within it. Sizing the disk to the
+        // partition length truncates vda1 beyond end-of-disk and breaks the ext4
+        // geometry, so the disk capacity must be the full base image.
+        virtio_block_logical_size_bytes: layout
+            .storage
+            .as_ref()
+            .map(|storage| storage.base_os_bytes),
         extra_regions,
     })
 }
@@ -7994,9 +9008,11 @@ fn linux_guest_mapped_regions(
                 }
                 _ => format!("linux-{}", range.label),
             };
+            let region_gpa = parse_guest_physical_address(&range.start_gpa)?;
             let bytes = match range.region_type.as_str() {
                 "bios-data" => linux_bios_data_area_page_bytes(size),
-                "bios-rom" | "legacy-rom" => vec![0_u8; size],
+                "bios-rom" => bios_rom_page_bytes_with_mptable(region_gpa, size),
+                "legacy-rom" => vec![0_u8; size],
                 "storage-contract" => layout
                     .storage
                     .as_ref()
@@ -8017,13 +9033,32 @@ fn linux_guest_mapped_regions(
             };
             Ok(crate::native::NativeGuestMemoryRegion {
                 label,
-                guest_gpa: parse_guest_physical_address(&range.start_gpa)?,
+                guest_gpa: region_gpa,
                 bytes,
                 writable: true,
                 executable: range.region_type == "usable",
             })
         })
         .collect()
+}
+
+/// Build the BIOS ROM region, embedding the MP table so the guest can discover
+/// the local APIC and I/O APIC by scanning the 0xF0000..0xFFFFF window.
+fn bios_rom_page_bytes_with_mptable(region_gpa: u64, size: usize) -> Vec<u8> {
+    let mut bytes = vec![0_u8; size];
+    let table = crate::mptable::build_pane_mptable();
+    for (gpa, blob) in [
+        (table.floating_pointer_gpa, &table.floating_pointer),
+        (table.config_table_gpa, &table.config_table),
+    ] {
+        if let Some(offset) = gpa.checked_sub(region_gpa) {
+            let offset = offset as usize;
+            if let Some(slot) = bytes.get_mut(offset..offset + blob.len()) {
+                slot.copy_from_slice(blob);
+            }
+        }
+    }
+    bytes
 }
 
 fn linux_bios_data_area_page_bytes(size: usize) -> Vec<u8> {
@@ -14018,24 +15053,25 @@ mod tests {
         legacy_virtio_block_backend_plan, linux_guest_mapped_regions, linux_loader_adapter_plan,
         load_kernel_layout_boot_image_artifact, load_verified_pane_block_module_metadata,
         pane_block_device_blocks, pane_block_driver_abi_sha256,
-        pane_initramfs_expected_serial_milestones, parse_guest_physical_address,
-        preferred_transport, read_base_os_block, read_json_file, read_user_disk_block,
-        register_base_os_image, register_boot_loader_image, register_kernel_boot_plan,
-        register_native_boot_set_artifacts, register_native_boot_set_from_manifest,
-        register_pane_block_module, register_pane_discovery_initramfs_artifact,
+        pane_initramfs_expected_serial_milestones, parse_display_resolution,
+        parse_guest_physical_address, preferred_transport, read_base_os_block, read_json_file,
+        read_user_disk_block, register_base_os_image, register_boot_loader_image,
+        register_kernel_boot_plan, register_native_boot_set_artifacts,
+        register_native_boot_set_from_manifest, register_pane_block_module,
+        register_pane_discovery_initramfs_artifact, register_virtio_mmio_module,
         repair_user_disk_metadata, resize_user_disk, resolve_bundle_output_path,
         resolve_init_source, resolve_launch_target, resolve_managed_environment_for_reset,
         resolve_saved_launch, resolve_session_context, resolve_status_distro,
         restore_user_disk_snapshot, runtime_contract_guest_memory_ranges, runtime_storage_budget,
         sha256_file, status_port_for, user_disk_artifact_ready, validate_setup_password,
-        validate_setup_username, windows_transport_check, write_json_file,
-        write_native_boot_set_manifest_template, write_pane_initramfs_driver_bundle,
-        write_user_disk_block, AppLifecyclePhase, AppNextAction, BaseOsImageMetadata, CheckStatus,
-        DistroHealth, DoctorCheck, DoctorReport, FramebufferContract, InitSource, KernelBootLayout,
-        KernelBootMetadata, NativeRuntimeState, PaneBlockModuleMetadata,
-        PaneInitramfsDriverMetadata, StatusReport, UserDiskExportManifest, UserDiskMetadata,
-        UserDiskSnapshotMetadata, WorkspaceHealth, WslInventory,
-        COMPATIBLE_PANE_BLOCK_DRIVER_SOURCE_SHA256_BY_ABI, EMBEDDED_APP_ASSETS,
+        validate_setup_username, virtio_mmio_module_metadata_path, virtio_mmio_module_path,
+        windows_transport_check, write_json_file, write_native_boot_set_manifest_template,
+        write_pane_initramfs_driver_bundle, write_user_disk_block, AppLifecyclePhase,
+        AppNextAction, BaseOsImageMetadata, CheckStatus, DistroHealth, DoctorCheck, DoctorReport,
+        FramebufferContract, InitSource, KernelBootLayout, KernelBootMetadata, NativeRuntimeState,
+        PaneBlockModuleMetadata, PaneInitramfsDriverMetadata, StatusReport, UserDiskExportManifest,
+        UserDiskMetadata, UserDiskSnapshotMetadata, VirtioMmioModuleMetadata, WorkspaceHealth,
+        WslInventory, COMPATIBLE_PANE_BLOCK_DRIVER_SOURCE_SHA256_BY_ABI, EMBEDDED_APP_ASSETS,
         PANE_USER_DISK_EXPORT_DISK_FILENAME, PANE_USER_DISK_EXPORT_MANIFEST_FILENAME,
         PANE_USER_DISK_EXPORT_METADATA_FILENAME,
     };
@@ -14126,6 +15162,8 @@ mod tests {
             kernel_build_dir: None,
             register_pane_block_module: None,
             pane_block_module_expected_sha256: None,
+            register_virtio_mmio_module: None,
+            virtio_mmio_module_expected_sha256: None,
             create_user_disk: false,
             snapshot_user_disk: false,
             restore_user_disk_snapshot: None,
@@ -14299,6 +15337,18 @@ mod tests {
         assert_eq!(budget.base_os_budget_gib, 4);
         assert_eq!(budget.snapshot_budget_gib, 1);
         assert_eq!(budget.user_packages_and_customizations_gib, 3);
+    }
+
+    #[test]
+    fn display_resolution_parser_accepts_standard_size() {
+        assert_eq!(parse_display_resolution("1920x1080").unwrap(), (1920, 1080));
+    }
+
+    #[test]
+    fn display_resolution_parser_rejects_invalid_values() {
+        assert!(parse_display_resolution("1920").is_err());
+        assert!(parse_display_resolution("640x480").is_err());
+        assert!(parse_display_resolution("widextall").is_err());
     }
 
     #[test]
@@ -15763,6 +16813,24 @@ mod tests {
         assert!(init_source.contains("PANE_VIRTIO_ROOT_MOUNT_ATTEMPT"));
         assert!(init_source.contains("PANE_VIRTIO_ROOT_DEVICE_WAIT_TIMEOUT"));
         assert!(init_source.contains("PANE_VIRTIO_ROOT_MOUNT_FALLBACK"));
+        assert!(init_source.contains("load_virtio_mmio_module"));
+        assert!(init_source.contains("/lib/modules/virtio_mmio.ko"));
+        assert!(init_source.contains("PANE_VIRTIO_MMIO_MODULE_LOAD_OK"));
+        assert!(init_source.contains("PANE_VIRTIO_MMIO_MODULE_NOT_PRESENT"));
+        // The device spec from the boot cmdline must be passed as the module's `device=`
+        // parameter; the kernel does not replay it to a userspace-loaded module.
+        assert!(init_source.contains("find_arg(cmdline, \"virtio_mmio.device\""));
+        assert!(init_source.contains("snprintf(params, sizeof(params), \"device=%s\""));
+        // The bus driver must be loaded before the virtio root device wait, otherwise
+        // /dev/vda never appears on a stock Arch kernel (CONFIG_VIRTIO_MMIO=m).
+        assert!(
+            init_source
+                .find("load_virtio_mmio_module(virtio_mmio_device);")
+                .unwrap()
+                < init_source
+                    .find("wait_for_device(virtio_root_device)")
+                    .unwrap()
+        );
         assert!(init_source.contains("attempt < 65536"));
         assert!(!init_source.contains("usleep(100000)"));
         assert!(init_source.contains("supported_root_fs"));
@@ -15778,14 +16846,9 @@ mod tests {
         assert!(init_source.contains("PANE_ROOT_MOUNT_ATTEMPT"));
         assert!(init_source.contains("PANE_ROOT_MOUNT_TRY"));
         assert!(init_source.contains("PANE_ROOT_MOUNT_FAIL"));
-        assert!(init_source.contains("PANE_ROOT_MOUNT_TIMEOUT"));
-        assert!(init_source.contains("PANE_ROOT_MOUNT_WAITING"));
-        assert!(init_source.contains("kill(child, SIGKILL)"));
-        assert!(init_source.contains("#define PANE_ROOT_MOUNT_MAX_POLLS 65536U"));
-        assert!(init_source.contains("#define PANE_ROOT_MOUNT_WAIT_LOG_INTERVAL 4096U"));
-        assert!(init_source.contains("attempt < PANE_ROOT_MOUNT_MAX_POLLS"));
-        assert!(init_source.contains("PANE_ROOT_MOUNT_WAITING fs=%s polls=%u"));
-        assert!(init_source.contains("PANE_ROOT_MOUNT_TIMEOUT fs=%s polls=%u"));
+        // The root mount now calls mount() directly (blocking) rather than fork()+poll,
+        // so the guest can idle while ext4 waits on I/O and its kernel threads run.
+        assert!(init_source.contains("mount(root_device, \"/newroot\", filesystem, flags, data)"));
         assert!(init_source.contains("PANE_ROOT_MOUNT_OK"));
         assert!(init_source.contains("execl(\"/sbin/init\""));
         assert!(init_source.contains("#define COM1_PORT 0x3f8"));
@@ -16155,6 +17218,60 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("current verified kernel"));
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn registers_virtio_mmio_module_and_packs_it_into_initramfs() {
+        let paths = temp_runtime_paths("runtime-virtio-mmio-module");
+        super::prepare_runtime_paths(&paths).unwrap();
+        let kernel = paths.downloads.join("vmlinuz-linux");
+        std::fs::write(&kernel, fake_linux_bzimage()).unwrap();
+        let kernel_sha = sha256_file(&kernel).unwrap();
+        write_pane_initramfs_driver_bundle(&paths).unwrap();
+        register_kernel_boot_plan(
+            &paths,
+            Some(&kernel),
+            Some(&kernel_sha),
+            None,
+            None,
+            Some("console=ttyS0 root=/dev/pane0 rw"),
+            false,
+        )
+        .unwrap();
+
+        let source = paths.downloads.join("virtio_mmio.ko");
+        std::fs::write(&source, b"fake virtio_mmio kernel module").unwrap();
+        let sha256 = sha256_file(&source).unwrap();
+
+        // Registration without the expected SHA is rejected.
+        let error = register_virtio_mmio_module(&paths, &source, None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--virtio-mmio-module-expected-sha256"));
+
+        register_virtio_mmio_module(&paths, &source, Some(&sha256), false).unwrap();
+
+        let stored = virtio_mmio_module_path(&paths);
+        assert!(stored.is_file());
+        assert_eq!(sha256_file(&stored).unwrap(), sha256);
+        let metadata =
+            read_json_file::<VirtioMmioModuleMetadata>(&virtio_mmio_module_metadata_path(&paths))
+                .unwrap();
+        assert!(metadata.verified);
+        assert_eq!(metadata.sha256, sha256);
+        assert_eq!(
+            metadata.target_kernel_sha256.as_deref(),
+            Some(kernel_sha.as_str())
+        );
+
+        // Re-registering over an existing module requires --force.
+        let error = register_virtio_mmio_module(&paths, &source, Some(&sha256), false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--force"));
+        register_virtio_mmio_module(&paths, &source, Some(&sha256), true).unwrap();
 
         let _ = std::fs::remove_dir_all(&paths.root);
     }

@@ -15,13 +15,17 @@ thiserror = "2.0.12"
 linux-loader = { version = "0.13.2", path = "third_party/linux-loader", default-features = false, features = ["bzimage", "elf"] }
 vm-memory = { version = "=0.17.1", default-features = false, features = ["backend-mmap"] }
 virtio-queue = { version = "0.17.0", path = "third_party/virtio-queue" }
+virtio-bindings = { version = "0.2.7", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
+tauri = "2"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_System_Hypervisor",
     "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
 ] }
 
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "3.0.6"
+tauri-build = "2"

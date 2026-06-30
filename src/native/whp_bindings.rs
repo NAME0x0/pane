@@ -34,6 +34,9 @@ pub(crate) const WHV_PARTITION_PROPERTY_CODE_LOCAL_APIC_EMULATION_MODE: u32 =
     WHvPartitionPropertyCodeLocalApicEmulationMode as u32;
 pub(crate) const WHV_X64_LOCAL_APIC_EMULATION_MODE_XAPIC: u32 =
     WHvX64LocalApicEmulationModeXApic as u32;
+/// `WHvX64LocalApicEmulationModeNone` (== 0): WHP does not emulate the local APIC, so
+/// the guest's 0xFEE00000 MMIO traps to Pane's userspace LAPIC.
+pub(crate) const WHV_X64_LOCAL_APIC_EMULATION_MODE_NONE: u32 = 0;
 pub(crate) const WHV_MAP_GPA_RANGE_FLAG_READ: u32 = WHvMapGpaRangeFlagRead as u32;
 pub(crate) const WHV_MAP_GPA_RANGE_FLAG_WRITE: u32 = WHvMapGpaRangeFlagWrite as u32;
 pub(crate) const WHV_MAP_GPA_RANGE_FLAG_EXECUTE: u32 = WHvMapGpaRangeFlagExecute as u32;

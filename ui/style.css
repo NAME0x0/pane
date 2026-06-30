@@ -1,0 +1,189 @@
+:root {
+  --bg: #f3efe7;
+  --surface: #fbf9f4;
+  --ink: #14110d;
+  --muted: #6b6457;
+  --line: #e0d9cc;
+  --accent: #14110d;
+  --accent-ink: #f7f3ea;
+  --ok: #1f7a4d;
+  --warn: #9a5b12;
+  --radius: 14px;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+}
+
+.bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 22px;
+  border-bottom: 1px solid var(--line);
+}
+
+.brand { font-weight: 700; font-size: 19px; letter-spacing: -0.01em; }
+.mark { margin-right: 6px; }
+
+.pill {
+  font-size: 13px;
+  font-weight: 600;
+  padding: 5px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+}
+.pill-idle { color: var(--muted); background: var(--surface); }
+.pill-run { color: var(--accent-ink); background: var(--ok); border-color: var(--ok); }
+.pill-off { color: var(--muted); background: var(--surface); }
+.pill-busy { color: var(--accent-ink); background: var(--warn); border-color: var(--warn); }
+
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  padding: 22px;
+  max-width: 980px;
+  margin: 0 auto;
+}
+.span2 { grid-column: 1 / -1; }
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 18px;
+}
+.card-top { display: flex; align-items: center; justify-content: space-between; }
+.card h2 { margin: 0 0 4px; font-size: 20px; }
+.card h3 { margin: 0 0 12px; font-size: 15px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+
+.muted { color: var(--muted); }
+.small { font-size: 12px; }
+
+.row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
+
+.spec-grid, .tuning-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+.spec-grid { margin: 12px 0 14px; }
+.spec-grid div {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 10px;
+  background: #fff;
+}
+.label {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.tuning-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.field output {
+  float: right;
+  color: var(--ink);
+  font-weight: 700;
+}
+.field input[type="range"] {
+  accent-color: var(--ink);
+  padding: 0;
+}
+.check {
+  display: flex;
+  gap: 9px;
+  align-items: center;
+  color: var(--muted);
+  font-size: 13px;
+  margin-top: 4px;
+}
+.check input { accent-color: var(--ink); }
+
+.btn {
+  font: inherit;
+  font-weight: 600;
+  padding: 9px 16px;
+  border-radius: 10px;
+  border: 1px solid var(--ink);
+  background: var(--surface);
+  color: var(--ink);
+  cursor: pointer;
+  transition: transform 0.05s ease, opacity 0.15s ease;
+}
+.btn:hover { opacity: 0.85; }
+.btn:active { transform: translateY(1px); }
+.btn:disabled { opacity: 0.45; cursor: default; }
+.btn-primary { background: var(--accent); color: var(--accent-ink); }
+.btn-ghost { border-color: var(--line); color: var(--muted); }
+
+.field { display: block; font-size: 13px; color: var(--muted); margin-bottom: 12px; }
+.field select, .field input {
+  display: block;
+  width: 100%;
+  margin-top: 5px;
+  padding: 8px 10px;
+  font: inherit;
+  color: var(--ink);
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+#screen-view {
+  position: fixed;
+  inset: 0;
+  background: #14110d;
+  display: none;
+  flex-direction: column;
+  z-index: 10;
+}
+#screen-view.show {
+  display: flex;
+}
+.screen-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 14px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+}
+.screen {
+  flex: 1;
+  min-height: 0;
+  background: #000;
+  overflow: hidden;
+}
+
+.log {
+  margin: 12px 0 0;
+  background: #1b1813;
+  color: #e8e2d6;
+  border-radius: 10px;
+  padding: 12px;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.5;
+  height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+@media (max-width: 760px) {
+  .grid { grid-template-columns: 1fr; padding: 14px; }
+  .span2 { grid-column: auto; }
+  .card-top { align-items: flex-start; gap: 8px; flex-direction: column; }
+  .spec-grid, .tuning-grid { grid-template-columns: 1fr; }
+}

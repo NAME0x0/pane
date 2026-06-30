@@ -145,6 +145,8 @@ $shortcutDesktopRoot = Join-Path $artifactRoot "desktop"
 $shortcutStartMenuRoot = Join-Path $artifactRoot "start-menu\Pane"
 $requiredFiles = @(
     "pane.exe",
+    "engine\pane-engine.exe",
+    "engine\qemu-img.exe",
     "README.md",
     "LICENSE",
     "docs\cli-reference.md",

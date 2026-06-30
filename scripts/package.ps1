@@ -3,7 +3,11 @@ param(
     [switch]$RunSmoke,
     [string]$Distro = "pane-arch",
     [string]$DesktopEnvironment = "xfce",
-    [switch]$Offline
+    [switch]$Offline,
+    [ValidateSet("Required", "Auto", "Disabled")]
+    [string]$BundleQemu = "Required",
+    [string]$QemuRoot,
+    [string]$BaseImagePath
 )
 
 $ErrorActionPreference = "Stop"
@@ -18,6 +22,63 @@ $certificationScript = Join-Path $repoRoot "scripts\certify-fresh-machine.ps1"
 $nativeBootSetManifestScript = Join-Path $repoRoot "scripts\write-native-boot-set-manifest.ps1"
 $assetRoot = Join-Path $repoRoot "scripts\package-assets"
 $iconAssetRoot = Join-Path $repoRoot "assets"
+
+function Resolve-QemuRoot {
+    param([string]$RequestedRoot)
+
+    if ($RequestedRoot) {
+        $resolved = Resolve-Path $RequestedRoot -ErrorAction Stop
+        $root = (Get-Item $resolved).FullName
+        if (-not (Test-Path (Join-Path $root "qemu-system-x86_64.exe"))) {
+            throw "QEMU root does not contain qemu-system-x86_64.exe: $root"
+        }
+        if (-not (Test-Path (Join-Path $root "qemu-img.exe"))) {
+            throw "QEMU root does not contain qemu-img.exe: $root"
+        }
+        return $root
+    }
+
+    $candidates = @(
+        "C:\Program Files\qemu",
+        "C:\Program Files\QEMU"
+    )
+    foreach ($candidate in $candidates) {
+        if ((Test-Path (Join-Path $candidate "qemu-system-x86_64.exe")) -and
+            (Test-Path (Join-Path $candidate "qemu-img.exe"))) {
+            return $candidate
+        }
+    }
+
+    $command = Get-Command "qemu-system-x86_64.exe" -ErrorAction SilentlyContinue
+    if ($command) {
+        $root = Split-Path -Parent $command.Source
+        if (Test-Path (Join-Path $root "qemu-img.exe")) {
+            return $root
+        }
+    }
+
+    return $null
+}
+
+function Copy-QemuEngine {
+    param(
+        [string]$SourceRoot,
+        [string]$PackageRoot
+    )
+
+    $engineDir = Join-Path $PackageRoot "engine"
+    New-Item -ItemType Directory -Force $engineDir | Out-Null
+    Copy-Item -Path (Join-Path $SourceRoot "*") -Destination $engineDir -Recurse -Force
+    Copy-Item (Join-Path $engineDir "qemu-system-x86_64.exe") (Join-Path $engineDir "pane-engine.exe") -Force
+
+    if (-not (Test-Path (Join-Path $engineDir "pane-engine.exe"))) {
+        throw "Failed to create bundled pane-engine.exe."
+    }
+    if (-not (Test-Path (Join-Path $engineDir "qemu-img.exe"))) {
+        throw "Failed to bundle qemu-img.exe."
+    }
+    Write-Host "Bundled QEMU engine: $engineDir"
+}
 
 Push-Location $repoRoot
 try {
@@ -73,6 +134,28 @@ try {
     Copy-Item $nativeBootSetManifestScript (Join-Path $packageDir "write-native-boot-set-manifest.ps1")
     Copy-Item (Join-Path $assetRoot "*") $packageDir
     Copy-Item $iconAssetRoot (Join-Path $packageDir "assets") -Recurse
+
+    if ($BundleQemu -ne "Disabled") {
+        $resolvedQemuRoot = Resolve-QemuRoot -RequestedRoot $QemuRoot
+        if ($resolvedQemuRoot) {
+            Copy-QemuEngine -SourceRoot $resolvedQemuRoot -PackageRoot $packageDir
+        }
+        elseif ($BundleQemu -eq "Required") {
+            throw "QEMU was not found. Install QEMU or pass -QemuRoot. Use -BundleQemu Disabled only for developer-only packages."
+        }
+        else {
+            Write-Warning "QEMU was not found; package will rely on PATH, Program Files, or first-run winget installation."
+        }
+    }
+
+    if ($BaseImagePath) {
+        $resolvedBaseImage = Resolve-Path $BaseImagePath -ErrorAction Stop
+        $imageDir = Join-Path $packageDir "images"
+        $packagedBaseImage = Join-Path $imageDir "arch-base.paneimg"
+        New-Item -ItemType Directory -Force $imageDir | Out-Null
+        Copy-Item $resolvedBaseImage $packagedBaseImage -Force
+        Write-Host "Bundled base OS image: $packagedBaseImage"
+    }
 
     if (Test-Path $archivePath) {
         Remove-Item $archivePath -Force

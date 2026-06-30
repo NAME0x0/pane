@@ -2148,27 +2148,44 @@ fn resolve_auto_runtime(args: &LaunchArgs) -> RuntimeMode {
     }
 }
 
-/// Built-in default Pane-hosted base OS image for download-on-first-run. Empty until hosting
-/// is wired; the env vars below override it without a rebuild so hosting can be pointed live.
-const PANE_BASE_IMAGE_URL: &str = "";
+/// Built-in default Pane-hosted base OS image for download-on-first-run. Release packages can
+/// also ship `images\arch-base.paneimg`; that bundled image is preferred over network fetches.
+const PANE_BASE_IMAGE_URL: &str =
+    "https://github.com/NAME0x0/pane/releases/latest/download/arch-base.paneimg";
 const PANE_BASE_IMAGE_SHA256: &str =
     "c589917dff159239bd8c1e8d5cd38413e15699192ef7236d3a24dbd7f1c9c931";
+
+fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn base_image_expected_sha256() -> Option<String> {
+    env_nonempty("PANE_BASE_IMAGE_SHA256").or_else(|| {
+        (!PANE_BASE_IMAGE_SHA256.trim().is_empty()).then(|| PANE_BASE_IMAGE_SHA256.to_string())
+    })
+}
 
 /// Resolve the base-image download source: `PANE_BASE_IMAGE_URL` env var overrides the
 /// built-in default; `PANE_BASE_IMAGE_SHA256` env var overrides the expected hash. Returns
 /// None when no URL is configured (Pane then guides the user to import an image).
 fn base_image_download_source() -> Option<(String, Option<String>)> {
-    let env_nonempty = |key: &str| {
-        std::env::var(key)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-    };
     let built_in_nonempty = |value: &str| (!value.trim().is_empty()).then(|| value.to_string());
     let url =
         env_nonempty("PANE_BASE_IMAGE_URL").or_else(|| built_in_nonempty(PANE_BASE_IMAGE_URL))?;
-    let sha = env_nonempty("PANE_BASE_IMAGE_SHA256")
-        .or_else(|| built_in_nonempty(PANE_BASE_IMAGE_SHA256));
-    Some((url, sha))
+    Some((url, base_image_expected_sha256()))
+}
+
+fn bundled_base_image_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("images").join("arch-base.paneimg"));
+            candidates.push(dir.join("arch-base.paneimg"));
+        }
+    }
+    candidates
 }
 
 /// Ensure a base OS image is registered for the QEMU engine, downloading it on first run
@@ -2178,9 +2195,29 @@ fn ensure_base_image(runtime_paths: &RuntimePaths) -> AppResult<()> {
     if runtime_paths.base_os_image.exists() {
         return Ok(());
     }
+    for candidate in bundled_base_image_candidates() {
+        if candidate.is_file() {
+            println!(
+                "Registering bundled Pane base OS image from {}...",
+                candidate.display()
+            );
+            register_base_os_image(
+                runtime_paths,
+                &candidate,
+                base_image_expected_sha256().as_deref(),
+                true,
+                false,
+            )?;
+            println!("Bundled base OS image registered.");
+            return Ok(());
+        }
+    }
     let Some((url, expected_sha)) = base_image_download_source() else {
         return Err(AppError::message(
-            "No base OS image is registered yet. Import one with `pane runtime --register-base-os <path> --base-os-expected-sha256 <sha>`, or set PANE_BASE_IMAGE_URL to enable download-on-first-run.",
+            format!(
+                "No base OS image is registered for this session. Pane expected it at {}. Import one with `pane runtime --prepare --session-name <same-session> --register-base-image <path> --expected-sha256 <sha> --require-native-root-disk`, place arch-base.paneimg beside pane.exe under images\\, or set PANE_BASE_IMAGE_URL to enable download-on-first-run.",
+                runtime_paths.base_os_image.display()
+            ),
         ));
     };
     let download = runtime_paths.downloads.join("arch-base.download");
@@ -2197,9 +2234,9 @@ fn ensure_base_image(runtime_paths: &RuntimePaths) -> AppResult<()> {
             ))
         })?;
     if !status.success() {
-        return Err(AppError::message(
-            "Base image download failed. Check your connection, or import the image manually with `pane runtime --register-base-os <path>`.",
-        ));
+        return Err(AppError::message(format!(
+            "Base image download failed from {url}. Check your connection, upload the expected arch-base.paneimg release asset, or import the image manually with `pane runtime --prepare --session-name <same-session> --register-base-image <path> --expected-sha256 <sha> --require-native-root-disk`."
+        )));
     }
     register_base_os_image(
         runtime_paths,

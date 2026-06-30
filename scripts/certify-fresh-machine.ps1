@@ -148,6 +148,8 @@ New-Item -ItemType Directory -Force $sandboxLocalAppData | Out-Null
 
 $requiredFiles = @(
     "pane.exe",
+    "engine\pane-engine.exe",
+    "engine\qemu-img.exe",
     "README.md",
     "LICENSE",
     "docs\cli-reference.md",

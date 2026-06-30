@@ -341,6 +341,14 @@ Common flags:
 | `--force` | Replace existing runtime artifact. |
 | `--json` | Print JSON. |
 
+Manual base-image registration:
+
+```powershell
+.\pane.exe runtime --prepare --session-name pane --register-base-image "C:\path\to\arch-base.img" --expected-sha256 "<64-char-sha256>" --require-native-root-disk
+```
+
+Pane also checks for `images\arch-base.paneimg` beside the packaged executable and can download the image from `PANE_BASE_IMAGE_URL` or the built-in GitHub Releases asset URL. Override the expected digest with `PANE_BASE_IMAGE_SHA256` when testing a custom image.
+
 ### `native-preflight`
 
 Flags: `--session-name <name>`, `--prepare-runtime`, `--json`.

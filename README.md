@@ -55,7 +55,7 @@ Pane should not be described as a finished zero-latency contained VM yet. The pr
 
 ## Quick Setup
 
-1. Download the latest Windows package from [GitHub Releases](https://github.com/NAME0x0/pane/releases).
+1. Download the latest `pane-windows-x86_64.zip` package from [GitHub Releases](https://github.com/NAME0x0/pane/releases).
 2. Extract the zip somewhere writable.
 3. Optional: run `Install Pane Shortcuts.cmd`.
 4. Launch `pane.exe` to open the Control Center.
@@ -63,12 +63,19 @@ Pane should not be described as a finished zero-latency contained VM yet. The pr
 
 Pane looks for QEMU in this order:
 
-1. bundled `pane-engine.exe` next to `pane.exe`,
-2. `qemu-system-x86_64` on `PATH`,
-3. `C:\Program Files\qemu\qemu-system-x86_64.exe`,
-4. automatic `winget install SoftwareFreedomConservancy.QEMU` when the QEMU path is explicitly used and QEMU is missing.
+1. bundled `engine\pane-engine.exe` from the Pane package,
+2. `pane-engine.exe` next to `pane.exe`,
+3. `qemu-system-x86_64` on `PATH`,
+4. `C:\Program Files\qemu\qemu-system-x86_64.exe`,
+5. automatic `winget install SoftwareFreedomConservancy.QEMU` when the QEMU path is explicitly used and QEMU is missing.
 
-The base Arch image is not hosted by default yet. If no base image is registered and no `PANE_BASE_IMAGE_URL` is configured, Pane will ask you to import one.
+Pane can register the Arch base image automatically from `images\arch-base.paneimg` inside the package, or download it from the configured release asset URL. For manual intake, use:
+
+```powershell
+.\pane.exe runtime --prepare --register-base-image "C:\path\to\arch-base.img" --expected-sha256 "<64-char-sha256>" --require-native-root-disk
+```
+
+Use the same `--session-name` during registration and launch if you are not using the default `pane` session.
 
 ## Launch Linux Desktop
 
@@ -208,6 +215,12 @@ Build the Windows package:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/package.ps1 -Profile release
+```
+
+The normal release package requires QEMU and bundles it under `engine\`. For a developer-only package that relies on the host's QEMU install instead:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/package.ps1 -Profile release -BundleQemu Disabled
 ```
 
 Certify the package entrypoints:

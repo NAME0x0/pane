@@ -9,6 +9,7 @@ A clean-machine pass should prove all of the following from the shipped package:
 - `pane.exe` starts outside the repo,
 - `pane.exe` launched without arguments opens the packaged Control Center, hydrating embedded app scripts first when sidecars are missing,
 - the package contains the docs and launcher files a user needs,
+- the package contains the bundled QEMU engine files required by the default desktop path,
 - the packaged control center entrypoint exists and self-identifies correctly,
 - `app-status` reports the app lifecycle and current display-transport boundary without claiming a contained window,
 - `runtime` can prepare the dedicated app-owned runtime-space layout, config, native-runtime manifest, serial boot image, verified boot-loader metadata, verified kernel boot-plan metadata, materialized kernel boot-layout metadata, mapped framebuffer/input queue contracts, and sparse user-disk artifact without requiring a live WSL install,

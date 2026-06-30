@@ -67,9 +67,13 @@ jobs:
           cargo test --locked
           cargo clippy --locked -- -D warnings
 
+      - name: Install QEMU engine
+        shell: pwsh
+        run: choco install qemu -y --no-progress
+
       - name: Build packaged release
         shell: pwsh
-        run: ./scripts/package.ps1 -Profile release
+        run: ./scripts/package.ps1 -Profile release -BundleQemu Required
 
       - name: Certify packaged release
         shell: pwsh
@@ -81,7 +85,6 @@ jobs:
           $ErrorActionPreference = "Stop"
           $dist = Join-Path $PWD "dist"
           $files = @(
-            "pane-windows-x86_64.exe",
             "pane-windows-x86_64.zip"
           )
           $manifest = [ordered]@{
@@ -113,8 +116,6 @@ jobs:
           retention-days: 30
           if-no-files-found: error
           path: |
-            dist/pane-windows-x86_64.exe
-            dist/pane-windows-x86_64.exe.sha256
             dist/pane-windows-x86_64.zip
             dist/pane-windows-x86_64.zip.sha256
             dist/pane-release-manifest.json
@@ -123,7 +124,6 @@ jobs:
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: |
-            dist/pane-windows-x86_64.exe
             dist/pane-windows-x86_64.zip
             dist/pane-release-manifest.json
 
@@ -132,8 +132,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/pane-windows-x86_64.exe
-            dist/pane-windows-x86_64.exe.sha256
             dist/pane-windows-x86_64.zip
             dist/pane-windows-x86_64.zip.sha256
             dist/pane-release-manifest.json

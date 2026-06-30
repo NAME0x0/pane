@@ -30,6 +30,8 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: "short"
+  PANE_RELEASE_BASE_IMAGE_URL: "https://github.com/NAME0x0/pane/releases/download/v0.2.0/arch-base.paneimg.zip"
+  PANE_RELEASE_BASE_IMAGE_ZIP_SHA256: "bc6be81d43d2e6837385849f2040eb08fd613949b6431d87baa5c9580b6e813c"
 
 jobs:
   validate-inputs:
@@ -79,13 +81,25 @@ jobs:
         shell: pwsh
         run: ./dist/pane-windows-x86_64/certify-fresh-machine.ps1 -Mode PackageOnly
 
+      - name: Download base image release asset
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $asset = Join-Path $PWD "dist\arch-base.paneimg.zip"
+          curl.exe -L --fail --retry 3 --retry-delay 5 -o $asset $env:PANE_RELEASE_BASE_IMAGE_URL
+          $hash = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne $env:PANE_RELEASE_BASE_IMAGE_ZIP_SHA256) {
+            throw "Base image asset SHA-256 mismatch. Expected $env:PANE_RELEASE_BASE_IMAGE_ZIP_SHA256, got $hash."
+          }
+
       - name: Generate checksums and manifest
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $dist = Join-Path $PWD "dist"
           $files = @(
-            "pane-windows-x86_64.zip"
+            "pane-windows-x86_64.zip",
+            "arch-base.paneimg.zip"
           )
           $manifest = [ordered]@{
             name = "pane"
@@ -118,6 +132,8 @@ jobs:
           path: |
             dist/pane-windows-x86_64.zip
             dist/pane-windows-x86_64.zip.sha256
+            dist/arch-base.paneimg.zip
+            dist/arch-base.paneimg.zip.sha256
             dist/pane-release-manifest.json
 
       - name: Attest release artifacts
@@ -125,6 +141,7 @@ jobs:
         with:
           subject-path: |
             dist/pane-windows-x86_64.zip
+            dist/arch-base.paneimg.zip
             dist/pane-release-manifest.json
 
       - name: Publish GitHub release
@@ -134,6 +151,8 @@ jobs:
           files: |
             dist/pane-windows-x86_64.zip
             dist/pane-windows-x86_64.zip.sha256
+            dist/arch-base.paneimg.zip
+            dist/arch-base.paneimg.zip.sha256
             dist/pane-release-manifest.json
           tag_name: ${{ inputs.tag_name }}
           name: Pane ${{ inputs.tag_name }}

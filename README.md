@@ -55,11 +55,17 @@ Pane should not be described as a finished zero-latency contained VM yet. The pr
 
 ## Quick Setup
 
+During the initial phase, use the zip package rather than a standalone executable. The zip keeps `pane.exe`, the bundled engine, helper scripts, docs, and shortcuts together.
+
 1. Download the latest `pane-windows-x86_64.zip` package from [GitHub Releases](https://github.com/NAME0x0/pane/releases).
-2. Extract the zip somewhere writable.
-3. Optional: run `Install Pane Shortcuts.cmd`.
-4. Launch `pane.exe` to open the Control Center.
-5. Use `Doctor` if you want a host readiness check before launching anything.
+2. Extract the zip somewhere writable, for example `C:\Users\your-name\Apps\Pane`.
+3. Run `pane.exe` from the extracted folder to open the Control Center.
+4. Optional: click `Doctor` to check host readiness.
+5. Create your Linux user from the app.
+6. Install the recommended XFCE desktop profile.
+7. Click `Launch` and log in with the Linux user you created.
+
+The first launch can take longer because Pane may download and register the Arch base image automatically. Keep the app open, stay connected to the internet, and make sure the drive containing `%LOCALAPPDATA%\Pane` has several GiB free.
 
 Pane looks for QEMU in this order:
 
@@ -74,6 +80,8 @@ Pane automatically prepares the Arch base image on first launch:
 1. if a registered image already exists, Pane reuses it and downloads nothing;
 2. otherwise, if the package contains `images\arch-base.paneimg` or `images\arch-base.paneimg.zip`, Pane registers it;
 3. otherwise, Pane downloads `arch-base.paneimg.zip` from the latest GitHub release, extracts it, verifies the raw image SHA-256, and registers it.
+
+Older Pane installs that never received a base image are repaired by the same flow: launch the current app and Pane will reuse an existing valid image or fetch the missing one.
 
 For manual intake or custom images, use:
 

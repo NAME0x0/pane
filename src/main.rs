@@ -31,10 +31,10 @@ fn main() -> ExitCode {
         };
     }
 
-    // Bare `pane` (or a double-click) opens the GUI Control Center; any subcommand runs the
-    // CLI. A subcommand is the first non-flag argument.
-    let has_subcommand = std::env::args().skip(1).any(|arg| !arg.starts_with('-'));
-    if !has_subcommand {
+    // Bare `pane` (or a double-click) opens the GUI Control Center; any argument belongs
+    // to the CLI so `pane --help` and other flag-only commands never launch a window.
+    let has_cli_args = std::env::args_os().nth(1).is_some();
+    if !has_cli_args {
         #[cfg(not(windows))]
         {
             eprintln!("Pane's GUI Control Center is currently Windows-only. Run a CLI subcommand instead.");

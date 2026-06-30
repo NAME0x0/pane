@@ -347,7 +347,7 @@ Manual base-image registration:
 .\pane.exe runtime --prepare --session-name pane --register-base-image "C:\path\to\arch-base.img" --expected-sha256 "<64-char-sha256>" --require-native-root-disk
 ```
 
-Pane also checks for `images\arch-base.paneimg` beside the packaged executable and can download the image from `PANE_BASE_IMAGE_URL` or the built-in GitHub Releases asset URL. Override the expected digest with `PANE_BASE_IMAGE_SHA256` when testing a custom image.
+Pane automatically prepares the base image before the QEMU path launches. If the image is already registered in Pane runtime storage, it is reused and no network request is made. If the package contains `images\arch-base.paneimg` or `images\arch-base.paneimg.zip`, Pane registers that bundled image. Otherwise it downloads `arch-base.paneimg.zip` from `PANE_BASE_IMAGE_URL` or the built-in GitHub Releases asset URL, extracts it, verifies the raw image SHA-256, and registers it. Override the expected digest with `PANE_BASE_IMAGE_SHA256` when testing a custom image.
 
 ### `native-preflight`
 

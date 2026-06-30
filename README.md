@@ -45,7 +45,7 @@ The current practical path is Arch-first:
 | Host OS | Windows 10/11 |
 | Primary distro | Arch Linux |
 | App entrypoint | `pane.exe` opens the Pane Control Center when launched without arguments |
-| Boot engine | QEMU + WHPX when QEMU and a registered Arch base image are available |
+| Boot engine | QEMU + WHPX with automatic first-run Arch base image registration |
 | Legacy fallback | WSL2 + XRDP remains available for the older Arch + XFCE bridge path |
 | Desktop profiles | XFCE is the recommended/default profile; GNOME and KDE installs exist but are heavier and less proven |
 | Shared storage | PaneShared, durable by default and scratchable when requested |
@@ -69,7 +69,13 @@ Pane looks for QEMU in this order:
 4. `C:\Program Files\qemu\qemu-system-x86_64.exe`,
 5. automatic `winget install SoftwareFreedomConservancy.QEMU` when the QEMU path is explicitly used and QEMU is missing.
 
-Pane can register the Arch base image automatically from `images\arch-base.paneimg` inside the package, or download it from the configured release asset URL. For manual intake, use:
+Pane automatically prepares the Arch base image on first launch:
+
+1. if a registered image already exists, Pane reuses it and downloads nothing;
+2. otherwise, if the package contains `images\arch-base.paneimg` or `images\arch-base.paneimg.zip`, Pane registers it;
+3. otherwise, Pane downloads `arch-base.paneimg.zip` from the latest GitHub release, extracts it, verifies the raw image SHA-256, and registers it.
+
+For manual intake or custom images, use:
 
 ```powershell
 .\pane.exe runtime --prepare --register-base-image "C:\path\to\arch-base.img" --expected-sha256 "<64-char-sha256>" --require-native-root-disk

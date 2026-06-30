@@ -2150,10 +2150,30 @@ fn resolve_auto_runtime(args: &LaunchArgs) -> RuntimeMode {
 
 /// Built-in default Pane-hosted base OS image for download-on-first-run. Release packages can
 /// also ship `images\arch-base.paneimg`; that bundled image is preferred over network fetches.
+/// The hosted artifact is compressed because the raw verified image is a sparse 4 GiB disk.
 const PANE_BASE_IMAGE_URL: &str =
-    "https://github.com/NAME0x0/pane/releases/latest/download/arch-base.paneimg";
+    "https://github.com/NAME0x0/pane/releases/latest/download/arch-base.paneimg.zip";
 const PANE_BASE_IMAGE_SHA256: &str =
     "c589917dff159239bd8c1e8d5cd38413e15699192ef7236d3a24dbd7f1c9c931";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BaseImagePayloadKind {
+    Raw,
+    Zip,
+}
+
+fn base_image_payload_kind(path_or_url: &str) -> BaseImagePayloadKind {
+    let normalized = path_or_url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(path_or_url)
+        .to_ascii_lowercase();
+    if normalized.ends_with(".zip") {
+        BaseImagePayloadKind::Zip
+    } else {
+        BaseImagePayloadKind::Raw
+    }
+}
 
 fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key)
@@ -2182,10 +2202,112 @@ fn bundled_base_image_candidates() -> Vec<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             candidates.push(dir.join("images").join("arch-base.paneimg"));
+            candidates.push(dir.join("images").join("arch-base.paneimg.zip"));
             candidates.push(dir.join("arch-base.paneimg"));
+            candidates.push(dir.join("arch-base.paneimg.zip"));
         }
     }
     candidates
+}
+
+fn find_extracted_base_image(dir: &Path) -> AppResult<PathBuf> {
+    let mut stack = vec![dir.to_path_buf()];
+    let mut first_paneimg = None;
+    while let Some(current) = stack.pop() {
+        for entry in fs::read_dir(&current)? {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if file_name.eq_ignore_ascii_case("arch-base.paneimg") {
+                return Ok(path);
+            }
+            if first_paneimg.is_none()
+                && path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("paneimg"))
+            {
+                first_paneimg = Some(path);
+            }
+        }
+    }
+    first_paneimg.ok_or_else(|| {
+        AppError::message(format!(
+            "The downloaded base image archive did not contain arch-base.paneimg under {}.",
+            dir.display()
+        ))
+    })
+}
+
+fn extract_base_image_zip(
+    archive: &Path,
+    runtime_paths: &RuntimePaths,
+) -> AppResult<(PathBuf, PathBuf)> {
+    let extract_dir = runtime_paths.downloads.join("arch-base-extracted");
+    let _ = fs::remove_dir_all(&extract_dir);
+    fs::create_dir_all(&extract_dir)?;
+
+    let tar_status = Command::new("tar.exe")
+        .arg("-xf")
+        .arg(archive)
+        .arg("-C")
+        .arg(&extract_dir)
+        .status();
+
+    let extracted = match tar_status {
+        Ok(status) if status.success() => true,
+        _ => {
+            let script = "Expand-Archive -LiteralPath $args[0] -DestinationPath $args[1] -Force";
+            let status = Command::new("powershell.exe")
+                .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script])
+                .arg(archive)
+                .arg(&extract_dir)
+                .status()
+                .map_err(|error| {
+                    AppError::message(format!(
+                        "Could not extract the base image archive with tar.exe or PowerShell: {error}"
+                    ))
+                })?;
+            status.success()
+        }
+    };
+
+    if !extracted {
+        return Err(AppError::message(format!(
+            "Could not extract the base image archive {}.",
+            archive.display()
+        )));
+    }
+
+    let image = find_extracted_base_image(&extract_dir)?;
+    Ok((image, extract_dir))
+}
+
+fn register_base_image_payload(
+    runtime_paths: &RuntimePaths,
+    payload: &Path,
+    expected_sha256: Option<&str>,
+) -> AppResult<()> {
+    let (image_source, cleanup_dir) = match base_image_payload_kind(&payload.display().to_string())
+    {
+        BaseImagePayloadKind::Raw => (payload.to_path_buf(), None),
+        BaseImagePayloadKind::Zip => {
+            let (image_source, cleanup_dir) = extract_base_image_zip(payload, runtime_paths)?;
+            (image_source, Some(cleanup_dir))
+        }
+    };
+    let result = register_base_os_image(runtime_paths, &image_source, expected_sha256, true, false);
+    if let Some(cleanup_dir) = cleanup_dir {
+        let _ = fs::remove_dir_all(cleanup_dir);
+    }
+    result
 }
 
 /// Ensure a base OS image is registered for the QEMU engine, downloading it on first run
@@ -2201,12 +2323,10 @@ fn ensure_base_image(runtime_paths: &RuntimePaths) -> AppResult<()> {
                 "Registering bundled Pane base OS image from {}...",
                 candidate.display()
             );
-            register_base_os_image(
+            register_base_image_payload(
                 runtime_paths,
                 &candidate,
                 base_image_expected_sha256().as_deref(),
-                true,
-                false,
             )?;
             println!("Bundled base OS image registered.");
             return Ok(());
@@ -2220,11 +2340,15 @@ fn ensure_base_image(runtime_paths: &RuntimePaths) -> AppResult<()> {
             ),
         ));
     };
-    let download = runtime_paths.downloads.join("arch-base.download");
+    let payload_kind = base_image_payload_kind(&url);
+    let download = match payload_kind {
+        BaseImagePayloadKind::Raw => runtime_paths.downloads.join("arch-base.paneimg.download"),
+        BaseImagePayloadKind::Zip => runtime_paths.downloads.join("arch-base.paneimg.zip"),
+    };
     if let Some(parent) = download.parent() {
         fs::create_dir_all(parent)?;
     }
-    println!("Downloading the Pane base OS image from {url} (one-time ~4 GiB fetch)...");
+    println!("Downloading the Pane base OS image from {url} (one-time first-run fetch)...");
     let status = std::process::Command::new("curl.exe")
         .args(["-L", "--fail", "-o", &download.display().to_string(), &url])
         .status()
@@ -2235,16 +2359,10 @@ fn ensure_base_image(runtime_paths: &RuntimePaths) -> AppResult<()> {
         })?;
     if !status.success() {
         return Err(AppError::message(format!(
-            "Base image download failed from {url}. Check your connection, upload the expected arch-base.paneimg release asset, or import the image manually with `pane runtime --prepare --session-name <same-session> --register-base-image <path> --expected-sha256 <sha> --require-native-root-disk`."
+            "Base image download failed from {url}. Check your connection, upload the expected arch-base.paneimg.zip release asset, or import the image manually with `pane runtime --prepare --session-name <same-session> --register-base-image <path> --expected-sha256 <sha> --require-native-root-disk`."
         )));
     }
-    register_base_os_image(
-        runtime_paths,
-        &download,
-        expected_sha.as_deref(),
-        true,
-        false,
-    )?;
+    register_base_image_payload(runtime_paths, &download, expected_sha.as_deref())?;
     let _ = fs::remove_file(&download);
     println!("Base OS image downloaded, verified, and registered.");
     Ok(())
@@ -16334,6 +16452,40 @@ mod tests {
         assert!(metadata.bootable_disk_hint);
         assert!(metadata.root_partition_hint.is_some());
         assert!(paths.base_os_image.is_file());
+
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn base_image_payload_kind_detects_zip_archives() {
+        assert_eq!(
+            super::base_image_payload_kind("https://example.test/arch-base.paneimg.zip"),
+            super::BaseImagePayloadKind::Zip
+        );
+        assert_eq!(
+            super::base_image_payload_kind(
+                "https://example.test/arch-base.paneimg.zip?download=1#asset"
+            ),
+            super::BaseImagePayloadKind::Zip
+        );
+        assert_eq!(
+            super::base_image_payload_kind("C:\\Pane\\images\\arch-base.paneimg"),
+            super::BaseImagePayloadKind::Raw
+        );
+    }
+
+    #[test]
+    fn find_extracted_base_image_prefers_canonical_name() {
+        let paths = temp_runtime_paths("runtime-base-image-extract-find");
+        let nested = paths.downloads.join("payload").join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let decoy = nested.join("other.paneimg");
+        let canonical = nested.join("arch-base.paneimg");
+        std::fs::write(&decoy, b"decoy").unwrap();
+        std::fs::write(&canonical, b"canonical").unwrap();
+
+        let found = super::find_extracted_base_image(&paths.downloads).unwrap();
+        assert_eq!(found, canonical);
 
         let _ = std::fs::remove_dir_all(&paths.root);
     }
